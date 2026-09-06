@@ -7,7 +7,7 @@ assignees: ''
 ---
 
 **Board Information:**
-- Board Model / Vendor (e.g., Sapphire BC-250, ASRock, etc.):
+- Board Model / Vendor (e.g., ASRock BC-250, AMD OEM, etc.):
 - BIOS Version:
 - Active Compute Units (40 CUs or 24 CUs):
 - Linux Distribution:
