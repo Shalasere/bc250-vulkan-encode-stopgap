@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
@@ -30,10 +30,11 @@ struct h264_decoder {
 };
 
 static const uint8_t* find_start_code(const uint8_t *data, size_t size) {
-    for (size_t i = 0; i + 3 < size; i++) {
+    if (!data || size < 3) return NULL;
+    for (size_t i = 0; i + 2 < size; i++) {
         if (data[i] == 0 && data[i+1] == 0) {
             if (data[i+2] == 1) return &data[i];
-            if (data[i+2] == 0 && i + 4 < size && data[i+3] == 1) return &data[i];
+            if (data[i+2] == 0 && i + 3 < size && data[i+3] == 1) return &data[i];
         }
     }
     return NULL;

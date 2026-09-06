@@ -11,4 +11,4 @@ When working with experimental drivers on the BC-250:
    ```
 4. **Recovery.** If a hard lock occurs, hold the power button or use SysRq keys (REISUB) to safely shut down.
 
-<!-- bc250-vcn-driver v0.1.0 -->
+<!-- bc250-vcn-driver v0.2.0 -->

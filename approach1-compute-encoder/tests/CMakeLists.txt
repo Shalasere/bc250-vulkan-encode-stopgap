@@ -1,4 +1,4 @@
-# bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
 cmake_minimum_required(VERSION 3.16)
 
 add_executable(test_bitstream test_bitstream.c ../src/bitstream.c)

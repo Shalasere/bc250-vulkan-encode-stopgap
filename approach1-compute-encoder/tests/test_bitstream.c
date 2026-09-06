@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * test_bitstream.c - Unit tests for H.264 Bitstream & Exp-Golomb Writer
  */
@@ -30,6 +30,13 @@ static void test_exp_golomb_unsigned(void) {
     bs_rbsp_trailing_bits(&bs);
     assert((buf[0] & 0xe0) == 0x60);
 
+    /* Extreme unsigned edge case: UINT32_MAX must not cause unsigned 32-bit overflow */
+    uint8_t large_buf[32];
+    bs_init(&bs, large_buf, sizeof(large_buf));
+    bs_write_ue(&bs, 0xFFFFFFFFU);
+    bs_rbsp_trailing_bits(&bs);
+    assert(bs_bytes_written(&bs) > 0);
+
     printf("[PASS] Exp-Golomb Unsigned (ue) tests\n");
 }
 
@@ -54,6 +61,13 @@ static void test_exp_golomb_signed(void) {
     bs_write_se(&bs, -1);
     bs_rbsp_trailing_bits(&bs);
     assert((buf[0] & 0xe0) == 0x60);
+
+    /* Extreme signed edge case: INT32_MIN must not cause signed integer overflow or crash */
+    uint8_t s_large_buf[32];
+    bs_init(&bs, s_large_buf, sizeof(s_large_buf));
+    bs_write_se(&bs, -2147483647 - 1);
+    bs_rbsp_trailing_bits(&bs);
+    assert(bs_bytes_written(&bs) > 0);
 
     printf("[PASS] Exp-Golomb Signed (se) tests\n");
 }

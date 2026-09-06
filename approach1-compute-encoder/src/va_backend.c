@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
@@ -245,6 +245,7 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
             c->height = picture_height;
             c->flag = flag;
             c->num_render_targets = num_render_targets;
+            c->current_render_target = VA_INVALID_SURFACE;
             c->coded_buf_id = VA_INVALID_ID;
 
             if (num_render_targets > 0 && render_targets) {
@@ -479,13 +480,15 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
     bc250_context *c = &data->contexts[context];
+    if (!VALID_ID(c->current_render_target, MAX_SURFACES) || !data->surfaces[c->current_render_target].allocated) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
     bc250_surface *surf = &data->surfaces[c->current_render_target];
 
     if ((c->h264_enc || c->hevc_enc) && VALID_ID(c->coded_buf_id, MAX_BUFFERS) && data->buffers[c->coded_buf_id].allocated) {
         bc250_buffer *coded_buf = &data->buffers[c->coded_buf_id];
         uint8_t *dest = ((uint8_t *)coded_buf->data) + sizeof(VACodedBufferSegment);
-        size_t total_buf_sz = (coded_buf->size * coded_buf->num_elements);
-        size_t max_payload = total_buf_sz > sizeof(VACodedBufferSegment) ? (total_buf_sz - sizeof(VACodedBufferSegment)) : 0;
+        size_t max_payload = (size_t)coded_buf->size * coded_buf->num_elements;
 
         int written = -1;
         if (c->h264_enc) {

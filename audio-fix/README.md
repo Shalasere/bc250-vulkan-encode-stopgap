@@ -70,4 +70,4 @@ patch -p1 < /path/to/0002-hdmi-audio-adapter-compat.patch
 make && sudo make modules_install install
 ```
 
-<!-- bc250-vcn-driver v0.1.0 -->
+<!-- bc250-vcn-driver v0.2.0 -->

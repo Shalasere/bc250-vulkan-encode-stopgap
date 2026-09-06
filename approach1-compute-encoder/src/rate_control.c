@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
@@ -20,6 +20,7 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps) {
     rc->framerate = fps > 0 ? fps : 60.0;
 
     rc->target_bits_per_frame = (uint32_t)(rc->target_bitrate / rc->framerate);
+    if (rc->target_bits_per_frame < 100) rc->target_bits_per_frame = 100;
 
     if (mode == RC_LOW_LATENCY) {
         /* 2-frame buffer for instant game streaming feedback */
@@ -28,6 +29,7 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps) {
         /* Standard 1-second leaky bucket buffer */
         rc->buffer_size = rc->target_bitrate;
     }
+    if (rc->buffer_size < 1000) rc->buffer_size = 1000;
 
     rc->buffer_fullness = rc->buffer_size / 2;
     rc->base_qp = 26;
@@ -41,6 +43,7 @@ int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad) {
 
     /* Compute buffer fullness deviation from 50% target */
     int64_t target_level = rc->buffer_size / 2;
+    if (target_level <= 0) target_level = 1;
     int64_t error = rc->buffer_fullness - target_level;
 
     /* Proportional feedback: map buffer error to QP adjustments */

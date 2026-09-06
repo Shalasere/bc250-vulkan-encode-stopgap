@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
@@ -14,6 +14,9 @@ void bs_init(bitstream_t *bs, uint8_t *buf, size_t size) {
     bs->byte_offset = 0;
     bs->bit_offset = 0;
     bs->overflow = false;
+    if (buf && size > 0) {
+        buf[0] = 0;
+    }
 }
 
 void bs_write_u(bitstream_t *bs, int bits, uint32_t val) {
@@ -50,22 +53,22 @@ void bs_write_u(bitstream_t *bs, int bits, uint32_t val) {
 }
 
 void bs_write_ue(bitstream_t *bs, uint32_t val) {
-    uint32_t temp = val + 1;
+    uint64_t temp = (uint64_t)val + 1;
     int zeros = 0;
     while (temp > 1) {
         zeros++;
         temp >>= 1;
     }
     bs_write_u(bs, zeros, 0);
-    bs_write_u(bs, zeros + 1, val + 1);
+    bs_write_u(bs, zeros + 1, (uint32_t)(val + 1));
 }
 
 void bs_write_se(bitstream_t *bs, int32_t val) {
     uint32_t uval;
     if (val <= 0) {
-        uval = -2 * val;
+        uval = (uint32_t)(-(int64_t)val * 2);
     } else {
-        uval = 2 * val - 1;
+        uval = (uint32_t)((uint32_t)val * 2 - 1);
     }
     bs_write_ue(bs, uval);
 }
@@ -192,6 +195,7 @@ size_t bs_write_sps(uint8_t *buf, size_t buf_size, const h264_sps_t *sps) {
     bs_init(&out_bs, buf, buf_size);
     bs_write_nal_header(&out_bs, NAL_REF_IDC_HIGH, NAL_TYPE_SPS);
     size_t payload_offset = bs_bytes_written(&out_bs);
+    if (payload_offset >= buf_size) return 0;
     size_t ebsp_size = bs_rbsp_to_ebsp(buf + payload_offset, buf_size - payload_offset, rbsp, bs_bytes_written(&bs));
     
     return payload_offset + ebsp_size;
@@ -229,6 +233,7 @@ size_t bs_write_pps(uint8_t *buf, size_t buf_size, const h264_pps_t *pps) {
     bs_init(&out_bs, buf, buf_size);
     bs_write_nal_header(&out_bs, NAL_REF_IDC_HIGH, NAL_TYPE_PPS);
     size_t payload_offset = bs_bytes_written(&out_bs);
+    if (payload_offset >= buf_size) return 0;
     size_t ebsp_size = bs_rbsp_to_ebsp(buf + payload_offset, buf_size - payload_offset, rbsp, bs_bytes_written(&bs));
     
     return payload_offset + ebsp_size;

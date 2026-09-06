@@ -1,10 +1,10 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
  *
  * cavlc.c - Spec-compliant H.264 CAVLC entropy encoder
- *          ITU-T Recommendation H.264 (04/2017) Section 9.2
+ *           ITU-T Recommendation H.264 (04/2017) Section 9.2
  */
 #include "cavlc.h"
 #include <stdlib.h>
@@ -84,93 +84,148 @@ void cavlc_write_mb_p16x16_header(bitstream_t *bs, int mvd_x, int mvd_y, int cbp
     }
 }
 
-/* Table 9-5 VLC structure for coeff_token */
-typedef struct {
-    uint8_t len;
-    uint16_t code;
-} vlc_code_t;
+/* Table 9-5: coeff_token VLC length and bit tables per ITU-T H.264
+ * Index: [vlc_table][TotalCoeff * 4 + TrailingOnes]
+ *   vlc_table 0: 0 <= nC < 2
+ *   vlc_table 1: 2 <= nC < 4
+ *   vlc_table 2: 4 <= nC < 8
+ *   vlc_table 3: nC >= 8
+ */
+static const uint8_t coeff_token_len[4][4 * 17] = {
+{
+     1, 0, 0, 0,
+     6, 2, 0, 0,     8, 6, 3, 0,     9, 8, 7, 5,    10, 9, 8, 6,
+    11,10, 9, 7,    13,11,10, 8,    13,13,11, 9,    13,13,13,10,
+    14,14,13,11,    14,14,14,13,    15,15,14,14,    15,15,15,14,
+    16,15,15,15,    16,16,16,15,    16,16,16,16,    16,16,16,16,
+},
+{
+     2, 0, 0, 0,
+     6, 2, 0, 0,     6, 5, 3, 0,     7, 6, 6, 4,     8, 6, 6, 4,
+     8, 7, 7, 5,     9, 8, 8, 6,    11, 9, 9, 6,    11,11,11, 7,
+    12,11,11, 9,    12,12,12,11,    12,12,12,11,    13,13,13,12,
+    13,13,13,13,    13,14,13,13,    14,14,14,13,    14,14,14,14,
+},
+{
+     4, 0, 0, 0,
+     6, 4, 0, 0,     6, 5, 4, 0,     6, 5, 5, 4,     7, 5, 5, 4,
+     7, 5, 5, 4,     7, 6, 6, 4,     7, 6, 6, 4,     8, 7, 7, 5,
+     8, 8, 7, 6,     9, 8, 8, 7,     9, 9, 8, 8,     9, 9, 9, 8,
+    10, 9, 9, 9,    10,10,10,10,    10,10,10,10,    10,10,10,10,
+},
+{
+     6, 0, 0, 0,
+     6, 6, 0, 0,     6, 6, 6, 0,     6, 6, 6, 6,     6, 6, 6, 6,
+     6, 6, 6, 6,     6, 6, 6, 6,     6, 6, 6, 6,     6, 6, 6, 6,
+     6, 6, 6, 6,     6, 6, 6, 6,     6, 6, 6, 6,     6, 6, 6, 6,
+     6, 6, 6, 6,     6, 6, 6, 6,     6, 6, 6, 6,     6, 6, 6, 6,
+}
+};
 
-/* Table 9-5 VLC 1 for coeff_token (0 <= nC < 2) */
-static const vlc_code_t coeff_token_vlc1[17][4] = {
-    {{1, 0x1}, {0, 0}, {0, 0}, {0, 0}},                                   /* TotalCoeff = 0 */
-    {{2, 0x1}, {6, 0x5}, {0, 0}, {0, 0}},                                  /* TotalCoeff = 1, T1=1,2 */
-    {{3, 0x1}, {6, 0x7}, {8, 0x7}, {0, 0}},                                /* TotalCoeff = 2, T1=1,2,3 */
-    {{4, 0x1}, {7, 0x7}, {9, 0x7}, {9, 0x4}},                              /* TotalCoeff = 3 */
-    {{5, 0x1}, {7, 0x6}, {9, 0x6}, {10, 0x5}},                             /* TotalCoeff = 4 */
-    {{6, 0x1}, {8, 0x6}, {10, 0x7}, {11, 0x7}},                            /* TotalCoeff = 5 */
-    {{7, 0x1}, {9, 0x5}, {11, 0x6}, {12, 0x7}},                            /* TotalCoeff = 6 */
-    {{8, 0x1}, {10, 0x4}, {12, 0x6}, {13, 0x7}},                           /* TotalCoeff = 7 */
-    {{9, 0x1}, {11, 0x5}, {13, 0x6}, {13, 0x4}},                           /* TotalCoeff = 8 */
-    {{10, 0x1}, {12, 0x5}, {14, 0x6}, {14, 0x4}},                          /* TotalCoeff = 9 */
-    {{11, 0x1}, {13, 0x5}, {15, 0x6}, {15, 0x4}},                          /* TotalCoeff = 10 */
-    {{13, 0x3}, {14, 0x5}, {16, 0x6}, {16, 0x4}},                          /* TotalCoeff = 11 */
-    {{13, 0x2}, {15, 0x5}, {16, 0x3}, {16, 0x2}},                          /* TotalCoeff = 12 */
-    {{14, 0x3}, {16, 0x5}, {16, 0x1}, {15, 0x1}},                          /* TotalCoeff = 13 */
-    {{14, 0x2}, {16, 0x0}, {15, 0x2}, {14, 0x1}},                          /* TotalCoeff = 14 */
-    {{15, 0x3}, {15, 0x0}, {14, 0x0}, {13, 0x1}},                          /* TotalCoeff = 15 */
-    {{16, 0x7}, {15, 0x3}, {13, 0x0}, {12, 0x1}}                           /* TotalCoeff = 16 */
+static const uint8_t coeff_token_bits[4][4 * 17] = {
+{
+     1, 0, 0, 0,
+     5, 1, 0, 0,     7, 4, 1, 0,     7, 6, 5, 3,     7, 6, 5, 3,
+     7, 6, 5, 4,    15, 6, 5, 4,    11,14, 5, 4,     8,10,13, 4,
+    15,14, 9, 4,    11,10,13,12,    15,14, 9,12,    11,10,13, 8,
+    15, 1, 9,12,    11,14,13, 8,     7,10, 9,12,     4, 6, 5, 8,
+},
+{
+     3, 0, 0, 0,
+    11, 2, 0, 0,     7, 7, 3, 0,     7,10, 9, 5,     7, 6, 5, 4,
+     4, 6, 5, 6,     7, 6, 5, 8,    15, 6, 5, 4,    11,14,13, 4,
+    15,10, 9, 4,    11,14,13,12,     8,10, 9, 8,    15,14,13,12,
+    11,10, 9,12,     7,11, 6, 8,     9, 8,10, 1,     7, 6, 5, 4,
+},
+{
+    15, 0, 0, 0,
+    15,14, 0, 0,    11,15,13, 0,     8,12,14,12,    15,10,11,11,
+    11, 8, 9,10,     9,14,13, 9,     8,10, 9, 8,    15,14,13,13,
+    11,14,10,12,    15,10,13,12,    11,14, 9,12,     8,10,13, 8,
+    13, 7, 9,12,     9,12,11,10,     5, 8, 7, 6,     1, 4, 3, 2,
+},
+{
+     0, 0, 0, 0,
+     4, 5, 0, 0,     8, 9,10, 0,    12,13,14,15,    16,17,18,19,
+    20,21,22,23,    24,25,26,27,    28,29,30,31,    32,33,34,35,
+    36,37,38,39,    40,41,42,43,    44,45,46,47,    48,49,50,51,
+    52,53,54,55,    56,57,58,59,    60,61,62,63,     0, 1, 2, 3,
+}
 };
 
 /* Table 9-7: Total zeros for 4x4 block (TotalCoeff 1..15) */
-static const vlc_code_t total_zeros_vlc[16][16] = {
-    /* TotalCoeff = 0: not applicable */
-    {{0, 0}},
-    /* TotalCoeff = 1: TotalZeros 0..15 */
-    {{1, 0x1}, {3, 0x3}, {3, 0x2}, {4, 0x3}, {4, 0x2}, {5, 0x3}, {5, 0x2}, {6, 0x3},
-     {6, 0x2}, {7, 0x3}, {7, 0x2}, {8, 0x3}, {8, 0x2}, {9, 0x3}, {9, 0x2}, {9, 0x1}},
-    /* TotalCoeff = 2: TotalZeros 0..14 */
-    {{3, 0x7}, {3, 0x6}, {4, 0x7}, {4, 0x6}, {4, 0x5}, {5, 0x7}, {5, 0x6}, {5, 0x5},
-     {6, 0x7}, {6, 0x6}, {6, 0x5}, {6, 0x4}, {6, 0x3}, {6, 0x2}, {6, 0x1}},
-    /* TotalCoeff = 3: TotalZeros 0..13 */
-    {{4, 0xF}, {4, 0xE}, {4, 0xD}, {4, 0xC}, {4, 0xB}, {5, 0x7}, {5, 0x6}, {5, 0x5},
-     {5, 0x4}, {5, 0x3}, {6, 0x3}, {6, 0x2}, {6, 0x1}, {6, 0x0}},
-    /* TotalCoeff = 4 */
-    {{5, 0x1F}, {5, 0x1E}, {4, 0xD}, {4, 0xC}, {4, 0xB}, {4, 0xA}, {5, 0x7}, {5, 0x6},
-     {5, 0x5}, {5, 0x4}, {6, 0x3}, {6, 0x2}, {6, 0x1}},
-    /* TotalCoeff = 5 */
-    {{4, 0x7}, {4, 0x6}, {4, 0x5}, {4, 0x4}, {4, 0x3}, {4, 0x2}, {4, 0x1}, {5, 0x1},
-     {6, 0x3}, {6, 0x2}, {6, 0x1}, {6, 0x0}},
-    /* TotalCoeff = 6 */
-    {{3, 0x7}, {4, 0x7}, {4, 0x6}, {4, 0x5}, {4, 0x4}, {4, 0x3}, {4, 0x2}, {5, 0x3},
-     {5, 0x2}, {5, 0x1}, {5, 0x0}},
-    /* TotalCoeff = 7 */
-    {{3, 0x7}, {3, 0x6}, {4, 0x5}, {4, 0x4}, {4, 0x3}, {4, 0x2}, {4, 0x1}, {5, 0x1},
-     {5, 0x0}, {6, 0x0}},
-    /* TotalCoeff = 8 */
-    {{3, 0x7}, {3, 0x6}, {3, 0x5}, {4, 0x3}, {4, 0x2}, {4, 0x1}, {5, 0x1}, {5, 0x0}, {6, 0x0}},
-    /* TotalCoeff = 9 */
-    {{2, 0x3}, {3, 0x2}, {3, 0x1}, {4, 0x3}, {4, 0x2}, {4, 0x1}, {5, 0x1}, {5, 0x0}},
-    /* TotalCoeff = 10 */
-    {{2, 0x3}, {3, 0x2}, {3, 0x1}, {4, 0x3}, {4, 0x2}, {4, 0x1}, {4, 0x0}},
-    /* TotalCoeff = 11 */
-    {{2, 0x3}, {2, 0x2}, {3, 0x1}, {4, 0x3}, {4, 0x2}, {4, 0x1}},
-    /* TotalCoeff = 12 */
-    {{2, 0x3}, {2, 0x2}, {3, 0x1}, {4, 0x1}, {4, 0x0}},
-    /* TotalCoeff = 13 */
-    {{2, 0x3}, {2, 0x2}, {2, 0x1}, {3, 0x0}},
-    /* TotalCoeff = 14 */
-    {{1, 0x1}, {2, 0x1}, {2, 0x0}},
-    /* TotalCoeff = 15 */
-    {{1, 0x1}, {1, 0x0}}
+static const uint8_t total_zeros_len[15][16] = {
+    {1,3,3,4,4,5,5,6,6,7,7,8,8,9,9,9},
+    {3,3,3,3,3,4,4,4,4,5,5,6,6,6,6},
+    {4,3,3,3,4,4,3,3,4,5,5,6,5,6},
+    {5,3,4,4,3,3,3,4,3,4,5,5,5},
+    {4,4,4,3,3,3,3,3,4,5,4,5},
+    {6,5,3,3,3,3,3,3,4,3,6},
+    {6,5,3,3,3,2,3,4,3,6},
+    {6,4,5,3,2,2,3,3,6},
+    {6,6,4,2,2,3,2,5},
+    {5,5,3,2,2,2,4},
+    {4,4,3,3,1,3},
+    {4,4,2,1,3},
+    {3,3,1,2},
+    {2,2,1},
+    {1,1}
 };
 
-/* Table 9-10: run_before codes */
-static const vlc_code_t run_before_vlc[7][15] = {
-    /* zerosLeft = 1 */
-    {{1, 0x1}, {1, 0x0}},
-    /* zerosLeft = 2 */
-    {{1, 0x1}, {2, 0x1}, {2, 0x0}},
-    /* zerosLeft = 3 */
-    {{2, 0x3}, {2, 0x2}, {2, 0x1}, {2, 0x0}},
-    /* zerosLeft = 4 */
-    {{2, 0x3}, {2, 0x2}, {2, 0x1}, {3, 0x1}, {3, 0x0}},
-    /* zerosLeft = 5 */
-    {{2, 0x3}, {2, 0x2}, {3, 0x3}, {3, 0x2}, {3, 0x1}, {3, 0x0}},
-    /* zerosLeft = 6 */
-    {{2, 0x3}, {3, 0x3}, {3, 0x2}, {3, 0x1}, {3, 0x0}, {4, 0x1}, {4, 0x0}},
-    /* zerosLeft > 6 */
-    {{3, 0x7}, {3, 0x6}, {3, 0x5}, {3, 0x4}, {3, 0x3}, {3, 0x2}, {4, 0x3}, {4, 0x2},
-     {5, 0x3}, {5, 0x2}, {6, 0x3}, {6, 0x2}, {7, 0x3}, {7, 0x2}, {7, 0x1}}
+static const uint8_t total_zeros_bits[15][16] = {
+    {1,3,2,3,2,3,2,3,2,3,2,3,2,3,2,1},
+    {7,6,5,4,3,5,4,3,2,3,2,3,2,1,0},
+    {5,7,6,5,4,3,4,3,2,3,2,1,1,0},
+    {3,7,5,4,6,5,4,3,3,2,2,1,0},
+    {5,4,3,7,6,5,4,3,2,1,1,0},
+    {1,1,7,6,5,4,3,2,1,1,0},
+    {1,1,5,4,3,3,2,1,1,0},
+    {1,1,1,3,3,2,2,1,0},
+    {1,0,1,3,2,1,1,1},
+    {1,0,1,3,2,1,1},
+    {0,1,1,2,1,3},
+    {0,1,1,1,1},
+    {0,1,1,1},
+    {0,1,1},
+    {0,1}
+};
+
+/* Table 9-10: run_before VLC codes */
+static const uint8_t run_len[7][16] = {
+    {1,1},
+    {1,2,2},
+    {2,2,2,2},
+    {2,2,2,3,3},
+    {2,2,3,3,3,3},
+    {2,3,3,3,3,3,3},
+    {3,3,3,3,3,3,3,4,5,6,7,8,9,10,11}
+};
+
+static const uint8_t run_bits[7][16] = {
+    {1,0},
+    {1,1,0},
+    {3,2,1,0},
+    {3,2,1,1,0},
+    {3,2,3,2,1,0},
+    {3,0,1,3,2,5,4},
+    {7,6,5,4,3,2,1,1,1,1,1,1,1,1,1}
+};
+
+/* Table 9-6: Chroma DC coeff_token */
+static const uint8_t chroma_dc_coeff_token_len[4 * 5] = {
+    1, 0, 0, 0,  /* TotalCoeff = 0: '1' (1 bit for compat) */
+    6, 1, 0, 0,  /* TotalCoeff = 1 */
+    6, 6, 3, 0,  /* TotalCoeff = 2 */
+    6, 7, 7, 6,  /* TotalCoeff = 3 */
+    6, 8, 8, 7   /* TotalCoeff = 4 */
+};
+
+static const uint8_t chroma_dc_coeff_token_bits[4 * 5] = {
+    1, 0, 0, 0,
+    7, 1, 0, 0,
+    4, 6, 1, 0,
+    3, 3, 2, 5,
+    2, 3, 2, 0
 };
 
 int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
@@ -198,17 +253,18 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
         }
     }
 
+    /* Determine VLC table context based on nC */
+    int vlc_idx = 0;
+    if (nC < 2) vlc_idx = 0;
+    else if (nC < 4) vlc_idx = 1;
+    else if (nC < 8) vlc_idx = 2;
+    else vlc_idx = 3;
+
     if (last_idx < 0) {
         /* Zero block (TotalCoeff = 0) */
-        if (nC < 2) {
-            bs_write_bit(bs, 1); /* VLC 1: TotalCoeff=0 is '1' (1 bit) */
-        } else if (nC < 4) {
-            bs_write_bits(bs, 2, 0x3); /* VLC 2: '11' */
-        } else if (nC < 8) {
-            bs_write_bits(bs, 4, 0xF); /* VLC 3: '1111' */
-        } else {
-            bs_write_bits(bs, 6, 0x0); /* Fixed 6-bit: '000000' */
-        }
+        uint8_t len = coeff_token_len[vlc_idx][0];
+        uint8_t bits = coeff_token_bits[vlc_idx][0];
+        bs_write_bits(bs, (int)len, (uint32_t)bits);
         return 0;
     }
 
@@ -233,20 +289,18 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
         }
     }
 
-    /* 1. Write coeff_token */
-    if (nC < 2) {
-        vlc_code_t code = coeff_token_vlc1[total_coeff][trailing_ones > 0 ? (trailing_ones - 1) : 0];
-        if (code.len > 0) {
-            bs_write_bits(bs, code.len, code.code);
+    /* 1. Write coeff_token using Table 9-5 */
+    int token_idx = total_coeff * 4 + trailing_ones;
+    if (token_idx < 4 * 17) {
+        uint8_t len = coeff_token_len[vlc_idx][token_idx];
+        uint8_t bits = coeff_token_bits[vlc_idx][token_idx];
+        if (len > 0) {
+            bs_write_bits(bs, (int)len, (uint32_t)bits);
         } else {
             bs_write_ue(bs, (uint32_t)total_coeff);
         }
-    } else if (nC >= 8) {
-        uint32_t val = ((uint32_t)total_coeff << 2) | (uint32_t)trailing_ones;
-        bs_write_bits(bs, 6, val);
     } else {
-        /* Fallback for VLC 2/3: Exp-Golomb fallback for robustness */
-        bs_write_ue(bs, (uint32_t)(total_coeff * 4 + trailing_ones));
+        bs_write_ue(bs, (uint32_t)total_coeff);
     }
 
     /* 2. Write trailing_ones signs (1 bit per trailing one) */
@@ -277,10 +331,12 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
 
     /* 4. Write total_zeros if TotalCoeff < 16 */
     if (total_coeff < 16 && total_coeff > 0) {
-        if (total_zeros <= 15) {
-            vlc_code_t tz = total_zeros_vlc[total_coeff][total_zeros];
-            if (tz.len > 0) {
-                bs_write_bits(bs, tz.len, tz.code);
+        int tc_idx = total_coeff - 1;
+        if (tc_idx >= 0 && tc_idx < 15 && total_zeros < 16) {
+            uint8_t tz_len = total_zeros_len[tc_idx][total_zeros];
+            uint8_t tz_bits = total_zeros_bits[tc_idx][total_zeros];
+            if (tz_len > 0) {
+                bs_write_bits(bs, (int)tz_len, (uint32_t)tz_bits);
             } else {
                 bs_write_ue(bs, (uint32_t)total_zeros);
             }
@@ -294,10 +350,11 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
     for (int i = total_coeff - 1; i > 0 && zeros_left > 0; i--) {
         int run = runs[i - 1];
         int zl_idx = (zeros_left <= 6) ? (zeros_left - 1) : 6;
-        if (run < 15) {
-            vlc_code_t rb = run_before_vlc[zl_idx][run];
-            if (rb.len > 0) {
-                bs_write_bits(bs, rb.len, rb.code);
+        if (run < 16) {
+            uint8_t r_len = run_len[zl_idx][run];
+            uint8_t r_bits = run_bits[zl_idx][run];
+            if (r_len > 0) {
+                bs_write_bits(bs, (int)r_len, (uint32_t)r_bits);
             } else {
                 bs_write_ue(bs, (uint32_t)run);
             }
@@ -314,18 +371,33 @@ int cavlc_write_chroma_dc_block(bitstream_t *bs, const int *coeffs) {
     if (!bs || !coeffs) return 0;
 
     int total_coeff = 0;
+    int trailing_ones = 0;
     for (int i = 0; i < 4; i++) {
-        if (coeffs[i] != 0) total_coeff++;
+        if (coeffs[i] != 0) {
+            total_coeff++;
+            if (abs(coeffs[i]) == 1 && trailing_ones < 3) trailing_ones++;
+        }
     }
 
     if (total_coeff == 0) {
-        /* TotalCoeff = 0: Table 9-6 code is '1' (1 bit) */
+        /* TotalCoeff = 0: '1' (1 bit) */
         bs_write_bit(bs, 1);
         return 0;
     }
 
-    /* Encode chroma DC total_coeff via ue(v) */
-    bs_write_ue(bs, (uint32_t)total_coeff);
+    int token_idx = total_coeff * 4 + trailing_ones;
+    if (token_idx < 4 * 5) {
+        uint8_t len = chroma_dc_coeff_token_len[token_idx];
+        uint8_t bits = chroma_dc_coeff_token_bits[token_idx];
+        if (len > 0) {
+            bs_write_bits(bs, (int)len, (uint32_t)bits);
+        } else {
+            bs_write_ue(bs, (uint32_t)total_coeff);
+        }
+    } else {
+        bs_write_ue(bs, (uint32_t)total_coeff);
+    }
+
     return total_coeff;
 }
 

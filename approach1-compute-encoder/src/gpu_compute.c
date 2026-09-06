@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
@@ -190,6 +190,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
 
 static VkShaderModule load_spirv_shader(VkDevice device, const char *filename) {
     const char *search_paths[] = {
+        "/var/lib/bc250/shaders",
         "/usr/share/bc250/shaders",
         "/usr/local/share/bc250/shaders",
         "/usr/lib64/dri/shaders",

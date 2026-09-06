@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 #version 450
 layout(local_size_x = 64) in; // Wave64 / Dual-Wave32 for RDNA 2
 
@@ -28,6 +28,8 @@ layout(push_constant) uniform PushConstants {
 shared float search_window[48][48];
 shared float current_mb[16][16];
 shared uint thread_sad[64];
+shared ivec2 shared_best_mv;
+shared uint shared_best_cost;
 
 // Early termination threshold for zero-motion detection (~2 intensity levels per pixel)
 const uint STATIC_MB_THRESHOLD = 512;
@@ -103,12 +105,16 @@ void main() {
     }
 
     // 4. Hierarchical Adaptive Diamond Search
-    ivec2 best_mv = ivec2(0);
-    uint best_cost = initial_sad;
+    if (local_id == 0) {
+        shared_best_mv = ivec2(0);
+        shared_best_cost = initial_sad;
+    }
+    barrier();
+
     ivec2 diamond[4] = { ivec2(0,1), ivec2(0,-1), ivec2(1,0), ivec2(-1,0) };
 
     for (int step = 8; step >= 1; step /= 2) {
-        ivec2 center = best_mv;
+        ivec2 center = shared_best_mv;
         for (int c = 0; c < 4; c++) {
             ivec2 test_mv = center + diamond[c] * step;
             if (abs(test_mv.x) > 16 || abs(test_mv.y) > 16) continue;
@@ -145,20 +151,20 @@ void main() {
             if (local_id == 0) {
                 uint cand_sad = thread_sad[0];
                 uint cost = cand_sad + pcs.lambda_motion * uint(abs(test_mv.x) + abs(test_mv.y));
-                if (cost < best_cost) {
-                    best_cost = cost;
-                    best_mv = test_mv;
+                if (cost < shared_best_cost) {
+                    shared_best_cost = cost;
+                    shared_best_mv = test_mv;
                 }
             }
             barrier();
         }
 
-        // Early termination if quality is already high (saves extra iterations)
-        if (best_cost < 768) break;
+        // Early termination if quality is already high (all invocations break together)
+        if (shared_best_cost < 768) break;
     }
 
     if (local_id == 0) {
-        mvs[mb_idx].mv = best_mv;
-        mvs[mb_idx].sad = best_cost;
+        mvs[mb_idx].mv = shared_best_mv;
+        mvs[mb_idx].sad = shared_best_cost;
     }
 }

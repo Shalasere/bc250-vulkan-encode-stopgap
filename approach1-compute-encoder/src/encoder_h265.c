@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: MIT
@@ -141,7 +141,11 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->fps = fps;
     enc->bitrate = bitrate;
     enc->output_buf_size = width * height * 2 + 65536;
-    enc->output_buf = malloc(enc->output_buf_size);
+    enc->output_buf = calloc(1, enc->output_buf_size);
+    if (!enc->output_buf) {
+        free(enc);
+        return NULL;
+    }
 
     return enc;
 }

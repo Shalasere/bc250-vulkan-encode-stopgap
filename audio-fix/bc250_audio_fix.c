@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * bc250_audio_fix.c - AMD BC-250 (Cyan Skillfish) Audio Clock & DTO Fix Driver
  *
@@ -338,7 +338,6 @@ static void __exit bc250_audio_exit(void)
     }
 
     if (gpu_dev) {
-        pci_disable_device(gpu_dev);
         pci_dev_put(gpu_dev);
         gpu_dev = NULL;
     }
