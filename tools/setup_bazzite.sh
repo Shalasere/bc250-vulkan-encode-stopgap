@@ -48,24 +48,36 @@ echo -e "\n${BOLD}[2/4] Installing VA-API Driver & Shaders to /usr/local...${NC}
 $SUDO mkdir -p "$INSTALL_LIB_DIR"
 $SUDO mkdir -p "$INSTALL_SHADER_DIR"
 
-# Build driver if needed
-BUILD_DIR="$REPO_ROOT/approach1-compute-encoder/build"
-if [ ! -f "$BUILD_DIR/bc250_drv_video.so" ]; then
-    echo -e "  -> Building driver from source..."
-    mkdir -p "$BUILD_DIR"
-    (cd "$BUILD_DIR" && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j"$(nproc)")
+# Build driver if needed (or use pre-built package)
+PREBUILT_SO="$REPO_ROOT/bc250_drv_video.so"
+if [ -f "$PREBUILT_SO" ]; then
+    echo -e "  ${GREEN}✓ Found pre-built driver package: $PREBUILT_SO${NC}"
+    DRIVER_BIN="$PREBUILT_SO"
+else
+    BUILD_DIR="$REPO_ROOT/approach1-compute-encoder/build"
+    if [ ! -f "$BUILD_DIR/bc250_drv_video.so" ]; then
+        echo -e "  -> Building driver from source..."
+        mkdir -p "$BUILD_DIR"
+        (cd "$BUILD_DIR" && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j"$(nproc)")
+    fi
+    DRIVER_BIN="$BUILD_DIR/bc250_drv_video.so"
 fi
 
 # Copy driver to /usr/local/lib64/dri/ and standard fallback paths
 echo -e "  -> Installing $INSTALL_LIB_DIR/bc250_drv_video.so"
-$SUDO cp -f "$BUILD_DIR/bc250_drv_video.so" "$INSTALL_LIB_DIR/"
+$SUDO cp -f "$DRIVER_BIN" "$INSTALL_LIB_DIR/"
 $SUDO mkdir -p "/usr/local/lib/dri"
-$SUDO cp -f "$BUILD_DIR/bc250_drv_video.so" "/usr/local/lib/dri/"
+$SUDO cp -f "$DRIVER_BIN" "/usr/local/lib/dri/"
 
 # Copy shaders
-if [ -d "$REPO_ROOT/approach1-compute-encoder/shaders" ]; then
+if [ -d "$REPO_ROOT/shaders" ]; then
+    echo -e "  -> Copying shaders from $REPO_ROOT/shaders to $INSTALL_SHADER_DIR/"
+    $SUDO cp -f "$REPO_ROOT/shaders"/* "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+elif [ -d "$REPO_ROOT/approach1-compute-encoder/shaders" ]; then
     echo -e "  -> Copying shaders to $INSTALL_SHADER_DIR/"
-    $SUDO cp -f "$BUILD_DIR"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+    if [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ]; then
+        $SUDO cp -f "$BUILD_DIR"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+    fi
     $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/shaders"/*.comp "$INSTALL_SHADER_DIR/" 2>/dev/null || true
 fi
 
@@ -77,6 +89,7 @@ cat << 'EOF' | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null
 LIBVA_DRIVER_NAME=bc250
 LIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib64/dri
 BC250_FAST_MODE=1
+BC250_SLICES_PER_FRAME=4
 BC250_SHADER_DIR=/usr/local/share/bc250/shaders
 EOF
 echo -e "  ${GREEN}✓ Configured /etc/environment.d/99-bc250.conf${NC}"

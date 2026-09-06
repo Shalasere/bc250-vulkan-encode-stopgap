@@ -20,6 +20,7 @@
 #include <linux/seq_file.h>
 #include <linux/io.h>
 #include <linux/uaccess.h>
+#include <linux/suspend.h>
 
 #define BC250_PCI_VENDOR_ID 0x1002
 #define BC250_PCI_DEVICE_ID 0x13fe
@@ -167,11 +168,36 @@ static int audio_status_show(struct seq_file *m, void *v)
     seq_printf(m, "DTO Modulo:       %u\n", current_modulo);
     seq_printf(m, "DTO Effective MCLK: %llu Hz\n",
                current_modulo ? ((u64)current_phase * 100000000ULL / current_modulo) : 0ULL);
+    seq_printf(m, "Power Management: Sleep/Resume Auto-Clock Notifier Active\n");
     seq_printf(m, "===============================================\n");
     seq_printf(m, "Tip: To adjust rate at runtime: echo 44100 > /proc/bc250_audio_status\n");
 
     return 0;
 }
+
+/*
+ * Power Management Notifier: Automatically reapplies DTO clocks when system
+ * resumes from sleep / S3 suspend / hibernation on living room consoles (Bazzite / SteamOS).
+ */
+static int bc250_pm_notifier(struct notifier_block *nb, unsigned long action, void *data)
+{
+    (void)nb; (void)data;
+    switch (action) {
+    case PM_POST_SUSPEND:
+    case PM_POST_HIBERNATION:
+    case PM_POST_RESTORE:
+        pr_info("bc250_audio_fix: System resumed from sleep/suspend; reapplying audio DTO clocks...\n");
+        bc250_apply_audio_fix();
+        break;
+    default:
+        break;
+    }
+    return NOTIFY_OK;
+}
+
+static struct notifier_block bc250_pm_nb = {
+    .notifier_call = bc250_pm_notifier,
+};
 
 static ssize_t audio_status_write(struct file *file, const char __user *ubuf,
                                   size_t count, loff_t *ppos)
@@ -281,6 +307,10 @@ static int __init bc250_audio_init(void)
     proc_create("bc250_audio_status", 0666, NULL, &audio_status_ops);
     pr_info("bc250_audio_fix: Registered /proc/bc250_audio_status monitor.\n");
 
+    /* 5. Register sleep/wake power management resume notifier */
+    register_pm_notifier(&bc250_pm_nb);
+    pr_info("bc250_audio_fix: Registered sleep/wake power management resume notifier.\n");
+
     return 0;
 }
 
@@ -288,6 +318,7 @@ static void __exit bc250_audio_exit(void)
 {
     pr_info("bc250_audio_fix: Unloading module...\n");
 
+    unregister_pm_notifier(&bc250_pm_nb);
     remove_proc_entry("bc250_audio_status", NULL);
 
     if (hda_mmio && hda_dev) {

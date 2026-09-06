@@ -229,122 +229,131 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         gpu_compute_get_staging_data(gpu_ctx, &gpu_staging, &staging_size);
     }
 
-    /* 4. Encode Slice RBSP into temporary buffer */
-    size_t rbsp_buf_size = encoder->total_mbs * 64 + 4096;
-    uint8_t *slice_rbsp = malloc(rbsp_buf_size);
-    if (!slice_rbsp) return -1;
-
-    bitstream_t bs;
-    bs_init(&bs, slice_rbsp, rbsp_buf_size);
-
-    /* 4a. Slice Header per H.264 Section 7.3.3 */
-    int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
-    bs_write_ue(&bs, 0); /* first_mb_in_slice = 0 */
-    bs_write_ue(&bs, (uint32_t)slice_type);
-    bs_write_ue(&bs, (uint32_t)encoder->pps.pps_id);
-    bs_write_u(&bs, encoder->sps.log2_max_frame_num + 4, encoder->frame_num);
-
-    if (is_idr) {
-        bs_write_ue(&bs, encoder->idr_pic_id);
+    /* 4. Encode Slices (supporting multi-slice partitioning for Sunshine/Moonlight network resilience) */
+    int num_slices = 1;
+    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
+    if (slice_env) {
+        int s = atoi(slice_env);
+        if (s >= 1 && s <= 16) num_slices = s;
     }
 
-    int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
-    bs_write_u(&bs, poc_bits, encoder->poc & ((1 << poc_bits) - 1));
-
-    if (!is_idr) {
-        bs_write1(&bs, 0); /* num_ref_idx_active_override_flag = 0 */
-        bs_write1(&bs, 0); /* ref_pic_list_modification_flag_l0 = 0 */
-        bs_write1(&bs, 0); /* adaptive_ref_pic_marking_mode_flag = 0 */
-    } else {
-        bs_write1(&bs, 0); /* no_output_of_prior_pics_flag = 0 */
-        bs_write1(&bs, 0); /* long_term_reference_flag = 0 */
-    }
-
-    int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
-    bs_write_se(&bs, slice_qp_delta);
-
-    /* Deblocking filter control: 1 = disabled (fast gaming mode) */
     const char *fm = getenv("BC250_FAST_MODE");
     int deblock_idc = (fm && (strcmp(fm, "1") == 0 || strcmp(fm, "true") == 0)) ? 1 : 0;
-    bs_write_ue(&bs, (uint32_t)deblock_idc);
-    bs_write_se(&bs, 0);
-    bs_write_se(&bs, 0);
+    int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
+    int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
+    int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
 
-    /* 4b. Slice Data (Macroblock Layer) using CAVLC per Section 7.3.4 */
-    if (is_idr) {
-        /* I-slice: macroblocks coded as Intra 16x16 with GPU-informed mode selection */
-        for (uint32_t mb = 0; mb < encoder->total_mbs; mb++) {
-            int pred_mode = H264_I16x16_DC;
-            if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
-                uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
-                uint32_t top_act = (mb_blocks[0] & 0xFF) + (mb_blocks[1] & 0xFF);
-                uint32_t left_act = (mb_blocks[0] & 0xFF) + (mb_blocks[4] & 0xFF);
-                if (top_act > left_act * 2) pred_mode = H264_I16x16_VERT;
-                else if (left_act > top_act * 2) pred_mode = H264_I16x16_HORIZ;
-            }
-            cavlc_write_mb_i16x16_header(&bs, pred_mode, 0, 0, 0);
+    for (int s = 0; s < num_slices; s++) {
+        uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
+        uint32_t end_mb = (uint32_t)((s + 1) * encoder->total_mbs / num_slices);
+
+        size_t rbsp_buf_size = (end_mb - start_mb) * 64 + 4096;
+        uint8_t *slice_rbsp = malloc(rbsp_buf_size);
+        if (!slice_rbsp) return -1;
+
+        bitstream_t bs;
+        bs_init(&bs, slice_rbsp, rbsp_buf_size);
+
+        /* 4a. Slice Header per H.264 Section 7.3.3 */
+        bs_write_ue(&bs, start_mb); /* first_mb_in_slice */
+        bs_write_ue(&bs, (uint32_t)slice_type);
+        bs_write_ue(&bs, (uint32_t)encoder->pps.pps_id);
+        bs_write_u(&bs, encoder->sps.log2_max_frame_num + 4, encoder->frame_num);
+
+        if (is_idr) {
+            bs_write_ue(&bs, encoder->idr_pic_id);
         }
-    } else {
-        /* P-slice: encode macroblocks with motion-adaptive skip runs */
-        uint32_t current_skip_run = 0;
-        for (uint32_t mb = 0; mb < encoder->total_mbs; mb++) {
-            bool mb_changed = false;
-            if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
-                uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
-                for (int b = 0; b < 16; b++) {
-                    if ((mb_blocks[b] & 0xFF) > 0) {
-                        mb_changed = true;
-                        break;
-                    }
-                }
-            }
 
-            if (!mb_changed) {
-                current_skip_run++;
-            } else {
-                if (current_skip_run > 0) {
-                    cavlc_write_p_skip_run(&bs, current_skip_run);
-                    current_skip_run = 0;
-                }
-                int mvd_x = 0, mvd_y = 0;
+        bs_write_u(&bs, poc_bits, encoder->poc & ((1 << poc_bits) - 1));
+
+        if (!is_idr) {
+            bs_write1(&bs, 0); /* num_ref_idx_active_override_flag = 0 */
+            bs_write1(&bs, 0); /* ref_pic_list_modification_flag_l0 = 0 */
+            bs_write1(&bs, 0); /* adaptive_ref_pic_marking_mode_flag = 0 */
+        } else {
+            bs_write1(&bs, 0); /* no_output_of_prior_pics_flag = 0 */
+            bs_write1(&bs, 0); /* long_term_reference_flag = 0 */
+        }
+
+        bs_write_se(&bs, slice_qp_delta);
+        bs_write_ue(&bs, (uint32_t)deblock_idc);
+        bs_write_se(&bs, 0);
+        bs_write_se(&bs, 0);
+
+        /* 4b. Slice Data (Macroblock Layer) using CAVLC per Section 7.3.4 */
+        if (is_idr) {
+            for (uint32_t mb = start_mb; mb < end_mb; mb++) {
+                int pred_mode = H264_I16x16_DC;
                 if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
                     uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
-                    int top_act = (int)(mb_blocks[0] & 0xFF) - (int)(mb_blocks[1] & 0xFF);
-                    int left_act = (int)(mb_blocks[0] & 0xFF) - (int)(mb_blocks[4] & 0xFF);
-                    if (abs(top_act) > 4) mvd_x = (top_act > 0 ? 1 : -1) * 4;
-                    if (abs(left_act) > 4) mvd_y = (left_act > 0 ? 1 : -1) * 4;
+                    uint32_t top_act = (mb_blocks[0] & 0xFF) + (mb_blocks[1] & 0xFF);
+                    uint32_t left_act = (mb_blocks[0] & 0xFF) + (mb_blocks[4] & 0xFF);
+                    if (top_act > left_act * 2) pred_mode = H264_I16x16_VERT;
+                    else if (left_act > top_act * 2) pred_mode = H264_I16x16_HORIZ;
                 }
-                cavlc_write_mb_p16x16_header(&bs, mvd_x, mvd_y, 0, 0);
+                cavlc_write_mb_i16x16_header(&bs, pred_mode, 0, 0, 0);
+            }
+        } else {
+            uint32_t current_skip_run = 0;
+            for (uint32_t mb = start_mb; mb < end_mb; mb++) {
+                bool mb_changed = false;
+                if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
+                    uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
+                    for (int b = 0; b < 16; b++) {
+                        if ((mb_blocks[b] & 0xFF) > 0) {
+                            mb_changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!mb_changed) {
+                    current_skip_run++;
+                } else {
+                    if (current_skip_run > 0) {
+                        cavlc_write_p_skip_run(&bs, current_skip_run);
+                        current_skip_run = 0;
+                    }
+                    int mvd_x = 0, mvd_y = 0;
+                    if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
+                        uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
+                        int top_act = (int)(mb_blocks[0] & 0xFF) - (int)(mb_blocks[1] & 0xFF);
+                        int left_act = (int)(mb_blocks[0] & 0xFF) - (int)(mb_blocks[4] & 0xFF);
+                        if (abs(top_act) > 4) mvd_x = (top_act > 0 ? 1 : -1) * 4;
+                        if (abs(left_act) > 4) mvd_y = (left_act > 0 ? 1 : -1) * 4;
+                    }
+                    cavlc_write_mb_p16x16_header(&bs, mvd_x, mvd_y, 0, 0);
+                }
+            }
+            if (current_skip_run > 0) {
+                cavlc_write_p_skip_run(&bs, current_skip_run);
             }
         }
-        if (current_skip_run > 0) {
-            cavlc_write_p_skip_run(&bs, current_skip_run);
+
+        /* 4c. RBSP Trailing bits (1 followed by zero bits to byte boundary) */
+        cavlc_write_slice_trailing_bits(&bs);
+        bs_flush(&bs);
+
+        size_t rbsp_len = bs_bytes_written(&bs);
+
+        /* 5. Assemble Slice NAL unit: 4-byte start code + NAL header + EBSP */
+        if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
+            uint8_t *nal_dst = encoder->output_buf + total_written;
+            nal_dst[0] = 0x00;
+            nal_dst[1] = 0x00;
+            nal_dst[2] = 0x00;
+            nal_dst[3] = 0x01;
+            nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
+                                : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
+
+            size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
+                                              encoder->output_buf_size - total_written - 5,
+                                              slice_rbsp,
+                                              rbsp_len);
+            total_written += 5 + ebsp_len;
         }
+        free(slice_rbsp);
     }
-
-    /* 4c. RBSP Trailing bits (1 followed by zero bits to byte boundary) */
-    cavlc_write_slice_trailing_bits(&bs);
-    bs_flush(&bs);
-
-    size_t rbsp_len = bs_bytes_written(&bs);
-
-    /* 5. Assemble Slice NAL unit: 4-byte start code + NAL header + EBSP */
-    if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
-        uint8_t *nal_dst = encoder->output_buf + total_written;
-        nal_dst[0] = 0x00;
-        nal_dst[1] = 0x00;
-        nal_dst[2] = 0x00;
-        nal_dst[3] = 0x01;
-        nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
-                            : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
-
-        size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
-                                          encoder->output_buf_size - total_written - 5,
-                                          slice_rbsp,
-                                          rbsp_len);
-        total_written += 5 + ebsp_len;
-    }
-    free(slice_rbsp);
 
     if (output_size < total_written) {
         fprintf(stderr, "[bc250-h264] Output buffer too small: need %zu, have %zu\n",
@@ -402,49 +411,61 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                                       &encoder->pps);
     }
 
-    /* 3. Encode Slice RBSP */
-    size_t rbsp_buf_size = encoder->total_mbs * 64 + 4096;
-    uint8_t *slice_rbsp = malloc(rbsp_buf_size);
-    if (!slice_rbsp) return -1;
-
-    bitstream_t bs;
-    bs_init(&bs, slice_rbsp, rbsp_buf_size);
-
-    int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
-    bs_write_ue(&bs, 0);
-    bs_write_ue(&bs, (uint32_t)slice_type);
-    bs_write_ue(&bs, (uint32_t)encoder->pps.pps_id);
-    bs_write_u(&bs, encoder->sps.log2_max_frame_num + 4, encoder->frame_num);
-
-    if (is_idr) {
-        bs_write_ue(&bs, encoder->idr_pic_id);
+    /* 3. Encode Slices (supporting multi-slice partitioning for network resilience) */
+    int num_slices = 1;
+    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
+    if (slice_env) {
+        int s = atoi(slice_env);
+        if (s >= 1 && s <= 16) num_slices = s;
     }
-
-    int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
-    bs_write_u(&bs, poc_bits, encoder->poc & ((1 << poc_bits) - 1));
-
-    if (!is_idr) {
-        bs_write1(&bs, 0);
-        bs_write1(&bs, 0);
-        bs_write1(&bs, 0);
-    } else {
-        bs_write1(&bs, 0);
-        bs_write1(&bs, 0);
-    }
-
-    int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
-    bs_write_se(&bs, slice_qp_delta);
 
     const char *fm = getenv("BC250_FAST_MODE");
     int deblock_idc = (fm && (strcmp(fm, "1") == 0 || strcmp(fm, "true") == 0)) ? 1 : 0;
-    bs_write_ue(&bs, (uint32_t)deblock_idc);
-    bs_write_se(&bs, 0);
-    bs_write_se(&bs, 0);
+    int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
+    int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
+    int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
 
-    /* Macroblock layer */
-    if (is_idr) {
-        for (uint32_t mby = 0; mby < encoder->height_in_mbs; mby++) {
-            for (uint32_t mbx = 0; mbx < encoder->width_in_mbs; mbx++) {
+    for (int s = 0; s < num_slices; s++) {
+        uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
+        uint32_t end_mb = (uint32_t)((s + 1) * encoder->total_mbs / num_slices);
+
+        size_t rbsp_buf_size = (end_mb - start_mb) * 64 + 4096;
+        uint8_t *slice_rbsp = malloc(rbsp_buf_size);
+        if (!slice_rbsp) return -1;
+
+        bitstream_t bs;
+        bs_init(&bs, slice_rbsp, rbsp_buf_size);
+
+        bs_write_ue(&bs, start_mb); /* first_mb_in_slice */
+        bs_write_ue(&bs, (uint32_t)slice_type);
+        bs_write_ue(&bs, (uint32_t)encoder->pps.pps_id);
+        bs_write_u(&bs, encoder->sps.log2_max_frame_num + 4, encoder->frame_num);
+
+        if (is_idr) {
+            bs_write_ue(&bs, encoder->idr_pic_id);
+        }
+
+        bs_write_u(&bs, poc_bits, encoder->poc & ((1 << poc_bits) - 1));
+
+        if (!is_idr) {
+            bs_write1(&bs, 0);
+            bs_write1(&bs, 0);
+            bs_write1(&bs, 0);
+        } else {
+            bs_write1(&bs, 0);
+            bs_write1(&bs, 0);
+        }
+
+        bs_write_se(&bs, slice_qp_delta);
+        bs_write_ue(&bs, (uint32_t)deblock_idc);
+        bs_write_se(&bs, 0);
+        bs_write_se(&bs, 0);
+
+        /* Macroblock layer */
+        if (is_idr) {
+            for (uint32_t mb = start_mb; mb < end_mb; mb++) {
+                uint32_t mby = mb / encoder->width_in_mbs;
+                uint32_t mbx = mb % encoder->width_in_mbs;
                 uint32_t v_diff = 0, h_diff = 0;
                 for (int r = 0; r < 15; r++) {
                     uint32_t py = mby * 16 + r;
@@ -462,11 +483,11 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                 else if (h_diff * 3 < v_diff * 2) mode = H264_I16x16_HORIZ;
                 cavlc_write_mb_i16x16_header(&bs, mode, 0, 0, 0);
             }
-        }
-    } else {
-        uint32_t current_skip_run = 0;
-        for (uint32_t mby = 0; mby < encoder->height_in_mbs; mby++) {
-            for (uint32_t mbx = 0; mbx < encoder->width_in_mbs; mbx++) {
+        } else {
+            uint32_t current_skip_run = 0;
+            for (uint32_t mb = start_mb; mb < end_mb; mb++) {
+                uint32_t mby = mb / encoder->width_in_mbs;
+                uint32_t mbx = mb % encoder->width_in_mbs;
                 uint32_t sad = 0;
                 if (encoder->has_prev_frame && encoder->prev_y_frame) {
                     for (int r = 0; r < 16; r++) {
@@ -527,10 +548,31 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                     cavlc_write_mb_p16x16_header(&bs, best_dx * 4, best_dy * 4, 0, 0);
                 }
             }
+            if (current_skip_run > 0) {
+                cavlc_write_p_skip_run(&bs, current_skip_run);
+            }
         }
-        if (current_skip_run > 0) {
-            cavlc_write_p_skip_run(&bs, current_skip_run);
+
+        cavlc_write_slice_trailing_bits(&bs);
+        bs_flush(&bs);
+
+        size_t rbsp_len = bs_bytes_written(&bs);
+        if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
+            uint8_t *nal_dst = encoder->output_buf + total_written;
+            nal_dst[0] = 0x00;
+            nal_dst[1] = 0x00;
+            nal_dst[2] = 0x00;
+            nal_dst[3] = 0x01;
+            nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
+                                : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
+
+            size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
+                                              encoder->output_buf_size - total_written - 5,
+                                              slice_rbsp,
+                                              rbsp_len);
+            total_written += 5 + ebsp_len;
         }
+        free(slice_rbsp);
     }
 
     if (encoder->prev_y_frame) {
@@ -541,27 +583,6 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
         }
         encoder->has_prev_frame = true;
     }
-
-    cavlc_write_slice_trailing_bits(&bs);
-    bs_flush(&bs);
-
-    size_t rbsp_len = bs_bytes_written(&bs);
-    if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
-        uint8_t *nal_dst = encoder->output_buf + total_written;
-        nal_dst[0] = 0x00;
-        nal_dst[1] = 0x00;
-        nal_dst[2] = 0x00;
-        nal_dst[3] = 0x01;
-        nal_dst[4] = is_idr ? ((NAL_REF_IDC_HIGH << 5) | NAL_TYPE_IDR_SLICE)
-                            : ((NAL_REF_IDC_MEDIUM << 5) | NAL_TYPE_SLICE);
-
-        size_t ebsp_len = bs_rbsp_to_ebsp(nal_dst + 5,
-                                          encoder->output_buf_size - total_written - 5,
-                                          slice_rbsp,
-                                          rbsp_len);
-        total_written += 5 + ebsp_len;
-    }
-    free(slice_rbsp);
 
     if (output_size < total_written) {
         return -1;
