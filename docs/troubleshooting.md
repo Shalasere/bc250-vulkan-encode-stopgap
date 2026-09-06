@@ -157,20 +157,47 @@ cat /sys/class/drm/card0/device/current_compute_units 2>/dev/null || dmesg | gre
 
 ---
 
-## 7. How to Completely Uninstall the Driver
+## 7. SteamOS & Bazzite (Immutable Distribution) Considerations
+
+### SteamOS / HoloISO
+* **Why `/var/lib/bc250`?** SteamOS uses an A/B partition layout where the root partition (`/` and `/usr`) is completely overwritten during system upgrades (e.g. SteamOS 3.5 → 3.6). The `/var` and `/etc` partitions are persistent state partitions. By installing the driver to `/var/lib/bc250/dri` and configuring `/etc/environment.d/99-bc250.conf`, your driver survives all future OS updates.
+* **Kernel headers for Audio Fix:** If `setup_steamos.sh` notes missing kernel headers for DKMS, run:
+  ```bash
+  sudo steamos-readonly disable
+  sudo pacman -S --needed linux-neptune-headers dkms
+  sudo ./tools/setup_steamos.sh
+  ```
+
+### Bazzite / Fedora Silverblue
+* **SELinux context denials:** On Fedora Silverblue and Bazzite, SELinux is set to Enforcing. If Gamescope or Sunshine fails to load the driver from `/usr/local/lib64/dri/`, restore SELinux file contexts:
+  ```bash
+  sudo restorecon -Rv /usr/local/lib64/dri /usr/local/share/bc250
+  ```
+* **Kernel headers on Bazzite:** If DKMS fails to compile the audio fix:
+  ```bash
+  ujust install-kernel-headers
+  sudo ./tools/setup_bazzite.sh
+  ```
+
+---
+
+## 8. How to Completely Uninstall the Driver
 
 If you ever wish to remove the driver:
 
 ```bash
-# 1. Remove DRI libraries
+# 1. Remove DRI libraries (standard, SteamOS persistent, and Bazzite /usr/local)
 sudo rm -f /usr/lib*/dri/bc250_drv_video.so
 sudo rm -f /usr/lib/x86_64-linux-gnu/dri/bc250_drv_video.so
+sudo rm -f /usr/local/lib*/dri/bc250_drv_video.so
+sudo rm -rf /var/lib/bc250
 
 # 2. Remove shaders
-sudo rm -rf /usr/share/bc250
+sudo rm -rf /usr/share/bc250 /usr/local/share/bc250
 
-# 3. Remove environment configs
+# 3. Remove environment configs & shell profiles
 sudo rm -f /etc/environment.d/99-bc250.conf
+sudo rm -f /etc/profile.d/bc250.sh
 
 # 4. Uninstall audio fix from DKMS
 cd audio-fix && sudo ./uninstall_dkms.sh

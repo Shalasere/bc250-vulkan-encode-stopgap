@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
 #
 # bc250_diagnose.sh - Comprehensive hardware verification, VA-API test, and encode benchmark
 #
@@ -60,7 +60,16 @@ fi
 # 3. VA-API Driver Installation
 echo -e "\n${BOLD}[3/4] Checking VA-API Compute Driver...${NC}"
 FOUND_DRIVER=0
-for dri in "/usr/lib/x86_64-linux-gnu/dri" "/usr/lib64/dri" "/usr/lib/dri"; do
+DRI_CANDIDATES=(
+    "/var/lib/bc250/dri"
+    "/usr/local/lib64/dri"
+    "/usr/local/lib/dri"
+    "/usr/lib/x86_64-linux-gnu/dri"
+    "/usr/lib64/dri"
+    "/usr/lib/dri"
+)
+
+for dri in "${DRI_CANDIDATES[@]}"; do
     if [ -f "$dri/bc250_drv_video.so" ]; then
         echo -e "  ${GREEN}✓ Found driver binary: $dri/bc250_drv_video.so${NC}"
         FOUND_DRIVER=1
@@ -69,23 +78,33 @@ for dri in "/usr/lib/x86_64-linux-gnu/dri" "/usr/lib64/dri" "/usr/lib/dri"; do
 done
 
 if [ $FOUND_DRIVER -eq 0 ]; then
-    echo -e "  ${RED}✗ bc250_drv_video.so not found in system DRI paths.${NC}"
-    echo -e "    Run ./build_and_install.sh first!"
+    echo -e "  ${RED}✗ bc250_drv_video.so not found in standard or immutable system DRI paths.${NC}"
+    echo -e "    Run ./build_and_install.sh, ./tools/setup_bazzite.sh, or ./tools/setup_steamos.sh first!"
 fi
 
-if [ -d "/usr/share/bc250/shaders" ]; then
-    spv_count=$(ls -1 /usr/share/bc250/shaders/*.spv 2>/dev/null | wc -l)
-    echo -e "  ${GREEN}✓ Found ${spv_count} compiled SPIR-V shaders in /usr/share/bc250/shaders${NC}"
-else
-    echo -e "  ${YELLOW}! Shaders directory /usr/share/bc250/shaders not found.${NC}"
+FOUND_SHADERS=0
+for sdir in "/var/lib/bc250/shaders" "/usr/local/share/bc250/shaders" "/usr/share/bc250/shaders"; do
+    if [ -d "$sdir" ]; then
+        spv_count=$(ls -1 "$sdir"/*.spv 2>/dev/null | wc -l)
+        if [ "$spv_count" -gt 0 ]; then
+            echo -e "  ${GREEN}✓ Found ${spv_count} compiled SPIR-V shaders in $sdir${NC}"
+            FOUND_SHADERS=1
+            break
+        fi
+    fi
+done
+
+if [ $FOUND_SHADERS -eq 0 ]; then
+    echo -e "  ${YELLOW}! No compiled shaders found in standard paths.${NC}"
 fi
 
 # 4. VA-API Capabilities & Benchmark
 echo -e "\n${BOLD}[4/4] Testing VA-API Driver & Running Encode Benchmark...${NC}"
 export LIBVA_DRIVER_NAME=bc250
+export LIBVA_DRIVERS_PATH="/var/lib/bc250/dri:/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri"
 
 if command -v vainfo &> /dev/null; then
-    if LIBVA_DRIVER_NAME=bc250 vainfo --display drm > /tmp/bc250_vainfo.log 2>&1; then
+    if LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$LIBVA_DRIVERS_PATH" vainfo --display drm > /tmp/bc250_vainfo.log 2>&1; then
         echo -e "  ${GREEN}✓ VA-API initialized successfully with BC-250 driver!${NC}"
         grep -i -E "VAProfileH264|VAProfileHEVC" /tmp/bc250_vainfo.log | sed 's/^/    /'
     else
@@ -100,7 +119,7 @@ if command -v ffmpeg &> /dev/null; then
     echo -e "\n${BOLD}==> Running 100-Frame 1080p60 Live Compute Encode Benchmark...${NC}"
     START_TIME=$(date +%s%N)
     
-    if ffmpeg -v error -f lavfi -i testsrc=duration=1.66:size=1920x1080:rate=60 \
+    if LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$LIBVA_DRIVERS_PATH" ffmpeg -v error -f lavfi -i testsrc=duration=1.66:size=1920x1080:rate=60 \
        -vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload' \
        -c:v h264_vaapi -b:v 10M -f null - 2>/tmp/bc250_bench.err; then
         

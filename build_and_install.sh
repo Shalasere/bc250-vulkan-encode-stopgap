@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.1.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
 #
 # build_and_install.sh - Automated build, test, and installer for AMD BC-250 custom drivers
 #
@@ -138,11 +138,11 @@ done
 
 # Configure system-wide environment for boot persistence
 if [ -d "/etc/environment.d" ]; then
-    printf "LIBVA_DRIVER_NAME=bc250\nBC250_FAST_MODE=1\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
+    printf "LIBVA_DRIVER_NAME=bc250\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
     echo -e "  -> Configured system-wide environment in /etc/environment.d/99-bc250.conf"
 elif [ -f "/etc/environment" ]; then
     if ! grep -q "LIBVA_DRIVER_NAME=bc250" /etc/environment 2>/dev/null; then
-        printf "LIBVA_DRIVER_NAME=bc250\nBC250_FAST_MODE=1\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
+        printf "LIBVA_DRIVER_NAME=bc250\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
         echo -e "  -> Configured system-wide environment in /etc/environment"
     fi
 fi

@@ -50,7 +50,25 @@ If you just want to play games and don't want to install compilers or developmen
 
 ---
 
-### Option B: Build from Source (One Simple Command)
+### Option B: Dedicated SteamOS & Bazzite Installers (Immutable Gaming Distros)
+
+If you are running **Valve SteamOS 3.x / HoloISO** or **Bazzite (Fedora Silverblue)** on your BC-250 console:
+
+* **For SteamOS / HoloISO (Survives OS updates!):**
+  ```bash
+  sudo ./tools/setup_steamos.sh
+  ```
+  *Stages driver to `/var/lib/bc250/dri` and shaders to `/var/lib/bc250/shaders` so they persist permanently across SteamOS A/B root partition updates. Configures Gamescope user session and re-locks rootfs.*
+
+* **For Bazzite / Fedora Silverblue (SELinux & Gamescope ready):**
+  ```bash
+  sudo ./tools/setup_bazzite.sh
+  ```
+  *Installs to `/usr/local/lib64/dri`, restores SELinux security contexts, and configures multi-slice streaming for Sunshine.*
+
+---
+
+### Option C: Build from Source (One Simple Command)
 If you prefer compiling locally, the automated setup script handles everything (including automatically installing missing packages for Ubuntu, Fedora, Arch, and openSUSE):
 
 ```bash
