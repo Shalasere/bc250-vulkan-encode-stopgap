@@ -17,9 +17,11 @@ Hardware-accelerated video encoding and DisplayPort/HDMI audio fixes for the **A
 
 ## 📖 Why Does This Project Exist?
 
-The **AMD BC-250** is a repurposed PlayStation 5 APU equipped with an 8-core Zen 2 CPU and **40 unlocked RDNA 2 Compute Units** (2,560 stream processors, ~10 TFLOPs of GPU power). It has quickly become a budget favorite for building powerful living room gaming consoles.
+The AMD BC-250 is a repurposed PlayStation 5 APU equipped with a Zen 2 CPU and up to 40 RDNA 2-class Compute Units when the community-discovered CU unlock is applied, providing up to 2,560 stream processors and roughly 10 TFLOPS of GPU compute. This has made it a popular low-cost platform for powerful living-room gaming PCs.
 
-However, Sony permanently disabled the physical **VCN 3.0 (Video Core Next)** hardware video encoder on these chips using cryptographic security processor (PSP) fuses. Without a video encoder, applications like **Sunshine, Moonlight, OBS Studio, and Steam Link** cannot stream or record gameplay.
+However, the BC-250 currently has a major limitation: its VCN hardware video engine cannot be used for hardware encoding/decoding. Unlike earlier assumptions that the encoder was permanently fused off, recent reverse-engineering suggests that the VCN block is physically present and may instead be inaccessible because of an unresolved power-management/firmware initialization problem.
+
+As a result, applications such as Sunshine, OBS Studio, and Steam Link cannot currently use the BC-250’s hardware video encoder and must rely on software encoding where supported. This project exists to investigate whether the VCN can be properly powered and initialized and ultimately restore hardware video encoding.
 
 ### The Solution:
 This project solves video encoding without touching the locked VCN silicon:
