@@ -41,55 +41,32 @@
 # script with a very low PSNR against a textured/moving test pattern; a
 # real encode should score comfortably above the threshold.
 #
-# INVESTIGATION NOTE (2026-09-08, against integration/all-fixes @ 402d531)
+# INVESTIGATION NOTE (RESOLVED 2026-09-08) -- luma-specific corruption
 # --------------------------------------------------------------------------
-# After the CAVLC/intra/inter-prediction fixes landed, this script kept
-# reporting FAIL (~12.9 dB @ 640x480, ~12.5 dB @ 1280x720) even though a
-# manually-extracted decoded frame looked like the right test pattern at a
-# glance. Before assuming that was a harness false-positive, the frame
-# pairing/alignment logic below (the reference/decoded trim-and-compare in
-# step [5/6]-[6/6]) was audited end-to-end and specifically checked for two
-# suspected harness bugs; both were ruled out empirically, not assumed:
+# Between the intra/inter-prediction fixes landing and the two commits
+# below, this script reported FAIL (~12-17 dB average PSNR) on real content.
+# Before looking at the encoder itself, two harness-side theories were
+# considered and both ruled out by direct measurement: a fixed-frame-lag
+# misalignment between the dumped ground-truth input and decoded output
+# (a per-offset PSNR sweep showed no peak at any offset, ruling out a lag),
+# and a color-range mismatch between limited/TV and full range (a control
+# encode through software libx264 via the same decode/extract commands
+# preserved the input range faithfully, and pre-converting the test source
+# to full range didn't change the score either) -- this script's frame
+# pairing and range handling were never the problem.
 #
-#   1. Fixed-lag misalignment (double-buffered pipeline skewing which
-#      dumped input frame lines up with which decoded output frame): a
-#      per-offset PSNR sweep (decoded[i] vs reference[i+k] for k in -3..3)
-#      on a 10-frame clip came back essentially FLAT (13.38-13.47 dB across
-#      every offset, no peak anywhere). A real N-frame lag would produce a
-#      sharp maximum at the true offset and much lower scores elsewhere;
-#      the absence of any such peak rules this out. offset=0 (today's
-#      direct N-vs-N pairing, as already implemented below) is exactly as
-#      good as every other candidate, so no offset compensation was added.
-#   2. Color-range mismatch (reference captured as limited/TV range 16-235
-#      -- confirmed to exactly match raw lavfi testsrc output -- vs. the
-#      decoded stream reading full range 0-255 at the same pixel): a
-#      control encode of the identical source through software libx264
-#      (no VAAPI, no this driver) round-tripped through the *same*
-#      decode/extract commands this script uses and preserved the input
-#      range faithfully (16-235 in, ~12-239 out), proving this script's
-#      ffmpeg decode/rawvideo-extraction commands are not the source of
-#      the discrepancy. Separately, re-running the real VAAPI pipeline
-#      with the test source pre-converted to full range (scale=in_range=
-#      tv:out_range=pc) still scored ~12 dB, i.e. matching the range
-#      convention end-to-end did not fix the score either.
-#
-# Having ruled those out, decoded frames were extracted to PNG and viewed
-# directly. They are NOT clean: large flat-color regions (bar interiors)
-# decode correctly, but the circle boundary, the flashing test box, and
-# the left picture edge -- all high-spatial-frequency / sharp-edge
-# regions -- show real block-shaped luma+chroma corruption. Frames pulled
-# from three widely separated points in the same clip (indices 0, 5, 25 of
-# 50) are visually near-identical to each other despite the reference
-# clearly changing frame to frame (the scrolling gradient bar, the
-# flashing box) -- consistent with a P-slice/motion-compensation defect
-# rather than anything this script's frame pairing could cause.
-#
-# Conclusion: the FAIL this script reports is a true positive -- real
-# pixel-level corruption in the encoder's own output, not a test-harness
-# artifact -- so no change to the pairing/scoring logic in this script was
-# warranted. Per this project's process, a confirmed encoder-side defect
-# is out of scope for a test-harness change and is not fixed here; see the
-# accompanying report for the evidence above in full and next steps.
+# Root cause: two independent CAVLC/entropy-coding bugs, both in the
+# encoder, neither in this script -- fixed in commit 8feddef
+# (cavlc_write_run_befores() coded run_before values in the wrong
+# frequency order per ITU-T 9.2.3) and commit d95b840 (Intra16x16 luma DC
+# array was not transposed before being handed to CAVLC). Both left the
+# GPU transform/reconstruction pipeline itself untouched and correct
+# (confirmed via a ground-truth-vs-GPU-reconstruction comparison at
+# ~50dB), which is why a manually-extracted decoded frame could look
+# plausible at a glance while differing from the source pixel-for-pixel.
+# Current board-validated result with both fixes applied: PSNR avg
+# 37.7 dB / SSIM 0.99, PASS -- see those two commits' messages for full
+# methodology and numbers.
 #
 # USAGE
 #   ./tools/quality_test.sh
