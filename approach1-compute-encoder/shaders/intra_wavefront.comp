@@ -1,0 +1,663 @@
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+#version 450
+layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB), same as residual_predict.comp
+
+/*
+ * intra_wavefront.comp - combined intra (I16x16) predict + forward-transform
+ * + quantize + dequantize + inverse-transform + reconstruct, ALL IN ONE
+ * SHADER, for exactly the macroblocks on one anti-diagonal
+ * (mbx + mby == pcs.diagonal) of an I-slice frame.
+ *
+ * WHY THIS EXISTS (see gpu_compute_dispatch_encode()'s doc comment for the
+ * CPU-side dispatch loop that drives this shader, and residual_predict.comp's
+ * "DELIBERATE SIMPLIFICATION" comment for the defect this replaces):
+ *
+ * Real H.264 intra prediction has a genuine spatial dependency - macroblock
+ * (mbx,mby)'s top/left/corner neighbor SAMPLES must be truly RECONSTRUCTED
+ * (post-residual) pixels, not source pixels, because that is what a real
+ * decoder actually has available when it reconstructs that same macroblock.
+ * residual_predict.comp (still used, unmodified, for P-slices only) dispatches
+ * every macroblock of the frame in one fully-parallel pass with no cross-MB
+ * ordering, so it deliberately reads source-frame neighbor pixels instead -
+ * a correctly-formed but not decoder-accurate approximation for I-slices.
+ *
+ * The fix is diagonal-wavefront processing (a standard technique - this is
+ * literally what HEVC/VVC's own Wavefront Parallel Processing does, and GPU
+ * implementations of exactly this scheme for H.264 have been demonstrated in
+ * published research): every macroblock on anti-diagonal d = mbx+mby depends
+ * ONLY on macroblocks on diagonal d-1 (its immediate top and left neighbors,
+ * and the top-left corner sample which is on diagonal d-2 or earlier - all
+ * strictly earlier diagonals). Macroblocks WITHIN a diagonal are mutually
+ * independent. gpu_compute_dispatch_encode() dispatches this shader once per
+ * diagonal (0 .. width_in_mbs+height_in_mbs-2), with an explicit compute
+ * memory barrier (insert_compute_barrier()) between dispatches, so by the
+ * time diagonal d's macroblocks run, every macroblock they could possibly
+ * need as a neighbor has already been fully reconstructed and its pixels
+ * flushed to reconY/reconUV by an EARLIER dispatch in the same command
+ * buffer.
+ *
+ * This shader does the COMPLETE per-macroblock intra pipeline in one
+ * dispatch (predict -> residual -> forward DCT -> quantize -> dequantize ->
+ * inverse DCT -> reconstruct) rather than reusing the existing 4 separate
+ * shaders (residual_predict.comp/dct_transform.comp/quantize.comp/
+ * reconstruct.comp) once per diagonal each: running 4 separate shaders per
+ * diagonal would multiply an already-large dispatch count (124 diagonals for
+ * a 1280x720 frame) by 4, and each stage's per-MB context (retained
+ * prediction values, intermediate transform state) would have to round-trip
+ * through device buffers between dispatches instead of staying in shared
+ * memory/registers for the lifetime of one workgroup's macroblock.
+ *
+ * DISPATCH SHAPE: gpu_compute_dispatch_encode() dispatches exactly
+ * min(d+1, width_in_mbs, height_in_mbs, width_in_mbs+height_in_mbs-1-d)
+ * workgroups in the X dimension for diagonal d - i.e. the real count of
+ * macroblocks on that diagonal, no more. Each workgroup independently
+ * recomputes its own (mbx,mby) from pcs.diagonal, pcs.width_in_mbs/
+ * height_in_mbs and gl_WorkGroupID.x below (see s_mbx/s_mby derivation in
+ * main()) - the diagonal is a *set* of macroblocks at varying (mbx,mby)
+ * with mbx+mby==d, not a rectangular dispatch region, so this cannot be a
+ * plain 2D dispatch the way the other whole-frame shaders are.
+ *
+ * reconY/reconUV (bindings 2/3) ARE ctx->recon_image (see gpu_compute.c) -
+ * this same image doubles as "this frame's in-progress reconstruction"
+ * during the diagonal loop (read for neighbor samples AND written with this
+ * macroblock's own reconstructed pixels) and, once the whole loop finishes,
+ * becomes the correct fully-reconstructed reference frame for the NEXT
+ * frame's P-slice motion compensation. This is safe because:
+ *   1. I-slices never read recon_image as a P-reference for THEMSELVES (this
+ *      encoder never mixes intra MBs into a P-slice - see
+ *      residual_predict.comp's top-of-file comment), so overwriting it
+ *      during THIS frame's own encode cannot corrupt this frame's own
+ *      prediction.
+ *   2. The only thing that reads recon_image's OLD (previous-frame) contents
+ *      during this same command buffer is Stage 2 (motion estimation, for
+ *      its `referenceImage` binding) in gpu_compute_dispatch_encode(), which
+ *      always runs - with an explicit compute barrier after it - BEFORE this
+ *      shader's first dispatch. So the read-old/write-new ordering is
+ *      already correctly serialized by the existing barrier structure.
+ *
+ * All per-macroblock math below is a verbatim port of already-validated
+ * logic from residual_predict.comp (I16x16 SAD-based mode decision, chroma
+ * DC prediction), dct_transform.comp (forward 4x4 DCT), quantize.comp (AC
+ * quantizer), and reconstruct.comp (AC dequantizer, inverse 4x4 DCT, luma/
+ * chroma DC Hadamard forward+quantize+inverse+dequant - including this
+ * session's DC-dequant-scale and V[][] table-order fixes) - nothing here is
+ * independently reinvented; see those files' own comments and
+ * encoder_h264.c's quantize_dc_luma()/quantize_dc_chroma() for the full
+ * derivations and spec/x264 cross-references this math was validated
+ * against.
+ */
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;  // Y, current (source) frame
+layout(set = 0, binding = 1, rg8) uniform readonly image2D currentUV;   // Cb/Cr, current (source) frame
+
+/* This frame's in-progress reconstruction (== ctx->recon_image) - both read
+ * (neighbor samples from earlier diagonals) and written (this MB's own
+ * reconstructed pixels) by this shader. See top-of-file comment. */
+layout(set = 0, binding = 2, r8) uniform image2D reconY;
+layout(set = 0, binding = 3, rg8) uniform image2D reconUV;
+
+layout(std430, set = 0, binding = 4) writeonly buffer QuantLevels {
+    int levels[];
+};
+/* Pre-quantization transform coefficients - only position 0 of each block
+ * (the block's own pre-Hadamard DC term) is actually consumed downstream
+ * (encoder_h264.c's encode_mb_i16x16 independently re-derives the luma/
+ * chroma DC Hadamard from exactly this), but all 16 positions are written
+ * for parity with dct_transform.comp's output layout / reconstruct.comp's
+ * debug-readable convention. */
+layout(std430, set = 0, binding = 5) writeonly buffer CoeffBuf {
+    int coeffs[];
+};
+layout(std430, set = 0, binding = 6) writeonly buffer PredModeOut {
+    uint pred_modes[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint width_in_mbs;
+    uint height_in_mbs;
+    uint qp;
+    uint is_intra;   // always 1 for this shader; kept for push-constant-layout parity with the other stages
+    uint color_space;
+    uint lambda_motion;
+    uint num_slices;
+    uint diagonal;   // d = mbx + mby for the macroblocks THIS dispatch covers
+} pcs;
+
+const uint MODE_VERT  = 0u;
+const uint MODE_HORIZ = 1u;
+const uint MODE_DC    = 2u;
+const uint MODE_PLANE = 3u;
+
+/* Which slice MB `mb` belongs to - see residual_predict.comp's SLICE
+ * BOUNDARIES comment for the derivation. */
+uint slice_of(uint mb) {
+    uint total_mbs = pcs.width_in_mbs * pcs.height_in_mbs;
+    return (mb * pcs.num_slices) / total_mbs;
+}
+
+int clip1(int v) { return clamp(v, 0, 255); }
+
+/* ---- forward 4x4 core transform (verbatim port of dct_transform.comp) ---- */
+void forward_4x4(in int in_block[16], out int out_block[16]) {
+    int m[16];
+    for (int i = 0; i < 4; i++) {
+        int r = i * 4;
+        int p0 = in_block[r + 0], p1 = in_block[r + 1], p2 = in_block[r + 2], p3 = in_block[r + 3];
+        int a0 = p0 + p3, a1 = p1 + p2, a2 = p1 - p2, a3 = p0 - p3;
+        m[r + 0] = a0 + a1; m[r + 1] = (a3 << 1) + a2; m[r + 2] = a0 - a1; m[r + 3] = a3 - (a2 << 1);
+    }
+    for (int j = 0; j < 4; j++) {
+        int p0 = m[0 * 4 + j], p1 = m[1 * 4 + j], p2 = m[2 * 4 + j], p3 = m[3 * 4 + j];
+        int a0 = p0 + p3, a1 = p1 + p2, a2 = p1 - p2, a3 = p0 - p3;
+        out_block[0 * 4 + j] = a0 + a1; out_block[1 * 4 + j] = (a3 << 1) + a2;
+        out_block[2 * 4 + j] = a0 - a1; out_block[3 * 4 + j] = a3 - (a2 << 1);
+    }
+}
+
+/* ---- AC quantizer (verbatim port of quantize.comp), is_intra==1 always ---- */
+const int MF[6][3] = {
+    {13107, 5243, 8066},
+    {11916, 4660, 7490},
+    {10082, 4194, 6554},
+    {9362,  3647, 5825},
+    {8192,  3355, 5243},
+    {7282,  2893, 4559}
+};
+int get_pos_type_q(int idx) {
+    int r = idx / 4, c = idx % 4;
+    int r_even = r & 1, c_even = c & 1;
+    if (r_even == 0 && c_even == 0) return 0;
+    if (r_even == 1 && c_even == 1) return 1;
+    return 2;
+}
+int quantize_ac(int coeff, int idx, int qp_per, int qp_rem, int f) {
+    int sign = coeff < 0 ? -1 : 1;
+    int abs_coeff = abs(coeff);
+    int pos_type = get_pos_type_q(idx);
+    int level = (abs_coeff * MF[qp_rem][pos_type] + f) >> (15 + qp_per);
+    return level * sign;
+}
+
+/* ---- dequant/hadamard/inverse (verbatim port of reconstruct.comp,
+ * INCLUDING this session's DC-dequant-scale + V[][] column-order fixes) ---- */
+const int DC_LEVEL_SCALE0[6] = { 160, 176, 208, 224, 256, 288 };
+const int V[6][3] = {
+    {10, 16, 13},
+    {11, 18, 14},
+    {13, 20, 16},
+    {14, 23, 18},
+    {16, 25, 20},
+    {18, 29, 23}
+};
+int get_pos_type(int idx) {
+    int r = idx / 4, c = idx % 4;
+    bool r_even = (r % 2) == 0, c_even = (c % 2) == 0;
+    if (r_even && c_even) return 0;
+    if (!r_even && !c_even) return 1;
+    return 2;
+}
+int dequant_ac(int level, int idx, int qp_per, int qp_rem) {
+    int scale = 16 * V[qp_rem][get_pos_type(idx)];
+    if (qp_per >= 4) return (level * scale) << (qp_per - 4);
+    return (level * scale + (1 << (3 - qp_per))) >> (4 - qp_per);
+}
+void inverse_4x4(inout int d[16], out int r[16]) {
+    int tmp[16];
+    d[0] += 32;
+    for (int i = 0; i < 4; i++) {
+        int rr = i * 4;
+        int p0 = d[rr + 0], p1 = d[rr + 1], p2 = d[rr + 2], p3 = d[rr + 3];
+        int z0 = p0 + p2, z1 = p0 - p2, z2 = (p1 >> 1) - p3, z3 = p1 + (p3 >> 1);
+        tmp[rr + 0] = z0 + z3; tmp[rr + 1] = z1 + z2; tmp[rr + 2] = z1 - z2; tmp[rr + 3] = z0 - z3;
+    }
+    for (int j = 0; j < 4; j++) {
+        int p0 = tmp[0 * 4 + j], p1 = tmp[1 * 4 + j], p2 = tmp[2 * 4 + j], p3 = tmp[3 * 4 + j];
+        int z0 = p0 + p2, z1 = p0 - p2, z2 = (p1 >> 1) - p3, z3 = p1 + (p3 >> 1);
+        r[0 * 4 + j] = (z0 + z3) >> 6; r[1 * 4 + j] = (z1 + z2) >> 6;
+        r[2 * 4 + j] = (z1 - z2) >> 6; r[3 * 4 + j] = (z0 - z3) >> 6;
+    }
+}
+void luma_dc_hadamard_fwd(in int dc_in[16], out int dc_out[16]) {
+    int tmp[16];
+    for (int i = 0; i < 4; i++) {
+        int s01 = dc_in[i * 4 + 0] + dc_in[i * 4 + 1], d01 = dc_in[i * 4 + 0] - dc_in[i * 4 + 1];
+        int s23 = dc_in[i * 4 + 2] + dc_in[i * 4 + 3], d23 = dc_in[i * 4 + 2] - dc_in[i * 4 + 3];
+        tmp[0 * 4 + i] = s01 + s23; tmp[1 * 4 + i] = s01 - s23; tmp[2 * 4 + i] = d01 - d23; tmp[3 * 4 + i] = d01 + d23;
+    }
+    for (int i = 0; i < 4; i++) {
+        int s01 = tmp[i * 4 + 0] + tmp[i * 4 + 1], d01 = tmp[i * 4 + 0] - tmp[i * 4 + 1];
+        int s23 = tmp[i * 4 + 2] + tmp[i * 4 + 3], d23 = tmp[i * 4 + 2] - tmp[i * 4 + 3];
+        dc_out[i * 4 + 0] = (s01 + s23 + 1) >> 1; dc_out[i * 4 + 1] = (s01 - s23 + 1) >> 1;
+        dc_out[i * 4 + 2] = (d01 - d23 + 1) >> 1; dc_out[i * 4 + 3] = (d01 + d23 + 1) >> 1;
+    }
+}
+void luma_dc_hadamard_inv(in int c[16], out int f[16]) {
+    int tmp[16];
+    for (int i = 0; i < 4; i++) {
+        int s01 = c[i * 4 + 0] + c[i * 4 + 1], d01 = c[i * 4 + 0] - c[i * 4 + 1];
+        int s23 = c[i * 4 + 2] + c[i * 4 + 3], d23 = c[i * 4 + 2] - c[i * 4 + 3];
+        tmp[0 * 4 + i] = s01 + s23; tmp[1 * 4 + i] = s01 - s23; tmp[2 * 4 + i] = d01 - d23; tmp[3 * 4 + i] = d01 + d23;
+    }
+    for (int i = 0; i < 4; i++) {
+        int s01 = tmp[i * 4 + 0] + tmp[i * 4 + 1], d01 = tmp[i * 4 + 0] - tmp[i * 4 + 1];
+        int s23 = tmp[i * 4 + 2] + tmp[i * 4 + 3], d23 = tmp[i * 4 + 2] - tmp[i * 4 + 3];
+        f[i * 4 + 0] = s01 + s23; f[i * 4 + 1] = s01 - s23; f[i * 4 + 2] = d01 - d23; f[i * 4 + 3] = d01 + d23;
+    }
+}
+void chroma_dc_hadamard(in int c[4], out int out4[4]) {
+    int c00 = c[0], c01 = c[1], c10 = c[2], c11 = c[3];
+    out4[0] = c00 + c01 + c10 + c11;
+    out4[1] = c00 - c01 + c10 - c11;
+    out4[2] = c00 + c01 - c10 - c11;
+    out4[3] = c00 - c01 - c10 + c11;
+}
+int quantize_dc_luma_scalar(int v, int qp_per, int qp_rem) {
+    int LS = DC_LEVEL_SCALE0[qp_rem];
+    int sign = v < 0 ? -1 : 1;
+    int av = abs(v);
+    int numer_av, denom;
+    if (qp_per >= 5) { numer_av = av; denom = LS << (qp_per - 5); }
+    else { numer_av = av << (5 - qp_per); denom = LS; }
+    int level = (numer_av + denom / 2) / denom;
+    return sign * level;
+}
+int quantize_dc_chroma_scalar(int v, int qp_per, int qp_rem) {
+    int LS = DC_LEVEL_SCALE0[qp_rem];
+    int sign = v < 0 ? -1 : 1;
+    int av = abs(v);
+    int numer_av, denom;
+    if (qp_per >= 5) { numer_av = av; denom = LS << (qp_per - 5); }
+    else { numer_av = av << (5 - qp_per); denom = LS; }
+    int level = (numer_av + denom / 2) / denom;
+    return sign * level;
+}
+int dequant_dc_luma(int f, int qp_per, int qp_rem) {
+    int LS = DC_LEVEL_SCALE0[qp_rem];
+    if (qp_per >= 6) return (f * LS) << (qp_per - 6);
+    return (f * LS + (1 << (5 - qp_per))) >> (6 - qp_per);
+}
+int dequant_dc_chroma(int f, int qp_per, int qp_rem) {
+    int LS = DC_LEVEL_SCALE0[qp_rem];
+    if (qp_per >= 5) return (f * LS) << (qp_per - 5);
+    return (f * LS) >> (5 - qp_per);
+}
+
+/* ---- shared state ---- */
+shared uint s_mbx, s_mby;
+
+shared int current_mb[16][16];   // source luma pixels, [py][px]
+shared int top_row[16];
+shared int left_col[16];
+shared int corner;
+shared bool top_avail, left_avail;
+
+shared int dc_value;
+shared int plane_a, plane_b, plane_c;
+shared uint sad_dc, sad_v, sad_h, sad_plane;
+shared uint chosen_mode;
+
+shared ivec2 top_uv[8];
+shared ivec2 left_uv[8];
+shared int cb_dc[4], cr_dc[4];
+
+/* Per-block residual/prediction, indexed [block 0..15][pos_in_block 0..15]
+ * (raster within the 4x4 block, matching forward_4x4's expected layout). */
+shared int s_res[16][16];
+shared int s_predv[16][16];
+shared int s_dc_in[16];     // pre-Hadamard per-block DC term (coeff position 0)
+shared int s_ac_level[16][16];
+shared int s_dc_val[16];    // dequantized DC term, ready for inverse_4x4's dqt[0]
+
+/* Chroma equivalents, indexed [sub 0..3][pos_in_block 0..15]. */
+shared int s_cb_res[4][16], s_cr_res[4][16];
+shared int s_cb_predv[4][16], s_cr_predv[4][16];
+shared int s_cb_dc_in[4], s_cr_dc_in[4];
+shared int s_cb_ac_level[4][16], s_cr_ac_level[4][16];
+shared int s_cb_dc_val[4], s_cr_dc_val[4];
+
+void main() {
+    uint local_id = gl_LocalInvocationIndex;
+
+    /* --- derive this workgroup's (mbx,mby) from the diagonal + WorkGroupID
+     * (see top-of-file DISPATCH SHAPE comment) --- */
+    if (local_id == 0u) {
+        int d = int(pcs.diagonal);
+        int height_mbs = int(pcs.height_in_mbs);
+        int mbx_start = max(0, d - height_mbs + 1);
+        int mbx = mbx_start + int(gl_WorkGroupID.x);
+        int mby = d - mbx;
+        s_mbx = uint(mbx);
+        s_mby = uint(mby);
+    }
+    barrier();
+
+    uint mb_x = s_mbx;
+    uint mb_y = s_mby;
+    if (mb_x >= pcs.width_in_mbs || mb_y >= pcs.height_in_mbs) return;
+
+    uint mb_idx = mb_y * pcs.width_in_mbs + mb_x;
+    ivec2 mb_pos = ivec2(mb_x * 16u, mb_y * 16u);
+    ivec2 frame_max = ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1);
+
+    uint px = local_id % 16u;
+    uint py = local_id / 16u;
+    ivec2 coord = clamp(mb_pos + ivec2(px, py), ivec2(0), frame_max);
+    current_mb[py][px] = int(round(imageLoad(currentImage, coord).r * 255.0));
+
+    uint my_slice = slice_of(mb_idx);
+    bool top_exists = mb_y > 0u;
+    bool left_exists = mb_x > 0u;
+
+    if (local_id == 0u) {
+        top_avail = top_exists && (slice_of(mb_idx - pcs.width_in_mbs) == my_slice);
+        left_avail = left_exists && (slice_of(mb_idx - 1u) == my_slice);
+    }
+
+    /* Top/left/corner neighbor samples come from reconY - the TRULY
+     * reconstructed pixels of earlier-diagonal macroblocks - NOT from
+     * currentImage. This is the entire point of the fix; see top-of-file
+     * comment. */
+    if (local_id < 16u) {
+        ivec2 tc = clamp(mb_pos + ivec2(local_id, -1), ivec2(0), frame_max);
+        top_row[local_id] = top_exists ? int(round(imageLoad(reconY, tc).r * 255.0)) : 128;
+        ivec2 lc = clamp(mb_pos + ivec2(-1, local_id), ivec2(0), frame_max);
+        left_col[local_id] = left_exists ? int(round(imageLoad(reconY, lc).r * 255.0)) : 128;
+    }
+    if (local_id == 0u) {
+        ivec2 cc = clamp(mb_pos + ivec2(-1, -1), ivec2(0), frame_max);
+        corner = (left_exists && top_exists) ? int(round(imageLoad(reconY, cc).r * 255.0)) : 128;
+    }
+
+    barrier();
+
+    /* --- candidate predictor construction (thread 0 only) --- */
+    if (local_id == 0u) {
+        int sum_top = 0, sum_left = 0;
+        for (int i = 0; i < 16; i++) { sum_top += top_row[i]; sum_left += left_col[i]; }
+
+        if (top_avail && left_avail) dc_value = (sum_top + sum_left + 16) >> 5;
+        else if (top_avail) dc_value = (sum_top + 8) >> 4;
+        else if (left_avail) dc_value = (sum_left + 8) >> 4;
+        else dc_value = 128;
+
+        if (top_avail && left_avail) {
+            int H = 0, V = 0;
+            for (int xp = 0; xp < 8; xp++) {
+                int left_sample = (6 - xp >= 0) ? top_row[6 - xp] : corner;
+                H += (xp + 1) * (top_row[8 + xp] - left_sample);
+            }
+            for (int yp = 0; yp < 8; yp++) {
+                int above_sample = (6 - yp >= 0) ? left_col[6 - yp] : corner;
+                V += (yp + 1) * (left_col[8 + yp] - above_sample);
+            }
+            plane_a = 16 * (left_col[15] + top_row[15]);
+            plane_b = (5 * H + 32) >> 6;
+            plane_c = (5 * V + 32) >> 6;
+        }
+
+        sad_dc = 0u; sad_v = 0u; sad_h = 0u; sad_plane = 0u;
+    }
+    barrier();
+
+    int src = current_mb[py][px];
+    atomicAdd(sad_dc, uint(abs(src - dc_value)));
+    if (top_avail) atomicAdd(sad_v, uint(abs(src - top_row[px])));
+    if (left_avail) atomicAdd(sad_h, uint(abs(src - left_col[py])));
+    if (top_avail && left_avail) {
+        int pv = clip1((plane_a + plane_b * (int(px) - 7) + plane_c * (int(py) - 7) + 16) >> 5);
+        atomicAdd(sad_plane, uint(abs(src - pv)));
+    }
+    barrier();
+
+    if (local_id == 0u) {
+        uint best = sad_dc;
+        uint mode = MODE_DC;
+        if (top_avail && sad_v < best) { best = sad_v; mode = MODE_VERT; }
+        if (left_avail && sad_h < best) { best = sad_h; mode = MODE_HORIZ; }
+        if (top_avail && left_avail && sad_plane < best) { best = sad_plane; mode = MODE_PLANE; }
+        chosen_mode = mode;
+        pred_modes[mb_idx] = mode;
+    }
+    barrier();
+
+    int pred_val;
+    if (chosen_mode == MODE_VERT) pred_val = top_row[px];
+    else if (chosen_mode == MODE_HORIZ) pred_val = left_col[py];
+    else if (chosen_mode == MODE_PLANE)
+        pred_val = clip1((plane_a + plane_b * (int(px) - 7) + plane_c * (int(py) - 7) + 16) >> 5);
+    else
+        pred_val = dc_value;
+
+    int residual = src - pred_val;
+
+    uint bx = px / 4u, by = py / 4u;
+    uint block = by * 4u + bx;
+    uint pos_in_block = (py % 4u) * 4u + (px % 4u);
+    s_res[block][pos_in_block] = residual;
+    s_predv[block][pos_in_block] = pred_val;
+
+    barrier();
+
+    int qp = int(pcs.qp);
+    int qp_per = qp / 6;
+    int qp_rem = qp % 6;
+    int f_ac = (1 << (15 + qp_per)) / 3; /* intra AC rounding offset (1/3), matching quantize.comp */
+
+    /* --- per-block forward transform + AC quantize (one thread per luma
+     * block: local_id 0..15) --- */
+    if (local_id < 16u) {
+        uint block_id = local_id;
+        int in_block[16];
+        for (int p = 0; p < 16; p++) in_block[p] = s_res[block_id][p];
+        int coeff_block[16];
+        forward_4x4(in_block, coeff_block);
+
+        uint global_block_idx = mb_idx * 24u + block_id;
+        for (int p = 0; p < 16; p++) coeffs[global_block_idx * 16u + uint(p)] = coeff_block[p];
+        s_dc_in[block_id] = coeff_block[0];
+
+        levels[global_block_idx * 16u + 0u] = 0; /* DC handled separately below; AC quantizer's own position-0 output is unused */
+        for (int p = 1; p < 16; p++) {
+            int level = quantize_ac(coeff_block[p], p, qp_per, qp_rem, f_ac);
+            s_ac_level[block_id][p] = level;
+            levels[global_block_idx * 16u + uint(p)] = level;
+        }
+    }
+    barrier();
+
+    /* --- luma DC Hadamard: forward + quantize + inverse + dequant (thread 0
+     * only - 16 values, trivially cheap) --- */
+    if (local_id == 0u) {
+        int dc_in[16];
+        for (int b = 0; b < 16; b++) dc_in[b] = s_dc_in[b];
+        int dc_out_raw[16];
+        luma_dc_hadamard_fwd(dc_in, dc_out_raw);
+        int dc_level[16];
+        for (int b = 0; b < 16; b++) dc_level[b] = quantize_dc_luma_scalar(dc_out_raw[b], qp_per, qp_rem);
+        int f[16];
+        luma_dc_hadamard_inv(dc_level, f);
+        for (int b = 0; b < 16; b++) s_dc_val[b] = dequant_dc_luma(f[b], qp_per, qp_rem);
+    }
+    barrier();
+
+    /* --- per-block dequant + inverse transform + reconstruct + imageStore
+     * (one thread per luma block again) --- */
+    if (local_id < 16u) {
+        uint block_id = local_id;
+        int dqt[16];
+        dqt[0] = s_dc_val[block_id];
+        for (int p = 1; p < 16; p++) dqt[p] = dequant_ac(s_ac_level[block_id][p], p, qp_per, qp_rem);
+
+        int res16[16];
+        inverse_4x4(dqt, res16);
+
+        uint bbx = block_id % 4u, bby = block_id / 4u;
+        ivec2 blk_origin = ivec2(int(mb_x * 16u + bbx * 4u), int(mb_y * 16u + bby * 4u));
+        for (int p = 0; p < 16; p++) {
+            int prow = p / 4, pcol = p % 4;
+            ivec2 wcoord = blk_origin + ivec2(pcol, prow);
+            if (wcoord.x >= int(pcs.frame_width) || wcoord.y >= int(pcs.frame_height)) continue;
+            int val = clip1(s_predv[block_id][p] + res16[p]);
+            imageStore(reconY, wcoord, vec4(float(val) / 255.0, 0.0, 0.0, 0.0));
+        }
+    }
+
+    /* =====================================================================
+     * Chroma: I-slice DC-only prediction, spatial neighbors now from
+     * reconUV (reconstructed-so-far), not currentUV - same fix rationale as
+     * luma above. 128 threads needed (4 blocks * 2 planes * 16 positions).
+     * ===================================================================== */
+    ivec2 mb_pos_uv = mb_pos / 2;
+    ivec2 uv_max = ivec2(int(pcs.frame_width) / 2 - 1, int(pcs.frame_height) / 2 - 1);
+
+    if (local_id < 8u) {
+        ivec2 tc = clamp(mb_pos_uv + ivec2(local_id, -1), ivec2(0), uv_max);
+        vec2 tv = top_avail ? imageLoad(reconUV, tc).rg : vec2(128.0 / 255.0);
+        top_uv[local_id] = ivec2(round(tv * 255.0));
+
+        ivec2 lc = clamp(mb_pos_uv + ivec2(-1, local_id), ivec2(0), uv_max);
+        vec2 lv = left_avail ? imageLoad(reconUV, lc).rg : vec2(128.0 / 255.0);
+        left_uv[local_id] = ivec2(round(lv * 255.0));
+    }
+    barrier();
+
+    if (local_id == 0u) {
+        for (int plane = 0; plane < 2; plane++) {
+            int sum_top4[2], sum_left4[2];
+            sum_top4[0] = top_uv[0][plane] + top_uv[1][plane] + top_uv[2][plane] + top_uv[3][plane];
+            sum_top4[1] = top_uv[4][plane] + top_uv[5][plane] + top_uv[6][plane] + top_uv[7][plane];
+            sum_left4[0] = left_uv[0][plane] + left_uv[1][plane] + left_uv[2][plane] + left_uv[3][plane];
+            sum_left4[1] = left_uv[4][plane] + left_uv[5][plane] + left_uv[6][plane] + left_uv[7][plane];
+
+            int dc_tl, dc_tr, dc_bl, dc_br;
+            if (top_avail && left_avail) dc_tl = (sum_top4[0] + sum_left4[0] + 4) >> 3;
+            else if (top_avail) dc_tl = (sum_top4[0] + 2) >> 2;
+            else if (left_avail) dc_tl = (sum_left4[0] + 2) >> 2;
+            else dc_tl = 128;
+
+            if (top_avail) dc_tr = (sum_top4[1] + 2) >> 2;
+            else if (left_avail) dc_tr = (sum_left4[0] + 2) >> 2;
+            else dc_tr = 128;
+
+            if (left_avail) dc_bl = (sum_left4[1] + 2) >> 2;
+            else if (top_avail) dc_bl = (sum_top4[0] + 2) >> 2;
+            else dc_bl = 128;
+
+            if (top_avail && left_avail) dc_br = (sum_top4[1] + sum_left4[1] + 4) >> 3;
+            else if (top_avail) dc_br = (sum_top4[1] + 2) >> 2;
+            else if (left_avail) dc_br = (sum_left4[1] + 2) >> 2;
+            else dc_br = 128;
+
+            if (plane == 0) { cb_dc[0] = dc_tl; cb_dc[1] = dc_tr; cb_dc[2] = dc_bl; cb_dc[3] = dc_br; }
+            else            { cr_dc[0] = dc_tl; cr_dc[1] = dc_tr; cr_dc[2] = dc_bl; cr_dc[3] = dc_br; }
+        }
+    }
+    barrier();
+
+    if (local_id < 128u) {
+        uint idx = local_id;
+        uint sub = (idx / 16u) % 4u;      // 0=TL,1=TR,2=BL,3=BR
+        uint pos_in_block = idx % 16u;
+        bool is_cr = idx >= 64u;
+
+        uint xO = (sub % 2u) * 4u, yO = (sub / 2u) * 4u;
+        uint px_off = xO + (pos_in_block % 4u), py_off = yO + (pos_in_block / 4u);
+        ivec2 uv_coord = clamp(mb_pos_uv + ivec2(px_off, py_off), ivec2(0), uv_max);
+        vec2 uv = imageLoad(currentUV, uv_coord).rg;
+        int src_val = int(round((is_cr ? uv.g : uv.r) * 255.0));
+
+        int pred_val_c = is_cr ? cr_dc[sub] : cb_dc[sub];
+        int residual_c = src_val - pred_val_c;
+
+        if (is_cr) { s_cr_res[sub][pos_in_block] = residual_c; s_cr_predv[sub][pos_in_block] = pred_val_c; }
+        else       { s_cb_res[sub][pos_in_block] = residual_c; s_cb_predv[sub][pos_in_block] = pred_val_c; }
+    }
+    barrier();
+
+    /* Per-sub-block forward transform + AC quantize (local_id 0..3, one
+     * thread handles BOTH Cb and Cr for its sub-block - avoids any
+     * read-modify-write race on the packed rg8 reconUV texel later). */
+    if (local_id < 4u) {
+        uint sub = local_id;
+
+        int cb_in[16], cr_in[16];
+        for (int p = 0; p < 16; p++) { cb_in[p] = s_cb_res[sub][p]; cr_in[p] = s_cr_res[sub][p]; }
+        int cb_coeff[16], cr_coeff[16];
+        forward_4x4(cb_in, cb_coeff);
+        forward_4x4(cr_in, cr_coeff);
+
+        uint cb_global = mb_idx * 24u + 16u + sub;
+        uint cr_global = mb_idx * 24u + 20u + sub;
+        for (int p = 0; p < 16; p++) {
+            coeffs[cb_global * 16u + uint(p)] = cb_coeff[p];
+            coeffs[cr_global * 16u + uint(p)] = cr_coeff[p];
+        }
+        s_cb_dc_in[sub] = cb_coeff[0];
+        s_cr_dc_in[sub] = cr_coeff[0];
+
+        levels[cb_global * 16u + 0u] = 0;
+        levels[cr_global * 16u + 0u] = 0;
+        for (int p = 1; p < 16; p++) {
+            int cb_level = quantize_ac(cb_coeff[p], p, qp_per, qp_rem, f_ac);
+            int cr_level = quantize_ac(cr_coeff[p], p, qp_per, qp_rem, f_ac);
+            s_cb_ac_level[sub][p] = cb_level;
+            s_cr_ac_level[sub][p] = cr_level;
+            levels[cb_global * 16u + uint(p)] = cb_level;
+            levels[cr_global * 16u + uint(p)] = cr_level;
+        }
+    }
+    barrier();
+
+    /* Joint chroma DC Hadamard across the 4 sub-blocks of each plane
+     * (thread 0 only - 4 values per plane, trivially cheap). */
+    if (local_id == 0u) {
+        int cb_dc_raw[4], cr_dc_raw[4];
+        chroma_dc_hadamard(s_cb_dc_in, cb_dc_raw);
+        chroma_dc_hadamard(s_cr_dc_in, cr_dc_raw);
+        int cb_level4[4], cr_level4[4];
+        for (int i = 0; i < 4; i++) {
+            cb_level4[i] = quantize_dc_chroma_scalar(cb_dc_raw[i], qp_per, qp_rem);
+            cr_level4[i] = quantize_dc_chroma_scalar(cr_dc_raw[i], qp_per, qp_rem);
+        }
+        int cb_f[4], cr_f[4];
+        chroma_dc_hadamard(cb_level4, cb_f);
+        chroma_dc_hadamard(cr_level4, cr_f);
+        for (int i = 0; i < 4; i++) {
+            s_cb_dc_val[i] = dequant_dc_chroma(cb_f[i], qp_per, qp_rem);
+            s_cr_dc_val[i] = dequant_dc_chroma(cr_f[i], qp_per, qp_rem);
+        }
+    }
+    barrier();
+
+    /* Per-sub-block dequant + inverse transform + reconstruct + single
+     * combined imageStore into reconUV (local_id 0..3). */
+    if (local_id < 4u) {
+        uint sub = local_id;
+
+        int cb_dqt[16], cr_dqt[16];
+        cb_dqt[0] = s_cb_dc_val[sub];
+        cr_dqt[0] = s_cr_dc_val[sub];
+        for (int p = 1; p < 16; p++) {
+            cb_dqt[p] = dequant_ac(s_cb_ac_level[sub][p], p, qp_per, qp_rem);
+            cr_dqt[p] = dequant_ac(s_cr_ac_level[sub][p], p, qp_per, qp_rem);
+        }
+        int cb_res16[16], cr_res16[16];
+        inverse_4x4(cb_dqt, cb_res16);
+        inverse_4x4(cr_dqt, cr_res16);
+
+        uint xO = (sub % 2u) * 4u, yO = (sub / 2u) * 4u;
+        ivec2 uv_origin = ivec2(int(mb_x * 8u + xO), int(mb_y * 8u + yO));
+        int uv_max_x = int(pcs.frame_width / 2u) - 1;
+        int uv_max_y = int(pcs.frame_height / 2u) - 1;
+        for (int p = 0; p < 16; p++) {
+            int prow = p / 4, pcol = p % 4;
+            ivec2 wcoord = uv_origin + ivec2(pcol, prow);
+            if (wcoord.x > uv_max_x || wcoord.y > uv_max_y) continue;
+            int val_cb = clip1(s_cb_predv[sub][p] + cb_res16[p]);
+            int val_cr = clip1(s_cr_predv[sub][p] + cr_res16[p]);
+            imageStore(reconUV, wcoord, vec4(float(val_cb) / 255.0, float(val_cr) / 255.0, 0.0, 0.0));
+        }
+    }
+}

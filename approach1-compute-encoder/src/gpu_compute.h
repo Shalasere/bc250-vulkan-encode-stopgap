@@ -80,6 +80,15 @@ typedef struct bc250_gpu_context {
      * reconstruct.comp's top-of-file comment. */
     VkDescriptorSetLayout reconstruct_desc_layout;
 
+    /* intra_wavefront.comp: current Y/UV images (readonly), recon Y/UV
+     * images (read-write - this frame's in-progress reconstruction, doubles
+     * as the next frame's P-reference once the diagonal loop completes),
+     * quant_levels_buffer/coeff_buffer/pred_mode_buffer (writeonly). Used
+     * ONLY for I-slices, dispatched once per diagonal by
+     * gpu_compute_dispatch_encode() - see intra_wavefront.comp's top-of-file
+     * comment. */
+    VkDescriptorSetLayout intra_wavefront_desc_layout;
+
     /* Pipeline layouts */
     VkPipelineLayout motion_est_layout;
     VkPipelineLayout predict_layout;
@@ -89,6 +98,7 @@ typedef struct bc250_gpu_context {
     VkPipelineLayout entropy_layout;
     VkPipelineLayout color_convert_layout;
     VkPipelineLayout reconstruct_layout;
+    VkPipelineLayout intra_wavefront_layout;
 
     /* Compute pipelines */
     VkPipeline motion_est_pipeline;
@@ -99,6 +109,7 @@ typedef struct bc250_gpu_context {
     VkPipeline entropy_pipeline;
     VkPipeline color_convert_pipeline;
     VkPipeline reconstruct_pipeline;
+    VkPipeline intra_wavefront_pipeline;
 
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
@@ -109,6 +120,7 @@ typedef struct bc250_gpu_context {
     VkDescriptorSet entropy_desc_set;
     VkDescriptorSet cc_desc_set;
     VkDescriptorSet reconstruct_desc_set;
+    VkDescriptorSet intra_wavefront_desc_set;
 
     /* Encoding Buffers */
     VkBuffer mv_buffer;

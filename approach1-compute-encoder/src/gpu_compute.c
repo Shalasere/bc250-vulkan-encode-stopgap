@@ -280,6 +280,16 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     update_storage_buffer_descriptor(ctx->device, ctx->reconstruct_desc_set, 1, ctx->coeff_buffer, coeff_size);
     update_storage_buffer_descriptor(ctx->device, ctx->reconstruct_desc_set, 2, ctx->pred_buffer, residual_size);
 
+    /* intra_wavefront.comp's buffer bindings: quant_levels_buffer/coeff_buffer/
+     * pred_mode_buffer (writeonly - same underlying buffers as the whole-frame
+     * P-slice path, just written by this shader instead for I-slices). Image
+     * bindings (current Y/UV, recon Y/UV) are updated per-dispatch in
+     * gpu_compute_dispatch_encode() since recon_image can be (re)created there
+     * and render_target changes every frame. */
+    update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 4, ctx->quant_levels_buffer, quant_levels_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 5, ctx->coeff_buffer, coeff_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 6, ctx->pred_mode_buffer, pred_mode_size);
+
     return 0;
 }
 
@@ -606,6 +616,23 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VkDescriptorSetLayoutCreateInfo reconstruct_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 5, .pBindings = reconstruct_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &reconstruct_layout_info, NULL, &ctx->reconstruct_desc_layout);
 
+    /* intra_wavefront.comp: current Y/UV (readonly), recon Y/UV (read-write -
+     * see gpu_compute.h's comment), quant_levels_buffer/coeff_buffer/
+     * pred_mode_buffer (writeonly). I-slice-only, diagonal-wavefront
+     * dispatch - see that shader's top-of-file comment and
+     * gpu_compute_dispatch_encode() below. */
+    VkDescriptorSetLayoutBinding intra_wavefront_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = intra_wavefront_bindings };
+    vkCreateDescriptorSetLayout(ctx->device, &intra_wavefront_layout_info, NULL, &ctx->intra_wavefront_desc_layout);
+
     /* Descriptor Pool */
     VkDescriptorPoolSize pool_sizes[] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32},
@@ -620,14 +647,15 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     vkCreateDescriptorPool(ctx->device, &pool_info_desc, NULL, &ctx->desc_pool);
 
     /* Push constants. 9th word (num_slices) is only read by
-     * residual_predict.comp (see its SLICE BOUNDARIES comment) - every other
-     * shader still only declares the first 8 words in its own PushConstants
-     * block, which is fine, they just don't read the extra tail byte range
-     * this layout now allows. */
+     * residual_predict.comp (see its SLICE BOUNDARIES comment); 10th word
+     * (diagonal) is only read by intra_wavefront.comp (see its DISPATCH
+     * SHAPE comment) - every other shader still only declares the first 8
+     * (or 9) words in its own PushConstants block, which is fine, they just
+     * don't read the extra tail byte range this layout now allows. */
     VkPushConstantRange pc_range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
-        .size = sizeof(uint32_t) * 9
+        .size = sizeof(uint32_t) * 10
     };
 
     /* Pipeline Layouts */
@@ -662,6 +690,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     layout_info.pSetLayouts = &ctx->reconstruct_desc_layout;
     vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->reconstruct_layout);
 
+    layout_info.pSetLayouts = &ctx->intra_wavefront_desc_layout;
+    vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->intra_wavefront_layout);
+
     /* Allocate Descriptor Sets */
     VkDescriptorSetAllocateInfo alloc_set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -692,6 +723,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     alloc_set_info.pSetLayouts = &ctx->reconstruct_desc_layout;
     vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->reconstruct_desc_set);
+
+    alloc_set_info.pSetLayouts = &ctx->intra_wavefront_desc_layout;
+    vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->intra_wavefront_desc_set);
 
     /* Shaders & Pipelines */
     VkShaderModule me_shader = load_spirv_shader(ctx->device, "motion_estimation.comp.spv");
@@ -739,6 +773,16 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     } else {
         fprintf(stderr, "[bc250-gpu] FAILED to load reconstruct.comp.spv shader module\n");
     }
+    VkShaderModule intra_wavefront_shader = load_spirv_shader(ctx->device, "intra_wavefront.comp.spv");
+    if (intra_wavefront_shader) {
+        ctx->intra_wavefront_pipeline = create_compute_pipeline(ctx->device, intra_wavefront_shader, ctx->intra_wavefront_layout);
+        vkDestroyShaderModule(ctx->device, intra_wavefront_shader, NULL);
+        if (!ctx->intra_wavefront_pipeline) {
+            fprintf(stderr, "[bc250-gpu] FAILED to create intra_wavefront_pipeline (shader loaded but pipeline creation failed)\n");
+        }
+    } else {
+        fprintf(stderr, "[bc250-gpu] FAILED to load intra_wavefront.comp.spv shader module\n");
+    }
 
     /* Allocate device buffers for 4K maximum resolution */
     allocate_encoding_buffers(ctx, 3840, 2160);
@@ -759,6 +803,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->entropy_pipeline) vkDestroyPipeline(ctx->device, ctx->entropy_pipeline, NULL);
     if (ctx->color_convert_pipeline) vkDestroyPipeline(ctx->device, ctx->color_convert_pipeline, NULL);
     if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
+    if (ctx->intra_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->intra_wavefront_pipeline, NULL);
 
     if (ctx->motion_est_layout) vkDestroyPipelineLayout(ctx->device, ctx->motion_est_layout, NULL);
     if (ctx->predict_layout) vkDestroyPipelineLayout(ctx->device, ctx->predict_layout, NULL);
@@ -768,6 +813,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->entropy_layout) vkDestroyPipelineLayout(ctx->device, ctx->entropy_layout, NULL);
     if (ctx->color_convert_layout) vkDestroyPipelineLayout(ctx->device, ctx->color_convert_layout, NULL);
     if (ctx->reconstruct_layout) vkDestroyPipelineLayout(ctx->device, ctx->reconstruct_layout, NULL);
+    if (ctx->intra_wavefront_layout) vkDestroyPipelineLayout(ctx->device, ctx->intra_wavefront_layout, NULL);
 
     if (ctx->me_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->me_desc_layout, NULL);
     if (ctx->predict_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->predict_desc_layout, NULL);
@@ -777,6 +823,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->entropy_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->entropy_desc_layout, NULL);
     if (ctx->cc_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->cc_desc_layout, NULL);
     if (ctx->reconstruct_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->reconstruct_desc_layout, NULL);
+    if (ctx->intra_wavefront_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->intra_wavefront_desc_layout, NULL);
 
     if (ctx->desc_pool) vkDestroyDescriptorPool(ctx->device, ctx->desc_pool, NULL);
 
@@ -1236,62 +1283,122 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         insert_compute_barrier(cmd_buf);
     }
 
-    /* Stage 2.5: Real intra/inter prediction + residual generation (see
-     * residual_predict.comp) - consumes the real MVs Stage 2 just wrote, for
-     * P-slice motion-compensated residual. */
-    if (ctx->predict_pipeline && render_target.y_view && render_target.uv_view) {
-        update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 0, render_target.y_view);
-        update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 1, render_target.uv_view);
-        update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 2, ref_view);
-        update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 6, ref_uv_view);
+    if (!is_intra) {
+        /* P-slice path - UNCHANGED (whole-frame-parallel). See
+         * residual_predict.comp's top-of-file comment: P-slices are always
+         * inter-coded in this encoder and only depend on the PREVIOUS frame
+         * (already fully reconstructed via recon_image by the time this
+         * frame starts), so there is no same-frame macroblock-ordering
+         * problem here - only I-slices (the `else` branch below) need
+         * diagonal-wavefront dispatch. */
 
-        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->predict_pipeline);
-        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->predict_layout, 0, 1, &ctx->predict_desc_set, 0, NULL);
-        vkCmdPushConstants(cmd_buf, ctx->predict_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
-        insert_compute_barrier(cmd_buf);
-    }
+        /* Stage 2.5: Real intra/inter prediction + residual generation (see
+         * residual_predict.comp) - consumes the real MVs Stage 2 just wrote,
+         * for P-slice motion-compensated residual. */
+        if (ctx->predict_pipeline && render_target.y_view && render_target.uv_view) {
+            update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 0, render_target.y_view);
+            update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 1, render_target.uv_view);
+            update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 2, ref_view);
+            update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 6, ref_uv_view);
 
-    /* Stage 3: DCT */
-    if (ctx->transform_pipeline) {
-        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->transform_pipeline);
-        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->transform_layout, 0, 1, &ctx->dct_desc_set, 0, NULL);
-        vkCmdPushConstants(cmd_buf, ctx->transform_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
-        insert_compute_barrier(cmd_buf);
-    }
+            vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->predict_pipeline);
+            vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->predict_layout, 0, 1, &ctx->predict_desc_set, 0, NULL);
+            vkCmdPushConstants(cmd_buf, ctx->predict_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+            insert_compute_barrier(cmd_buf);
+        }
 
-    /* Stage 4: Quantize */
-    if (ctx->quantize_pipeline) {
-        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->quantize_pipeline);
-        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->quantize_layout, 0, 1, &ctx->quant_desc_set, 0, NULL);
-        vkCmdPushConstants(cmd_buf, ctx->quantize_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
-        insert_compute_barrier(cmd_buf);
-    }
+        /* Stage 3: DCT */
+        if (ctx->transform_pipeline) {
+            vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->transform_pipeline);
+            vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->transform_layout, 0, 1, &ctx->dct_desc_set, 0, NULL);
+            vkCmdPushConstants(cmd_buf, ctx->transform_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+            insert_compute_barrier(cmd_buf);
+        }
 
-    /* Stage 4.5: Reconstruct (see reconstruct.comp's top-of-file comment) -
-     * dequantizes+inverse-transforms this frame's real quantized residual
-     * (quant_levels_buffer, plus coeff_buffer for the I16x16/chroma DC
-     * Hadamard) and adds it back to the retained prediction (pred_buffer,
-     * written by Stage 2.5 above), writing the clipped result directly into
-     * ctx->recon_image - this REPLACES the old raw vkCmdCopyImage-from-source
-     * population of recon_image, so the NEXT frame's P-slice inter
-     * prediction (referenceImage/referenceUV, set up via ref_view/ref_uv_view
-     * above) sees real reconstructed pixels instead of source pixels. Must
-     * run after Stage 4 (quantize) and Stage 2.5 (predict, for pred_buffer);
-     * ordering relative to deblock/entropy below doesn't matter since it
-     * only needs quantized coefficients + retained prediction. */
-    if (ctx->reconstruct_pipeline && ctx->recon_image.y_view != VK_NULL_HANDLE && ctx->recon_image.uv_view != VK_NULL_HANDLE) {
-        update_storage_image_descriptor(ctx->device, ctx->reconstruct_desc_set, 3, ctx->recon_image.y_view);
-        update_storage_image_descriptor(ctx->device, ctx->reconstruct_desc_set, 4, ctx->recon_image.uv_view);
+        /* Stage 4: Quantize */
+        if (ctx->quantize_pipeline) {
+            vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->quantize_pipeline);
+            vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->quantize_layout, 0, 1, &ctx->quant_desc_set, 0, NULL);
+            vkCmdPushConstants(cmd_buf, ctx->quantize_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+            insert_compute_barrier(cmd_buf);
+        }
 
-        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->reconstruct_pipeline);
-        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->reconstruct_layout, 0, 1, &ctx->reconstruct_desc_set, 0, NULL);
-        vkCmdPushConstants(cmd_buf, ctx->reconstruct_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
-        insert_compute_barrier(cmd_buf);
-        ctx->has_recon_frame = true;
+        /* Stage 4.5: Reconstruct (see reconstruct.comp's top-of-file comment) -
+         * dequantizes+inverse-transforms this frame's real quantized residual
+         * (quant_levels_buffer, plus coeff_buffer for the chroma DC Hadamard)
+         * and adds it back to the retained prediction (pred_buffer, written
+         * by Stage 2.5 above), writing the clipped result directly into
+         * ctx->recon_image - this REPLACES the old raw vkCmdCopyImage-from-source
+         * population of recon_image, so the NEXT frame's P-slice inter
+         * prediction (referenceImage/referenceUV, set up via ref_view/ref_uv_view
+         * above) sees real reconstructed pixels instead of source pixels. Must
+         * run after Stage 4 (quantize) and Stage 2.5 (predict, for pred_buffer);
+         * ordering relative to deblock/entropy below doesn't matter since it
+         * only needs quantized coefficients + retained prediction. */
+        if (ctx->reconstruct_pipeline && ctx->recon_image.y_view != VK_NULL_HANDLE && ctx->recon_image.uv_view != VK_NULL_HANDLE) {
+            update_storage_image_descriptor(ctx->device, ctx->reconstruct_desc_set, 3, ctx->recon_image.y_view);
+            update_storage_image_descriptor(ctx->device, ctx->reconstruct_desc_set, 4, ctx->recon_image.uv_view);
+
+            vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->reconstruct_pipeline);
+            vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->reconstruct_layout, 0, 1, &ctx->reconstruct_desc_set, 0, NULL);
+            vkCmdPushConstants(cmd_buf, ctx->reconstruct_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+            insert_compute_barrier(cmd_buf);
+            ctx->has_recon_frame = true;
+        }
+    } else {
+        /* I-slice path - diagonal-wavefront intra reconstruction (see
+         * intra_wavefront.comp's top-of-file comment for the full
+         * rationale). REPLACES, for I-slices only, the whole-frame-parallel
+         * predict->dct->quantize->reconstruct chain above: real I16x16 intra
+         * prediction has a genuine same-frame spatial dependency (macroblock
+         * (mbx,mby) needs macroblocks (mbx-1,mby)/(mbx,mby-1) to be truly
+         * reconstructed FIRST), which a single whole-frame-parallel dispatch
+         * cannot provide. Dispatched one anti-diagonal (d = mbx+mby) at a
+         * time, with an explicit compute memory barrier between diagonals,
+         * so every macroblock on diagonal d can safely read diagonal d-1's
+         * (and earlier's) already-reconstructed neighbor pixels out of
+         * ctx->recon_image (bound as intra_wavefront_desc_set's reconY/
+         * reconUV, read-write - see gpu_compute.h's comment on that
+         * descriptor set for why reusing recon_image here is safe). */
+        if (ctx->intra_wavefront_pipeline && render_target.y_view && render_target.uv_view &&
+            ctx->recon_image.y_view != VK_NULL_HANDLE && ctx->recon_image.uv_view != VK_NULL_HANDLE) {
+            update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 0, render_target.y_view);
+            update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 1, render_target.uv_view);
+            update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 2, ctx->recon_image.y_view);
+            update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 3, ctx->recon_image.uv_view);
+
+            vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->intra_wavefront_pipeline);
+            vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->intra_wavefront_layout, 0, 1, &ctx->intra_wavefront_desc_set, 0, NULL);
+
+            /* One dispatch per anti-diagonal d in [0, width_mbs+height_mbs-2].
+             * Diagonal d's macroblocks are exactly those (mbx,mby) with
+             * mbx+mby==d, 0<=mbx<width_mbs, 0<=mby<height_mbs - i.e.
+             * mbx in [mbx_start, mbx_end] below. count = mbx_end-mbx_start+1
+             * equals min(d+1, width_mbs, height_mbs, width_mbs+height_mbs-1-d),
+             * the real number of macroblocks on that diagonal - no more, no
+             * fewer. intra_wavefront.comp independently recomputes the same
+             * mbx_start (and its own workgroup's mbx/mby) from pcs.diagonal +
+             * pcs.width_in_mbs/height_in_mbs - see its DISPATCH SHAPE comment -
+             * so nothing else needs to be threaded through push constants
+             * beyond the diagonal index itself. */
+            uint32_t num_diagonals = width_mbs + height_mbs - 1;
+            for (uint32_t d = 0; d < num_diagonals; d++) {
+                uint32_t mbx_start = (d + 1 > height_mbs) ? (d + 1 - height_mbs) : 0;
+                uint32_t mbx_end = (d < width_mbs) ? d : (width_mbs - 1);
+                uint32_t count = mbx_end - mbx_start + 1;
+
+                uint32_t pcw[10] = { (uint32_t)width, (uint32_t)height, width_mbs, height_mbs,
+                                      (uint32_t)qp, 1u, 0, 5, (uint32_t)num_slices, d };
+                vkCmdPushConstants(cmd_buf, ctx->intra_wavefront_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcw), pcw);
+                vkCmdDispatch(cmd_buf, count, 1, 1);
+                insert_compute_barrier(cmd_buf);
+            }
+            ctx->has_recon_frame = true;
+        }
     }
 
     /* Stage 5: Deblock (Skipped in BC250_FAST_MODE to maximize gaming framerates) */
