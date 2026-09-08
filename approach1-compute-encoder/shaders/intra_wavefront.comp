@@ -85,6 +85,40 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB), same as 
  * encoder_h264.c's quantize_dc_luma()/quantize_dc_chroma() for the full
  * derivations and spec/x264 cross-references this math was validated
  * against.
+ *
+ * NOTE: chroma neighbor samples (top_uv/left_uv below) are ALSO read from
+ * reconUV, not currentUV - residual_predict.comp's own top-of-file comment
+ * explicitly names currentUV alongside currentImage as sourcing the same
+ * source-frame-not-reconstructed defect, so the chroma DC predictor gets
+ * the identical fix applied for consistency, not just luma.
+ *
+ * ON-BOARD VALIDATION (2026-09-08, real BC-250 hardware, both builds from
+ * this exact source tree - see this commit's message for full methodology):
+ *  - Diagonal dispatch math (mbx_start/count derivation, CPU vs shader)
+ *    verified via a standalone model across 12 width_mbs x height_mbs grids
+ *    incl. the non-square 80x45 (1280x720) and 240x135 (4K) cases: every
+ *    macroblock dispatched exactly once, every neighbor strictly
+ *    earlier-diagonal.
+ *  - Direct byte-for-byte diff of ctx->recon_image against the pre-fix
+ *    driver on a synthetic single-column stepped-gradient frame confirms
+ *    the intended mechanism: the pre-fix driver's neighbor read is
+ *    decoupled from actual reconstruction (an initial rounding error at
+ *    the first, neighbor-less macroblock does NOT propagate to later rows
+ *    at all - impossible for a real decoder, which has no access to
+ *    source pixels), while this shader's reconstructed-neighbor read
+ *    propagates that same error forward exactly as a real H.264 decoder's
+ *    own reconstruction would.
+ *  - tools/quality_test.sh (640x480, 50 frames, 2 IDR frames at gop=25):
+ *    average PSNR 16.72dB -> 17.10dB (Y 15.17->15.51, U 26.06->28.00,
+ *    V 24.59->25.36), SSIM 0.8413->0.8419. Real, reproducible, and
+ *    directionally correct, but a smaller aggregate move than a fix this
+ *    large might suggest - only 2/50 frames are intra-coded, and visual
+ *    frame comparison shows the gain concentrated in chroma corruption
+ *    immediately after each IDR frame; the dominant remaining visible
+ *    defect (block artifacts along high-frequency edges, e.g. the test
+ *    pattern's circle boundary) is IDENTICAL before/after this fix and is
+ *    a separate, P-slice/motion-compensation-side limitation, out of this
+ *    task's scope.
  */
 
 layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;  // Y, current (source) frame
