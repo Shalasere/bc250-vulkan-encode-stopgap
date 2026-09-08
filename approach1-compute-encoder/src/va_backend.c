@@ -431,6 +431,33 @@ VAStatus bc250_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf) {
 VAStatus bc250_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) return VA_STATUS_ERROR_INVALID_BUFFER;
+
+    /* Test-harness instrumentation (tools/quality_test.sh): a derived-image
+     * buffer (see bc250_DeriveImage) is a direct mapping of GPU surface
+     * memory, so a caller (e.g. ffmpeg's vaapi hwupload doing a zero-copy
+     * upload) writes frame data straight into it via vaMapBuffer without
+     * ever calling vaPutImage / gpu_compute_upload_nv12(). Capture the
+     * frame here, at unmap time, so that upload path is covered too. Only
+     * active when BC250_DUMP_INPUT_FRAMES=1 (see bc250_debug_dump_nv12_frame).
+     */
+    if (data->buffers[buf_id].is_derived && data->buffers[buf_id].data && getenv("BC250_DUMP_INPUT_FRAMES")) {
+        for (int i = 0; i < MAX_IMAGES; i++) {
+            bc250_image *img = &data->images[i];
+            if (img->allocated && img->buffer_id == buf_id) {
+                if (VALID_ID(img->surface_id, MAX_SURFACES) && data->surfaces[img->surface_id].allocated) {
+                    bc250_surface *surf = &data->surfaces[img->surface_id];
+                    const uint8_t *base = (const uint8_t *)data->buffers[buf_id].data;
+                    const uint8_t *y_plane = base + img->image.offsets[0];
+                    const uint8_t *uv_plane = base + img->image.offsets[1];
+                    int y_pitch = img->image.pitches[0] > 0 ? (int)img->image.pitches[0] : surf->width;
+                    int uv_pitch = img->image.pitches[1] > 0 ? (int)img->image.pitches[1] : surf->width;
+                    bc250_debug_dump_nv12_frame(y_plane, y_pitch, uv_plane, uv_pitch, surf->width, surf->height);
+                }
+                break;
+            }
+        }
+    }
+
     data->buffers[buf_id].mapped = 0;
     return VA_STATUS_SUCCESS;
 }

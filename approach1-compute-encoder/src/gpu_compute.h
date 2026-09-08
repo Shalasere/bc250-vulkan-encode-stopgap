@@ -148,6 +148,15 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
                              uint8_t *uv_plane, int uv_pitch,
                              int width, int height);
 
+/* Test-harness instrumentation (tools/quality_test.sh): dumps raw NV12
+ * frame bytes to BC250_DUMP_DIR (default /tmp/bc250_dump_frames) when
+ * BC250_DUMP_INPUT_FRAMES=1 is set in the environment; a no-op otherwise.
+ * Shared by every known VA-API upload path so the harness catches whichever
+ * one a given libva/ffmpeg build actually uses. See gpu_compute.c. */
+void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
+                                  const uint8_t *uv_plane, int uv_pitch,
+                                  int width, int height);
+
 /* Picture encoding orchestration */
 int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height);
