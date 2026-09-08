@@ -946,6 +946,36 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0) {
             mvs = (const gpu_mv_t *)mv_data;
         }
+
+        /* Opt-in diagnostic (BC250_DEBUG_MV_STATS=1): confirms the sub-pel
+         * refinement in motion_estimation.comp is actually landing on
+         * fractional (non-multiple-of-4) quarter-pel positions, not just
+         * silently degenerating back to integer-only motion - added while
+         * validating the sub-pel motion compensation change, kept as a
+         * permanent low-risk diagnostic since "is the search really finding
+         * sub-pel matches on this content" is a real, recurring question
+         * that's otherwise invisible from the outside (unlike PSNR, which
+         * conflates this with every other stage, including this test
+         * content's own DCT-ringing on hard edges - see the sub-pel
+         * validation notes in this change's commit history). */
+        if (mvs && !is_idr && getenv("BC250_DEBUG_MV_STATS")) {
+            uint32_t total = encoder->total_mbs;
+            uint32_t subpel_x = 0, subpel_y = 0, subpel_any = 0;
+            int32_t min_x = INT32_MAX, max_x = INT32_MIN, min_y = INT32_MAX, max_y = INT32_MIN;
+            for (uint32_t m = 0; m < total; m++) {
+                int32_t vx = mvs[m].mvx, vy = mvs[m].mvy;
+                if (vx & 3) subpel_x++;
+                if (vy & 3) subpel_y++;
+                if ((vx & 3) || (vy & 3)) subpel_any++;
+                if (vx < min_x) min_x = vx;
+                if (vx > max_x) max_x = vx;
+                if (vy < min_y) min_y = vy;
+                if (vy > max_y) max_y = vy;
+            }
+            fprintf(stderr, "[BC250_DEBUG_MV_STATS] frame=%u total_mbs=%u sub_pel_x=%u sub_pel_y=%u sub_pel_any=%u "
+                            "mvx_range=[%d,%d] mvy_range=[%d,%d] (units: quarter-luma-pel)\n",
+                    encoder->frame_count, total, subpel_x, subpel_y, subpel_any, min_x, max_x, min_y, max_y);
+        }
     }
 
     /* 4. Encode Slices */
