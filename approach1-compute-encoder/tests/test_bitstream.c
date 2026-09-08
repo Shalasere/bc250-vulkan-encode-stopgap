@@ -16,7 +16,7 @@ static void test_exp_golomb_unsigned(void) {
     bs_init(&bs, buf, sizeof(buf));
     bs_write_ue(&bs, 0);
     bs_rbsp_trailing_bits(&bs);
-    assert(buf[0] == 0x80);
+    assert(buf[0] == 0xC0);
 
     /* ue(1) -> '010' */
     bs_init(&bs, buf, sizeof(buf));
@@ -48,7 +48,7 @@ static void test_exp_golomb_signed(void) {
     bs_init(&bs, buf, sizeof(buf));
     bs_write_se(&bs, 0);
     bs_rbsp_trailing_bits(&bs);
-    assert(buf[0] == 0x80);
+    assert(buf[0] == 0xC0);
 
     /* se(1) -> ue(1) -> '010' */
     bs_init(&bs, buf, sizeof(buf));
