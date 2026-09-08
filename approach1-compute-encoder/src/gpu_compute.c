@@ -657,6 +657,8 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
     (void)format;
     image->width = width;
     image->height = height;
+    /* Matches the real initialLayout used below for both y_plane and uv_plane. */
+    image->current_layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
 
     VkImageCreateInfo y_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -880,13 +882,29 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     uint32_t height_mbs = (height + 15) / 16;
     uint32_t pc[8] = { (uint32_t)width, (uint32_t)height, width_mbs, height_mbs, 26, 0, 0, 5 };
 
-    /* Transition image layout to GENERAL for compute storage access */
+    /* Transition image layout to GENERAL for compute storage access.
+     *
+     * render_target is a copy of the caller's persistent gpu_image_t (e.g.
+     * bc250_surface.image in va_backend.c), so render_target.current_layout
+     * reflects the image's real layout at the start of this call: PREINITIALIZED
+     * on the very first dispatch for this surface (VA-API uploads pixels via
+     * host-mapped memory before the GPU touches them), or GENERAL on every
+     * dispatch after that, since nothing ever transitions the image back out of
+     * GENERAL. Using the tracked real layout here (instead of hardcoding
+     * VK_IMAGE_LAYOUT_UNDEFINED) is required by the Vulkan spec: claiming
+     * UNDEFINED when the real layout is GENERAL permits the implementation to
+     * discard the image's prior contents. Updating render_target.current_layout
+     * below only affects this local copy; the caller is responsible for
+     * persisting VK_IMAGE_LAYOUT_GENERAL back onto its own stored gpu_image_t
+     * (see va_backend.c's bc250_EndPicture) so the next dispatch call passes in
+     * the correct real layout. */
     if (render_target.y_plane) {
-        transition_image_layout(cmd_buf, render_target.y_plane, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        transition_image_layout(cmd_buf, render_target.y_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
     }
     if (render_target.uv_plane) {
-        transition_image_layout(cmd_buf, render_target.uv_plane, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+        transition_image_layout(cmd_buf, render_target.uv_plane, render_target.current_layout, VK_IMAGE_LAYOUT_GENERAL);
     }
+    render_target.current_layout = VK_IMAGE_LAYOUT_GENERAL;
 
     /* Reference image for ME: use recon frame if available, otherwise self */
     VkImageView ref_view = render_target.y_view;
@@ -959,6 +977,15 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
 
     /* Update GPU reference frame with current picture for subsequent P-frames */
     if (render_target.y_plane && ctx->recon_image.y_plane) {
+        /* ctx->recon_image is created via gpu_compute_create_image() too, so it
+         * also starts VK_IMAGE_LAYOUT_PREINITIALIZED. Unlike render_target it is
+         * never host-written; it's the destination of the vkCmdCopyImage below.
+         * ctx owns recon_image directly (not a by-value copy), so the tracked
+         * layout can be persisted in place here. Transition it to GENERAL using
+         * its real tracked old layout instead of assuming it is already GENERAL. */
+        transition_image_layout(cmd_buf, ctx->recon_image.y_plane, ctx->recon_image.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+        ctx->recon_image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
         VkImageCopy copy_region_y = {
             .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
             .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
