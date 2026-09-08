@@ -512,6 +512,17 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         gpu_compute_end_picture(&data->gpu);
     }
 
+    /* gpu_compute_dispatch_encode() (called above, either directly or via
+     * h264_encoder_encode_frame()/hevc_encoder_encode_frame()) always
+     * transitions the render target's image layout to VK_IMAGE_LAYOUT_GENERAL.
+     * It receives gpu_image_t by value, so that transition only affects its
+     * local copy -- surf here is a real pointer into data->surfaces[], so we
+     * persist the real post-encode layout onto the surface's stored image
+     * state ourselves. This is what lets the next bc250_EndPicture() call for
+     * this surface pass the correct real old layout (GENERAL, not a hardcoded
+     * and spec-incorrect UNDEFINED) into gpu_compute_dispatch_encode(). */
+    surf->image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
     return VA_STATUS_SUCCESS;
 }
 

@@ -24,6 +24,13 @@ typedef struct {
     VkImageView uv_view;
     uint32_t width;
     uint32_t height;
+    /* Tracks the real current VkImageLayout of both planes (they are always
+     * transitioned together). Starts at VK_IMAGE_LAYOUT_PREINITIALIZED to match
+     * the images' real initialLayout (VA-API uploads pixels via host-mapped
+     * memory before the GPU ever touches them) and becomes
+     * VK_IMAGE_LAYOUT_GENERAL after the first compute dispatch, where it stays
+     * forever since nothing transitions the image back out of GENERAL. */
+    VkImageLayout current_layout;
 } gpu_image_t;
 
 typedef struct {
