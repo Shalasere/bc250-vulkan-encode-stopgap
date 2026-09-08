@@ -108,6 +108,14 @@ VAStatus bc250_CreateConfig(VADriverContextP ctx, VAProfile profile, VAEntrypoin
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !config_id) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
+    /* data->configs[i].attribs is a fixed-size array (see bc250_config in
+     * va_backend.h). Without this check a caller-supplied num_attribs larger
+     * than that capacity would memcpy past the end of the attribs array and
+     * corrupt adjacent bc250_config fields / neighboring array entries. */
+    if (num_attribs < 0 || (size_t)num_attribs > (sizeof(((bc250_config *)0)->attribs) / sizeof(VAConfigAttrib))) {
+        return VA_STATUS_ERROR_MAX_NUM_EXCEEDED;
+    }
+
     for (int i = 0; i < MAX_CONFIGS; i++) {
         if (!data->configs[i].allocated) {
             data->configs[i].allocated = 1;
@@ -186,13 +194,27 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
         if (!data->surfaces[i].allocated) {
             bc250_surface *surf = &data->surfaces[i];
             memset(surf, 0, sizeof(*surf));
+
+            /* gpu_compute_create_image() can fail (e.g. Vulkan allocation
+             * failure) and returns nonzero in that case (see VK_CHECK in
+             * gpu_compute.c). The return value was previously discarded, so
+             * a failed surface was still marked allocated and handed back
+             * to the caller as a "valid" surface backed by a
+             * partially-initialized/invalid gpu_image_t - any later use
+             * (encode, GetImage/PutImage, DestroySurfaces) would operate on
+             * garbage Vulkan handles. Skip publishing this surface on
+             * failure instead. */
+            if (gpu_compute_create_image(&data->gpu, width, height, format, &surf->image, &surf->memory) != 0) {
+                memset(surf, 0, sizeof(*surf));
+                continue;
+            }
+
             surf->allocated = 1;
             surf->width = width;
             surf->height = height;
             surf->format = format;
             surf->ref_count = 1;
 
-            gpu_compute_create_image(&data->gpu, width, height, format, &surf->image, &surf->memory);
             surfaces[allocated++] = i;
         }
     }
@@ -307,18 +329,29 @@ VAStatus bc250_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferT
     for (int i = 0; i < MAX_BUFFERS; i++) {
         if (!data->buffers[i].allocated) {
             bc250_buffer *b = &data->buffers[i];
-            b->allocated = 1;
             b->type = type;
             b->size = size;
             b->num_elements = num_elements;
             b->mapped = 0;
+            b->is_derived = 0;
+            b->gpu_mem = VK_NULL_HANDLE;
 
             size_t total_alloc = (size_t)size * num_elements;
             if (type == VAEncCodedBufferType) {
                 total_alloc += sizeof(VACodedBufferSegment);
             }
 
-            b->data = calloc(1, total_alloc);
+            b->data = calloc(1, total_alloc > 0 ? total_alloc : 1);
+            if (!b->data) {
+                /* Leave the slot free (allocated stays 0) so this failure
+                 * doesn't permanently strand a buffer slot with no backing
+                 * memory - a caller that ignored this error and later called
+                 * vaMapBuffer/vaDestroyBuffer on buf_id would otherwise
+                 * dereference/free a NULL data pointer or operate on a slot
+                 * that looks valid but never had memory. */
+                return VA_STATUS_ERROR_ALLOCATION_FAILED;
+            }
+            b->allocated = 1;
             if (data_ptr) {
                 memcpy(b->data, data_ptr, (size_t)size * num_elements);
             } else if (type == VAEncCodedBufferType) {
@@ -585,7 +618,17 @@ VAStatus bc250_CreateImage(VADriverContextP ctx, VAImageFormat *format, int widt
             }
 
             VABufferID buf_id;
-            bc250_CreateBuffer(ctx, 0, VAImageBufferType, image->data_size, 1, NULL, &buf_id);
+            VAStatus buf_status = bc250_CreateBuffer(ctx, 0, VAImageBufferType, image->data_size, 1, NULL, &buf_id);
+            if (buf_status != VA_STATUS_SUCCESS) {
+                /* Roll back: without this, buf_id is left uninitialized and
+                 * gets stored as img->buffer_id / image->buf. A later
+                 * vaDestroyImage() would then call bc250_DestroyBuffer() on
+                 * that garbage id, which - if it happens to fall in range
+                 * and alias a live, unrelated buffer slot - would corrupt or
+                 * free memory that belongs to something else entirely. */
+                img->allocated = 0;
+                return buf_status;
+            }
             image->buf = buf_id;
             img->image = *image;
             img->buffer_id = buf_id;
@@ -787,6 +830,39 @@ VAStatus bc250_QueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID cont
 VAStatus bc250_Terminate(VADriverContextP ctx) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (data) {
+        /* The VA-API contract expects callers to have destroyed every
+         * config/context/buffer/image/surface before vaTerminate(), but a
+         * driver should not silently leak GPU memory and heap allocations
+         * if a caller doesn't. Free anything still outstanding here, before
+         * tearing down the GPU context, by reusing the existing Destroy*
+         * paths. Order matters: contexts (which hold encoder/decoder state
+         * and reference surfaces/buffers by id, but don't own them) must go
+         * before the buffers/images/surfaces they reference; images (which
+         * own a buffer each) before the remaining plain buffers; and
+         * surfaces last, since gpu_compute_terminate() below invalidates the
+         * VkDevice that surface/derived-image teardown still needs. */
+        for (int i = 0; i < MAX_CONTEXTS; i++) {
+            if (data->contexts[i].allocated) {
+                bc250_DestroyContext(ctx, i);
+            }
+        }
+        for (int i = 0; i < MAX_IMAGES; i++) {
+            if (data->images[i].allocated) {
+                bc250_DestroyImage(ctx, i);
+            }
+        }
+        for (int i = 0; i < MAX_BUFFERS; i++) {
+            if (data->buffers[i].allocated) {
+                bc250_DestroyBuffer(ctx, i);
+            }
+        }
+        for (int i = 0; i < MAX_SURFACES; i++) {
+            if (data->surfaces[i].allocated) {
+                VASurfaceID id = (VASurfaceID)i;
+                bc250_DestroySurfaces(ctx, &id, 1);
+            }
+        }
+
         gpu_compute_terminate(&data->gpu);
         free(data);
         ctx->pDriverData = NULL;
