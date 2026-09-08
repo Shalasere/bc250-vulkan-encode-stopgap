@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 
 #include "bitstream.h"
 #include "cavlc.h"
@@ -931,6 +932,22 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
 {
     if (!encoder || !output_buf) return -1;
 
+    /* Opt-in CPU-side timing (BC250_PERF_STATS=1), added for real-time
+     * throughput diagnosis. Two brackets: `frame_t0` covers this entire
+     * function call (wall clock, as seen by the caller - includes the
+     * synchronous GPU dispatch+sync below, all CPU CAVLC/bitstream work,
+     * and rate-control/DPB bookkeeping), while `cavlc_t0` (set later, right
+     * before the per-slice macroblock loop) isolates just the CPU-side
+     * CAVLC entropy coding + bitstream writing, matching gpu_compute.c's
+     * "[BC250_PERF_GPU] ..." lines so the two can be correlated per frame
+     * (both are printed with the same `type=I|P` tag; join on stream order,
+     * since the GPU line is emitted a few lines above this function's own
+     * synchronous gpu_compute_sync() call within the same call). */
+    const char *perf_env = getenv("BC250_PERF_STATS");
+    bool perf_stats = perf_env && (strcmp(perf_env, "1") == 0 || strcmp(perf_env, "true") == 0);
+    struct timespec frame_t0;
+    if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &frame_t0);
+
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr;
     encoder->force_idr = false;
 
@@ -1076,6 +1093,16 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
     int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
     int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
+
+    /* Opt-in CPU-side CAVLC timing (BC250_PERF_STATS=1) - see this
+     * function's top-of-body comment. Brackets the whole per-slice loop
+     * below: slice header bits, the CAVLC macroblock layer itself
+     * (encode_mb_i16x16()/encode_mb_p16x16(), the actual entropy coding),
+     * and RBSP->EBSP/NAL assembly - i.e. everything this driver does on the
+     * CPU per frame besides GPU dispatch/readback and rate-control/DPB
+     * bookkeeping (which stay outside this bracket). */
+    struct timespec cavlc_t0;
+    if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &cavlc_t0);
 
     for (int s = 0; s < num_slices; s++) {
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
@@ -1247,6 +1274,15 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         free(slice_rbsp);
     }
 
+    if (perf_stats) {
+        struct timespec cavlc_t1;
+        clock_gettime(CLOCK_MONOTONIC, &cavlc_t1);
+        double cavlc_ms = (double)(cavlc_t1.tv_sec - cavlc_t0.tv_sec) * 1000.0 +
+                          (double)(cavlc_t1.tv_nsec - cavlc_t0.tv_nsec) / 1e6;
+        fprintf(stderr, "[BC250_PERF_CPU] frame=%u type=%s cavlc_ms=%.3f\n",
+                encoder->frame_count, is_idr ? "I" : "P", cavlc_ms);
+    }
+
     if (output_size < total_written) {
         fprintf(stderr, "[bc250-h264] Output buffer too small: need %zu, have %zu\n",
                 total_written, output_size);
@@ -1260,6 +1296,15 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     encoder->frame_num++;
     encoder->poc += 2;
     encoder->frame_count++;
+
+    if (perf_stats) {
+        struct timespec frame_t1;
+        clock_gettime(CLOCK_MONOTONIC, &frame_t1);
+        double wall_ms = (double)(frame_t1.tv_sec - frame_t0.tv_sec) * 1000.0 +
+                         (double)(frame_t1.tv_nsec - frame_t0.tv_nsec) / 1e6;
+        fprintf(stderr, "[BC250_PERF_FRAME] frame=%u type=%s wall_ms=%.3f bytes=%zu\n",
+                encoder->frame_count - 1, is_idr ? "I" : "P", wall_ms, total_written);
+    }
 
     return (int)total_written;
 }

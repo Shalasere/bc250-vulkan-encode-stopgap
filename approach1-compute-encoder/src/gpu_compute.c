@@ -14,6 +14,25 @@
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
 
+/* Opt-in GPU per-stage timing (BC250_PERF_STATS=1), added for real-time
+ * throughput diagnosis - see gpu_compute_dispatch_encode()'s timestamp
+ * writes and gpu_compute_sync()'s readback. One VkQueryPool slot per
+ * checkpoint, written in strictly increasing time order every frame
+ * regardless of P/I path so the deltas are always well-defined (the path
+ * NOT taken just gets a run of zero-duration slots):
+ *   0 = frame start (top of command buffer)
+ *   1 = after motion estimation
+ *   2 = after residual_predict (P only; == 1 on I frames)
+ *   3 = after DCT (P only; == 2 on I frames)
+ *   4 = after quantize (P only; == 3 on I frames)
+ *   5 = after reconstruct (P only; == 4 on I frames)
+ *   6 = after diagonal-wavefront intra reconstruction (I only; == 5 on P frames)
+ *   7 = after deblock (both paths; == 6 if BC250_FAST_MODE skipped it)
+ *   8 = after entropy encode (both paths)
+ *   9 = after the GPU->host staging buffer copies (frame end)
+ */
+#define BC250_PERF_NUM_TIMESTAMPS 10
+
 #define VK_CHECK(x) do { \
     VkResult err = (x); \
     if (err != VK_SUCCESS) { \
@@ -536,6 +555,41 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VK_CHECK(vkCreateSemaphore(ctx->device, &sem_info, NULL, &ctx->timeline_sem));
     ctx->timeline_value = 0;
 
+    /* Opt-in GPU per-stage timing (BC250_PERF_STATS=1) - see the
+     * BC250_PERF_NUM_TIMESTAMPS comment above and gpu_compute_dispatch_encode()/
+     * gpu_compute_sync(). Query pool creation failure or a device that
+     * doesn't expose compute-queue timestamps just disables the feature;
+     * it is a pure diagnostic and must never affect the encode path. */
+    ctx->perf_stats_enabled = false;
+    ctx->timestamp_period_ns = 0.0;
+    ctx->perf_frame_counter = 0;
+    const char *perf_env = getenv("BC250_PERF_STATS");
+    if (perf_env && (strcmp(perf_env, "1") == 0 || strcmp(perf_env, "true") == 0)) {
+        if (ctx->dev_props.limits.timestampComputeAndGraphics) {
+            ctx->timestamp_period_ns = (double)ctx->dev_props.limits.timestampPeriod;
+            VkQueryPoolCreateInfo qp_info = {
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = BC250_PERF_NUM_TIMESTAMPS
+            };
+            bool pools_ok = true;
+            for (int i = 0; i < 2; i++) {
+                if (vkCreateQueryPool(ctx->device, &qp_info, NULL, &ctx->timestamp_pools[i]) != VK_SUCCESS) {
+                    pools_ok = false;
+                    break;
+                }
+            }
+            if (pools_ok) {
+                ctx->perf_stats_enabled = true;
+                fprintf(stderr, "[bc250-gpu] BC250_PERF_STATS enabled (timestampPeriod=%.4f ns/tick)\n", ctx->timestamp_period_ns);
+            } else {
+                fprintf(stderr, "[bc250-gpu] BC250_PERF_STATS: failed to create timestamp query pools, disabling\n");
+            }
+        } else {
+            fprintf(stderr, "[bc250-gpu] BC250_PERF_STATS: device does not report timestampComputeAndGraphics support, disabling\n");
+        }
+    }
+
     /* Create Descriptor Set Layouts */
     VkDescriptorSetLayoutBinding me_bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
@@ -883,6 +937,8 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
         ctx->recon_image.y_plane = VK_NULL_HANDLE;
     }
 
+    if (ctx->timestamp_pools[0]) vkDestroyQueryPool(ctx->device, ctx->timestamp_pools[0], NULL);
+    if (ctx->timestamp_pools[1]) vkDestroyQueryPool(ctx->device, ctx->timestamp_pools[1], NULL);
     if (ctx->timeline_sem) vkDestroySemaphore(ctx->device, ctx->timeline_sem, NULL);
     if (ctx->fences[0]) vkDestroyFence(ctx->device, ctx->fences[0], NULL);
     if (ctx->fences[1]) vkDestroyFence(ctx->device, ctx->fences[1], NULL);
@@ -1199,6 +1255,21 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     }
 
     VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+
+    /* Opt-in GPU per-stage timing (BC250_PERF_STATS=1) - see the
+     * BC250_PERF_NUM_TIMESTAMPS comment near the top of this file.
+     * perf_buf mirrors ctx->current_buf at the moment this frame's commands
+     * are being recorded into it (gpu_compute_end_picture() toggles
+     * ctx->current_buf AFTER submission, so this is stable for the whole
+     * function); is_intra is recorded now since gpu_compute_sync() reads it
+     * back later without visibility into this call's parameters. */
+    int perf_buf = ctx->current_buf;
+    if (ctx->perf_stats_enabled) {
+        ctx->perf_is_intra[perf_buf] = is_intra ? true : false;
+        vkCmdResetQueryPool(cmd_buf, ctx->timestamp_pools[perf_buf], 0, BC250_PERF_NUM_TIMESTAMPS);
+        vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 0);
+    }
+
     uint32_t width_mbs = (width + 15) / 16;
     uint32_t height_mbs = (height + 15) / 16;
     /* qp/is_intra used to be hardcoded (26, 0) here regardless of the actual
@@ -1282,6 +1353,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
         insert_compute_barrier(cmd_buf);
     }
+    if (ctx->perf_stats_enabled) {
+        vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 1);
+    }
 
     if (!is_intra) {
         /* P-slice path - UNCHANGED (whole-frame-parallel). See
@@ -1307,6 +1381,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
             vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
             insert_compute_barrier(cmd_buf);
         }
+        if (ctx->perf_stats_enabled) {
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 2);
+        }
 
         /* Stage 3: DCT */
         if (ctx->transform_pipeline) {
@@ -1316,6 +1393,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
             vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
             insert_compute_barrier(cmd_buf);
         }
+        if (ctx->perf_stats_enabled) {
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 3);
+        }
 
         /* Stage 4: Quantize */
         if (ctx->quantize_pipeline) {
@@ -1324,6 +1404,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
             vkCmdPushConstants(cmd_buf, ctx->quantize_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
             vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
             insert_compute_barrier(cmd_buf);
+        }
+        if (ctx->perf_stats_enabled) {
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 4);
         }
 
         /* Stage 4.5: Reconstruct (see reconstruct.comp's top-of-file comment) -
@@ -1349,6 +1432,13 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
             insert_compute_barrier(cmd_buf);
             ctx->has_recon_frame = true;
         }
+        if (ctx->perf_stats_enabled) {
+            /* Slot 6 (wavefront) is I-only; write it here as a zero-duration
+             * duplicate of slot 5 so the downstream delta is well-defined on
+             * P frames (see the BC250_PERF_NUM_TIMESTAMPS comment). */
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 5);
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 6);
+        }
     } else {
         /* I-slice path - diagonal-wavefront intra reconstruction (see
          * intra_wavefront.comp's top-of-file comment for the full
@@ -1364,6 +1454,17 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
          * ctx->recon_image (bound as intra_wavefront_desc_set's reconY/
          * reconUV, read-write - see gpu_compute.h's comment on that
          * descriptor set for why reusing recon_image here is safe). */
+        if (ctx->perf_stats_enabled) {
+            /* Slots 2-5 (predict/dct/quant/reconstruct) are P-only; write
+             * them here as zero-duration duplicates of slot 1 so the
+             * downstream delta is well-defined on I frames (see the
+             * BC250_PERF_NUM_TIMESTAMPS comment). Slot 6 (wavefront) is
+             * written below, after the diagonal loop completes. */
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 2);
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 3);
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 4);
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 5);
+        }
         if (ctx->intra_wavefront_pipeline && render_target.y_view && render_target.uv_view &&
             ctx->recon_image.y_view != VK_NULL_HANDLE && ctx->recon_image.uv_view != VK_NULL_HANDLE) {
             update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 0, render_target.y_view);
@@ -1399,6 +1500,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
             }
             ctx->has_recon_frame = true;
         }
+        if (ctx->perf_stats_enabled) {
+            vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 6);
+        }
     }
 
     /* Stage 5: Deblock (Skipped in BC250_FAST_MODE to maximize gaming framerates) */
@@ -1412,6 +1516,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
         insert_compute_barrier(cmd_buf);
     }
+    if (ctx->perf_stats_enabled) {
+        vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 7);
+    }
 
     /* Stage 6: Entropy */
     if (ctx->entropy_pipeline) {
@@ -1420,6 +1527,9 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         vkCmdPushConstants(cmd_buf, ctx->entropy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
         vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
         insert_compute_barrier(cmd_buf);
+    }
+    if (ctx->perf_stats_enabled) {
+        vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 8);
     }
 
     /* Copy entropy output buffer to current staging buffer for overlapped CPU readback */
@@ -1451,6 +1561,10 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
      * This replaces the old raw vkCmdCopyImage-from-render_target (source
      * pixels) that used to run here; has_recon_frame is set by Stage 4.5. */
 
+    if (ctx->perf_stats_enabled) {
+        vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 9);
+    }
+
     return 0;
 }
 
@@ -1471,6 +1585,39 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
 int gpu_compute_sync(gpu_context_t *ctx) {
     int prev_buf = (ctx->current_buf + 1) % 2;
     vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, UINT64_MAX);
+
+    /* Opt-in GPU per-stage timing readback (BC250_PERF_STATS=1). Safe to
+     * read now: the fence above just confirmed this exact command buffer's
+     * submission (the one gpu_compute_dispatch_encode()/gpu_compute_end_picture()
+     * most recently recorded into buffer `prev_buf`) has completed on the
+     * GPU, so every vkCmdWriteTimestamp in it is guaranteed available -
+     * VK_QUERY_RESULT_WAIT_BIT is added only as defense-in-depth. */
+    if (ctx->perf_stats_enabled && ctx->timestamp_pools[prev_buf]) {
+        uint64_t ts[BC250_PERF_NUM_TIMESTAMPS];
+        VkResult qres = vkGetQueryPoolResults(ctx->device, ctx->timestamp_pools[prev_buf], 0, BC250_PERF_NUM_TIMESTAMPS,
+                                               sizeof(ts), ts, sizeof(uint64_t),
+                                               VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (qres == VK_SUCCESS) {
+            double p = ctx->timestamp_period_ns;
+            double me_ms        = (double)(ts[1] - ts[0]) * p / 1e6;
+            double predict_ms   = (double)(ts[2] - ts[1]) * p / 1e6;
+            double dct_ms       = (double)(ts[3] - ts[2]) * p / 1e6;
+            double quant_ms     = (double)(ts[4] - ts[3]) * p / 1e6;
+            double reconstr_ms  = (double)(ts[5] - ts[4]) * p / 1e6;
+            double wavefront_ms = (double)(ts[6] - ts[5]) * p / 1e6;
+            double deblock_ms   = (double)(ts[7] - ts[6]) * p / 1e6;
+            double entropy_ms   = (double)(ts[8] - ts[7]) * p / 1e6;
+            double copy_ms      = (double)(ts[9] - ts[8]) * p / 1e6;
+            double total_ms     = (double)(ts[9] - ts[0]) * p / 1e6;
+            fprintf(stderr,
+                "[BC250_PERF_GPU] frame=%u type=%s total_ms=%.3f me_ms=%.3f predict_ms=%.3f dct_ms=%.3f "
+                "quant_ms=%.3f reconstruct_ms=%.3f wavefront_ms=%.3f deblock_ms=%.3f entropy_ms=%.3f copy_ms=%.3f\n",
+                ctx->perf_frame_counter, ctx->perf_is_intra[prev_buf] ? "I" : "P",
+                total_ms, me_ms, predict_ms, dct_ms, quant_ms, reconstr_ms, wavefront_ms, deblock_ms, entropy_ms, copy_ms);
+            ctx->perf_frame_counter++;
+        }
+    }
+
     return 0;
 }
 

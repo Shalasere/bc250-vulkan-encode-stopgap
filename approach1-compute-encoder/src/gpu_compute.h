@@ -208,6 +208,20 @@ typedef struct bc250_gpu_context {
     VkPhysicalDeviceProperties dev_props;
     uint32_t max_workgroup_size;
     bool is_rdna2;
+
+    /* Opt-in GPU per-stage timing (BC250_PERF_STATS=1) - see gpu_compute.c's
+     * BC250_PERF_NUM_TIMESTAMPS comment and gpu_compute_dispatch_encode()/
+     * gpu_compute_sync(). One VkQueryPool per double-buffered command
+     * buffer, read back (and a "[BC250_PERF_GPU] ..." line printed to
+     * stderr) once its frame's fence is known-signaled in gpu_compute_sync().
+     * perf_is_intra[] records which prediction path (whole-frame-parallel
+     * P-path vs diagonal-wavefront I-path) that buffer's frame took, since
+     * the two paths write different subsets of the timestamp slots. */
+    bool perf_stats_enabled;
+    VkQueryPool timestamp_pools[2];
+    double timestamp_period_ns;
+    bool perf_is_intra[2];
+    uint32_t perf_frame_counter;
 } bc250_gpu_context_t;
 
 typedef bc250_gpu_context_t gpu_context_t;
