@@ -74,8 +74,14 @@ void bs_write_se(bitstream_t *bs, int32_t val) {
 }
 
 void bs_rbsp_trailing_bits(bitstream_t *bs) {
+    if (!bs) return;
     bs_write1(bs, 1);
-    while (bs->bit_offset != 0) {
+    /* bs_write_u() (which bs_write1() calls) becomes a no-op once
+     * bs->overflow is set (buffer exhausted) and does not advance
+     * bit_offset. Without the overflow check here, hitting end-of-buffer
+     * with a non-zero bit_offset would spin this loop forever instead of
+     * returning. */
+    while (!bs->overflow && bs->bit_offset != 0) {
         bs_write1(bs, 0);
     }
 }
@@ -124,6 +130,7 @@ size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t
 }
 
 size_t bs_write_sps(uint8_t *buf, size_t buf_size, const h264_sps_t *sps) {
+    if (!buf || !sps) return 0;
     uint8_t rbsp[1024];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -202,6 +209,7 @@ size_t bs_write_sps(uint8_t *buf, size_t buf_size, const h264_sps_t *sps) {
 }
 
 size_t bs_write_pps(uint8_t *buf, size_t buf_size, const h264_pps_t *pps) {
+    if (!buf || !pps) return 0;
     uint8_t rbsp[1024];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
