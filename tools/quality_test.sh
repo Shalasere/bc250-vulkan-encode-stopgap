@@ -41,6 +41,56 @@
 # script with a very low PSNR against a textured/moving test pattern; a
 # real encode should score comfortably above the threshold.
 #
+# INVESTIGATION NOTE (2026-09-08, against integration/all-fixes @ 402d531)
+# --------------------------------------------------------------------------
+# After the CAVLC/intra/inter-prediction fixes landed, this script kept
+# reporting FAIL (~12.9 dB @ 640x480, ~12.5 dB @ 1280x720) even though a
+# manually-extracted decoded frame looked like the right test pattern at a
+# glance. Before assuming that was a harness false-positive, the frame
+# pairing/alignment logic below (the reference/decoded trim-and-compare in
+# step [5/6]-[6/6]) was audited end-to-end and specifically checked for two
+# suspected harness bugs; both were ruled out empirically, not assumed:
+#
+#   1. Fixed-lag misalignment (double-buffered pipeline skewing which
+#      dumped input frame lines up with which decoded output frame): a
+#      per-offset PSNR sweep (decoded[i] vs reference[i+k] for k in -3..3)
+#      on a 10-frame clip came back essentially FLAT (13.38-13.47 dB across
+#      every offset, no peak anywhere). A real N-frame lag would produce a
+#      sharp maximum at the true offset and much lower scores elsewhere;
+#      the absence of any such peak rules this out. offset=0 (today's
+#      direct N-vs-N pairing, as already implemented below) is exactly as
+#      good as every other candidate, so no offset compensation was added.
+#   2. Color-range mismatch (reference captured as limited/TV range 16-235
+#      -- confirmed to exactly match raw lavfi testsrc output -- vs. the
+#      decoded stream reading full range 0-255 at the same pixel): a
+#      control encode of the identical source through software libx264
+#      (no VAAPI, no this driver) round-tripped through the *same*
+#      decode/extract commands this script uses and preserved the input
+#      range faithfully (16-235 in, ~12-239 out), proving this script's
+#      ffmpeg decode/rawvideo-extraction commands are not the source of
+#      the discrepancy. Separately, re-running the real VAAPI pipeline
+#      with the test source pre-converted to full range (scale=in_range=
+#      tv:out_range=pc) still scored ~12 dB, i.e. matching the range
+#      convention end-to-end did not fix the score either.
+#
+# Having ruled those out, decoded frames were extracted to PNG and viewed
+# directly. They are NOT clean: large flat-color regions (bar interiors)
+# decode correctly, but the circle boundary, the flashing test box, and
+# the left picture edge -- all high-spatial-frequency / sharp-edge
+# regions -- show real block-shaped luma+chroma corruption. Frames pulled
+# from three widely separated points in the same clip (indices 0, 5, 25 of
+# 50) are visually near-identical to each other despite the reference
+# clearly changing frame to frame (the scrolling gradient bar, the
+# flashing box) -- consistent with a P-slice/motion-compensation defect
+# rather than anything this script's frame pairing could cause.
+#
+# Conclusion: the FAIL this script reports is a true positive -- real
+# pixel-level corruption in the encoder's own output, not a test-harness
+# artifact -- so no change to the pairing/scoring logic in this script was
+# warranted. Per this project's process, a confirmed encoder-side defect
+# is out of scope for a test-harness change and is not fixed here; see the
+# accompanying report for the evidence above in full and next steps.
+#
 # USAGE
 #   ./tools/quality_test.sh
 #
