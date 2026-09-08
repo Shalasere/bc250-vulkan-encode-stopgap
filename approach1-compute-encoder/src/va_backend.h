@@ -20,6 +20,8 @@
 
 #define MAX_PROFILES 16
 #define MAX_ENTRYPOINTS 16
+#define MAX_CONFIG_ATTRIBUTES 16
+#define MAX_IMAGE_FORMATS 8
 #define MAX_CONFIGS 256
 #define MAX_SURFACES 1024
 #define MAX_CONTEXTS 64
@@ -161,6 +163,22 @@ VAStatus bc250_DestroyImage(VADriverContextP ctx, VAImageID image);
 VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image);
 VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image);
 VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height);
+VAStatus bc250_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette);
+
+/* Subpictures (unsupported - stubs required by the libva driver contract) */
+VAStatus bc250_QuerySubpictureFormats(VADriverContextP ctx, VAImageFormat *format_list, unsigned int *flags, unsigned int *num_formats);
+VAStatus bc250_CreateSubpicture(VADriverContextP ctx, VAImageID image, VASubpictureID *subpicture);
+VAStatus bc250_DestroySubpicture(VADriverContextP ctx, VASubpictureID subpicture);
+VAStatus bc250_SetSubpictureImage(VADriverContextP ctx, VASubpictureID subpicture, VAImageID image);
+VAStatus bc250_SetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpicture, unsigned int chromakey_min, unsigned int chromakey_max, unsigned int chromakey_mask);
+VAStatus bc250_SetSubpictureGlobalAlpha(VADriverContextP ctx, VASubpictureID subpicture, float global_alpha);
+VAStatus bc250_AssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture, VASurfaceID *target_surfaces, int num_surfaces, short src_x, short src_y, unsigned short src_width, unsigned short src_height, short dest_x, short dest_y, unsigned short dest_width, unsigned short dest_height, unsigned int flags);
+VAStatus bc250_DeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture, VASurfaceID *target_surfaces, int num_surfaces);
+
+/* Display attributes (unsupported - stubs required by the libva driver contract) */
+VAStatus bc250_QueryDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int *num_attributes);
+VAStatus bc250_GetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes);
+VAStatus bc250_SetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes);
 
 /* Video Processing (VPP) */
 VAStatus bc250_QueryVideoProcFilters(VADriverContextP ctx, VAContextID context, VAProcFilterType *filters, unsigned int *num_filters);
