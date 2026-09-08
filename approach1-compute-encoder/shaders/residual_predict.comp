@@ -22,20 +22,20 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
  *    here, before DCT, from real pixel-domain SAD, and is published to
  *    PredModeOut for the CPU-side CAVLC header writer to read back verbatim
  *    instead of re-deriving it (see encoder_h264.c's gpu_pred_mode_i16()).
- *    Chroma always uses DC-only prediction (H264_CHROMA_DC) regardless of
- *    slice type - real directional chroma modes are not implemented, and for
- *    P-slices this chroma DC is spatial (from the current frame's own
- *    neighbor chroma pixels), NOT motion-compensated - see the second
- *    simplification note below.
+ *    Chroma uses DC-only prediction (H264_CHROMA_DC; real directional chroma
+ *    modes are not implemented), spatial from the current frame's own
+ *    neighbor chroma pixels.
  *
- *  - P-slices (pcs.is_intra==0): real motion-compensated LUMA residual using
- *    the ACTUAL per-MB integer-pel motion vector this pipeline already
- *    computes in motion_estimation.comp (mv_buffer) - previously computed
- *    but never consumed for residual, wastefully duplicated by a separate,
- *    much cruder CPU-side heuristic (encoder_h264.c's old
- *    choose_mv_heuristic). No sub-pel interpolation is done (matching this
- *    encoder's motion search, which is integer-pel only) - the MV is used as
- *    a direct nearest-neighbor pixel offset into referenceImage.
+ *  - P-slices (pcs.is_intra==0): real motion-compensated LUMA and CHROMA
+ *    residual using the ACTUAL per-MB integer-pel motion vector this
+ *    pipeline already computes in motion_estimation.comp (mv_buffer) -
+ *    previously computed but never consumed for residual at all,
+ *    wastefully duplicated by a separate, much cruder CPU-side heuristic
+ *    (encoder_h264.c's old choose_mv_heuristic). No sub-pel interpolation is
+ *    done anywhere (matching this encoder's motion search, which is
+ *    integer-pel only) - the luma MV is a direct nearest-neighbor pixel
+ *    offset into referenceImage, and the chroma offset is luma_mv/2 into
+ *    referenceUV (see the chroma motion-compensation note below).
  *
  * DELIBERATE SIMPLIFICATION (neighbor pixel source): a real H.264 decoder
  * reconstructs macroblocks in strict raster order within a slice, so intra
@@ -54,14 +54,13 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
  * documented simplifications (see quantize_dc()'s comment in
  * encoder_h264.c).
  *
- * DELIBERATE SIMPLIFICATION (chroma motion compensation): P-slice chroma
- * residual here is spatial DC prediction (same as I-slices), not real
- * motion compensation - doing that would need a second reference image
- * binding for the previous frame's CHROMA plane (recon_image's UV plane is
- * allocated but never populated - see gpu_compute.c) plus chroma MV
- * derivation (chroma MVs are luma MV/2 in this integer-pel-only encoder).
- * Deferred as a separate, smaller follow-up; this still fully resolves the
- * "chroma is always flat gray" gap for both I- and P-slices.
+ * P-slice chroma is now real motion-compensated residual too (see
+ * referenceUV below): chroma_mv = luma_mv/2 (integer division, truncating
+ * toward zero) since this encoder's motion search is integer-luma-pel only
+ * - there is no quarter/eighth-pel chroma derivation and no interpolation
+ * anywhere in this pipeline, so a plain half-scaled integer offset is the
+ * only precision level consistent with the rest of it. I-slice chroma is
+ * unchanged (spatial DC, see 8.3.4.1 below).
  *
  * SLICE BOUNDARIES: this project's own installed environment defaults to
  * BC250_SLICES_PER_FRAME=4 (see encoder_h264.c), so multi-slice is the
@@ -90,6 +89,7 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
 layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;   // Y, current (source) frame
 layout(set = 0, binding = 1, rg8) uniform readonly image2D currentUV;    // Cb/Cr, current (source) frame, NV12 half-res
 layout(set = 0, binding = 2, r8) uniform readonly image2D referenceImage; // Y, previous frame (for P MC)
+layout(set = 0, binding = 6, rg8) uniform readonly image2D referenceUV;  // Cb/Cr, previous frame (for P chroma MC)
 
 struct MotionVector {
     ivec2 mv;
@@ -160,6 +160,10 @@ void main() {
     uint local_id = gl_LocalInvocationIndex;
     ivec2 mb_pos = ivec2(mb_x * 16, mb_y * 16);
     ivec2 frame_max = ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1);
+    /* Plain buffer read, no synchronization needed - every thread computes
+     * the same value redundantly. Unused (but still safely readable) on
+     * I-slices. Used by both the luma and chroma P-paths below. */
+    ivec2 mb_mv = mvs[mb_idx].mv;
 
     uint px = local_id % 16u;
     uint py = local_id / 16u;
@@ -268,8 +272,7 @@ void main() {
          * actual searched motion vector (integer-pel, no sub-pel filter). */
         if (local_id == 0u) pred_modes[mb_idx] = MODE_DC; /* unused by the CPU P-path; keep the buffer defined */
 
-        ivec2 mv = mvs[mb_idx].mv;
-        ivec2 ref_coord = clamp(mb_pos + ivec2(px, py) + mv, ivec2(0), frame_max);
+        ivec2 ref_coord = clamp(mb_pos + ivec2(px, py) + mb_mv, ivec2(0), frame_max);
         int ref_val = int(round(imageLoad(referenceImage, ref_coord).r * 255.0));
         int residual = current_mb[py][px] - ref_val;
 
@@ -280,10 +283,11 @@ void main() {
         res[global_block_idx * 16u + pos_in_block] = residual;
     }
 
-    /* --- Chroma: DC-only prediction, current-frame spatial neighbors,
-     * regardless of slice type (see the chroma-MC simplification note
-     * above). 128 threads needed (4 blocks * 2 planes * 16 positions); this
-     * workgroup has 256, so gate on local_id < 128. --- */
+    /* --- Chroma: I-slices use DC-only prediction from current-frame
+     * spatial neighbors (computed here); P-slices use real motion
+     * compensation via referenceUV (applied below, per-pixel, alongside
+     * luma's equivalent). 128 threads needed (4 blocks * 2 planes * 16
+     * positions); this workgroup has 256, so gate on local_id < 128. --- */
     ivec2 mb_pos_uv = mb_pos / 2;
     ivec2 uv_max = ivec2(int(pcs.frame_width) / 2 - 1, int(pcs.frame_height) / 2 - 1);
 
@@ -298,7 +302,7 @@ void main() {
     }
     barrier();
 
-    if (local_id == 0u) {
+    if (pcs.is_intra == 1u && local_id == 0u) {
         /* Per ITU-T H.264 8.3.4.1: block (xO,yO) in {(0,0),(4,0),(0,4),(4,4)}
          * of each 8x8 chroma plane, sub-block index blk = (yO/4)*2+(xO/4). */
         for (int plane = 0; plane < 2; plane++) {
@@ -349,8 +353,20 @@ void main() {
         ivec2 uv_coord = clamp(mb_pos_uv + ivec2(px_off, py_off), ivec2(0), uv_max);
         vec2 uv = imageLoad(currentUV, uv_coord).rg;
         int src_val = int(round((is_cr ? uv.g : uv.r) * 255.0));
-        int dc_val = is_cr ? cr_dc[sub] : cb_dc[sub];
 
-        res[(mb_idx * 24u + block) * 16u + pos_in_block] = src_val - dc_val;
+        int pred_val;
+        if (pcs.is_intra == 1u) {
+            pred_val = is_cr ? cr_dc[sub] : cb_dc[sub];
+        } else {
+            /* chroma_mv = luma_mv/2 - see the chroma motion-compensation
+             * note at the top of this file. GLSL integer division
+             * truncates toward zero, same as C. */
+            ivec2 chroma_mv = mb_mv / 2;
+            ivec2 ref_coord = clamp(mb_pos_uv + ivec2(px_off, py_off) + chroma_mv, ivec2(0), uv_max);
+            vec2 ref_uv = imageLoad(referenceUV, ref_coord).rg;
+            pred_val = int(round((is_cr ? ref_uv.g : ref_uv.r) * 255.0));
+        }
+
+        res[(mb_idx * 24u + block) * 16u + pos_in_block] = src_val - pred_val;
     }
 }

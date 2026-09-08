@@ -527,9 +527,12 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 6: referenceUV - previous frame's chroma plane, for real
+         * P-slice chroma motion compensation (see residual_predict.comp). */
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo predict_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 6, .pBindings = predict_bindings };
+    VkDescriptorSetLayoutCreateInfo predict_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = predict_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &predict_layout_info, NULL, &ctx->predict_desc_layout);
 
     VkDescriptorSetLayoutBinding dct_bindings[] = {
@@ -1047,6 +1050,12 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     if (ctx->has_recon_frame && ctx->recon_image.y_view != VK_NULL_HANDLE) {
         ref_view = ctx->recon_image.y_view;
     }
+    /* Same idea for chroma - see residual_predict.comp's referenceUV /
+     * P-slice chroma motion compensation. */
+    VkImageView ref_uv_view = render_target.uv_view;
+    if (ctx->has_recon_frame && ctx->recon_image.uv_view != VK_NULL_HANDLE) {
+        ref_uv_view = ctx->recon_image.uv_view;
+    }
 
     /* Update image descriptors */
     if (render_target.y_view && render_target.uv_view) {
@@ -1073,6 +1082,7 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 0, render_target.y_view);
         update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 1, render_target.uv_view);
         update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 2, ref_view);
+        update_storage_image_descriptor(ctx->device, ctx->predict_desc_set, 6, ref_uv_view);
 
         vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->predict_pipeline);
         vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->predict_layout, 0, 1, &ctx->predict_desc_set, 0, NULL);
@@ -1153,6 +1163,21 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         };
         vkCmdCopyImage(cmd_buf, render_target.y_plane, VK_IMAGE_LAYOUT_GENERAL,
                        ctx->recon_image.y_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region_y);
+
+        /* Same for chroma - recon_image's UV plane used to be allocated but
+         * never populated (residual_predict.comp's P-slice chroma
+         * prediction was spatial-only, so nothing read it). Now that real
+         * chroma motion compensation reads it via referenceUV, it must
+         * carry the previous frame's real chroma data. */
+        if (render_target.uv_plane && ctx->recon_image.uv_plane) {
+            VkImageCopy copy_region_uv = {
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .extent = { (uint32_t)width / 2, (uint32_t)height / 2, 1 }
+            };
+            vkCmdCopyImage(cmd_buf, render_target.uv_plane, VK_IMAGE_LAYOUT_GENERAL,
+                           ctx->recon_image.uv_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region_uv);
+        }
         ctx->has_recon_frame = true;
     }
 
