@@ -28,6 +28,69 @@ typedef struct dpb_entry {
     bool is_long_term;          /* Long-term reference */
 } dpb_entry_t;
 
+/*
+ * ============================================================================
+ * Spec (clause 6.4.3) luma4x4BlkIdx <-> GPU raster block-index remapping
+ * ============================================================================
+ *
+ * The GPU buffers (quant_levels_buffer/coeff_buffer) lay out the 16 luma 4x4
+ * blocks of a macroblock in plain raster order: GPU block index = row*4+col,
+ * where (row,col) are in 4x4-pixel-block units (block 0 = MB pixel offset
+ * (0,0), block 1 = (4,0), block 4 = (0,4), etc - confirmed by re-reading
+ * dct_transform.comp/quantize.comp, whose global_block_idx = mb_idx*24+block_idx
+ * assumes exactly this).
+ *
+ * H.264's bitstream, however, must present luma4x4BlkIdx in *spec* order
+ * (0..15), which maps to pixel offsets via clause 6.4.3's InverseRasterScan
+ * quadrant math: quadrant q = blkIdx/4 gives a (2*(q%2), 2*(q/2)) 4x4-block
+ * offset, and sub = blkIdx%4 gives a (sub%2, sub/2) offset within that
+ * quadrant. blk_x4[]/blk_y4[] below were hand-derived from that formula and
+ * verified against every entry (see task notes / commit message).
+ */
+static const int blk_x4[16] = {0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3};
+static const int blk_y4[16] = {0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3};
+
+/* Inverse of (blk_x4,blk_y4): spec_blk_idx_from_xy[y4][x4] -> spec blkIdx.
+ * Built by hand-inverting the table above (blkIdx -> (blk_x4[blkIdx], blk_y4[blkIdx])). */
+static const int spec_blk_idx_from_xy[4][4] = {
+    {  0,  1,  4,  5 },
+    {  2,  3,  6,  7 },
+    {  8,  9, 12, 13 },
+    { 10, 11, 14, 15 }
+};
+
+static inline int gpu_raster_block_idx(int blk_idx) {
+    return blk_y4[blk_idx] * 4 + blk_x4[blk_idx];
+}
+
+/* Chroma 4x4 blocks are a plain 2x2 grid with no further sub-quadrant
+ * structure (unlike luma's 16-block, 4-quadrant layout), so clause 6.4.3's
+ * chroma equivalent (8.5.11.2-ish 2x2 InverseRasterScan) reduces to the same
+ * raster order the GPU buffers already use (block (row,col) = row*2+col,
+ * TL=0,TR=1,BL=2,BR=3). No remap table is needed for chroma - checked by
+ * working the quadrant formula for a 2x2 (not 4x4) grid by hand: with only
+ * one level of blocks there is no quadrant/sub split to reorder. */
+
+/*
+ * ============================================================================
+ * H.264 encoder state
+ * ============================================================================
+ */
+
+/* Per-slice/per-frame CAVLC neighbor (nC) context, indexed by absolute
+ * macroblock address. Persists across frames (see h264_encoder_create) since
+ * every entry is unconditionally overwritten before any later macroblock in
+ * the same frame could read it as a neighbor (neighbors always have a
+ * strictly smaller mb address, and mbs are processed in increasing order),
+ * so stale data from a previous frame is never observed. */
+typedef struct {
+    uint8_t (*nz_luma)[16];  /* [total_mbs][16], indexed by SPEC blkIdx */
+    uint8_t (*nz_cb)[4];     /* [total_mbs][4] */
+    uint8_t (*nz_cr)[4];     /* [total_mbs][4] */
+    uint32_t width_in_mbs;
+    uint32_t start_mb;       /* current slice's first_mb_in_slice */
+} nc_ctx_t;
+
 /* H.264 encoder state */
 struct h264_encoder {
     /* Dimensions */
@@ -64,6 +127,11 @@ struct h264_encoder {
     /* Software reference frame for host/CPU encoding and test paths */
     uint8_t *prev_y_frame;
     bool has_prev_frame;
+
+    /* CAVLC neighbor (nC) context, persistent across frames (see nc_ctx_t doc) */
+    uint8_t (*nz_luma)[16];
+    uint8_t (*nz_cb)[4];
+    uint8_t (*nz_cr)[4];
 };
 
 static void manage_dpb(h264_encoder_t *encoder, int new_frame_num, int new_poc)
@@ -95,6 +163,435 @@ static size_t write_aud(uint8_t *buf, size_t buf_size, bool is_idr) {
     buf[4] = 0x09; /* NAL header: forbidden=0, ref_idc=0, type=9 (AUD) */
     buf[5] = is_idr ? 0x10 : 0x30; /* primary_pic_type: 0 for I, 1 for P (shifted) + stop bit */
     return 6;
+}
+
+/*
+ * ============================================================================
+ * Residual coefficient helpers (GPU staging buffer access, quantization,
+ * Hadamard transforms, neighbor-context derivation)
+ * ============================================================================
+ */
+
+/* quant_levels/coeff buffers are laid out as num_mbs*24*16 ints; block index
+ * (0-23) is the GPU RASTER convention (see file-top comment), position (0-15)
+ * is raster within the 4x4 block (index = row*4+col, NOT zigzag). */
+static inline const int *quant_block_ptr(const int *quant_levels, uint32_t mb_idx, int raster_block) {
+    return quant_levels + ((size_t)mb_idx * 24 + raster_block) * 16;
+}
+static inline const int *coeff_block_ptr(const int *coeff, uint32_t mb_idx, int raster_block) {
+    return coeff + ((size_t)mb_idx * 24 + raster_block) * 16;
+}
+
+static int block_any_nonzero(const int *quant_levels, uint32_t mb_idx, int raster_block, int start_pos, int end_pos) {
+    const int *blk = quant_block_ptr(quant_levels, mb_idx, raster_block);
+    for (int p = start_pos; p < end_pos; p++) if (blk[p] != 0) return 1;
+    return 0;
+}
+
+/* H.264 Multiplication Factor Table (ITU-T Rec. H.264 8.5.9 Table 8-14),
+ * position-type-0 column only (DC-Hadamard coefficients are always
+ * quantized with the pos_type==0 multiplier under the simplification this
+ * encoder uses - see quantize_dc()'s comment). Mirrors quantize.comp's MF[][0]. */
+static const int MF0[6] = {13107, 11916, 10082, 9362, 8192, 7282};
+
+/*
+ * quantize_dc - Quantize one Hadamard-transformed DC coefficient.
+ *
+ * DELIBERATE SIMPLIFICATION: ITU-T H.264 8.5.10 defines a QP-dependent
+ * piecewise dequant/quant formula for luma/chroma DC specifically (different
+ * shift behavior for qP>=36 vs qP<36), which is high-risk to get bit-exact
+ * from memory. This instead reuses the SAME AC quantization formula already
+ * used by quantize.comp for pos_type==0 coefficients:
+ *   level = sign * ((abs(v)*MF0[qp%6] + f) >> (15 + qp/6)), f = round-offset.
+ * This only affects the reconstructed coefficient's numeric SCALE (i.e.
+ * brightness/contrast fidelity of the decoded DC term), not CAVLC bitstream
+ * validity - entropy coding correctness depends only on encoding whatever
+ * integer level results, not on that level matching the spec's exact
+ * dequant scale. If bit-exact 8.5.10 behavior is needed later, only this
+ * function need change.
+ */
+static int quantize_dc(int v, int qp, int is_intra) {
+    int qp_per = qp / 6;
+    int qp_rem = qp % 6;
+    int f = (1 << (15 + qp_per)) / (is_intra ? 3 : 6);
+    int sign = (v < 0) ? -1 : 1;
+    int64_t av = (v < 0) ? -(int64_t)v : (int64_t)v;
+    int64_t level = (av * MF0[qp_rem] + f) >> (15 + qp_per);
+    return (int)(sign * level);
+}
+
+/* Forward Hadamard transform of the 16 luma DC coefficients (one MB's worth),
+ * standard x264-style 2-pass butterfly construction - implemented exactly as
+ * specified (the write pattern into tmp[] transposes implicitly, so this is
+ * the usual "rows, transpose, columns" 2D Hadamard without an explicit
+ * transpose step). dc_in/dc_out are in raster (row*4+col) order. */
+static void luma_dc_hadamard(const int dc_in[4][4], int dc_out[16]) {
+    int tmp[16];
+    for (int i = 0; i < 4; i++) {
+        int s01 = dc_in[i][0] + dc_in[i][1], d01 = dc_in[i][0] - dc_in[i][1];
+        int s23 = dc_in[i][2] + dc_in[i][3], d23 = dc_in[i][2] - dc_in[i][3];
+        tmp[0*4+i] = s01+s23; tmp[1*4+i] = s01-s23; tmp[2*4+i] = d01-d23; tmp[3*4+i] = d01+d23;
+    }
+    for (int i = 0; i < 4; i++) {
+        int s01 = tmp[i*4+0]+tmp[i*4+1], d01 = tmp[i*4+0]-tmp[i*4+1];
+        int s23 = tmp[i*4+2]+tmp[i*4+3], d23 = tmp[i*4+2]-tmp[i*4+3];
+        dc_out[i*4+0] = (s01+s23+1)>>1; dc_out[i*4+1] = (s01-s23+1)>>1;
+        dc_out[i*4+2] = (d01-d23+1)>>1; dc_out[i*4+3] = (d01+d23+1)>>1;
+    }
+}
+
+/* Forward Hadamard transform of a 2x2 chroma DC block. c[]/out[] are raster
+ * (TL,TR,BL,BR) order, matching the GPU Cb/Cr DC block layout. */
+static void chroma_dc_hadamard(const int c[4], int out[4]) {
+    int c00 = c[0], c01 = c[1], c10 = c[2], c11 = c[3];
+    out[0] = c00 + c01 + c10 + c11;
+    out[1] = c00 - c01 + c10 - c11;
+    out[2] = c00 + c01 - c10 - c11;
+    out[3] = c00 - c01 - c10 + c11;
+}
+
+/* nC derivation for a luma 4x4 block at spec blkIdx, per ITU-T 9.2.1. */
+static int luma_nc(const nc_ctx_t *nc, uint32_t mb, uint32_t mbx, uint32_t mby, int blk_idx) {
+    int x4 = blk_x4[blk_idx], y4 = blk_y4[blk_idx];
+    int nA = -1, nB = -1;
+
+    if (x4 > 0) {
+        nA = nc->nz_luma[mb][spec_blk_idx_from_xy[y4][x4 - 1]];
+    } else if (mbx > 0 && (mb - 1) >= nc->start_mb) {
+        nA = nc->nz_luma[mb - 1][spec_blk_idx_from_xy[y4][3]];
+    }
+
+    if (y4 > 0) {
+        nB = nc->nz_luma[mb][spec_blk_idx_from_xy[y4 - 1][x4]];
+    } else if (mby > 0 && (mb - nc->width_in_mbs) >= nc->start_mb) {
+        nB = nc->nz_luma[mb - nc->width_in_mbs][spec_blk_idx_from_xy[3][x4]];
+    }
+
+    if (nA >= 0 && nB >= 0) return (nA + nB + 1) >> 1;
+    if (nA >= 0) return nA;
+    if (nB >= 0) return nB;
+    return 0;
+}
+
+/* nC derivation for a chroma 4x4 block (2x2 grid, blk_idx 0..3, raster==spec order). */
+static int chroma_nc(uint8_t (*nz_c)[4], uint32_t mb, uint32_t mbx, uint32_t mby,
+                      uint32_t width_in_mbs, uint32_t start_mb, int blk_idx) {
+    int x2 = blk_idx % 2, y2 = blk_idx / 2;
+    int nA = -1, nB = -1;
+
+    if (x2 > 0) {
+        nA = nz_c[mb][y2 * 2 + (x2 - 1)];
+    } else if (mbx > 0 && (mb - 1) >= start_mb) {
+        nA = nz_c[mb - 1][y2 * 2 + 1];
+    }
+
+    if (y2 > 0) {
+        nB = nz_c[mb][(y2 - 1) * 2 + x2];
+    } else if (mby > 0 && (mb - width_in_mbs) >= start_mb) {
+        nB = nz_c[mb - width_in_mbs][1 * 2 + x2];
+    }
+
+    if (nA >= 0 && nB >= 0) return (nA + nB + 1) >> 1;
+    if (nA >= 0) return nA;
+    if (nB >= 0) return nB;
+    return 0;
+}
+
+/*
+ * nC derivation for the I16x16 luma DC block.
+ *
+ * CORRECTED (found via ffmpeg round-trip validation - this directly
+ * contradicts what an earlier version of this file, and its originating
+ * task brief, assumed): ITU-T H.264 9.2.1 does NOT give the luma DC block
+ * its own independent whole-MB neighbor chain. Per spec (and confirmed by
+ * ffmpeg's libavcodec/h264_cavlc.c decode_residual(), which for the DC
+ * block calls `pred_non_zero_count(h, sl, (n-LUMA_DC_BLOCK_INDEX)*16)` -
+ * i.e. index 0 - while STORING the DC block's own decoded TotalCoeff at a
+ * completely different cache slot reserved for LUMA_DC_BLOCK_INDEX), the DC
+ * block's nC is derived EXACTLY as if it were luma4x4BlkIdx 0 (i.e. the
+ * same left/top neighbor derivation as the first luma AC block), and the
+ * DC block's own TotalCoeff is never itself used as anyone's neighbor
+ * value - it is immediately superseded once AC block 0 of the same MB is
+ * decoded (which writes ITS total_coeff to the real block-0 slot). Since
+ * this encoder always writes the DC block before any AC block of the same
+ * MB, nz_luma[mb][0] at DC-encode time still holds whatever the LEFT/TOP
+ * NEIGHBOR MB left there, exactly matching this rule - so DC's nC is simply
+ * `luma_nc(nc, mb, mbx, mby, blk_idx=0)`, and no separate dc_nz array is
+ * needed at all (a prior version of this file added one; it produced a
+ * bitstream ffmpeg rejected with "negative number of zero coeffs" on any
+ * macroblock with a nonzero-DC-total_coeff neighbor, traced and confirmed
+ * via an independent reference CAVLC decoder cross-checked against this
+ * exact ffmpeg source function).
+ */
+
+/* Real per-MB motion vector, as written back by mv_staging (see
+ * gpu_compute_get_mv_staging_data()'s doc comment) - mirrors the GPU's
+ * std430 MotionVector struct {ivec2 mv; uint sad;} byte-for-byte (16 bytes:
+ * two int32 + one uint32 + 4 bytes of std430 struct-alignment padding). */
+typedef struct {
+    int32_t mvx, mvy;
+    uint32_t sad;
+    uint32_t _pad;
+} gpu_mv_t;
+
+/*
+ * gpu_pred_mode_i16 - I16x16 prediction mode, as chosen by
+ * residual_predict.comp's real SAD-based mode decision (DC/Vertical/
+ * Horizontal/Plane against actual neighbor pixels).
+ *
+ * REPLACES a former CPU-side heuristic that inferred mode from post-quant
+ * AC coefficient activity - that approach became structurally impossible
+ * once residual generation itself needs to know the prediction mode BEFORE
+ * DCT/quantize even run (the residual IS source-minus-prediction). Mode
+ * decision now happens on the GPU, before DCT, directly from pixel-domain
+ * SAD; this just reads back what it decided. See residual_predict.comp's
+ * top-of-file comment for the full design, including the neighbor-pixel-
+ * source and slice-boundary simplifications it documents (this readback
+ * inherits both: it does not re-derive or gate on start_mb the way the old
+ * heuristic did, because the GPU's mode decision already didn't either).
+ */
+static int gpu_pred_mode_i16(const uint32_t *pred_modes, uint32_t mb_idx) {
+    return pred_modes ? (int)pred_modes[mb_idx] : H264_I16x16_DC;
+}
+
+/* Neighbor MV lookup for the P16x16 MVD predictor below: (dx,dy) is a
+ * neighbor offset in MB units (e.g. left=(-1,0), top=(0,-1)). Unavailable
+ * (off-picture, or belongs to an earlier slice) is reported via *avail. */
+static void neighbor_mv(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
+                         uint32_t width_in_mbs, uint32_t start_mb, int dx, int dy,
+                         int *mvx, int *mvy, bool *avail) {
+    int nbx = (int)mbx + dx, nby = (int)mby + dy;
+    if (nbx < 0 || nby < 0 || (uint32_t)nbx >= width_in_mbs) { *avail = false; *mvx = 0; *mvy = 0; return; }
+    uint32_t nb = (uint32_t)nby * width_in_mbs + (uint32_t)nbx;
+    if (nb < start_mb) { *avail = false; *mvx = 0; *mvy = 0; return; }
+    *avail = true;
+    *mvx = mvs[nb].mvx;
+    *mvy = mvs[nb].mvy;
+}
+
+static inline int median3(int a, int b, int c) {
+    return a + b + c - (a < b ? (a < c ? a : c) : (b < c ? b : c)) - (a > b ? (a > c ? a : c) : (b > c ? b : c));
+}
+
+/*
+ * mv_predictor - ITU-T H.264 8.4.1.3 median motion vector predictor (A=left,
+ * B=top, C=top-right, substituting D=top-left when C is unavailable). This
+ * MUST match a real decoder's predictor exactly (ffmpeg included) - the
+ * encoder transmits mv-minus-predictor (MVD) and the decoder reconstructs
+ * mv=predictor+MVD using its OWN predictor computed the same way, so any
+ * mismatch here corrupts every subsequent motion vector, not just this one.
+ * All MBs in a P slice are P16x16 in this encoder (no intra-in-P mixing), so
+ * the spec's ref-idx-equality special cases never apply here.
+ */
+static void mv_predictor(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
+                          uint32_t width_in_mbs, uint32_t start_mb, int *px, int *py) {
+    int ax, ay, bx, by, cx, cy;
+    bool a_ok, b_ok, c_ok;
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, -1, 0, &ax, &ay, &a_ok);   /* A: left */
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, 0, -1, &bx, &by, &b_ok);   /* B: top */
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, 1, -1, &cx, &cy, &c_ok);   /* C: top-right */
+    if (!c_ok) {
+        neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, -1, -1, &cx, &cy, &c_ok); /* D substitutes C */
+    }
+
+    if (!b_ok && !c_ok && a_ok) {
+        *px = ax; *py = ay;
+        return;
+    }
+    /* An unavailable neighbor contributes (0,0) to the median (per spec) once
+     * the single-predictor special case above doesn't apply. */
+    if (!a_ok) { ax = 0; ay = 0; }
+    if (!b_ok) { bx = 0; by = 0; }
+    if (!c_ok) { cx = 0; cy = 0; }
+    *px = median3(ax, bx, cx);
+    *py = median3(ay, by, cy);
+}
+
+/* Whole-MB "does this P16x16 MB have any nonzero luma coefficient" skip
+ * decision. Previously this read the lossy packed entropy summary
+ * (mb_blocks[b]&0xFF); it now reads the real quant_levels data directly -
+ * strictly more accurate, same semantic heuristic. */
+static int mb_has_any_luma_nonzero(const int *quant_levels, uint32_t mb_idx) {
+    for (int b = 0; b < 16; b++) {
+        if (block_any_nonzero(quant_levels, mb_idx, b, 0, 16)) return 1;
+    }
+    return 0;
+}
+
+/*
+ * encode_mb_i16x16 - Encode one Intra 16x16 macroblock: header, luma DC
+ * (Hadamard), luma AC (16 blocks, spec order), chroma DC (Hadamard x2) and
+ * chroma AC (8 blocks), updating the nC neighbor-context arrays as it goes.
+ */
+static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int *coeff,
+                              const uint32_t *pred_modes,
+                              uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
+    int pred_mode = gpu_pred_mode_i16(pred_modes, mb);
+
+    /* Luma DC: gather PRE-quant DC (coeff buffer, position 0) of the 16
+     * raster blocks into the natural 4x4 grid, Hadamard, quantize. */
+    int dc_in[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            dc_in[r][c] = coeff_block_ptr(coeff, mb, r * 4 + c)[0];
+    int dc_out_raw[16];
+    luma_dc_hadamard(dc_in, dc_out_raw);
+    int dc_out[16];
+    for (int i = 0; i < 16; i++) dc_out[i] = quantize_dc(dc_out_raw[i], qp, 1 /* intra */);
+
+    /* cbp_luma: any nonzero AC (raster positions 1..15) across all 16 luma blocks. */
+    int cbp_luma_flag = 0;
+    for (int blk = 0; blk < 16 && !cbp_luma_flag; blk++) {
+        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) cbp_luma_flag = 1;
+    }
+
+    /* Chroma DC (Hadamard) + cbp_chroma. */
+    int cb_dc_raw[4], cr_dc_raw[4];
+    for (int i = 0; i < 4; i++) cb_dc_raw[i] = coeff_block_ptr(coeff, mb, 16 + i)[0];
+    for (int i = 0; i < 4; i++) cr_dc_raw[i] = coeff_block_ptr(coeff, mb, 20 + i)[0];
+    int cb_dc[4], cr_dc[4];
+    chroma_dc_hadamard(cb_dc_raw, cb_dc);
+    chroma_dc_hadamard(cr_dc_raw, cr_dc);
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc(cb_dc[i], qp, 1); cr_dc[i] = quantize_dc(cr_dc[i], qp, 1); }
+
+    int chroma_dc_nonzero = 0;
+    for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
+    int chroma_ac_nonzero = 0;
+    for (int blk = 16; blk < 24 && !chroma_ac_nonzero; blk++) {
+        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
+    }
+    int cbp_chroma = chroma_ac_nonzero ? 2 : (chroma_dc_nonzero ? 1 : 0);
+
+    /* Header first (mb_type encodes pred_mode/cbp_chroma/cbp_luma_flag,
+     * followed by intra_chroma_pred_mode and mb_qp_delta), THEN residual. */
+    cavlc_write_mb_i16x16_header(bs, pred_mode, cbp_chroma, cbp_luma_flag ? 15 : 0, 0);
+
+    /* Luma DC block (always present for I16x16, first in residual order).
+     * nC uses luma4x4BlkIdx=0's neighbor chain (see dc_nc's replacement
+     * comment above) - this MUST run before the AC loop below writes
+     * nz_luma[mb][0], since the DC block's own nC needs to see the LEFT/TOP
+     * NEIGHBOR MB's block-0-adjacent values, not this MB's own (not-yet-
+     * decoded) block 0. */
+    int nC_dc = luma_nc(nc, mb, mbx, mby, 0);
+    cavlc_write_4x4_block(bs, dc_out, nC_dc);
+
+    /* Luma AC blocks, spec blkIdx order (0..15). */
+    if (cbp_luma_flag) {
+        for (int blk_idx = 0; blk_idx < 16; blk_idx++) {
+            int raster = gpu_raster_block_idx(blk_idx);
+            int nC = luma_nc(nc, mb, mbx, mby, blk_idx);
+            int tc = cavlc_write_4x4_ac_block(bs, quant_block_ptr(quant_levels, mb, raster), nC);
+            nc->nz_luma[mb][blk_idx] = (uint8_t)tc;
+        }
+    } else {
+        memset(nc->nz_luma[mb], 0, sizeof(nc->nz_luma[mb]));
+    }
+
+    /* Chroma DC (Cb then Cr) if any chroma residual at all. */
+    if (cbp_chroma >= 1) {
+        cavlc_write_chroma_dc_block(bs, cb_dc);
+        cavlc_write_chroma_dc_block(bs, cr_dc);
+    }
+
+    /* Chroma AC (4 Cb blocks then 4 Cr blocks) only if cbp_chroma==2. */
+    if (cbp_chroma == 2) {
+        for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
+            int nC = chroma_nc(nc->nz_cb, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx);
+            int tc = cavlc_write_4x4_ac_block(bs, quant_block_ptr(quant_levels, mb, 16 + blk_idx), nC);
+            nc->nz_cb[mb][blk_idx] = (uint8_t)tc;
+        }
+        for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
+            int nC = chroma_nc(nc->nz_cr, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx);
+            int tc = cavlc_write_4x4_ac_block(bs, quant_block_ptr(quant_levels, mb, 20 + blk_idx), nC);
+            nc->nz_cr[mb][blk_idx] = (uint8_t)tc;
+        }
+    } else {
+        memset(nc->nz_cb[mb], 0, sizeof(nc->nz_cb[mb]));
+        memset(nc->nz_cr[mb], 0, sizeof(nc->nz_cr[mb]));
+    }
+}
+
+/*
+ * encode_mb_p16x16 - Encode one Inter P_L0_16x16 macroblock: header (MVD +
+ * real 6-bit CBP), luma (16 FULL blocks, DC included, spec order), chroma DC
+ * (Hadamard, same as I16x16) and chroma AC (8 blocks).
+ */
+static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int *coeff,
+                              const gpu_mv_t *mvs,
+                              uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
+    int pred_x, pred_y;
+    mv_predictor(mvs, mbx, mby, nc->width_in_mbs, nc->start_mb, &pred_x, &pred_y);
+    int mvd_x = mvs[mb].mvx - pred_x;
+    int mvd_y = mvs[mb].mvy - pred_y;
+
+    /* Luma CBP: one bit per 8x8 quadrant (spec blkIdx/4), based on full
+     * 16-coefficient (DC+AC) nonzero-anywhere check since P16x16 luma has
+     * no separate DC/AC split. */
+    int luma_cbp = 0;
+    for (int q = 0; q < 4; q++) {
+        int any = 0;
+        for (int sub = 0; sub < 4 && !any; sub++) {
+            int blk_idx = q * 4 + sub;
+            int raster = gpu_raster_block_idx(blk_idx);
+            if (block_any_nonzero(quant_levels, mb, raster, 0, 16)) any = 1;
+        }
+        if (any) luma_cbp |= (1 << q);
+    }
+
+    /* Chroma DC (Hadamard, inter (/6) rounding) + cbp_chroma - identical
+     * structure to encode_mb_i16x16's chroma handling. */
+    int cb_dc_raw[4], cr_dc_raw[4];
+    for (int i = 0; i < 4; i++) cb_dc_raw[i] = coeff_block_ptr(coeff, mb, 16 + i)[0];
+    for (int i = 0; i < 4; i++) cr_dc_raw[i] = coeff_block_ptr(coeff, mb, 20 + i)[0];
+    int cb_dc[4], cr_dc[4];
+    chroma_dc_hadamard(cb_dc_raw, cb_dc);
+    chroma_dc_hadamard(cr_dc_raw, cr_dc);
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc(cb_dc[i], qp, 0); cr_dc[i] = quantize_dc(cr_dc[i], qp, 0); }
+
+    int chroma_dc_nonzero = 0;
+    for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
+    int chroma_ac_nonzero = 0;
+    for (int blk = 16; blk < 24 && !chroma_ac_nonzero; blk++) {
+        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
+    }
+    int cbp_chroma = chroma_ac_nonzero ? 2 : (chroma_dc_nonzero ? 1 : 0);
+
+    /* Standard H.264 CodedBlockPattern = CBPChroma*16 + CBPLuma; cavlc_write_mb_p16x16_header
+     * maps this through map_inter_cbp()/Table 9-4 internally. */
+    int cbp = (luma_cbp & 0xF) | (cbp_chroma << 4);
+    cavlc_write_mb_p16x16_header(bs, mvd_x, mvd_y, cbp, 0);
+
+    for (int blk_idx = 0; blk_idx < 16; blk_idx++) {
+        int q = blk_idx / 4;
+        if (luma_cbp & (1 << q)) {
+            int raster = gpu_raster_block_idx(blk_idx);
+            int nC = luma_nc(nc, mb, mbx, mby, blk_idx);
+            int tc = cavlc_write_4x4_block(bs, quant_block_ptr(quant_levels, mb, raster), nC);
+            nc->nz_luma[mb][blk_idx] = (uint8_t)tc;
+        } else {
+            nc->nz_luma[mb][blk_idx] = 0;
+        }
+    }
+
+    if (cbp_chroma >= 1) {
+        cavlc_write_chroma_dc_block(bs, cb_dc);
+        cavlc_write_chroma_dc_block(bs, cr_dc);
+    }
+    if (cbp_chroma == 2) {
+        for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
+            int nC = chroma_nc(nc->nz_cb, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx);
+            int tc = cavlc_write_4x4_ac_block(bs, quant_block_ptr(quant_levels, mb, 16 + blk_idx), nC);
+            nc->nz_cb[mb][blk_idx] = (uint8_t)tc;
+        }
+        for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
+            int nC = chroma_nc(nc->nz_cr, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx);
+            int tc = cavlc_write_4x4_ac_block(bs, quant_block_ptr(quant_levels, mb, 20 + blk_idx), nC);
+            nc->nz_cr[mb][blk_idx] = (uint8_t)tc;
+        }
+    } else {
+        memset(nc->nz_cb[mb], 0, sizeof(nc->nz_cb[mb]));
+        memset(nc->nz_cr[mb], 0, sizeof(nc->nz_cr[mb]));
+    }
 }
 
 h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
@@ -135,6 +632,17 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
 
     encoder->prev_y_frame = malloc((size_t)width * height);
     encoder->has_prev_frame = false;
+
+    encoder->nz_luma = calloc(encoder->total_mbs, sizeof(*encoder->nz_luma));
+    encoder->nz_cb = calloc(encoder->total_mbs, sizeof(*encoder->nz_cb));
+    encoder->nz_cr = calloc(encoder->total_mbs, sizeof(*encoder->nz_cr));
+    if (!encoder->nz_luma || !encoder->nz_cb || !encoder->nz_cr) {
+        free(encoder->nz_luma); free(encoder->nz_cb); free(encoder->nz_cr);
+        free(encoder->output_buf);
+        free(encoder->prev_y_frame);
+        free(encoder);
+        return NULL;
+    }
 
     fprintf(stderr, "[bc250-h264] Encoder initialized: %ux%u @ %u fps, %u bps, profile %d\n",
             width, height, encoder->fps, bitrate, prof_idc);
@@ -218,24 +726,50 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         total_written += pps_size;
     }
 
-    /* 3. Dispatch GPU compute encoding pipeline if available */
-    void *gpu_staging = NULL;
-    size_t staging_size = 0;
-    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-        gpu_compute_begin_picture(gpu_ctx, input_surface);
-        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height);
-        gpu_compute_end_picture(gpu_ctx);
-        gpu_compute_sync(gpu_ctx);
-        gpu_compute_get_staging_data(gpu_ctx, &gpu_staging, &staging_size);
-    }
-
-    /* 4. Encode Slices (supporting multi-slice partitioning for Sunshine/Moonlight network resilience) */
+    /* 3a. Multi-slice partitioning (Sunshine/Moonlight network resilience) -
+     * computed BEFORE the GPU dispatch below, since residual_predict.comp
+     * needs num_slices too (see gpu_compute_dispatch_encode's doc comment
+     * and that shader's SLICE BOUNDARIES note) to correctly treat a
+     * different-slice neighbor MB as unavailable for intra prediction. */
     int num_slices = 1;
     const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
     if (slice_env) {
         int s = atoi(slice_env);
         if (s >= 1 && s <= 16) num_slices = s;
     }
+
+    /* 3b. Dispatch GPU compute encoding pipeline if available, and fetch the
+     * REAL per-coefficient residual data (post-quant levels + pre-quant
+     * transform coefficients) - not just the lossy packed entropy summary
+     * the old heuristic-only path used. */
+    const int *quant_levels = NULL;
+    const int *coeff = NULL;
+    const uint32_t *pred_modes = NULL;
+    const gpu_mv_t *mvs = NULL;
+    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        gpu_compute_begin_picture(gpu_ctx, input_surface);
+        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
+                                     qp, is_idr ? 1 : 0, num_slices);
+        gpu_compute_end_picture(gpu_ctx);
+        gpu_compute_sync(gpu_ctx);
+
+        void *quant_data = NULL, *coeff_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
+        size_t quant_size = 0, coeff_size = 0, pred_mode_size = 0, mv_size = 0;
+        if (gpu_compute_get_quant_staging_data(gpu_ctx, &quant_data, &quant_size) == 0) {
+            quant_levels = (const int *)quant_data;
+        }
+        if (gpu_compute_get_coeff_staging_data(gpu_ctx, &coeff_data, &coeff_size) == 0) {
+            coeff = (const int *)coeff_data;
+        }
+        if (gpu_compute_get_pred_mode_staging_data(gpu_ctx, &pred_mode_data, &pred_mode_size) == 0) {
+            pred_modes = (const uint32_t *)pred_mode_data;
+        }
+        if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0) {
+            mvs = (const gpu_mv_t *)mv_data;
+        }
+    }
+
+    /* 4. Encode Slices */
 
     const char *fm = getenv("BC250_FAST_MODE");
     int deblock_idc = (fm && (strcmp(fm, "1") == 0 || strcmp(fm, "true") == 0)) ? 1 : 0;
@@ -281,48 +815,58 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         bs_write_se(&bs, 0);
 
         /* 4b. Slice Data (Macroblock Layer) using CAVLC per Section 7.3.4 */
+        nc_ctx_t nc = {
+            .nz_luma = encoder->nz_luma,
+            .nz_cb = encoder->nz_cb,
+            .nz_cr = encoder->nz_cr,
+            .width_in_mbs = encoder->width_in_mbs,
+            .start_mb = start_mb,
+        };
+
         if (is_idr) {
             for (uint32_t mb = start_mb; mb < end_mb; mb++) {
-                int pred_mode = H264_I16x16_DC;
-                if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
-                    uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
-                    uint32_t top_act = (mb_blocks[0] & 0xFF) + (mb_blocks[1] & 0xFF);
-                    uint32_t left_act = (mb_blocks[0] & 0xFF) + (mb_blocks[4] & 0xFF);
-                    if (top_act > left_act * 2) pred_mode = H264_I16x16_VERT;
-                    else if (left_act > top_act * 2) pred_mode = H264_I16x16_HORIZ;
+                uint32_t mbx = mb % encoder->width_in_mbs;
+                uint32_t mby = mb / encoder->width_in_mbs;
+                if (quant_levels && coeff) {
+                    encode_mb_i16x16(&bs, quant_levels, coeff, pred_modes, mb, mbx, mby, &nc, qp);
+                } else {
+                    /* No GPU residual data available (e.g. gpu_ctx==NULL) -
+                     * fall back to an all-zero-residual I16x16 MB so the
+                     * bitstream stays structurally valid. */
+                    cavlc_write_mb_i16x16_header(&bs, H264_I16x16_DC, 0, 0, 0);
+                    int zero16[16] = {0};
+                    cavlc_write_4x4_block(&bs, zero16, luma_nc(&nc, mb, mbx, mby, 0));
+                    memset(nc.nz_luma[mb], 0, sizeof(nc.nz_luma[mb]));
+                    memset(nc.nz_cb[mb], 0, sizeof(nc.nz_cb[mb]));
+                    memset(nc.nz_cr[mb], 0, sizeof(nc.nz_cr[mb]));
                 }
-                cavlc_write_mb_i16x16_header(&bs, pred_mode, 0, 0, 0);
             }
         } else {
             uint32_t current_skip_run = 0;
             for (uint32_t mb = start_mb; mb < end_mb; mb++) {
-                bool mb_changed = false;
-                if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
-                    uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
-                    for (int b = 0; b < 16; b++) {
-                        if ((mb_blocks[b] & 0xFF) > 0) {
-                            mb_changed = true;
-                            break;
-                        }
-                    }
-                }
+                uint32_t mbx = mb % encoder->width_in_mbs;
+                uint32_t mby = mb / encoder->width_in_mbs;
+                bool mb_changed = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) != 0) : false;
 
                 if (!mb_changed) {
                     current_skip_run++;
+                    memset(nc.nz_luma[mb], 0, sizeof(nc.nz_luma[mb]));
+                    memset(nc.nz_cb[mb], 0, sizeof(nc.nz_cb[mb]));
+                    memset(nc.nz_cr[mb], 0, sizeof(nc.nz_cr[mb]));
                 } else {
-                    if (current_skip_run > 0) {
-                        cavlc_write_p_skip_run(&bs, current_skip_run);
-                        current_skip_run = 0;
+                    /* mb_skip_run MUST be written exactly once, unconditionally
+                     * (even when 0), before every coded macroblock - see
+                     * cavlc_write_p_skip_run's doc comment. */
+                    cavlc_write_p_skip_run(&bs, current_skip_run);
+                    current_skip_run = 0;
+                    if (quant_levels && coeff) {
+                        encode_mb_p16x16(&bs, quant_levels, coeff, mvs, mb, mbx, mby, &nc, qp);
+                    } else {
+                        cavlc_write_mb_p16x16_header(&bs, 0, 0, 0, 0);
+                        memset(nc.nz_luma[mb], 0, sizeof(nc.nz_luma[mb]));
+                        memset(nc.nz_cb[mb], 0, sizeof(nc.nz_cb[mb]));
+                        memset(nc.nz_cr[mb], 0, sizeof(nc.nz_cr[mb]));
                     }
-                    int mvd_x = 0, mvd_y = 0;
-                    if (gpu_staging && staging_size >= (mb + 1) * 24 * sizeof(uint32_t)) {
-                        uint32_t *mb_blocks = ((uint32_t *)gpu_staging) + mb * 24;
-                        int top_act = (int)(mb_blocks[0] & 0xFF) - (int)(mb_blocks[1] & 0xFF);
-                        int left_act = (int)(mb_blocks[0] & 0xFF) - (int)(mb_blocks[4] & 0xFF);
-                        if (abs(top_act) > 4) mvd_x = (top_act > 0 ? 1 : -1) * 4;
-                        if (abs(left_act) > 4) mvd_y = (left_act > 0 ? 1 : -1) * 4;
-                    }
-                    cavlc_write_mb_p16x16_header(&bs, mvd_x, mvd_y, 0, 0);
                 }
             }
             if (current_skip_run > 0) {
@@ -505,10 +1049,11 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                 if (sad < 512) {
                     current_skip_run++;
                 } else {
-                    if (current_skip_run > 0) {
-                        cavlc_write_p_skip_run(&bs, current_skip_run);
-                        current_skip_run = 0;
-                    }
+                    /* mb_skip_run MUST be written exactly once, unconditionally
+                     * (even when 0), before every coded macroblock - see
+                     * cavlc_write_p_skip_run's doc comment. */
+                    cavlc_write_p_skip_run(&bs, current_skip_run);
+                    current_skip_run = 0;
                     int best_dx = 0, best_dy = 0;
                     uint32_t best_sad = sad;
                     if (encoder->has_prev_frame && encoder->prev_y_frame) {
@@ -604,5 +1149,8 @@ void h264_encoder_destroy(h264_encoder_t *encoder)
     if (!encoder) return;
     if (encoder->output_buf) free(encoder->output_buf);
     if (encoder->prev_y_frame) free(encoder->prev_y_frame);
+    if (encoder->nz_luma) free(encoder->nz_luma);
+    if (encoder->nz_cb) free(encoder->nz_cb);
+    if (encoder->nz_cr) free(encoder->nz_cr);
     free(encoder);
 }

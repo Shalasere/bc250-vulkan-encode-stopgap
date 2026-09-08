@@ -177,7 +177,7 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
 
     /* Execute compute shaders */
     gpu_compute_begin_picture(gpu_ctx, input_surface);
-    gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height);
+    gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height, 26, is_idr ? 1 : 0, 1);
     gpu_compute_end_picture(gpu_ctx);
     gpu_compute_sync(gpu_ctx);
 

@@ -625,7 +625,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         }
     } else {
         gpu_compute_begin_picture(&data->gpu, surf->image);
-        gpu_compute_dispatch_encode(&data->gpu, surf->image, c->width, c->height);
+        gpu_compute_dispatch_encode(&data->gpu, surf->image, c->width, c->height, 26, 0, 1);
         gpu_compute_end_picture(&data->gpu);
     }
 
