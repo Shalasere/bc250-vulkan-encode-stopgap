@@ -500,12 +500,60 @@ static void cavlc_write_chroma_dc_total_zeros(bitstream_t *bs, int total_coeff, 
     }
 }
 
-/* Write run_before for each non-zero coefficient but the last (DC-most) one.
+/*
+ * Write run_before for each non-zero coefficient but the last (DC-most) one.
  * Table 9-10 is indexed purely by zerosLeft, independent of block size, so
- * this is shared unmodified across 4x4/AC/chroma-DC blocks. */
+ * this is shared unmodified across 4x4/AC/chroma-DC blocks.
+ *
+ * BUG FIX (found via a byte-level round-trip investigation into
+ * quality_test.sh's ~17.2dB luma-specific corruption - see this commit's
+ * message for the full methodology, including a 3-way GT/GPU-recon/decoded
+ * comparison that proved the GPU reconstruction chain - transform, quantize,
+ * dequantize, IDCT, intra/inter prediction, deblocking - was already correct
+ * to ~50dB, isolating the defect to entropy coding, plus a byte-for-byte diff
+ * of every VLC table in this file against ffmpeg's libavcodec/h264_cavlc.c
+ * that came back clean, narrowing it to this function's own iteration order):
+ *
+ * runs[] is populated by cavlc_scan_coeffs() as runs[j] = the zero-run
+ * immediately preceding the (j+1)-th coefficient IN HIGHEST-TO-LOWEST
+ * FREQUENCY RANK ORDER (rank 0 = highest frequency, matching levels[]'s own
+ * ordering - see that function's doc comment), for j = 0 .. total_coeff-2
+ * (the lowest-frequency/closest-to-DC coefficient's own preceding run is
+ * folded into total_zeros directly, per that function's comment, and is
+ * never coded as a separate run_before).
+ *
+ * Per ITU-T H.264 9.2.3 - and confirmed against ffmpeg's decode_residual()
+ * STORE_BLOCK macro, which decodes run_before values in a plain
+ * `for (i = 1; i < total_coeff && zeros_left > 0; i++)` loop, i.e. reads the
+ * run before rank-1 (second-highest frequency) FIRST and the run before
+ * rank-(total_coeff-1) (lowest frequency) LAST - run_before is coded
+ * HIGHEST-to-LOWEST frequency, the same direction as coeff_token/levels.
+ *
+ * This function used to iterate `for (i = total_coeff-1; i > 0; i--)`, i.e.
+ * runs[i-1] for i counting DOWN from total_coeff-1 to 1 - which visits
+ * runs[total_coeff-2] (the LOWEST-frequency run) FIRST and runs[0] (the
+ * second-highest-frequency run) LAST: exactly BACKWARDS from what a
+ * spec-compliant decoder reads. For total_coeff <= 2 there is only ever one
+ * run_before value, so the bug was invisible (order of one element doesn't
+ * matter) - which is exactly why the flat/DC-dominated and simple-edge
+ * surgical round-trip tests earlier in this investigation (almost always
+ * total_coeff 0-2 per block) came back clean while real, busy content
+ * (color-bar/edge-rich test patterns, routinely total_coeff >= 3 per luma
+ * AC block) came back at ~15.5dB luma PSNR: every block with 3+ nonzero
+ * coefficients had its run_before values coded in reversed order, which is
+ * still perfectly valid CAVLC syntax (same token set, same total_zeros, same
+ * total run length) - hence ffmpeg reporting "0 decode errors" - but places
+ * every affected coefficient at the WRONG scan position once decoded,
+ * scrambling energy between frequency bands. Chroma uses this same function
+ * for its AC blocks, but 4:2:0-subsampled/smoother chroma content hits
+ * total_coeff >= 3 far less often than luma, which is why chroma PSNR
+ * (~29dB) was far less degraded than luma (~15.5dB) despite sharing this
+ * exact code path - not because chroma has a separate, correct
+ * implementation.
+ */
 static void cavlc_write_run_befores(bitstream_t *bs, const int *runs, int total_coeff, int total_zeros) {
     int zeros_left = total_zeros;
-    for (int i = total_coeff - 1; i > 0 && zeros_left > 0; i--) {
+    for (int i = 1; i < total_coeff && zeros_left > 0; i++) {
         int run = runs[i - 1];
         int zl_idx = (zeros_left <= 6) ? (zeros_left - 1) : 6;
         if (run < 16) {
