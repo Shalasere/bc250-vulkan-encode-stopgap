@@ -92,7 +92,20 @@ fi
 
 # Build or Stage Compute Encoder VA-API driver
 echo -e "\n${BLUE}[3/5] Setting up Compute Encoder VA-API driver...${NC}"
-DRI_DIRS=("/usr/lib/x86_64-linux-gnu/dri" "/usr/lib64/dri" "/usr/lib/dri")
+
+# On rpm-ostree/immutable systems (Bazzite, Silverblue, SteamOS, etc.) /usr is a
+# read-only bind mount. Writing there fails, so /usr/local (writable, and
+# persistent because /usr/local is itself a symlink into /var on these distros)
+# MUST be tried too, or the driver silently ends up installed nowhere.
+IS_OSTREE=0
+if [ -f "/run/ostree-booted" ] || command -v rpm-ostree &> /dev/null; then
+    IS_OSTREE=1
+    echo -e "${YELLOW}! Detected an rpm-ostree/immutable filesystem. /usr is read-only here;${NC}"
+    echo -e "${YELLOW}  consider using tools/setup_bazzite.sh or tools/setup_steamos.sh instead,${NC}"
+    echo -e "${YELLOW}  which target the correct persistent paths for this OS.${NC}"
+fi
+
+DRI_DIRS=("/usr/lib/x86_64-linux-gnu/dri" "/usr/lib64/dri" "/usr/lib/dri" "/usr/local/lib64/dri" "/usr/local/lib/dri")
 SHADER_DESTS=("/usr/share/bc250/shaders" "/usr/local/share/bc250/shaders")
 
 if [ "$IS_PREBUILT" -eq 1 ]; then
@@ -129,20 +142,43 @@ for dest in "${SHADER_DESTS[@]}"; do
     fi
 done
 
+INSTALLED_DRIVER=0
 for d in "${DRI_DIRS[@]}"; do
+    # /usr/local/lib64/dri and /usr/local/lib/dri may not exist yet on any distro;
+    # the rest are standard system paths we only touch if already present.
+    case "$d" in
+        /usr/local/*) $SUDO mkdir -p "$d" 2>/dev/null || true ;;
+    esac
     if [ -d "$d" ]; then
-        echo -e "  -> Installing driver into $d/bc250_drv_video.so"
-        $SUDO cp -f "$DRIVER_BIN" "$d/bc250_drv_video.so" 2>/dev/null || true
+        if $SUDO cp -f "$DRIVER_BIN" "$d/bc250_drv_video.so" 2>/dev/null; then
+            echo -e "  ${GREEN}-> Installed driver into $d/bc250_drv_video.so${NC}"
+            INSTALLED_DRIVER=1
+        else
+            echo -e "  ${YELLOW}-> Skipped $d (not writable, likely a read-only ostree /usr mount)${NC}"
+        fi
     fi
 done
 
-# Configure system-wide environment for boot persistence
+if [ "$INSTALLED_DRIVER" -eq 0 ]; then
+    echo -e "\n${RED}${BOLD}Error: could not install bc250_drv_video.so into any DRI driver path.${NC}"
+    echo -e "${RED}Every candidate directory was missing or read-only (this is expected on${NC}"
+    echo -e "${RED}rpm-ostree/immutable systems like Bazzite or SteamOS).${NC}"
+    echo -e "Use the dedicated installer for your OS instead:"
+    echo -e "  ${BOLD}sudo ./tools/setup_bazzite.sh${NC}   (Bazzite / Fedora Silverblue / Kinoite)"
+    echo -e "  ${BOLD}sudo ./tools/setup_steamos.sh${NC}   (SteamOS / HoloISO)"
+    exit 1
+fi
+
+# Configure system-wide environment for boot persistence. Always include the
+# /usr/local DRI paths in LIBVA_DRIVERS_PATH: libva's compiled-in default search
+# path does NOT include /usr/local, so a driver installed only there (the only
+# path that actually succeeds on an ostree system) would otherwise never be found.
 if [ -d "/etc/environment.d" ]; then
-    printf "LIBVA_DRIVER_NAME=bc250\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
+    printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
     echo -e "  -> Configured system-wide environment in /etc/environment.d/99-bc250.conf"
 elif [ -f "/etc/environment" ]; then
     if ! grep -q "LIBVA_DRIVER_NAME=bc250" /etc/environment 2>/dev/null; then
-        printf "LIBVA_DRIVER_NAME=bc250\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
+        printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
         echo -e "  -> Configured system-wide environment in /etc/environment"
     fi
 fi
