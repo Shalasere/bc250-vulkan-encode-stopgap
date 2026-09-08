@@ -45,6 +45,17 @@ struct bc250_surface {
     gpu_image_t image;
     gpu_memory_t memory;
     int ref_count;
+    /* Set by bc250_DestroySurfaces() the moment the application asks to
+     * destroy this surface. From that point on the VASurfaceID is invalid
+     * for any further application-facing VA call (vaBeginPicture,
+     * vaDeriveImage, vaGetImage/vaPutImage, vaSyncSurface, ...), even
+     * though `allocated` may still be 1 and the underlying Vulkan
+     * image/memory may still be alive because a derived VAImage created via
+     * vaDeriveImage() is keeping ref_count above zero. This lets the
+     * driver honor normal VA-API surface-destroy semantics from the
+     * caller's point of view while still deferring the actual Vulkan
+     * teardown until the last outstanding derived image is destroyed. */
+    int pending_destroy;
 };
 
 struct bc250_config {
@@ -100,6 +111,12 @@ struct bc250_buffer {
     int mapped;
     int is_derived;
     VkDeviceMemory gpu_mem;
+    /* Only meaningful when is_derived is set: the surface whose Vulkan
+     * memory this buffer aliases (via vaDeriveImage()). Used to release
+     * the reference that buffer took on that surface when this buffer is
+     * torn down (bc250_DestroyBuffer). VA_INVALID_SURFACE when this slot
+     * does not currently back a derived image. */
+    VASurfaceID derived_surface;
 };
 
 struct bc250_image {

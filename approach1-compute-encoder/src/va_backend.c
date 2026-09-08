@@ -233,20 +233,49 @@ VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsign
     return bc250_CreateSurfaces(ctx, width, height, format, num_surfaces, surfaces);
 }
 
+/* Drop one reference on surface `id` (data->surfaces[id] must already be
+ * known valid/allocated by the caller). The surface's Vulkan image/memory
+ * are only actually freed once ref_count reaches zero - i.e. once both the
+ * original vaCreateSurfaces() reference AND every vaDeriveImage()-derived
+ * image's reference have been released. This is the single place that
+ * performs the real Vulkan teardown, shared by bc250_DestroySurfaces()
+ * (releasing the app's own reference) and bc250_DestroyBuffer()
+ * (releasing a derived image's reference on the surface it aliases). */
+static void bc250_surface_unref(bc250_driver_data *data, VASurfaceID id) {
+    bc250_surface *surf = &data->surfaces[id];
+    if (surf->ref_count > 0) {
+        surf->ref_count--;
+    }
+    if (surf->ref_count <= 0) {
+        gpu_compute_destroy_image(&data->gpu, surf->image, surf->memory);
+        surf->allocated = 0;
+        surf->pending_destroy = 0;
+    }
+}
+
 VAStatus bc250_DestroySurfaces(VADriverContextP ctx, VASurfaceID *surface_list, int num_surfaces) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !surface_list) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     for (int i = 0; i < num_surfaces; i++) {
         VASurfaceID id = surface_list[i];
-        if (VALID_ID(id, MAX_SURFACES) && data->surfaces[id].allocated) {
-            bc250_surface *surf = &data->surfaces[id];
-            surf->ref_count--;
-            if (surf->ref_count <= 0) {
-                gpu_compute_destroy_image(&data->gpu, surf->image, surf->memory);
-                surf->allocated = 0;
-            }
-        }
+        if (!VALID_ID(id, MAX_SURFACES) || !data->surfaces[id].allocated) continue;
+
+        bc250_surface *surf = &data->surfaces[id];
+        /* Idempotent: an application that (incorrectly) destroys the same
+         * surface twice must not decrement ref_count twice for a single
+         * app-held reference - only the first vaDestroySurfaces() call on
+         * a given surface releases that reference. */
+        if (surf->pending_destroy) continue;
+
+        /* From here on this VASurfaceID is invalid for the application to
+         * use in any other VA call (vaBeginPicture, vaDeriveImage,
+         * vaGetImage/vaPutImage, vaSyncSurface, ...), regardless of
+         * whether the underlying Vulkan resources are freed immediately
+         * below or kept alive a while longer for an outstanding derived
+         * image - see bc250_surface.pending_destroy in va_backend.h. */
+        surf->pending_destroy = 1;
+        bc250_surface_unref(data, id);
     }
     return VA_STATUS_SUCCESS;
 }
@@ -335,6 +364,7 @@ VAStatus bc250_CreateBuffer(VADriverContextP ctx, VAContextID context, VABufferT
             b->mapped = 0;
             b->is_derived = 0;
             b->gpu_mem = VK_NULL_HANDLE;
+            b->derived_surface = VA_INVALID_SURFACE;
 
             size_t total_alloc = (size_t)size * num_elements;
             if (type == VAEncCodedBufferType) {
@@ -397,22 +427,37 @@ VAStatus bc250_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id) {
 VAStatus bc250_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !VALID_ID(buffer_id, MAX_BUFFERS) || !data->buffers[buffer_id].allocated) return VA_STATUS_ERROR_INVALID_BUFFER;
-    if (data->buffers[buffer_id].is_derived) {
-        if (data->buffers[buffer_id].gpu_mem) {
-            vkUnmapMemory(data->gpu.device, data->buffers[buffer_id].gpu_mem);
+    bc250_buffer *b = &data->buffers[buffer_id];
+    if (b->is_derived) {
+        if (b->gpu_mem) {
+            /* Unmap while the surface's VkDeviceMemory is still guaranteed
+             * alive (it can't have been freed yet: this buffer's own
+             * reference, taken in bc250_DeriveImage(), is still held at
+             * this point and keeps the surface's ref_count above zero). */
+            vkUnmapMemory(data->gpu.device, b->gpu_mem);
         }
+        /* Release this derived image's reference on the surface it
+         * aliases. If the application already called vaDestroySurfaces()
+         * on that surface while this image was still alive, this is what
+         * finally lets the surface's Vulkan resources be freed - safely,
+         * now that nothing is mapping them anymore. */
+        if (VALID_ID(b->derived_surface, MAX_SURFACES) && data->surfaces[b->derived_surface].allocated) {
+            bc250_surface_unref(data, b->derived_surface);
+        }
+        b->derived_surface = VA_INVALID_SURFACE;
     } else {
-        free(data->buffers[buffer_id].data);
+        free(b->data);
     }
-    data->buffers[buffer_id].data = NULL;
-    data->buffers[buffer_id].allocated = 0;
+    b->data = NULL;
+    b->allocated = 0;
     return VA_STATUS_SUCCESS;
 }
 
 VAStatus bc250_BeginPicture(VADriverContextP ctx, VAContextID context, VASurfaceID render_target) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) return VA_STATUS_ERROR_INVALID_CONTEXT;
-    if (!VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated ||
+        data->surfaces[render_target].pending_destroy) return VA_STATUS_ERROR_INVALID_SURFACE;
 
     bc250_context *c = &data->contexts[context];
     c->current_render_target = render_target;
@@ -513,7 +558,8 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) return VA_STATUS_ERROR_INVALID_CONTEXT;
 
     bc250_context *c = &data->contexts[context];
-    if (!VALID_ID(c->current_render_target, MAX_SURFACES) || !data->surfaces[c->current_render_target].allocated) {
+    if (!VALID_ID(c->current_render_target, MAX_SURFACES) || !data->surfaces[c->current_render_target].allocated ||
+        data->surfaces[c->current_render_target].pending_destroy) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     bc250_surface *surf = &data->surfaces[c->current_render_target];
@@ -550,7 +596,8 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
 
 VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated) {
+    if (!data || !VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated ||
+        data->surfaces[render_target].pending_destroy) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     gpu_compute_sync(&data->gpu);
@@ -597,6 +644,11 @@ VAStatus bc250_CreateImage(VADriverContextP ctx, VAImageFormat *format, int widt
             bc250_image *img = &data->images[i];
             memset(img, 0, sizeof(*img));
             img->allocated = 1;
+            /* Not derived from any surface unless bc250_DeriveImage() below
+             * says otherwise. memset() above already zeroed this field, but
+             * 0 is a valid VASurfaceID (surface slot 0) - make the "no
+             * surface" state unambiguous instead of relying on that. */
+            img->surface_id = VA_INVALID_SURFACE;
 
             image->image_id = i;
             image->format = *format;
@@ -650,7 +702,13 @@ VAStatus bc250_DestroyImage(VADriverContextP ctx, VAImageID image) {
 
 VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated || !image) {
+    /* A surface with pending_destroy set has already been handed back to
+     * vaDestroySurfaces() by the application - it must be rejected here
+     * exactly like any other invalid surface, even if its Vulkan
+     * resources happen to still be alive internally pending an earlier
+     * derived image's teardown (see bc250_surface.pending_destroy). */
+    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
+        data->surfaces[surface].pending_destroy || !image) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
     }
     bc250_surface *surf = &data->surfaces[surface];
@@ -673,6 +731,24 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
             buf->mapped = 1;
             buf->is_derived = 1;
             buf->gpu_mem = surf->memory.memory;
+            /* This derived image now aliases the surface's own Vulkan
+             * memory directly (buf->data / buf->gpu_mem above). Take a
+             * reference on the surface so vaDestroySurfaces() cannot free
+             * that memory out from under this still-live mapping - see
+             * bc250_surface_unref() / bc250_DestroyBuffer() for the
+             * matching release. This is the fix for the use-after-free:
+             * previously ref_count was only ever set to 1 at
+             * vaCreateSurfaces() and never incremented here, so a
+             * vaDestroySurfaces() call while a derived image was still
+             * alive would free the surface's VkImage/VkDeviceMemory
+             * immediately, and a later vaDestroyImage() -> vkUnmapMemory()
+             * on that freed VkDeviceMemory handle would segfault
+             * (confirmed on-hardware: radv_UnmapMemory2 SIGSEGV via
+             * bc250_DestroyBuffer at va_backend.c, called from
+             * bc250_DestroyImage). */
+            surf->ref_count++;
+            buf->derived_surface = surface;
+            img->surface_id = surface;
         }
     }
     return VA_STATUS_SUCCESS;
@@ -681,7 +757,8 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
 VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image) {
     (void)x; (void)y; (void)width; (void)height;
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
+        data->surfaces[surface].pending_destroy) return VA_STATUS_ERROR_INVALID_SURFACE;
     if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) return VA_STATUS_ERROR_INVALID_IMAGE;
 
     bc250_surface *surf = &data->surfaces[surface];
@@ -706,7 +783,8 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
     (void)src_x; (void)src_y; (void)src_width; (void)src_height;
     (void)dest_x; (void)dest_y; (void)dest_width; (void)dest_height;
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated) return VA_STATUS_ERROR_INVALID_SURFACE;
+    if (!data || !VALID_ID(surface, MAX_SURFACES) || !data->surfaces[surface].allocated ||
+        data->surfaces[surface].pending_destroy) return VA_STATUS_ERROR_INVALID_SURFACE;
     if (!VALID_ID(image, MAX_IMAGES) || !data->images[image].allocated) return VA_STATUS_ERROR_INVALID_IMAGE;
 
     bc250_surface *surf = &data->surfaces[surface];
