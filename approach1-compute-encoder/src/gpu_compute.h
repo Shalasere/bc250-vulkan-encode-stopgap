@@ -38,6 +38,26 @@ typedef struct {
     VkDeviceSize size;
 } gpu_memory_t;
 
+/* Real, Vulkan-derived NV12 plane layout for an already-created+bound
+ * gpu_image_t/gpu_memory_t pair - i.e. exactly the addressing that
+ * gpu_compute_upload_nv12()/gpu_compute_download_nv12() already use
+ * internally (vkGetImageSubresourceLayout() for each plane's real row
+ * pitch/offset, plus the real inter-plane bind offset from
+ * vkGetImageMemoryRequirements()+alignment). Linear-tiled Vulkan images can
+ * have row padding and inter-plane alignment gaps that a naive
+ * tightly-packed width/height formula does not account for - any caller
+ * that needs to describe this image's memory layout to something outside
+ * this file (e.g. a VAImage's pitches/offsets/data_size handed to libva)
+ * must use these real values, not a naive formula, whenever that
+ * description will be used to address this same memory directly. */
+typedef struct {
+    uint32_t y_pitch;
+    uint64_t y_offset;
+    uint32_t uv_pitch;
+    uint64_t uv_offset;
+    uint64_t total_size;
+} gpu_nv12_layout_t;
+
 typedef struct bc250_gpu_context {
     VkInstance instance;
     VkPhysicalDevice physical_device;
@@ -137,6 +157,12 @@ void gpu_compute_terminate(gpu_context_t *ctx);
 /* Image allocation & transfers */
 int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int format, gpu_image_t *image, gpu_memory_t *memory);
 void gpu_compute_destroy_image(gpu_context_t *ctx, gpu_image_t image, gpu_memory_t memory);
+
+/* Queries the real layout described above for `image`/`memory` (both must
+ * already be created and bound, e.g. via gpu_compute_create_image()).
+ * Returns 0 on success, -1 if ctx/image/layout is NULL or memory is
+ * unbound. */
+int gpu_compute_get_nv12_layout(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, gpu_nv12_layout_t *layout);
 
 int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                            const uint8_t *y_plane, int y_pitch,

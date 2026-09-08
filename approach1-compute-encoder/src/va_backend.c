@@ -772,6 +772,40 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
 
     bc250_image *img = &data->images[image->image_id];
     bc250_buffer *buf = &data->buffers[img->buffer_id];
+
+    /* bc250_CreateImage() above just filled in `image`/`img->image` with a
+     * naive, tightly-packed pitches/offsets/data_size (pitches[0]=width,
+     * offsets[1]=width*height, data_size=width*height*3/2) - correct for a
+     * plain vaCreateImage() whose VAImageBufferType buffer is a private,
+     * non-aliased malloc(). But below, this derived image's buffer is about
+     * to be replaced with a *direct mapping of the surface's own real
+     * Vulkan memory* (buf->data = mapped). A consumer of this VAImage (e.g.
+     * ffmpeg's hwupload -> av_frame_copy -> av_image_copy, which does a
+     * plain memcpy straight into this buffer using exactly these
+     * pitches/offsets/data_size) will address that real memory using the
+     * naive numbers, which do not account for the real per-row pitch
+     * padding and inter-plane alignment gap that
+     * gpu_compute_create_image() actually bound Y/UV to (confirmed
+     * on-hardware: 854x480 real data_size=737280B vs naive 614880B;
+     * 1920x1080 real=3317760B vs naive=3110400B; the two happen to coincide
+     * exactly at 1280x720 because 1280 and 640*2=1280 are already multiples
+     * of this hardware's apparent 256-byte row-pitch alignment, so the
+     * mismatch is resolution-dependent, not universal). Overwrite the
+     * geometry with the real, Vulkan-derived layout (the same
+     * vkGetImageSubresourceLayout()/vkGetImageMemoryRequirements() math
+     * gpu_compute_upload_nv12()/gpu_compute_download_nv12() already use to
+     * address this same memory) before handing it back, so the caller's
+     * view of this buffer always matches the real allocation exactly. */
+    gpu_nv12_layout_t real_layout;
+    if (gpu_compute_get_nv12_layout(&data->gpu, &surf->image, surf->memory, &real_layout) == 0) {
+        image->pitches[0] = real_layout.y_pitch;
+        image->offsets[0] = (unsigned int)real_layout.y_offset;
+        image->pitches[1] = real_layout.uv_pitch;
+        image->offsets[1] = (unsigned int)real_layout.uv_offset;
+        image->data_size = (unsigned int)real_layout.total_size;
+        img->image = *image;
+    }
+
     if (buf && surf->memory.memory) {
         void *mapped = NULL;
         if (vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {

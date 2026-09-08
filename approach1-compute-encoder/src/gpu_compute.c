@@ -764,6 +764,37 @@ void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
     dump_frame_index++;
 }
 
+int gpu_compute_get_nv12_layout(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, gpu_nv12_layout_t *layout) {
+    if (!ctx || !image || !memory.memory || !layout) return -1;
+
+    /* Same math gpu_compute_upload_nv12()/gpu_compute_download_nv12() use
+     * to address this image's real memory: per-plane row pitch + offset via
+     * vkGetImageSubresourceLayout(), and the real inter-plane bind offset
+     * via vkGetImageMemoryRequirements() + alignment (must match the bind
+     * performed in gpu_compute_create_image() exactly, since that's the
+     * memory layout actually being described). */
+    VkImageSubresource subresource_y = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+    VkSubresourceLayout layout_y;
+    vkGetImageSubresourceLayout(ctx->device, image->y_plane, &subresource_y, &layout_y);
+
+    VkMemoryRequirements y_req, uv_req;
+    vkGetImageMemoryRequirements(ctx->device, image->y_plane, &y_req);
+    vkGetImageMemoryRequirements(ctx->device, image->uv_plane, &uv_req);
+    VkDeviceSize align = uv_req.alignment > y_req.alignment ? uv_req.alignment : y_req.alignment;
+    VkDeviceSize uv_bind_offset = (y_req.size + align - 1) & ~(align - 1);
+
+    VkImageSubresource subresource_uv = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+    VkSubresourceLayout layout_uv;
+    vkGetImageSubresourceLayout(ctx->device, image->uv_plane, &subresource_uv, &layout_uv);
+
+    layout->y_pitch = (uint32_t)layout_y.rowPitch;
+    layout->y_offset = (uint64_t)layout_y.offset;
+    layout->uv_pitch = (uint32_t)layout_uv.rowPitch;
+    layout->uv_offset = (uint64_t)(uv_bind_offset + layout_uv.offset);
+    layout->total_size = (uint64_t)memory.size;
+    return 0;
+}
+
 int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                            const uint8_t *y_plane, int y_pitch,
                            const uint8_t *uv_plane, int uv_pitch,
