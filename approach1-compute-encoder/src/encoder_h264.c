@@ -151,6 +151,27 @@ static void manage_dpb(h264_encoder_t *encoder, int new_frame_num, int new_poc)
 }
 
 /*
+ * apply_qp_override - test-only hook (BC250_FORCE_QP), same convention as
+ * this file's other BC250_* debug env vars (BC250_FAST_MODE,
+ * BC250_SLICES_PER_FRAME, BC250_DUMP_INPUT_FRAMES): lets a surgical
+ * round-trip test drive the encoder at an exact, deterministic QP instead of
+ * whatever the CBR/VBR rate_control.c feedback loop would pick (rate_control
+ * clamps QP drift to +-2/frame around base_qp=26 and is bitrate-driven, so
+ * hitting a specific QP like 12 or 51 through it deterministically on frame
+ * 0 isn't otherwise possible). No effect unless BC250_FORCE_QP is set; does
+ * not change any CAVLC/MVD/skip-decision logic, only which qp value those
+ * paths are handed.
+ */
+static int apply_qp_override(int qp) {
+    const char *force_qp_env = getenv("BC250_FORCE_QP");
+    if (force_qp_env) {
+        int forced = atoi(force_qp_env);
+        if (forced >= 0 && forced <= 51) return forced;
+    }
+    return qp;
+}
+
+/*
  * write_aud - Writes Access Unit Delimiter (NAL type 9)
  * Essential for Sunshine / Moonlight / WebRTC to identify frame boundaries.
  */
@@ -188,35 +209,164 @@ static int block_any_nonzero(const int *quant_levels, uint32_t mb_idx, int raste
     return 0;
 }
 
-/* H.264 Multiplication Factor Table (ITU-T Rec. H.264 8.5.9 Table 8-14),
- * position-type-0 column only (DC-Hadamard coefficients are always
- * quantized with the pos_type==0 multiplier under the simplification this
- * encoder uses - see quantize_dc()'s comment). Mirrors quantize.comp's MF[][0]. */
-static const int MF0[6] = {13107, 11916, 10082, 9362, 8192, 7282};
+/*
+ * DC_LEVEL_SCALE0 - LevelScale4x4(qP%6, 0, 0) under the default (flat) scaling
+ * list, i.e. 16 * V(qP%6, pos_type=0), where V is ITU-T H.264 Table 8-15's
+ * "norm_adjust" matrix, position-type-0 (both-indices-even) column:
+ * V(0..5,0) = {10,11,13,14,16,18} (cross-checked against x264's
+ * common/tables.c dequant4_mf[][0] initializer and ffmpeg's
+ * libavcodec/h264_ps.c / h264idct_template.c dequant tables - both reduce to
+ * this same 16*V constant for the DC position). This is the SAME table
+ * already used by this codebase's AC dequant at position 0
+ * (quantize.comp's/reconstruct.comp's V[][0]) - luma DC (8.5.10) and chroma
+ * DC (8.5.11.2) both scale by this exact value, they just apply a different
+ * qP-dependent shift/rounding around it (see quantize_dc_luma/_chroma below).
+ */
+static const int DC_LEVEL_SCALE0[6] = {160, 176, 208, 224, 256, 288};
 
 /*
- * quantize_dc - Quantize one Hadamard-transformed DC coefficient.
+ * quantize_dc_luma / quantize_dc_chroma - forward-quantize one
+ * Hadamard-transformed DC coefficient.
  *
- * DELIBERATE SIMPLIFICATION: ITU-T H.264 8.5.10 defines a QP-dependent
- * piecewise dequant/quant formula for luma/chroma DC specifically (different
- * shift behavior for qP>=36 vs qP<36), which is high-risk to get bit-exact
- * from memory. This instead reuses the SAME AC quantization formula already
- * used by quantize.comp for pos_type==0 coefficients:
- *   level = sign * ((abs(v)*MF0[qp%6] + f) >> (15 + qp/6)), f = round-offset.
- * This only affects the reconstructed coefficient's numeric SCALE (i.e.
- * brightness/contrast fidelity of the decoded DC term), not CAVLC bitstream
- * validity - entropy coding correctness depends only on encoding whatever
- * integer level results, not on that level matching the spec's exact
- * dequant scale. If bit-exact 8.5.10 behavior is needed later, only this
- * function need change.
+ * REPLACES the former "DELIBERATE SIMPLIFICATION" quantize_dc(), which
+ * reused the AC quantizer's MF0/shift-by-(15+qp/6) formula for DC too. That
+ * was confirmed wrong: real decoders (and ITU-T H.264 8.5.10/8.5.11.2)
+ * dequantize DC coefficients with a DC-specific piecewise formula built
+ * around DC_LEVEL_SCALE0 above, not the AC MF/V multiplier pairing at all.
+ * Verified against x264's actual common/quant.c:
+ *
+ *   dequant_4x4_dc() (luma I16x16 DC, 8.5.10):
+ *     qbits = qp/6 - 6
+ *     qbits >= 0 (qp >= 36): recovered = c * (LS << qbits)
+ *     qbits <  0 (qp <  36): recovered = (c * LS + (1 << (-qbits-1))) >> -qbits
+ *   dequant_2x2_dc() (chroma DC, 8.5.11.2 - a DIFFERENT function, not a
+ *   reuse of the luma one with a different rounding offset):
+ *     qbits = qp/6 - 5
+ *     qbits >= 0 (qp >= 30): recovered = c * (LS << qbits)
+ *     qbits <  0 (qp <  30): recovered = (c * LS) >> -qbits   (NO rounding
+ *                                          term added in this branch - the
+ *                                          spec text and x264 both omit it
+ *                                          here, unlike the luma DC low-QP
+ *                                          branch above)
+ *   where LS = DC_LEVEL_SCALE0[qp%6] in both cases.
+ *
+ * So chroma DC differs from luma DC in TWO ways, not one: a different
+ * qP>=30 (vs qP>=36) branch threshold, and no rounding addend on the low-QP
+ * side - not just "the same table with a different f". Both branches above
+ * are the same underlying relationship recovered ~= c * LS * 2^(qp/6 - K)
+ * (K=6 luma, K=5 chroma), just written as a left-shift-after-multiply
+ * (qp>=6K... i.e. high QP) or a multiply-then-round-right-shift (low QP) for
+ * integer-friendliness - not two structurally different formulas.
+ *
+ * These functions are near-inverses of that real dequant relationship
+ * (choose the integer level c minimizing error against
+ * recovered = c * LS * 2^(qp/6-K), i.e. c = round(v * 2^(K-qp/6) / LS)),
+ * with two encoder-side (non-normative) design choices layered on top:
+ *
+ * 1. Rounding: plain round-to-nearest (bias = denom/2) rather than this
+ *    file's AC quantizer's asymmetric intra=1/3 / inter=1/6 "dead-zone"
+ *    bias. That asymmetric bias is a rate-distortion tuning choice (bias
+ *    towards transmitting zero) which trades away worst-case reconstruction
+ *    accuracy - fine for AC energy, but directly counterproductive for DC,
+ *    where the goal (per the surgical round-trip validation this fix is
+ *    judged on) is minimizing |recovered - original|, and round-to-nearest
+ *    roughly halves the worst-case error the dead-zone bias would otherwise
+ *    leave on the table. Neither choice affects CAVLC bitstream validity,
+ *    only decoded numeric accuracy. No separate intra/inter parameter is
+ *    needed here as a result (unlike the AC path).
+ *
+ * 2. quantize_dc_luma's K is 5, NOT 6, even though dequant_dc_luma's real,
+ *    decoder-matching K is 6 - see quantize_dc_luma's own comment for why
+ *    this asymmetry is required (it compensates for this codebase's
+ *    specific luma_dc_hadamard() forward-transform gain, found empirically
+ *    via a board round-trip test after the K=6/K=6 symmetric version
+ *    clipped every reconstructed pixel to white regardless of QP).
+ *    quantize_dc_chroma has no such adjustment (K=5 both directions,
+ *    symmetric) - chroma_dc_hadamard's forward gain already matches what's
+ *    needed, verified the same way.
+ *
+ * Validated empirically via a surgical encode/ffmpeg-decode round-trip
+ * across qp in {12,24,26,30,36,40,51} (spanning both branches of both
+ * dequant functions) - see commit message.
  */
-static int quantize_dc(int v, int qp, int is_intra) {
+/*
+ * quantize_dc_luma's forward threshold is 5, NOT 6, even though
+ * dequant_dc_luma (below) correctly uses 6 to match real decoders. This is
+ * NOT a typo/copy-paste of quantize_dc_chroma - it is required, and was
+ * found empirically (see commit message for the full derivation and the
+ * board round-trip numbers that exposed it): this codebase's OWN
+ * luma_dc_hadamard()/luma_dc_hadamard_inv() pair (untouched, out of scope
+ * for this fix) is not gain-neutral the way a textbook normalized Hadamard
+ * would be. luma_dc_hadamard's forward pass includes exactly ONE
+ * normalizing ">>1" (only in its second/final stage), so a constant 4x4
+ * input of per-block-DC value X concentrates to a single Hadamard-domain
+ * value of 8*X (verified by hand-tracing the butterfly for constant input,
+ * and confirmed by the board test below) - i.e. HALF the 16*X gain a fully
+ * unnormalized 4x4 Hadamard would give, since real reference Hadamard
+ * transforms (e.g. x264's dct4x4dc()) apply NO normalization anywhere in
+ * the forward pass. luma_dc_hadamard_inv (decode-side, correctly
+ * unnormalized to match real decoders) does not undo any of that gain - it
+ * just replicates a DC-only level to all 16 positions unchanged. Meanwhile
+ * the value dequant_dc_luma() must hand to inverse_4x4() needs to be on the
+ * SAME scale a plain dequant_ac() coefficient would be for the identical
+ * raw value (since inverse_4x4/dequant_ac is the shared, already-correct
+ * AC path used verbatim by P16x16 luma, which has no DC/AC split at all) -
+ * and MF[qp_rem][0]*LevelScale4x4(qp_rem,0,0) is, by a well-known H.264
+ * design property, approximately 2^21 for every qp_rem (13107*160=2097120
+ * vs 2^21=2097152, a <0.002% design-rounding gap - confirmed by direct
+ * computation), making that AC round-trip's coefficient gain a QP-
+ * independent constant of exactly 4x the raw value. So the DC path needs
+ * dc_val = 4 * (raw per-block DC), but the composed
+ * quantize(spec-K=6)+dequant(spec-K=6) pair here would instead deliver
+ * 8 * (raw per-block DC) - a 2x-too-large value that clips reconstruction
+ * to white regardless of QP (exactly what an unfixed board round-trip
+ * test showed: every QP from 12 to 51 decoded pure white/255 for a flat
+ * non-128 macroblock). A forward-quantizer near-inverse threshold of 5
+ * (dividing by exactly double what threshold-6 would) exactly cancels that
+ * extra 2x, independent of qp_per, while dequant_dc_luma stays at the
+ * spec-correct threshold 6 that a real decoder actually applies - this
+ * asymmetry is deliberate, not an oversight. (chroma_dc_hadamard's forward
+ * gain for constant input is only 4x - already equal to the AC-path
+ * target - so quantize_dc_chroma below needs no such adjustment and stays
+ * symmetric with dequant_dc_chroma at threshold 5.) Confirmed empirically:
+ * after this fix, the same surgical round-trip decodes within a few
+ * pixels of the source value at low/mid QP - see commit message.
+ */
+static int quantize_dc_luma(int v, int qp) {
     int qp_per = qp / 6;
     int qp_rem = qp % 6;
-    int f = (1 << (15 + qp_per)) / (is_intra ? 3 : 6);
+    int64_t LS = DC_LEVEL_SCALE0[qp_rem];
     int sign = (v < 0) ? -1 : 1;
     int64_t av = (v < 0) ? -(int64_t)v : (int64_t)v;
-    int64_t level = (av * MF0[qp_rem] + f) >> (15 + qp_per);
+
+    int64_t numer_av, denom;
+    if (qp_per >= 5) {
+        numer_av = av;
+        denom = LS << (qp_per - 5);
+    } else {
+        numer_av = av << (5 - qp_per);
+        denom = LS;
+    }
+    int64_t level = (numer_av + denom / 2) / denom;
+    return (int)(sign * level);
+}
+
+static int quantize_dc_chroma(int v, int qp) {
+    int qp_per = qp / 6;
+    int qp_rem = qp % 6;
+    int64_t LS = DC_LEVEL_SCALE0[qp_rem];
+    int sign = (v < 0) ? -1 : 1;
+    int64_t av = (v < 0) ? -(int64_t)v : (int64_t)v;
+
+    int64_t numer_av, denom;
+    if (qp_per >= 5) {
+        numer_av = av;
+        denom = LS << (qp_per - 5);
+    } else {
+        numer_av = av << (5 - qp_per);
+        denom = LS;
+    }
+    int64_t level = (numer_av + denom / 2) / denom;
     return (int)(sign * level);
 }
 
@@ -437,7 +587,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
     int dc_out_raw[16];
     luma_dc_hadamard(dc_in, dc_out_raw);
     int dc_out[16];
-    for (int i = 0; i < 16; i++) dc_out[i] = quantize_dc(dc_out_raw[i], qp, 1 /* intra */);
+    for (int i = 0; i < 16; i++) dc_out[i] = quantize_dc_luma(dc_out_raw[i], qp);
 
     /* cbp_luma: any nonzero AC (raster positions 1..15) across all 16 luma blocks. */
     int cbp_luma_flag = 0;
@@ -452,7 +602,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
     int cb_dc[4], cr_dc[4];
     chroma_dc_hadamard(cb_dc_raw, cb_dc);
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
-    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc(cb_dc[i], qp, 1); cr_dc[i] = quantize_dc(cr_dc[i], qp, 1); }
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
 
     int chroma_dc_nonzero = 0;
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
@@ -568,7 +718,7 @@ static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int
     int cb_dc[4], cr_dc[4];
     chroma_dc_hadamard(cb_dc_raw, cb_dc);
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
-    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc(cb_dc[i], qp, 0); cr_dc[i] = quantize_dc(cr_dc[i], qp, 0); }
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
 
     int chroma_dc_nonzero = 0;
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
@@ -725,6 +875,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     int qp = rc_get_frame_qp(&encoder->rc, 0);
     if (qp < 12) qp = 12;
     if (qp > 51) qp = 51;
+    qp = apply_qp_override(qp);
 
     size_t total_written = 0;
 
@@ -1004,6 +1155,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     int qp = rc_get_frame_qp(&encoder->rc, 0);
     if (qp < 12) qp = 12;
     if (qp > 51) qp = 51;
+    qp = apply_qp_override(qp);
 
     size_t total_written = 0;
 
