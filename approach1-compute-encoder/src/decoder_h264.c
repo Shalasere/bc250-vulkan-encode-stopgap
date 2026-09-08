@@ -62,7 +62,7 @@ int h264_decoder_decode_frame(h264_decoder_t *decoder,
 
     /* Execute decoding shaders (inverse quant, inverse transform, deblock) */
     gpu_compute_begin_picture(decoder->gpu, output_surface);
-    gpu_compute_dispatch_encode(decoder->gpu, output_surface, decoder->width, decoder->height);
+    gpu_compute_dispatch_encode(decoder->gpu, output_surface, decoder->width, decoder->height, 26, 0);
     gpu_compute_end_picture(decoder->gpu);
     gpu_compute_sync(decoder->gpu);
 
