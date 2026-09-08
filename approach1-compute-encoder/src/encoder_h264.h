@@ -96,6 +96,32 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
  */
 void h264_encoder_destroy(h264_encoder_t *encoder);
 
+/**
+ * h264_intra16_luma_dc_transform - forward Hadamard transform, quantize, and
+ * transpose the 16 luma DC coefficients of an Intra16x16 macroblock into the
+ * row/column layout cavlc_write_4x4_block() (and a real decoder) expect.
+ *
+ * This is the exact pure-math DC path used by the encoder's Intra16x16
+ * macroblock encoding (see encoder_h264.c's encode_mb_i16x16, its only
+ * production caller). It is exposed here (rather than kept static) purely
+ * so it can be unit-tested in isolation without a GPU/Vulkan context - see
+ * tests/test_encode.c's test_intra16_dc_transpose() regression test for the
+ * transpose bug fixed in commit d95b840.
+ *
+ * @param dc_in                16 pre-quant luma DC values (one per luma 4x4
+ *                             sub-block of the macroblock), raster
+ *                             (row*4+col) order.
+ * @param qp                   Quantization parameter for this macroblock.
+ * @param dc_out               Output: quantized DC array in the natural
+ *                             row/column order CAVLC/a real decoder expect.
+ * @param dc_out_pretranspose  Optional (may be NULL): if non-NULL, filled
+ *                             with the quantized array BEFORE the transpose
+ *                             fix is applied. For regression testing only -
+ *                             no production caller needs this.
+ */
+void h264_intra16_luma_dc_transform(const int dc_in[4][4], int qp,
+                                     int dc_out[16], int dc_out_pretranspose[16]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -309,6 +309,67 @@ static void test_slice_trailing(void) {
     printf("      ✓ RBSP trailing bits byte alignment verified.\n");
 }
 
+/*
+ * Regression test for the cavlc_write_run_befores() iteration-order bug
+ * fixed in commit 8feddef ("fix(cavlc): correct run_before coding order
+ * (ITU-T 9.2.3) - major luma+chroma fix"). That bug wrote run_before values
+ * in LOW-to-HIGH frequency order instead of the spec-required HIGH-to-LOW
+ * order, and was invisible for total_coeff<=2 (only one run_before value
+ * exists, so "order" is moot) - every pre-existing test above has 3 or
+ * fewer nonzero coefficients per block and total_coeff<=2, which is exactly
+ * why none of them caught it. This test uses total_coeff=3 (the minimum
+ * that has 2 distinct run_before values, i.e. the minimum where order is
+ * observable at all) with deliberately UNEQUAL zero-run gaps between the 3
+ * coefficients, so that swapping the write order changes the actual
+ * bitstream bits, not just their sequence.
+ *
+ * Layout (scan-position indices, 0=DC, 15=highest AC frequency, matching
+ * cavlc_scan_coeffs' "highest frequency discovered first" convention):
+ *   scan position 12 = 5   (rank 0, highest frequency of the 3)
+ *   scan position  6 = -3  (rank 1)
+ *   scan position  2 = 2   (rank 2, lowest frequency of the 3)
+ * giving 5 zeros between rank0/rank1 and 3 zeros between rank1/rank2 (the 2
+ * zeros before scan position 2 fold into total_zeros directly, per
+ * cavlc_scan_coeffs' own doc comment, and are never a run_before value).
+ * All three magnitudes are >1 so none becomes a trailing-one (keeps the
+ * levels path simple/unambiguous). Raster-order positions are derived from
+ * zigzag_4x4[] so the desired SCAN positions land where intended once
+ * cavlc_write_4x4_block applies its own internal zigzag.
+ *
+ * Expected bytes below were captured from this exact input against the
+ * fixed code (hand-verified bit-by-bit against ITU-T Table 9-5/9-7/9-10 -
+ * see the derivation in this commit's message) and independently confirmed
+ * to require the fix: reverting only cavlc_write_run_befores' loop to the
+ * pre-8feddef iteration order changes byte[3] from 0x24 to 0x28 (this was
+ * verified locally before adding this test).
+ */
+static void test_run_before_order(void) {
+    printf("  [9] Regression: run_before HIGH-to-LOW frequency order (commit 8feddef)...\n");
+    static const int zigzag_4x4[16] = {
+         0,  1,  4,  8,
+         5,  2,  3,  6,
+         9, 12, 13, 10,
+         7, 11, 14, 15
+    };
+    int coeffs[16] = {0};
+    coeffs[zigzag_4x4[12]] = 5;   /* rank 0: highest freq of the 3 */
+    coeffs[zigzag_4x4[6]]  = -3;  /* rank 1 */
+    coeffs[zigzag_4x4[2]]  = 2;   /* rank 2: lowest freq of the 3 */
+
+    uint8_t buf[64];
+    bitstream_t bs;
+    bs_init(&bs, buf, sizeof(buf));
+    int tc = cavlc_write_4x4_block(&bs, coeffs, 0 /* nC < 2 */);
+    bs_flush(&bs);
+
+    assert(tc == 3);
+    assert(bs_bytes_written(&bs) == 5);
+    static const uint8_t expected[5] = { 0x03, 0x81, 0x5C, 0x24, 0x80 };
+    assert(memcmp(buf, expected, sizeof(expected)) == 0);
+
+    printf("      \xe2\x9c\x93 run_before high-to-low frequency order verified bit-exact.\n");
+}
+
 int main(void) {
     printf("=== Running BC-250 H.264 CAVLC Unit Test Suite ===\n");
     test_zero_blocks();
@@ -319,6 +380,7 @@ int main(void) {
     test_slice_trailing();
     test_ac_block();
     test_large_level_escalation();
+    test_run_before_order();
     printf("=== ALL CAVLC CONFORMANCE UNIT TESTS PASSED! ===\n");
     return 0;
 }
