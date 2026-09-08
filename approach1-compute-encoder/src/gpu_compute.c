@@ -1266,6 +1266,7 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     int perf_buf = ctx->current_buf;
     if (ctx->perf_stats_enabled) {
         ctx->perf_is_intra[perf_buf] = is_intra ? true : false;
+        ctx->perf_result_pending[perf_buf] = true;
         vkCmdResetQueryPool(cmd_buf, ctx->timestamp_pools[perf_buf], 0, BC250_PERF_NUM_TIMESTAMPS);
         vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 0);
     }
@@ -1592,7 +1593,8 @@ int gpu_compute_sync(gpu_context_t *ctx) {
      * most recently recorded into buffer `prev_buf`) has completed on the
      * GPU, so every vkCmdWriteTimestamp in it is guaranteed available -
      * VK_QUERY_RESULT_WAIT_BIT is added only as defense-in-depth. */
-    if (ctx->perf_stats_enabled && ctx->timestamp_pools[prev_buf]) {
+    if (ctx->perf_stats_enabled && ctx->timestamp_pools[prev_buf] && ctx->perf_result_pending[prev_buf]) {
+        ctx->perf_result_pending[prev_buf] = false;
         uint64_t ts[BC250_PERF_NUM_TIMESTAMPS];
         VkResult qres = vkGetQueryPoolResults(ctx->device, ctx->timestamp_pools[prev_buf], 0, BC250_PERF_NUM_TIMESTAMPS,
                                                sizeof(ts), ts, sizeof(uint64_t),

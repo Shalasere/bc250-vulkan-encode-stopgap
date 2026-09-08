@@ -230,10 +230,10 @@ for RES in $RESOLUTIONS; do
     # of the driver's own stderr lines (no re-encoding, no re-running).
     # ------------------------------------------------------------------
     if [ "$BC250_PERF_STATS_MODE" = "1" ]; then
-        GPU_LINES=$(grep -c '^\[BC250_PERF_GPU\]' "$LOG" || true)
+        GPU_LINES=$(grep -c '\[BC250_PERF_GPU\]' "$LOG" || true)
         if [ "$GPU_LINES" -gt 0 ]; then
             echo -e "\n  ${BOLD}Per-stage GPU time (mean ms/frame, ${GPU_LINES} frames captured):${NC}"
-            grep '^\[BC250_PERF_GPU\]' "$LOG" | \
+            grep '\[BC250_PERF_GPU\]' "$LOG" | \
                 sed -E 's/.*type=([IP]) /type=\1 /' | \
                 awk '
                 {
@@ -241,8 +241,9 @@ for RES in $RESOLUTIONS; do
                     for (i=1;i<=NF;i++) {
                         split($i,kv,"=")
                         if (kv[1]=="type") ftype=kv[2]
-                        else if (kv[1] ~ /_ms$/) { sum[kv[1]]+=kv[2]; sum_by_type[kv[1] SUBSEP ftype]+=kv[2]; cnt_by_type[ftype]++ }
+                        else if (kv[1] ~ /_ms$/) { sum[kv[1]]+=kv[2]; sum_by_type[kv[1] SUBSEP ftype]+=kv[2] }
                     }
+                    cnt_by_type[ftype]++
                     n++
                 }
                 END {
@@ -269,10 +270,10 @@ for RES in $RESOLUTIONS; do
             echo -e "  ${YELLOW}! No [BC250_PERF_GPU] lines found in log - BC250_PERF_STATS instrumentation did not fire${NC}"
         fi
 
-        FRAME_LINES=$(grep -c '^\[BC250_PERF_FRAME\]' "$LOG" || true)
+        FRAME_LINES=$(grep -c '\[BC250_PERF_FRAME\]' "$LOG" || true)
         if [ "$FRAME_LINES" -gt 0 ]; then
             echo -e "\n  ${BOLD}Per-frame wall-time variance (encoder_h264.c's own clock, ${FRAME_LINES} frames):${NC}"
-            grep '^\[BC250_PERF_FRAME\]' "$LOG" | grep -oP 'wall_ms=\K[0-9.]+' > "$WORK_DIR/wall_ms_${TAG}.txt"
+            grep '\[BC250_PERF_FRAME\]' "$LOG" | grep -oP 'wall_ms=\K[0-9.]+' > "$WORK_DIR/wall_ms_${TAG}.txt"
             awk '
                 { sum+=$1; n++; if(NR==1||$1<min)min=$1; if(NR==1||$1>max)max=$1; v[n]=$1 }
                 END {
@@ -284,7 +285,7 @@ for RES in $RESOLUTIONS; do
                 }' "$WORK_DIR/wall_ms_${TAG}.txt"
 
             echo -e "    -- I-frame vs P-frame wall_ms --"
-            grep '^\[BC250_PERF_FRAME\]' "$LOG" | awk '
+            grep '\[BC250_PERF_FRAME\]' "$LOG" | awk '
                 {
                     ftype=""; wall=0
                     for (i=1;i<=NF;i++) {
@@ -301,10 +302,10 @@ for RES in $RESOLUTIONS; do
                 }'
         fi
 
-        CPU_LINES=$(grep -c '^\[BC250_PERF_CPU\]' "$LOG" || true)
+        CPU_LINES=$(grep -c '\[BC250_PERF_CPU\]' "$LOG" || true)
         if [ "$CPU_LINES" -gt 0 ]; then
             echo -e "\n  ${BOLD}CPU-side CAVLC+bitstream time (${CPU_LINES} frames):${NC}"
-            grep '^\[BC250_PERF_CPU\]' "$LOG" | grep -oP 'cavlc_ms=\K[0-9.]+' | awk '
+            grep '\[BC250_PERF_CPU\]' "$LOG" | grep -oP 'cavlc_ms=\K[0-9.]+' | awk '
                 { sum+=$1; n++ } END { if(n>0) printf "    mean=%.3f ms/frame\n", sum/n }'
         fi
     fi

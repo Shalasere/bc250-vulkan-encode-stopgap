@@ -222,6 +222,15 @@ typedef struct bc250_gpu_context {
     double timestamp_period_ns;
     bool perf_is_intra[2];
     uint32_t perf_frame_counter;
+    /* gpu_compute_sync() is called from more than one place per real frame
+     * (h264_encoder_encode_frame()'s own EndPicture-driven encode, AND
+     * va_backend.c's bc250_SyncSurface()) - both calls are cheap/correct
+     * (the second just re-waits on an already-signaled fence), but without
+     * this flag the perf-stats printer would read+print the same buffer's
+     * still-valid query results again on every redundant call. Set true
+     * right after gpu_compute_dispatch_encode() resets+writes this buffer's
+     * queries; cleared after the first successful readback. */
+    bool perf_result_pending[2];
 } bc250_gpu_context_t;
 
 typedef bc250_gpu_context_t gpu_context_t;
