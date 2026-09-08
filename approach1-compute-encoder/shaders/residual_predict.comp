@@ -1,0 +1,356 @@
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+#version 450
+layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
+
+/*
+ * residual_predict.comp - real intra/inter prediction + residual generation.
+ *
+ * Replaces the constant-128 stopgap that used to live in
+ * motion_estimation.comp (see that shader's remaining comments / git history
+ * for the prior state). This is the first stage in the pipeline that
+ * actually predicts pixels instead of transmitting raw source amplitude as
+ * "residual":
+ *
+ *  - I-slices (pcs.is_intra==1): real H.264 8.3.3 Intra_16x16 prediction
+ *    (DC/Vertical/Horizontal/Plane), mode chosen per-MB by whichever
+ *    candidate has the lowest SAD against the real source pixels - the same
+ *    "no rate-distortion, SAD-only" mode decision a real encoder's fast path
+ *    uses. This ALSO resolves what would otherwise be a circular dependency:
+ *    mode selection used to run on the CPU AFTER DCT/quantize, derived from a
+ *    nonzero-coefficient-count heuristic - impossible once the residual
+ *    itself depends on knowing the mode first. Mode decision now happens
+ *    here, before DCT, from real pixel-domain SAD, and is published to
+ *    PredModeOut for the CPU-side CAVLC header writer to read back verbatim
+ *    instead of re-deriving it (see encoder_h264.c's gpu_pred_mode_i16()).
+ *    Chroma always uses DC-only prediction (H264_CHROMA_DC) regardless of
+ *    slice type - real directional chroma modes are not implemented, and for
+ *    P-slices this chroma DC is spatial (from the current frame's own
+ *    neighbor chroma pixels), NOT motion-compensated - see the second
+ *    simplification note below.
+ *
+ *  - P-slices (pcs.is_intra==0): real motion-compensated LUMA residual using
+ *    the ACTUAL per-MB integer-pel motion vector this pipeline already
+ *    computes in motion_estimation.comp (mv_buffer) - previously computed
+ *    but never consumed for residual, wastefully duplicated by a separate,
+ *    much cruder CPU-side heuristic (encoder_h264.c's old
+ *    choose_mv_heuristic). No sub-pel interpolation is done (matching this
+ *    encoder's motion search, which is integer-pel only) - the MV is used as
+ *    a direct nearest-neighbor pixel offset into referenceImage.
+ *
+ * DELIBERATE SIMPLIFICATION (neighbor pixel source): a real H.264 decoder
+ * reconstructs macroblocks in strict raster order within a slice, so intra
+ * prediction reads already-RECONSTRUCTED (post-residual) neighbor pixels.
+ * This pipeline has no reconstruction stage at all (no dequant+IDCT+add-back
+ * anywhere, on GPU or CPU - "recon_image" is just a copy of source pixels,
+ * see gpu_compute.c) and dispatches every MB of the frame in parallel, so
+ * there is no notion of "already decoded" neighbor pixels to read even if a
+ * reconstruction path existed. This shader instead reads the CURRENT
+ * (source) frame's neighbor MB pixels directly from currentImage/currentUV -
+ * not bit-exact with what a real decoder reconstructs (whose neighbors carry
+ * quantization error this encoder's neighbor pixels don't), but it is a
+ * correctly-formed, fully parallel, real per-MB prediction that captures
+ * actual picture structure - a large accuracy improvement over the constant
+ * predictor it replaces, in the same spirit as this codebase's other
+ * documented simplifications (see quantize_dc()'s comment in
+ * encoder_h264.c).
+ *
+ * DELIBERATE SIMPLIFICATION (chroma motion compensation): P-slice chroma
+ * residual here is spatial DC prediction (same as I-slices), not real
+ * motion compensation - doing that would need a second reference image
+ * binding for the previous frame's CHROMA plane (recon_image's UV plane is
+ * allocated but never populated - see gpu_compute.c) plus chroma MV
+ * derivation (chroma MVs are luma MV/2 in this integer-pel-only encoder).
+ * Deferred as a separate, smaller follow-up; this still fully resolves the
+ * "chroma is always flat gray" gap for both I- and P-slices.
+ *
+ * SLICE BOUNDARIES: this project's own installed environment defaults to
+ * BC250_SLICES_PER_FRAME=4 (see encoder_h264.c), so multi-slice is the
+ * common case, not an edge case - and the CPU already had to fix exactly
+ * this failure mode once before (see git history: ffmpeg rejects
+ * Intra_16x16_Vertical/Horizontal/Plane with "left/top block unavailable
+ * for requested intra mode" when the encoder picks one of those modes
+ * using a neighbor MB that belongs to a different slice, even though that
+ * neighbor is otherwise a normal in-picture MB). The GPU dispatches the
+ * whole frame in one pass with no notion of "the current slice" built in,
+ * so this shader is given pcs.num_slices and independently recomputes
+ * which slice a macroblock belongs to (slice_of() below), replicating the
+ * CPU's `start_mb = s*total_mbs/num_slices` partitioning exactly (a
+ * standard floor-partition identity: the slice containing MB m is
+ * floor(m*num_slices/total_mbs), the inverse of the CPU's boundary
+ * formula). top_avail/left_avail require BOTH frame-boundary and
+ * same-slice membership. The diagonal top-left neighbor used only to fill
+ * in the Plane predictor's p[-1,-1] corner sample is NOT separately
+ * slice-gated (it can only ever be read once top_avail && left_avail are
+ * both true, i.e. Plane is already legally selectable per spec - getting
+ * the corner sample itself from the wrong slice at worst makes Plane's
+ * SAD estimate marginally less accurate, it can never make Plane, Vertical
+ * or Horizontal illegally selectable).
+ */
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;   // Y, current (source) frame
+layout(set = 0, binding = 1, rg8) uniform readonly image2D currentUV;    // Cb/Cr, current (source) frame, NV12 half-res
+layout(set = 0, binding = 2, r8) uniform readonly image2D referenceImage; // Y, previous frame (for P MC)
+
+struct MotionVector {
+    ivec2 mv;
+    uint sad;
+};
+layout(std430, set = 0, binding = 3) readonly buffer MVs {
+    MotionVector mvs[];
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer OutputResidual {
+    int res[];
+};
+
+layout(std430, set = 0, binding = 5) writeonly buffer PredModeOut {
+    uint pred_modes[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint width_in_mbs;
+    uint height_in_mbs;
+    uint qp;
+    uint is_intra;
+    uint color_space;
+    uint lambda_motion;
+    uint num_slices;
+} pcs;
+
+/* Which slice MB `mb` belongs to, replicating the CPU's
+ * start_mb(s) = floor(s*total_mbs/num_slices) partitioning - see the
+ * SLICE BOUNDARIES note above. */
+uint slice_of(uint mb) {
+    uint total_mbs = pcs.width_in_mbs * pcs.height_in_mbs;
+    return (mb * pcs.num_slices) / total_mbs;
+}
+
+/* Intra 16x16 prediction modes - MUST match cavlc.h's H264_I16x16_* values,
+ * since pred_modes[] is read directly as the CAVLC header's pred_mode. */
+const uint MODE_VERT  = 0u;
+const uint MODE_HORIZ = 1u;
+const uint MODE_DC    = 2u;
+const uint MODE_PLANE = 3u;
+
+shared int current_mb[16][16];
+shared int top_row[16];
+shared int left_col[16];
+shared int corner;
+shared bool top_avail, left_avail;
+
+shared int dc_value;
+shared int plane_a, plane_b, plane_c;
+shared uint sad_dc, sad_v, sad_h, sad_plane;
+shared uint chosen_mode;
+
+shared ivec2 top_uv[8];
+shared ivec2 left_uv[8];
+shared int cb_dc[4], cr_dc[4];
+
+int clip1(int v) { return clamp(v, 0, 255); }
+
+void main() {
+    uint mb_x = gl_WorkGroupID.x;
+    uint mb_y = gl_WorkGroupID.y;
+    if (mb_x >= pcs.width_in_mbs || mb_y >= pcs.height_in_mbs) return;
+
+    uint mb_idx = mb_y * pcs.width_in_mbs + mb_x;
+    uint local_id = gl_LocalInvocationIndex;
+    ivec2 mb_pos = ivec2(mb_x * 16, mb_y * 16);
+    ivec2 frame_max = ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1);
+
+    uint px = local_id % 16u;
+    uint py = local_id / 16u;
+    ivec2 coord = clamp(mb_pos + ivec2(px, py), ivec2(0), frame_max);
+    current_mb[py][px] = int(round(imageLoad(currentImage, coord).r * 255.0));
+
+    uint my_slice = slice_of(mb_idx);
+    bool top_exists = mb_y > 0u;
+    bool left_exists = mb_x > 0u;
+
+    if (local_id == 0u) {
+        /* Same-slice check, not just frame-boundary - see the SLICE
+         * BOUNDARIES note above. */
+        top_avail = top_exists && (slice_of(mb_idx - pcs.width_in_mbs) == my_slice);
+        left_avail = left_exists && (slice_of(mb_idx - 1u) == my_slice);
+    }
+
+    /* Top/left/corner neighbor samples come from the CURRENT frame - see the
+     * "neighbor pixel source" simplification note above. */
+    if (local_id < 16u) {
+        ivec2 tc = clamp(mb_pos + ivec2(local_id, -1), ivec2(0), frame_max);
+        top_row[local_id] = top_exists ? int(round(imageLoad(currentImage, tc).r * 255.0)) : 128;
+        ivec2 lc = clamp(mb_pos + ivec2(-1, local_id), ivec2(0), frame_max);
+        left_col[local_id] = left_exists ? int(round(imageLoad(currentImage, lc).r * 255.0)) : 128;
+    }
+    if (local_id == 0u) {
+        ivec2 cc = clamp(mb_pos + ivec2(-1, -1), ivec2(0), frame_max);
+        corner = (left_exists && top_exists) ? int(round(imageLoad(currentImage, cc).r * 255.0)) : 128;
+    }
+
+    barrier();
+
+    if (pcs.is_intra == 1u) {
+        /* --- Candidate predictor construction (thread 0 only - cheap, 16
+         * samples per candidate at most) --- */
+        if (local_id == 0u) {
+            int sum_top = 0, sum_left = 0;
+            for (int i = 0; i < 16; i++) { sum_top += top_row[i]; sum_left += left_col[i]; }
+
+            if (top_avail && left_avail) dc_value = (sum_top + sum_left + 16) >> 5;
+            else if (top_avail) dc_value = (sum_top + 8) >> 4;
+            else if (left_avail) dc_value = (sum_left + 8) >> 4;
+            else dc_value = 128;
+
+            if (top_avail && left_avail) {
+                /* ITU-T H.264 8.3.3.4 Intra_16x16_Plane. */
+                /* p[6-x',-1] runs off the left edge of top_row (index -1) at
+                 * x'==7 and must read the corner sample there instead - same
+                 * for p[-1,6-y'] into left_col at y'==7. */
+                int H = 0, V = 0;
+                for (int xp = 0; xp < 8; xp++) {
+                    int left_sample = (6 - xp >= 0) ? top_row[6 - xp] : corner;
+                    H += (xp + 1) * (top_row[8 + xp] - left_sample);
+                }
+                for (int yp = 0; yp < 8; yp++) {
+                    int above_sample = (6 - yp >= 0) ? left_col[6 - yp] : corner;
+                    V += (yp + 1) * (left_col[8 + yp] - above_sample);
+                }
+                plane_a = 16 * (left_col[15] + top_row[15]);
+                plane_b = (5 * H + 32) >> 6;
+                plane_c = (5 * V + 32) >> 6;
+            }
+
+            sad_dc = 0u; sad_v = 0u; sad_h = 0u; sad_plane = 0u;
+        }
+        barrier();
+
+        int src = current_mb[py][px];
+        atomicAdd(sad_dc, uint(abs(src - dc_value)));
+        if (top_avail) atomicAdd(sad_v, uint(abs(src - top_row[px])));
+        if (left_avail) atomicAdd(sad_h, uint(abs(src - left_col[py])));
+        if (top_avail && left_avail) {
+            int pv = clip1((plane_a + plane_b * (int(px) - 7) + plane_c * (int(py) - 7) + 16) >> 5);
+            atomicAdd(sad_plane, uint(abs(src - pv)));
+        }
+        barrier();
+
+        if (local_id == 0u) {
+            uint best = sad_dc;
+            uint mode = MODE_DC;
+            if (top_avail && sad_v < best) { best = sad_v; mode = MODE_VERT; }
+            if (left_avail && sad_h < best) { best = sad_h; mode = MODE_HORIZ; }
+            if (top_avail && left_avail && sad_plane < best) { best = sad_plane; mode = MODE_PLANE; }
+            chosen_mode = mode;
+            pred_modes[mb_idx] = mode;
+        }
+        barrier();
+
+        int pred_val;
+        if (chosen_mode == MODE_VERT) pred_val = top_row[px];
+        else if (chosen_mode == MODE_HORIZ) pred_val = left_col[py];
+        else if (chosen_mode == MODE_PLANE)
+            pred_val = clip1((plane_a + plane_b * (int(px) - 7) + plane_c * (int(py) - 7) + 16) >> 5);
+        else
+            pred_val = dc_value;
+
+        int residual = src - pred_val;
+
+        uint bx = px / 4u, by = py / 4u;
+        uint block = by * 4u + bx;
+        uint pos_in_block = (py % 4u) * 4u + (px % 4u);
+        uint global_block_idx = mb_idx * 24u + block;
+        res[global_block_idx * 16u + pos_in_block] = residual;
+    } else {
+        /* P16x16: real motion-compensated luma residual using this MB's
+         * actual searched motion vector (integer-pel, no sub-pel filter). */
+        if (local_id == 0u) pred_modes[mb_idx] = MODE_DC; /* unused by the CPU P-path; keep the buffer defined */
+
+        ivec2 mv = mvs[mb_idx].mv;
+        ivec2 ref_coord = clamp(mb_pos + ivec2(px, py) + mv, ivec2(0), frame_max);
+        int ref_val = int(round(imageLoad(referenceImage, ref_coord).r * 255.0));
+        int residual = current_mb[py][px] - ref_val;
+
+        uint bx = px / 4u, by = py / 4u;
+        uint block = by * 4u + bx;
+        uint pos_in_block = (py % 4u) * 4u + (px % 4u);
+        uint global_block_idx = mb_idx * 24u + block;
+        res[global_block_idx * 16u + pos_in_block] = residual;
+    }
+
+    /* --- Chroma: DC-only prediction, current-frame spatial neighbors,
+     * regardless of slice type (see the chroma-MC simplification note
+     * above). 128 threads needed (4 blocks * 2 planes * 16 positions); this
+     * workgroup has 256, so gate on local_id < 128. --- */
+    ivec2 mb_pos_uv = mb_pos / 2;
+    ivec2 uv_max = ivec2(int(pcs.frame_width) / 2 - 1, int(pcs.frame_height) / 2 - 1);
+
+    if (local_id < 8u) {
+        ivec2 tc = clamp(mb_pos_uv + ivec2(local_id, -1), ivec2(0), uv_max);
+        vec2 tv = top_avail ? imageLoad(currentUV, tc).rg : vec2(128.0 / 255.0);
+        top_uv[local_id] = ivec2(round(tv * 255.0));
+
+        ivec2 lc = clamp(mb_pos_uv + ivec2(-1, local_id), ivec2(0), uv_max);
+        vec2 lv = left_avail ? imageLoad(currentUV, lc).rg : vec2(128.0 / 255.0);
+        left_uv[local_id] = ivec2(round(lv * 255.0));
+    }
+    barrier();
+
+    if (local_id == 0u) {
+        /* Per ITU-T H.264 8.3.4.1: block (xO,yO) in {(0,0),(4,0),(0,4),(4,4)}
+         * of each 8x8 chroma plane, sub-block index blk = (yO/4)*2+(xO/4). */
+        for (int plane = 0; plane < 2; plane++) {
+            int sum_top4[2], sum_left4[2]; /* [0]=first 4 samples, [1]=last 4 */
+            sum_top4[0] = top_uv[0][plane] + top_uv[1][plane] + top_uv[2][plane] + top_uv[3][plane];
+            sum_top4[1] = top_uv[4][plane] + top_uv[5][plane] + top_uv[6][plane] + top_uv[7][plane];
+            sum_left4[0] = left_uv[0][plane] + left_uv[1][plane] + left_uv[2][plane] + left_uv[3][plane];
+            sum_left4[1] = left_uv[4][plane] + left_uv[5][plane] + left_uv[6][plane] + left_uv[7][plane];
+
+            int dc_tl, dc_tr, dc_bl, dc_br;
+            /* TL (0,0): prefer both, else either, else 128 */
+            if (top_avail && left_avail) dc_tl = (sum_top4[0] + sum_left4[0] + 4) >> 3;
+            else if (top_avail) dc_tl = (sum_top4[0] + 2) >> 2;
+            else if (left_avail) dc_tl = (sum_left4[0] + 2) >> 2;
+            else dc_tl = 128;
+
+            /* TR (4,0): prefer top[4..7], else left[0..3], else 128 */
+            if (top_avail) dc_tr = (sum_top4[1] + 2) >> 2;
+            else if (left_avail) dc_tr = (sum_left4[0] + 2) >> 2;
+            else dc_tr = 128;
+
+            /* BL (0,4): prefer left[4..7], else top[0..3], else 128 */
+            if (left_avail) dc_bl = (sum_left4[1] + 2) >> 2;
+            else if (top_avail) dc_bl = (sum_top4[0] + 2) >> 2;
+            else dc_bl = 128;
+
+            /* BR (4,4): prefer both, else either, else 128 */
+            if (top_avail && left_avail) dc_br = (sum_top4[1] + sum_left4[1] + 4) >> 3;
+            else if (top_avail) dc_br = (sum_top4[1] + 2) >> 2;
+            else if (left_avail) dc_br = (sum_left4[1] + 2) >> 2;
+            else dc_br = 128;
+
+            if (plane == 0) { cb_dc[0] = dc_tl; cb_dc[1] = dc_tr; cb_dc[2] = dc_bl; cb_dc[3] = dc_br; }
+            else            { cr_dc[0] = dc_tl; cr_dc[1] = dc_tr; cr_dc[2] = dc_bl; cr_dc[3] = dc_br; }
+        }
+    }
+    barrier();
+
+    if (local_id < 128u) {
+        uint idx = local_id;               // 0..127
+        uint block = 16u + idx / 16u;      // 16..23
+        uint pos_in_block = idx % 16u;     // 0..15
+        uint sub = (block - 16u) % 4u;     // 0=TL,1=TR,2=BL,3=BR
+        bool is_cr = block >= 20u;
+
+        uint xO = (sub % 2u) * 4u, yO = (sub / 2u) * 4u;
+        uint px_off = xO + (pos_in_block % 4u), py_off = yO + (pos_in_block / 4u);
+        ivec2 uv_coord = clamp(mb_pos_uv + ivec2(px_off, py_off), ivec2(0), uv_max);
+        vec2 uv = imageLoad(currentUV, uv_coord).rg;
+        int src_val = int(round((is_cr ? uv.g : uv.r) * 255.0));
+        int dc_val = is_cr ? cr_dc[sub] : cb_dc[sub];
+
+        res[(mb_idx * 24u + block) * 16u + pos_in_block] = src_val - dc_val;
+    }
+}

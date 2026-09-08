@@ -42,6 +42,7 @@ typedef struct bc250_gpu_context {
     
     /* Descriptor set layouts */
     VkDescriptorSetLayout me_desc_layout;
+    VkDescriptorSetLayout predict_desc_layout;
     VkDescriptorSetLayout dct_desc_layout;
     VkDescriptorSetLayout quant_desc_layout;
     VkDescriptorSetLayout deblock_desc_layout;
@@ -50,6 +51,7 @@ typedef struct bc250_gpu_context {
 
     /* Pipeline layouts */
     VkPipelineLayout motion_est_layout;
+    VkPipelineLayout predict_layout;
     VkPipelineLayout transform_layout;
     VkPipelineLayout quantize_layout;
     VkPipelineLayout deblock_layout;
@@ -58,14 +60,16 @@ typedef struct bc250_gpu_context {
 
     /* Compute pipelines */
     VkPipeline motion_est_pipeline;
+    VkPipeline predict_pipeline;
     VkPipeline transform_pipeline;
     VkPipeline quantize_pipeline;
     VkPipeline deblock_pipeline;
     VkPipeline entropy_pipeline;
     VkPipeline color_convert_pipeline;
-    
+
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
+    VkDescriptorSet predict_desc_set;
     VkDescriptorSet dct_desc_set;
     VkDescriptorSet quant_desc_set;
     VkDescriptorSet deblock_desc_set;
@@ -109,6 +113,26 @@ typedef struct bc250_gpu_context {
     VkDeviceMemory coeff_staging_memories[2];
     void *coeff_staging_mapped[2];
     VkDeviceSize coeff_staging_size;
+
+    /* Per-MB chosen I16x16 prediction mode (see residual_predict.comp),
+     * device buffer + host-visible readback, same double-buffer contract as
+     * quant_staging_buffers/coeff_staging_buffers above. */
+    VkBuffer pred_mode_buffer;
+    VkDeviceMemory pred_mode_memory;
+    VkBuffer pred_mode_staging_buffers[2];
+    VkDeviceMemory pred_mode_staging_memories[2];
+    void *pred_mode_staging_mapped[2];
+    VkDeviceSize pred_mode_staging_size;
+
+    /* Host-visible readback of the real per-MB motion vectors motion_estimation.comp
+     * writes to mv_buffer (mv_buffer itself is device-local only and was never
+     * readable from the CPU before this). Needed so the CPU CAVLC writer can compute
+     * a real spec MVD (median-of-neighbors predictor) instead of a heuristic. Same
+     * double-buffer contract as the other staging buffers. */
+    VkBuffer mv_staging_buffers[2];
+    VkDeviceMemory mv_staging_memories[2];
+    void *mv_staging_mapped[2];
+    VkDeviceSize mv_staging_size;
 
     /* Reconstructed frame for DPB */
     gpu_image_t recon_image;
@@ -157,7 +181,12 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
 
 /* Picture encoding orchestration */
 int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
-int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra);
+/* num_slices: threaded through to residual_predict.comp so its I16x16
+ * neighbor-availability check can correctly treat a different-slice
+ * neighbor MB as unavailable - see that shader's SLICE BOUNDARIES comment.
+ * Must match the num_slices the caller will actually partition the CAVLC
+ * bitstream into (encoder_h264.c's BC250_SLICES_PER_FRAME). */
+int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);
@@ -171,6 +200,17 @@ int gpu_compute_release_staging_data(gpu_context_t *ctx);
  * the 4x4 block, NOT zigzag). */
 int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 int gpu_compute_get_coeff_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+
+/* Real per-MB I16x16 prediction mode (see residual_predict.comp), one uint32
+ * per MB, values match cavlc.h's H264_I16x16_* constants. Only meaningful for
+ * I-slices. Same fence-safe double-buffer contract as above. */
+int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+
+/* Real per-MB motion vectors (see motion_estimation.comp's OutputMV), laid
+ * out as num_mbs entries of {int32_t mvx, mvy; uint32_t sad; uint32_t pad;}
+ * (16 bytes/entry, matching the GPU's std430 MotionVector struct). Only
+ * meaningful for P-slices. Same fence-safe double-buffer contract as above. */
+int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 
 #ifdef __cplusplus
 }

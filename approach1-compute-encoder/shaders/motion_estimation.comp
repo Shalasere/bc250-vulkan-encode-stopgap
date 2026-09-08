@@ -15,46 +15,25 @@ layout(std430, set = 0, binding = 2) writeonly buffer OutputMV {
 };
 
 /*
- * binding 3: residual_buffer (dct_transform.comp's InputResiduals).
- *
- * FIX: nothing in this pipeline ever wrote to residual_buffer before this
- * change - color_convert.comp only writes the Y/UV *images*, this shader
- * only wrote motion vectors, and deblock_filter.comp only touches
- * reconstructed pixels in place. dct_transform.comp therefore always read
- * whatever was already in that freshly-allocated device-local buffer
- * (unwritten - zero or undefined depending on the driver), so every
- * downstream stage (quantize, CAVLC) had nothing real to encode regardless
- * of how correct the entropy coding was. Confirmed on real hardware: after
- * fixing CAVLC to be spec-correct (see encoder_h264.c/cavlc.c), ffmpeg
- * decoded the stream with zero errors but the frame was still flat gray.
- *
- * DELIBERATE SIMPLIFICATION (same spirit as encoder_h264.c's documented DC
- * dequant simplification): this shader is the only stage that already has
+ * Residual generation (writing dct_transform.comp's InputResiduals) used to
+ * live here as a stopgap - this shader was the only stage that already had
  * the current macroblock's raw luma pixels loaded into shared memory
- * (`current_mb`), so it doubles as the residual generator, using a
- * constant predictor of 128 (ITU-T H.264 8.3.3.1's actual Intra_16x16 DC
- * value when no neighbor MB is available) instead of real intra
- * prediction (neighbor-average DC/vertical/horizontal/plane, which would
- * need this shader to read reconstructed neighbor MBs and know the actual
- * H.264 prediction mode chosen for this MB - a real intra-prediction
- * compute stage, out of scope here). This is NOT bit-exact
- * reconstruction: the decoder adds back ITS OWN real prediction (which
- * matches 128 only where neighbors are genuinely unavailable), so
- * reconstructed pixels carry a per-MB DC bias equal to
- * (real_neighbor_average - 128). Chosen because it still transmits the
- * REAL AC/edge/gradient structure of the source picture through DCT/CAVLC
- * unchanged - the actual deliverable this task needed (a visibly
- * recognizable decoded picture instead of flat gray) - while a fully
- * spec-compliant intra-prediction shader is a substantially larger,
- * separate piece of work.
+ * (`current_mb`), and residual_buffer had nothing else writing to it at all
+ * (dct_transform.comp always read whatever was already in that freshly
+ * allocated device-local buffer - unwritten, zero or undefined depending on
+ * the driver). That stopgap used a constant 128 predictor (real intra
+ * prediction needs reconstructed-neighbor pixels and a chosen prediction
+ * mode - a real prediction compute stage, out of scope for a residual-buffer
+ * plumbing fix) and left chroma zeroed entirely (no chroma image was bound
+ * here).
  *
- * Chroma (blocks 16-23) is NOT computed here (this shader has no chroma
- * image bound) and is explicitly zeroed instead of left undefined -
- * chroma will decode as a flat plane; only luma carries real content.
+ * Real intra/inter prediction and residual generation now happens in
+ * residual_predict.comp, which runs after this shader (it consumes the real
+ * motion vectors this shader computes below, for P-slices) and before
+ * dct_transform.comp. See that shader's top-of-file comment for the full
+ * design (SAD-based I16x16 mode decision, real DC/Vertical/Horizontal/Plane
+ * prediction, real motion-compensated P16x16 residual, chroma DC).
  */
-layout(std430, set = 0, binding = 3) writeonly buffer OutputResidual {
-    int res[];
-};
 
 layout(push_constant) uniform PushConstants {
     uint frame_width;
@@ -94,26 +73,6 @@ void main() {
         coord = clamp(coord, ivec2(0), ivec2(pcs.frame_width - 1, pcs.frame_height - 1));
         float pixel = imageLoad(currentImage, coord).r;
         current_mb[py][px] = pixel;
-
-        // Write the luma residual for this pixel (see OutputResidual's doc
-        // comment above): raster block-of-4x4 layout matching
-        // dct_transform.comp's global_block_idx = mb_idx*24+block_idx,
-        // block_idx = (py/4)*4+(px/4), position within block = (py%4)*4+(px%4).
-        uint bx = px / 4u, by = py / 4u;
-        uint block = by * 4u + bx;
-        uint pos_in_block = (py % 4u) * 4u + (px % 4u);
-        uint global_block_idx = mb_idx * 24u + block;
-        res[global_block_idx * 16u + pos_in_block] = int(round(pixel * 255.0)) - 128;
-    }
-
-    // Chroma (blocks 16-23) is not computed by this shader - zero it
-    // explicitly rather than leaving it as undefined device memory.
-    // 4 Cb + 4 Cr blocks * 16 positions = 128 values / 64 threads = 2 each.
-    for (int i = 0; i < 2; i++) {
-        uint idx = local_id * 2u + uint(i); // 0..127
-        uint block = 16u + idx / 16u;       // 16..23
-        uint pos_in_block = idx % 16u;
-        res[(mb_idx * 24u + block) * 16u + pos_in_block] = 0;
     }
 
     // 2. Cooperative load of 48x48 search window (2304 pixels / 64 threads = 36 px/thread)

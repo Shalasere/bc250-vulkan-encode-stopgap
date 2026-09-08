@@ -182,13 +182,6 @@ static inline const int *coeff_block_ptr(const int *coeff, uint32_t mb_idx, int 
     return coeff + ((size_t)mb_idx * 24 + raster_block) * 16;
 }
 
-static int block_nonzero_count(const int *quant_levels, uint32_t mb_idx, int raster_block, int start_pos, int end_pos) {
-    const int *blk = quant_block_ptr(quant_levels, mb_idx, raster_block);
-    int c = 0;
-    for (int p = start_pos; p < end_pos; p++) if (blk[p] != 0) c++;
-    return c;
-}
-
 static int block_any_nonzero(const int *quant_levels, uint32_t mb_idx, int raster_block, int start_pos, int end_pos) {
     const int *blk = quant_block_ptr(quant_levels, mb_idx, raster_block);
     for (int p = start_pos; p < end_pos; p++) if (blk[p] != 0) return 1;
@@ -331,60 +324,87 @@ static int chroma_nc(uint8_t (*nz_c)[4], uint32_t mb, uint32_t mbx, uint32_t mby
  * exact ffmpeg source function).
  */
 
-/* Intra 16x16 prediction mode heuristic - same "top vs left activity" idea
- * as the previous packed-entropy-summary version, but now computed exactly
- * from the real quant_levels nonzero counts of raster blocks 0 (top-left),
- * 1 (its right neighbor) and 4 (its bottom neighbor) instead of a lossy
- * packed proxy. Thresholds unchanged (2x ratio).
+/* Real per-MB motion vector, as written back by mv_staging (see
+ * gpu_compute_get_mv_staging_data()'s doc comment) - mirrors the GPU's
+ * std430 MotionVector struct {ivec2 mv; uint sad;} byte-for-byte (16 bytes:
+ * two int32 + one uint32 + 4 bytes of std430 struct-alignment padding). */
+typedef struct {
+    int32_t mvx, mvy;
+    uint32_t sad;
+    uint32_t _pad;
+} gpu_mv_t;
+
+/*
+ * gpu_pred_mode_i16 - I16x16 prediction mode, as chosen by
+ * residual_predict.comp's real SAD-based mode decision (DC/Vertical/
+ * Horizontal/Plane against actual neighbor pixels).
  *
- * FIX (found via local ffmpeg-decode validation, not present in the task
- * spec but required for a conformant bitstream): the original heuristic -
- * both this replacement and the pre-existing packed-entropy version it
- * replaces - picked VERT/HORIZ purely from activity, with no check that the
- * corresponding neighbor macroblock actually exists. Intra_16x16_Vertical
- * requires an available macroblock above (mby>0) and Intra_16x16_Horizontal
- * requires one to the left (mbx>0); ffmpeg correctly rejected the very
- * first MB (0,0, no neighbors at all) with "left block unavailable for
- * requested intra mode" until this was gated. DC prediction is always valid
- * (defined to substitute 128 for unavailable neighbor samples per 8.3.3.1),
- * so it's the safe fallback whenever the heuristic's preferred direction
- * isn't actually available.
- *
- * SECOND FIX (also found via ffmpeg validation, this time with multi-slice
- * encoding enabled - which is this project's own DEFAULT installed
- * environment, BC250_SLICES_PER_FRAME=4): mbx>0/mby>0 alone are not enough.
- * A macroblock at a slice boundary can have mbx>0 or mby>0 (a neighbor
- * exists in the full picture) while that neighbor macroblock is still
- * unavailable because it belongs to a DIFFERENT slice (any macroblock
- * before the current slice's first_mb_in_slice). Needs the same
- * mb-start_mb>=start_mb check used everywhere else in this file for
- * neighbor availability. */
-static int choose_pred_mode_i16(const int *quant_levels, uint32_t mb_idx, uint32_t mbx, uint32_t mby,
-                                 uint32_t width_in_mbs, uint32_t start_mb) {
-    int c0 = block_nonzero_count(quant_levels, mb_idx, 0, 0, 16);
-    int c1 = block_nonzero_count(quant_levels, mb_idx, 1, 0, 16);
-    int c4 = block_nonzero_count(quant_levels, mb_idx, 4, 0, 16);
-    int top_act = c0 + c1;
-    int left_act = c0 + c4;
-    bool top_available = (mby > 0) && ((mb_idx - width_in_mbs) >= start_mb);
-    bool left_available = (mbx > 0) && ((mb_idx - 1) >= start_mb);
-    if (top_act > left_act * 2 && top_available) return H264_I16x16_VERT;
-    if (left_act > top_act * 2 && left_available) return H264_I16x16_HORIZ;
-    return H264_I16x16_DC;
+ * REPLACES a former CPU-side heuristic that inferred mode from post-quant
+ * AC coefficient activity - that approach became structurally impossible
+ * once residual generation itself needs to know the prediction mode BEFORE
+ * DCT/quantize even run (the residual IS source-minus-prediction). Mode
+ * decision now happens on the GPU, before DCT, directly from pixel-domain
+ * SAD; this just reads back what it decided. See residual_predict.comp's
+ * top-of-file comment for the full design, including the neighbor-pixel-
+ * source and slice-boundary simplifications it documents (this readback
+ * inherits both: it does not re-derive or gate on start_mb the way the old
+ * heuristic did, because the GPU's mode decision already didn't either).
+ */
+static int gpu_pred_mode_i16(const uint32_t *pred_modes, uint32_t mb_idx) {
+    return pred_modes ? (int)pred_modes[mb_idx] : H264_I16x16_DC;
 }
 
-/* Same idea for the P16x16 MVD heuristic (previously derived from packed
- * entropy activity bytes of blocks 0/1/4; now from real nonzero counts). */
-static void choose_mv_heuristic(const int *quant_levels, uint32_t mb_idx, int *mvd_x, int *mvd_y) {
-    int c0 = block_nonzero_count(quant_levels, mb_idx, 0, 0, 16);
-    int c1 = block_nonzero_count(quant_levels, mb_idx, 1, 0, 16);
-    int c4 = block_nonzero_count(quant_levels, mb_idx, 4, 0, 16);
-    int top_act = c0 - c1;
-    int left_act = c0 - c4;
-    *mvd_x = 0;
-    *mvd_y = 0;
-    if (abs(top_act) > 4) *mvd_x = (top_act > 0 ? 1 : -1) * 4;
-    if (abs(left_act) > 4) *mvd_y = (left_act > 0 ? 1 : -1) * 4;
+/* Neighbor MV lookup for the P16x16 MVD predictor below: (dx,dy) is a
+ * neighbor offset in MB units (e.g. left=(-1,0), top=(0,-1)). Unavailable
+ * (off-picture, or belongs to an earlier slice) is reported via *avail. */
+static void neighbor_mv(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
+                         uint32_t width_in_mbs, uint32_t start_mb, int dx, int dy,
+                         int *mvx, int *mvy, bool *avail) {
+    int nbx = (int)mbx + dx, nby = (int)mby + dy;
+    if (nbx < 0 || nby < 0 || (uint32_t)nbx >= width_in_mbs) { *avail = false; *mvx = 0; *mvy = 0; return; }
+    uint32_t nb = (uint32_t)nby * width_in_mbs + (uint32_t)nbx;
+    if (nb < start_mb) { *avail = false; *mvx = 0; *mvy = 0; return; }
+    *avail = true;
+    *mvx = mvs[nb].mvx;
+    *mvy = mvs[nb].mvy;
+}
+
+static inline int median3(int a, int b, int c) {
+    return a + b + c - (a < b ? (a < c ? a : c) : (b < c ? b : c)) - (a > b ? (a > c ? a : c) : (b > c ? b : c));
+}
+
+/*
+ * mv_predictor - ITU-T H.264 8.4.1.3 median motion vector predictor (A=left,
+ * B=top, C=top-right, substituting D=top-left when C is unavailable). This
+ * MUST match a real decoder's predictor exactly (ffmpeg included) - the
+ * encoder transmits mv-minus-predictor (MVD) and the decoder reconstructs
+ * mv=predictor+MVD using its OWN predictor computed the same way, so any
+ * mismatch here corrupts every subsequent motion vector, not just this one.
+ * All MBs in a P slice are P16x16 in this encoder (no intra-in-P mixing), so
+ * the spec's ref-idx-equality special cases never apply here.
+ */
+static void mv_predictor(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
+                          uint32_t width_in_mbs, uint32_t start_mb, int *px, int *py) {
+    int ax, ay, bx, by, cx, cy;
+    bool a_ok, b_ok, c_ok;
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, -1, 0, &ax, &ay, &a_ok);   /* A: left */
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, 0, -1, &bx, &by, &b_ok);   /* B: top */
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, 1, -1, &cx, &cy, &c_ok);   /* C: top-right */
+    if (!c_ok) {
+        neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, -1, -1, &cx, &cy, &c_ok); /* D substitutes C */
+    }
+
+    if (!b_ok && !c_ok && a_ok) {
+        *px = ax; *py = ay;
+        return;
+    }
+    /* An unavailable neighbor contributes (0,0) to the median (per spec) once
+     * the single-predictor special case above doesn't apply. */
+    if (!a_ok) { ax = 0; ay = 0; }
+    if (!b_ok) { bx = 0; by = 0; }
+    if (!c_ok) { cx = 0; cy = 0; }
+    *px = median3(ax, bx, cx);
+    *py = median3(ay, by, cy);
 }
 
 /* Whole-MB "does this P16x16 MB have any nonzero luma coefficient" skip
@@ -404,8 +424,9 @@ static int mb_has_any_luma_nonzero(const int *quant_levels, uint32_t mb_idx) {
  * chroma AC (8 blocks), updating the nC neighbor-context arrays as it goes.
  */
 static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int *coeff,
+                              const uint32_t *pred_modes,
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
-    int pred_mode = choose_pred_mode_i16(quant_levels, mb, mbx, mby, nc->width_in_mbs, nc->start_mb);
+    int pred_mode = gpu_pred_mode_i16(pred_modes, mb);
 
     /* Luma DC: gather PRE-quant DC (coeff buffer, position 0) of the 16
      * raster blocks into the natural 4x4 grid, Hadamard, quantize. */
@@ -496,9 +517,12 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
  * (Hadamard, same as I16x16) and chroma AC (8 blocks).
  */
 static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int *coeff,
+                              const gpu_mv_t *mvs,
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
-    int mvd_x, mvd_y;
-    choose_mv_heuristic(quant_levels, mb, &mvd_x, &mvd_y);
+    int pred_x, pred_y;
+    mv_predictor(mvs, mbx, mby, nc->width_in_mbs, nc->start_mb, &pred_x, &pred_y);
+    int mvd_x = mvs[mb].mvx - pred_x;
+    int mvd_y = mvs[mb].mvy - pred_y;
 
     /* Luma CBP: one bit per 8x8 quadrant (spec blkIdx/4), based on full
      * 16-coefficient (DC+AC) nonzero-anywhere check since P16x16 luma has
@@ -702,36 +726,50 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         total_written += pps_size;
     }
 
-    /* 3. Dispatch GPU compute encoding pipeline if available, and fetch the
-     * REAL per-coefficient residual data (post-quant levels + pre-quant
-     * transform coefficients) - not just the lossy packed entropy summary
-     * the old heuristic-only path used. */
-    const int *quant_levels = NULL;
-    const int *coeff = NULL;
-    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-        gpu_compute_begin_picture(gpu_ctx, input_surface);
-        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
-                                     qp, is_idr ? 1 : 0);
-        gpu_compute_end_picture(gpu_ctx);
-        gpu_compute_sync(gpu_ctx);
-
-        void *quant_data = NULL, *coeff_data = NULL;
-        size_t quant_size = 0, coeff_size = 0;
-        if (gpu_compute_get_quant_staging_data(gpu_ctx, &quant_data, &quant_size) == 0) {
-            quant_levels = (const int *)quant_data;
-        }
-        if (gpu_compute_get_coeff_staging_data(gpu_ctx, &coeff_data, &coeff_size) == 0) {
-            coeff = (const int *)coeff_data;
-        }
-    }
-
-    /* 4. Encode Slices (supporting multi-slice partitioning for Sunshine/Moonlight network resilience) */
+    /* 3a. Multi-slice partitioning (Sunshine/Moonlight network resilience) -
+     * computed BEFORE the GPU dispatch below, since residual_predict.comp
+     * needs num_slices too (see gpu_compute_dispatch_encode's doc comment
+     * and that shader's SLICE BOUNDARIES note) to correctly treat a
+     * different-slice neighbor MB as unavailable for intra prediction. */
     int num_slices = 1;
     const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
     if (slice_env) {
         int s = atoi(slice_env);
         if (s >= 1 && s <= 16) num_slices = s;
     }
+
+    /* 3b. Dispatch GPU compute encoding pipeline if available, and fetch the
+     * REAL per-coefficient residual data (post-quant levels + pre-quant
+     * transform coefficients) - not just the lossy packed entropy summary
+     * the old heuristic-only path used. */
+    const int *quant_levels = NULL;
+    const int *coeff = NULL;
+    const uint32_t *pred_modes = NULL;
+    const gpu_mv_t *mvs = NULL;
+    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        gpu_compute_begin_picture(gpu_ctx, input_surface);
+        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
+                                     qp, is_idr ? 1 : 0, num_slices);
+        gpu_compute_end_picture(gpu_ctx);
+        gpu_compute_sync(gpu_ctx);
+
+        void *quant_data = NULL, *coeff_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
+        size_t quant_size = 0, coeff_size = 0, pred_mode_size = 0, mv_size = 0;
+        if (gpu_compute_get_quant_staging_data(gpu_ctx, &quant_data, &quant_size) == 0) {
+            quant_levels = (const int *)quant_data;
+        }
+        if (gpu_compute_get_coeff_staging_data(gpu_ctx, &coeff_data, &coeff_size) == 0) {
+            coeff = (const int *)coeff_data;
+        }
+        if (gpu_compute_get_pred_mode_staging_data(gpu_ctx, &pred_mode_data, &pred_mode_size) == 0) {
+            pred_modes = (const uint32_t *)pred_mode_data;
+        }
+        if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0) {
+            mvs = (const gpu_mv_t *)mv_data;
+        }
+    }
+
+    /* 4. Encode Slices */
 
     const char *fm = getenv("BC250_FAST_MODE");
     int deblock_idc = (fm && (strcmp(fm, "1") == 0 || strcmp(fm, "true") == 0)) ? 1 : 0;
@@ -790,7 +828,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                 uint32_t mbx = mb % encoder->width_in_mbs;
                 uint32_t mby = mb / encoder->width_in_mbs;
                 if (quant_levels && coeff) {
-                    encode_mb_i16x16(&bs, quant_levels, coeff, mb, mbx, mby, &nc, qp);
+                    encode_mb_i16x16(&bs, quant_levels, coeff, pred_modes, mb, mbx, mby, &nc, qp);
                 } else {
                     /* No GPU residual data available (e.g. gpu_ctx==NULL) -
                      * fall back to an all-zero-residual I16x16 MB so the
@@ -822,7 +860,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                     cavlc_write_p_skip_run(&bs, current_skip_run);
                     current_skip_run = 0;
                     if (quant_levels && coeff) {
-                        encode_mb_p16x16(&bs, quant_levels, coeff, mb, mbx, mby, &nc, qp);
+                        encode_mb_p16x16(&bs, quant_levels, coeff, mvs, mb, mbx, mby, &nc, qp);
                     } else {
                         cavlc_write_mb_p16x16_header(&bs, 0, 0, 0, 0);
                         memset(nc.nz_luma[mb], 0, sizeof(nc.nz_luma[mb]));
