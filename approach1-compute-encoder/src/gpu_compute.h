@@ -75,6 +75,10 @@ typedef struct bc250_gpu_context {
     VkDescriptorSetLayout deblock_desc_layout;
     VkDescriptorSetLayout entropy_desc_layout;
     VkDescriptorSetLayout cc_desc_layout;
+    /* reconstruct.comp: quant_levels_buffer + coeff_buffer (readonly) +
+     * pred_buffer (readonly) + recon Y/UV images (writeonly). See
+     * reconstruct.comp's top-of-file comment. */
+    VkDescriptorSetLayout reconstruct_desc_layout;
 
     /* Pipeline layouts */
     VkPipelineLayout motion_est_layout;
@@ -84,6 +88,7 @@ typedef struct bc250_gpu_context {
     VkPipelineLayout deblock_layout;
     VkPipelineLayout entropy_layout;
     VkPipelineLayout color_convert_layout;
+    VkPipelineLayout reconstruct_layout;
 
     /* Compute pipelines */
     VkPipeline motion_est_pipeline;
@@ -93,6 +98,7 @@ typedef struct bc250_gpu_context {
     VkPipeline deblock_pipeline;
     VkPipeline entropy_pipeline;
     VkPipeline color_convert_pipeline;
+    VkPipeline reconstruct_pipeline;
 
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
@@ -102,6 +108,7 @@ typedef struct bc250_gpu_context {
     VkDescriptorSet deblock_desc_set;
     VkDescriptorSet entropy_desc_set;
     VkDescriptorSet cc_desc_set;
+    VkDescriptorSet reconstruct_desc_set;
 
     /* Encoding Buffers */
     VkBuffer mv_buffer;
@@ -118,9 +125,17 @@ typedef struct bc250_gpu_context {
     
     VkBuffer nz_count_buffer;
     VkDeviceMemory nz_count_memory;
-    
+
     VkBuffer entropy_buffer;
     VkDeviceMemory entropy_memory;
+
+    /* Prediction value retained by residual_predict.comp (its PredOut,
+     * binding 7), same size/indexing as residual_buffer - consumed by
+     * reconstruct.comp so it adds the EXACT prediction value back to the
+     * reconstructed residual instead of recomputing it. Device-local only;
+     * no host readback needed. */
+    VkBuffer pred_buffer;
+    VkDeviceMemory pred_memory;
 
     VkBuffer staging_buffers[2];
     VkDeviceMemory staging_memories[2];
@@ -253,6 +268,10 @@ int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size
  * (16 bytes/entry, matching the GPU's std430 MotionVector struct). Only
  * meaningful for P-slices. Same fence-safe double-buffer contract as above. */
 int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+
+/* TEMPORARY debug instrumentation for Part A (reconstruction) verification -
+ * see gpu_compute.c for details. No-op unless BC250_DUMP_RECON_FRAMES=1. */
+void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height);
 
 #ifdef __cplusplus
 }

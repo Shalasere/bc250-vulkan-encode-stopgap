@@ -1,0 +1,328 @@
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+#version 450
+layout(local_size_x = 32) in;
+
+/*
+ * reconstruct.comp - real in-loop reconstruction: dequantize + inverse
+ * transform + add back to prediction + clip, writing the result into
+ * ctx->recon_image so the NEXT frame's P-slice inter prediction
+ * (referenceImage/referenceUV in residual_predict.comp) sees what a real
+ * decoder will actually reconstruct, instead of raw source pixels.
+ *
+ * This is PART A of the reconstruction fix (see the task's design notes):
+ * whole-frame-parallel, dispatched once per frame after quantize.comp, one
+ * workgroup per macroblock - exactly mirroring quantize.comp/dct_transform.comp's
+ * dispatch shape (width_in_mbs x height_in_mbs workgroups, local_size_x=32).
+ * It does NOT fix intra-frame prediction drift (residual_predict.comp's
+ * I16x16 prediction still reads source-frame neighbor pixels, not
+ * reconstructed ones - see that shader's DELIBERATE SIMPLIFICATION comment
+ * and gpu_compute.c/GOP structure notes for why this alone is expected to
+ * recover most of quality_test.sh's PSNR gap on a GOP with mostly P-frames).
+ *
+ * MATH: dequantization/IDCT below is the standard ITU-T H.264 8.5.12.1 4x4
+ * AC/DC scaling process and 8.5.12.2 inverse core transform (the well-known
+ * MF/V multiplicative-quantizer pair and butterfly transform pair also used
+ * by real decoders, e.g. ffmpeg's libavcodec/h264idct_template.c) - this is
+ * the exact mathematical inverse of quantize.comp's forward AC quantizer and
+ * dct_transform.comp's forward_4x4(), so those two paths are guaranteed
+ * consistent by construction (both are textbook H.264 4x4 core transform
+ * pairs, not independently-invented math).
+ *
+ * The one deliberately-approximate piece is the I16x16 luma/chroma DC
+ * Hadamard path: encoder_h264.c's quantize_dc() (used for both, see its own
+ * "DELIBERATE SIMPLIFICATION" comment) reuses the AC quantizer's shift-by-
+ * (15+qp/6) rounding instead of the spec's separate DC-specific dequant
+ * shift - a pre-existing, documented, out-of-scope numeric-scale simplification
+ * this file does not change. To stay internally consistent with what
+ * encoder_h264.c actually transmits (rather than silently diverging from
+ * it), this shader independently recomputes the SAME forward Hadamard +
+ * quantize_dc() math from the same pre-quant coeff buffer (both this shader
+ * and encoder_h264.c are pure functions of the same coeff_buffer/qp inputs,
+ * so they always agree - see luma_dc_hadamard_fwd()/quantize_dc_scalar()
+ * below, ported 1:1 from encoder_h264.c's luma_dc_hadamard()/quantize_dc()),
+ * then applies a matching unnormalized inverse Hadamard + DC-specific scale
+ * (qmul-based, mirroring the standard decoder's combined dequant+inverse-
+ * Hadamard form) to reconstruct each block's DC term.
+ */
+
+layout(std430, set = 0, binding = 0) readonly buffer QuantLevels {
+    int levels[];
+};
+/* Pre-quantization transform coefficients (dct_transform.comp's output) -
+ * needed to independently re-derive the I16x16 luma DC Hadamard and the
+ * (both slice types') chroma DC Hadamard, exactly as encoder_h264.c does
+ * from the same buffer. */
+layout(std430, set = 0, binding = 1) readonly buffer CoeffBuf {
+    int coeffs[];
+};
+/* Retained prediction value, written by residual_predict.comp (PredOut,
+ * its binding 7) - added back to the reconstructed residual verbatim, never
+ * recomputed here. */
+layout(std430, set = 0, binding = 2) readonly buffer PredBuf {
+    int pred[];
+};
+layout(set = 0, binding = 3, r8) uniform writeonly image2D reconY;
+layout(set = 0, binding = 4, rg8) uniform writeonly image2D reconUV;
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint width_in_mbs;
+    uint height_in_mbs;
+    uint qp;
+    uint is_intra;
+    uint color_space;
+    uint lambda_motion;
+} pcs;
+
+/* H.264 Multiplication Factor Table (ITU-T 8.5.9 Table 8-14), position-type-0
+ * column only - mirrors quantize.comp's MF[][0] and encoder_h264.c's MF0[].
+ * Needed here to replicate quantize_dc()'s forward math exactly. */
+const int MF0[6] = { 13107, 11916, 10082, 9362, 8192, 7282 };
+
+/* ITU-T 8.5.9 Table 8-15 "V" normAdjust table, indexed [qp%6][pos_type],
+ * pos_type as defined by get_pos_type() below (0 = both even, 1 = both odd,
+ * 2 = other) - the standard dequantization scale that exactly pairs with
+ * quantize.comp's MF table (LevelScale4x4 = 16*V under the default flat
+ * scaling list, per 8.5.9). */
+const int V[6][3] = {
+    {10, 13, 16},
+    {11, 14, 18},
+    {13, 16, 20},
+    {14, 18, 23},
+    {16, 20, 25},
+    {18, 23, 29}
+};
+
+int get_pos_type(int idx) {
+    int r = idx / 4;
+    int c = idx % 4;
+    bool r_even = (r % 2) == 0;
+    bool c_even = (c % 2) == 0;
+    if (r_even && c_even) return 0;
+    if (!r_even && !c_even) return 1;
+    return 2;
+}
+
+int clip1(int v) { return clamp(v, 0, 255); }
+
+/* Standard ITU-T 8.5.12.1 AC/DC-position-agnostic 4x4 residual dequant for
+ * one coefficient at raster position idx (0..15). Exact inverse pairing of
+ * quantize.comp's forward AC quantizer. */
+int dequant_ac(int level, int idx, int qp_per, int qp_rem) {
+    int scale = 16 * V[qp_rem][get_pos_type(idx)];
+    if (qp_per >= 4) {
+        return (level * scale) << (qp_per - 4);
+    }
+    return (level * scale + (1 << (3 - qp_per))) >> (4 - qp_per);
+}
+
+/* Standard ITU-T 8.5.12.2 inverse 4x4 core transform - exact inverse of
+ * dct_transform.comp's forward_4x4(), same raster [r*4+c] axis convention
+ * (horizontal pass first, then vertical pass). d[0] gets the +32 rounding
+ * term added (spec/reference-decoder convention: added once to the DC
+ * position before the first pass), final combine includes the >>6 that
+ * removes the transform pair's implicit x64 gain. */
+void inverse_4x4(inout int d[16], out int r[16]) {
+    int tmp[16];
+    d[0] += 32;
+    for (int i = 0; i < 4; i++) {
+        int rr = i * 4;
+        int p0 = d[rr + 0], p1 = d[rr + 1], p2 = d[rr + 2], p3 = d[rr + 3];
+        int z0 = p0 + p2, z1 = p0 - p2, z2 = (p1 >> 1) - p3, z3 = p1 + (p3 >> 1);
+        tmp[rr + 0] = z0 + z3; tmp[rr + 1] = z1 + z2; tmp[rr + 2] = z1 - z2; tmp[rr + 3] = z0 - z3;
+    }
+    for (int j = 0; j < 4; j++) {
+        int p0 = tmp[0 * 4 + j], p1 = tmp[1 * 4 + j], p2 = tmp[2 * 4 + j], p3 = tmp[3 * 4 + j];
+        int z0 = p0 + p2, z1 = p0 - p2, z2 = (p1 >> 1) - p3, z3 = p1 + (p3 >> 1);
+        r[0 * 4 + j] = (z0 + z3) >> 6; r[1 * 4 + j] = (z1 + z2) >> 6;
+        r[2 * 4 + j] = (z1 - z2) >> 6; r[3 * 4 + j] = (z0 - z3) >> 6;
+    }
+}
+
+/* 1:1 port of encoder_h264.c's luma_dc_hadamard() (forward). dc_in/dc_out
+ * are flattened raster [r*4+c], matching that function's dc_in[4][4]. */
+void luma_dc_hadamard_fwd(in int dc_in[16], out int dc_out[16]) {
+    int tmp[16];
+    for (int i = 0; i < 4; i++) {
+        int s01 = dc_in[i * 4 + 0] + dc_in[i * 4 + 1], d01 = dc_in[i * 4 + 0] - dc_in[i * 4 + 1];
+        int s23 = dc_in[i * 4 + 2] + dc_in[i * 4 + 3], d23 = dc_in[i * 4 + 2] - dc_in[i * 4 + 3];
+        tmp[0 * 4 + i] = s01 + s23; tmp[1 * 4 + i] = s01 - s23; tmp[2 * 4 + i] = d01 - d23; tmp[3 * 4 + i] = d01 + d23;
+    }
+    for (int i = 0; i < 4; i++) {
+        int s01 = tmp[i * 4 + 0] + tmp[i * 4 + 1], d01 = tmp[i * 4 + 0] - tmp[i * 4 + 1];
+        int s23 = tmp[i * 4 + 2] + tmp[i * 4 + 3], d23 = tmp[i * 4 + 2] - tmp[i * 4 + 3];
+        dc_out[i * 4 + 0] = (s01 + s23 + 1) >> 1; dc_out[i * 4 + 1] = (s01 - s23 + 1) >> 1;
+        dc_out[i * 4 + 2] = (d01 - d23 + 1) >> 1; dc_out[i * 4 + 3] = (d01 + d23 + 1) >> 1;
+    }
+}
+
+/* Decode-side unnormalized inverse Hadamard: identical butterfly structure
+ * to luma_dc_hadamard_fwd() but WITHOUT the ">>1" rounding shifts (matching
+ * real decoders' combined dequant+inverse-Hadamard form, which folds all
+ * normalization into a single final qmul-based shift - see main()). */
+void luma_dc_hadamard_inv(in int c[16], out int f[16]) {
+    int tmp[16];
+    for (int i = 0; i < 4; i++) {
+        int s01 = c[i * 4 + 0] + c[i * 4 + 1], d01 = c[i * 4 + 0] - c[i * 4 + 1];
+        int s23 = c[i * 4 + 2] + c[i * 4 + 3], d23 = c[i * 4 + 2] - c[i * 4 + 3];
+        tmp[0 * 4 + i] = s01 + s23; tmp[1 * 4 + i] = s01 - s23; tmp[2 * 4 + i] = d01 - d23; tmp[3 * 4 + i] = d01 + d23;
+    }
+    for (int i = 0; i < 4; i++) {
+        int s01 = tmp[i * 4 + 0] + tmp[i * 4 + 1], d01 = tmp[i * 4 + 0] - tmp[i * 4 + 1];
+        int s23 = tmp[i * 4 + 2] + tmp[i * 4 + 3], d23 = tmp[i * 4 + 2] - tmp[i * 4 + 3];
+        f[i * 4 + 0] = s01 + s23; f[i * 4 + 1] = s01 - s23; f[i * 4 + 2] = d01 - d23; f[i * 4 + 3] = d01 + d23;
+    }
+}
+
+/* 1:1 port of encoder_h264.c's chroma_dc_hadamard() - self-dual (H*H=4I for
+ * a 2x2 Hadamard), so this SAME function is used both forward (on raw
+ * coefficients) and, decode-side, on the quantized levels (see main()) -
+ * exactly like real decoders do (e.g. ffmpeg's chroma DC dequant reduces to
+ * this identical butterfly on the transmitted levels). */
+void chroma_dc_hadamard(in int c[4], out int out4[4]) {
+    int c00 = c[0], c01 = c[1], c10 = c[2], c11 = c[3];
+    out4[0] = c00 + c01 + c10 + c11;
+    out4[1] = c00 - c01 + c10 - c11;
+    out4[2] = c00 + c01 - c10 - c11;
+    out4[3] = c00 - c01 - c10 + c11;
+}
+
+/* 1:1 port of encoder_h264.c's quantize_dc() - see that function's
+ * DELIBERATE SIMPLIFICATION comment. is_intra_flag matches quantize_dc()'s
+ * own is_intra parameter (1 for I16x16 luma DC and I-slice chroma DC, 0 for
+ * P-slice chroma DC). */
+int quantize_dc_scalar(int v, int qp_per, int qp_rem, int is_intra_flag) {
+    int f = (1 << (15 + qp_per)) / (is_intra_flag == 1 ? 3 : 6);
+    int sign = v < 0 ? -1 : 1;
+    int av = abs(v);
+    int level = (av * MF0[qp_rem] + f) >> (15 + qp_per);
+    return sign * level;
+}
+
+void main() {
+    uint mb_x = gl_WorkGroupID.x;
+    uint mb_y = gl_WorkGroupID.y;
+    if (mb_x >= pcs.width_in_mbs || mb_y >= pcs.height_in_mbs) return;
+
+    /* block_idx 0..15: one luma 4x4 block each. block_idx 16..19: chroma
+     * sub-block index (TL,TR,BL,BR of the 8x8 chroma MB) - each of these 4
+     * invocations reconstructs BOTH the Cb and Cr block at that sub-position
+     * and does a single combined imageStore into reconUV's packed rg8 texel,
+     * to avoid two invocations racing on a read-modify-write of the same
+     * pixel's other channel. block_idx 20..23 are idle. */
+    uint block_idx = gl_LocalInvocationIndex;
+    if (block_idx >= 20u) return;
+
+    uint mb_idx = mb_y * pcs.width_in_mbs + mb_x;
+    int qp = int(pcs.qp);
+    int qp_per = qp / 6;
+    int qp_rem = qp % 6;
+    /* Shared DC dequant scale (posType0) for luma DC and chroma DC alike -
+     * mirrors real decoders' qmul = LevelScale4x4(qp%6,0,0) << qp/6. */
+    int qmul = (16 * V[qp_rem][0]) << qp_per;
+
+    if (block_idx < 16u) {
+        uint raster = block_idx;
+        uint global_block_idx = mb_idx * 24u + raster;
+
+        int blk[16];
+        for (int p = 0; p < 16; p++) blk[p] = levels[global_block_idx * 16u + uint(p)];
+
+        int dc_val;
+        if (pcs.is_intra == 1u) {
+            int dc_in[16];
+            for (int b = 0; b < 16; b++) dc_in[b] = coeffs[(mb_idx * 24u + uint(b)) * 16u + 0u];
+            int dc_out_raw[16];
+            luma_dc_hadamard_fwd(dc_in, dc_out_raw);
+            int dc_level[16];
+            for (int b = 0; b < 16; b++) dc_level[b] = quantize_dc_scalar(dc_out_raw[b], qp_per, qp_rem, 1);
+            int f[16];
+            luma_dc_hadamard_inv(dc_level, f);
+            dc_val = (f[int(raster)] * qmul + 128) >> 8;
+        } else {
+            /* P16x16 luma has no DC/AC split (see encoder_h264.c's
+             * encode_mb_p16x16 comment) - position 0 is just a normal
+             * posType0 AC coefficient. */
+            dc_val = dequant_ac(blk[0], 0, qp_per, qp_rem);
+        }
+
+        int dqt[16];
+        dqt[0] = dc_val;
+        for (int p = 1; p < 16; p++) dqt[p] = dequant_ac(blk[p], p, qp_per, qp_rem);
+
+        int res[16];
+        inverse_4x4(dqt, res);
+
+        uint bx = raster % 4u, by = raster / 4u;
+        ivec2 mb_origin = ivec2(int(mb_x * 16u + bx * 4u), int(mb_y * 16u + by * 4u));
+        for (int p = 0; p < 16; p++) {
+            int prow = p / 4, pcol = p % 4;
+            ivec2 coord = mb_origin + ivec2(pcol, prow);
+            if (coord.x >= int(pcs.frame_width) || coord.y >= int(pcs.frame_height)) continue;
+            int predv = pred[global_block_idx * 16u + uint(p)];
+            int val = clip1(predv + res[p]);
+            imageStore(reconY, coord, vec4(float(val) / 255.0, 0.0, 0.0, 0.0));
+        }
+    } else {
+        uint sub = block_idx - 16u; /* 0=TL,1=TR,2=BL,3=BR */
+        uint cb_raster = 16u + sub, cr_raster = 20u + sub;
+        uint cb_global = mb_idx * 24u + cb_raster, cr_global = mb_idx * 24u + cr_raster;
+
+        int cb_blk[16], cr_blk[16];
+        for (int p = 0; p < 16; p++) {
+            cb_blk[p] = levels[cb_global * 16u + uint(p)];
+            cr_blk[p] = levels[cr_global * 16u + uint(p)];
+        }
+
+        /* Joint chroma DC Hadamard across the 4 sub-blocks of each plane -
+         * recomputed redundantly by all 4 UV invocations of this MB (cheap:
+         * 4 raw coefficients, done once per plane). */
+        int cb_dc_in[4], cr_dc_in[4];
+        for (int b = 0; b < 4; b++) {
+            cb_dc_in[b] = coeffs[(mb_idx * 24u + 16u + uint(b)) * 16u + 0u];
+            cr_dc_in[b] = coeffs[(mb_idx * 24u + 20u + uint(b)) * 16u + 0u];
+        }
+        int cb_dc_raw[4], cr_dc_raw[4];
+        chroma_dc_hadamard(cb_dc_in, cb_dc_raw);
+        chroma_dc_hadamard(cr_dc_in, cr_dc_raw);
+
+        int is_intra_flag = int(pcs.is_intra);
+        int cb_level[4], cr_level[4];
+        for (int i = 0; i < 4; i++) {
+            cb_level[i] = quantize_dc_scalar(cb_dc_raw[i], qp_per, qp_rem, is_intra_flag);
+            cr_level[i] = quantize_dc_scalar(cr_dc_raw[i], qp_per, qp_rem, is_intra_flag);
+        }
+        int cb_f[4], cr_f[4];
+        chroma_dc_hadamard(cb_level, cb_f);
+        chroma_dc_hadamard(cr_level, cr_f);
+        int cb_dc = (cb_f[int(sub)] * qmul) >> 7;
+        int cr_dc = (cr_f[int(sub)] * qmul) >> 7;
+
+        int cb_dqt[16], cr_dqt[16];
+        cb_dqt[0] = cb_dc; cr_dqt[0] = cr_dc;
+        for (int p = 1; p < 16; p++) {
+            cb_dqt[p] = dequant_ac(cb_blk[p], p, qp_per, qp_rem);
+            cr_dqt[p] = dequant_ac(cr_blk[p], p, qp_per, qp_rem);
+        }
+
+        int cb_res[16], cr_res[16];
+        inverse_4x4(cb_dqt, cb_res);
+        inverse_4x4(cr_dqt, cr_res);
+
+        uint xO = (sub % 2u) * 4u, yO = (sub / 2u) * 4u;
+        ivec2 uv_origin = ivec2(int(mb_x * 8u + xO), int(mb_y * 8u + yO));
+        int uv_max_x = int(pcs.frame_width / 2u) - 1;
+        int uv_max_y = int(pcs.frame_height / 2u) - 1;
+        for (int p = 0; p < 16; p++) {
+            int prow = p / 4, pcol = p % 4;
+            ivec2 coord = uv_origin + ivec2(pcol, prow);
+            if (coord.x > uv_max_x || coord.y > uv_max_y) continue;
+            int predcb = pred[cb_global * 16u + uint(p)];
+            int predcr = pred[cr_global * 16u + uint(p)];
+            int valcb = clip1(predcb + cb_res[p]);
+            int valcr = clip1(predcr + cr_res[p]);
+            imageStore(reconUV, coord, vec4(float(valcb) / 255.0, float(valcr) / 255.0, 0.0, 0.0));
+        }
+    }
+}

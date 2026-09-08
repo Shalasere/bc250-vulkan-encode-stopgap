@@ -774,6 +774,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                                      qp, is_idr ? 1 : 0, num_slices);
         gpu_compute_end_picture(gpu_ctx);
         gpu_compute_sync(gpu_ctx);
+        gpu_compute_debug_dump_recon(gpu_ctx, (int)encoder->width, (int)encoder->height);
 
         void *quant_data = NULL, *coeff_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
         size_t quant_size = 0, coeff_size = 0, pred_mode_size = 0, mv_size = 0;

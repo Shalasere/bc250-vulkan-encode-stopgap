@@ -108,6 +108,11 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
         vkFreeMemory(ctx->device, ctx->residual_memory, NULL);
         ctx->residual_buffer = VK_NULL_HANDLE;
     }
+    if (ctx->pred_buffer) {
+        vkDestroyBuffer(ctx->device, ctx->pred_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->pred_memory, NULL);
+        ctx->pred_buffer = VK_NULL_HANDLE;
+    }
     if (ctx->coeff_buffer) {
         vkDestroyBuffer(ctx->device, ctx->coeff_buffer, NULL);
         vkFreeMemory(ctx->device, ctx->coeff_memory, NULL);
@@ -209,6 +214,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
 
     create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
     create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->residual_buffer, &ctx->residual_memory);
+    create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_buffer, &ctx->pred_memory);
     create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->coeff_buffer, &ctx->coeff_memory);
     create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->quant_levels_buffer, &ctx->quant_levels_memory);
     create_buffer_with_memory(ctx, nz_count_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->nz_count_buffer, &ctx->nz_count_memory);
@@ -250,6 +256,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     update_storage_buffer_descriptor(ctx->device, ctx->predict_desc_set, 3, ctx->mv_buffer, mv_size);
     update_storage_buffer_descriptor(ctx->device, ctx->predict_desc_set, 4, ctx->residual_buffer, residual_size);
     update_storage_buffer_descriptor(ctx->device, ctx->predict_desc_set, 5, ctx->pred_mode_buffer, pred_mode_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->predict_desc_set, 7, ctx->pred_buffer, residual_size);
 
     update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 0, ctx->residual_buffer, residual_size);
     update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 1, ctx->coeff_buffer, coeff_size);
@@ -263,6 +270,15 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
 
     update_storage_buffer_descriptor(ctx->device, ctx->entropy_desc_set, 0, ctx->quant_levels_buffer, quant_levels_size);
     update_storage_buffer_descriptor(ctx->device, ctx->entropy_desc_set, 1, ctx->entropy_buffer, entropy_size);
+
+    /* reconstruct.comp's buffer bindings: quant_levels_buffer (post-quant AC
+     * levels), coeff_buffer (pre-quant, for the I16x16/chroma DC Hadamard)
+     * and pred_buffer (retained prediction). Image bindings (recon Y/UV) are
+     * updated per-dispatch in gpu_compute_dispatch_encode() since recon_image
+     * can be (re)created there. */
+    update_storage_buffer_descriptor(ctx->device, ctx->reconstruct_desc_set, 0, ctx->quant_levels_buffer, quant_levels_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->reconstruct_desc_set, 1, ctx->coeff_buffer, coeff_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->reconstruct_desc_set, 2, ctx->pred_buffer, residual_size);
 
     return 0;
 }
@@ -531,9 +547,12 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         /* binding 6: referenceUV - previous frame's chroma plane, for real
          * P-slice chroma motion compensation (see residual_predict.comp). */
-        {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 7: PredOut - retained prediction value, consumed by
+         * reconstruct.comp (see that shader's top-of-file comment). */
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo predict_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = predict_bindings };
+    VkDescriptorSetLayoutCreateInfo predict_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 8, .pBindings = predict_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &predict_layout_info, NULL, &ctx->predict_desc_layout);
 
     VkDescriptorSetLayoutBinding dct_bindings[] = {
@@ -573,6 +592,19 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     };
     VkDescriptorSetLayoutCreateInfo cc_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = cc_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &cc_layout_info, NULL, &ctx->cc_desc_layout);
+
+    /* reconstruct.comp: quant_levels_buffer + coeff_buffer + pred_buffer
+     * (readonly), recon Y/UV images (writeonly) - see that shader's
+     * top-of-file comment. */
+    VkDescriptorSetLayoutBinding reconstruct_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo reconstruct_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 5, .pBindings = reconstruct_bindings };
+    vkCreateDescriptorSetLayout(ctx->device, &reconstruct_layout_info, NULL, &ctx->reconstruct_desc_layout);
 
     /* Descriptor Pool */
     VkDescriptorPoolSize pool_sizes[] = {
@@ -627,6 +659,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     layout_info.pSetLayouts = &ctx->cc_desc_layout;
     vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->color_convert_layout);
 
+    layout_info.pSetLayouts = &ctx->reconstruct_desc_layout;
+    vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->reconstruct_layout);
+
     /* Allocate Descriptor Sets */
     VkDescriptorSetAllocateInfo alloc_set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -654,6 +689,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     alloc_set_info.pSetLayouts = &ctx->cc_desc_layout;
     vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->cc_desc_set);
+
+    alloc_set_info.pSetLayouts = &ctx->reconstruct_desc_layout;
+    vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->reconstruct_desc_set);
 
     /* Shaders & Pipelines */
     VkShaderModule me_shader = load_spirv_shader(ctx->device, "motion_estimation.comp.spv");
@@ -691,6 +729,16 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         ctx->color_convert_pipeline = create_compute_pipeline(ctx->device, cc_shader, ctx->color_convert_layout);
         vkDestroyShaderModule(ctx->device, cc_shader, NULL);
     }
+    VkShaderModule reconstruct_shader = load_spirv_shader(ctx->device, "reconstruct.comp.spv");
+    if (reconstruct_shader) {
+        ctx->reconstruct_pipeline = create_compute_pipeline(ctx->device, reconstruct_shader, ctx->reconstruct_layout);
+        vkDestroyShaderModule(ctx->device, reconstruct_shader, NULL);
+        if (!ctx->reconstruct_pipeline) {
+            fprintf(stderr, "[bc250-gpu] FAILED to create reconstruct_pipeline (shader loaded but pipeline creation failed)\n");
+        }
+    } else {
+        fprintf(stderr, "[bc250-gpu] FAILED to load reconstruct.comp.spv shader module\n");
+    }
 
     /* Allocate device buffers for 4K maximum resolution */
     allocate_encoding_buffers(ctx, 3840, 2160);
@@ -710,6 +758,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->deblock_pipeline) vkDestroyPipeline(ctx->device, ctx->deblock_pipeline, NULL);
     if (ctx->entropy_pipeline) vkDestroyPipeline(ctx->device, ctx->entropy_pipeline, NULL);
     if (ctx->color_convert_pipeline) vkDestroyPipeline(ctx->device, ctx->color_convert_pipeline, NULL);
+    if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
 
     if (ctx->motion_est_layout) vkDestroyPipelineLayout(ctx->device, ctx->motion_est_layout, NULL);
     if (ctx->predict_layout) vkDestroyPipelineLayout(ctx->device, ctx->predict_layout, NULL);
@@ -718,6 +767,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->deblock_layout) vkDestroyPipelineLayout(ctx->device, ctx->deblock_layout, NULL);
     if (ctx->entropy_layout) vkDestroyPipelineLayout(ctx->device, ctx->entropy_layout, NULL);
     if (ctx->color_convert_layout) vkDestroyPipelineLayout(ctx->device, ctx->color_convert_layout, NULL);
+    if (ctx->reconstruct_layout) vkDestroyPipelineLayout(ctx->device, ctx->reconstruct_layout, NULL);
 
     if (ctx->me_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->me_desc_layout, NULL);
     if (ctx->predict_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->predict_desc_layout, NULL);
@@ -726,11 +776,13 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->deblock_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->deblock_desc_layout, NULL);
     if (ctx->entropy_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->entropy_desc_layout, NULL);
     if (ctx->cc_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->cc_desc_layout, NULL);
+    if (ctx->reconstruct_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->reconstruct_desc_layout, NULL);
 
     if (ctx->desc_pool) vkDestroyDescriptorPool(ctx->device, ctx->desc_pool, NULL);
 
     if (ctx->mv_buffer) { vkDestroyBuffer(ctx->device, ctx->mv_buffer, NULL); vkFreeMemory(ctx->device, ctx->mv_memory, NULL); }
     if (ctx->residual_buffer) { vkDestroyBuffer(ctx->device, ctx->residual_buffer, NULL); vkFreeMemory(ctx->device, ctx->residual_memory, NULL); }
+    if (ctx->pred_buffer) { vkDestroyBuffer(ctx->device, ctx->pred_buffer, NULL); vkFreeMemory(ctx->device, ctx->pred_memory, NULL); }
     if (ctx->coeff_buffer) { vkDestroyBuffer(ctx->device, ctx->coeff_buffer, NULL); vkFreeMemory(ctx->device, ctx->coeff_memory, NULL); }
     if (ctx->quant_levels_buffer) { vkDestroyBuffer(ctx->device, ctx->quant_levels_buffer, NULL); vkFreeMemory(ctx->device, ctx->quant_levels_memory, NULL); }
     if (ctx->nz_count_buffer) { vkDestroyBuffer(ctx->device, ctx->nz_count_buffer, NULL); vkFreeMemory(ctx->device, ctx->nz_count_memory, NULL); }
@@ -1157,6 +1209,22 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         update_storage_image_descriptor(ctx->device, ctx->deblock_desc_set, 0, render_target.y_view);
     }
 
+    /* Transition recon_image to GENERAL up front, before reconstruct.comp's
+     * imageStore writes into it below (Stage 4.5). Like render_target, it
+     * starts VK_IMAGE_LAYOUT_PREINITIALIZED (see gpu_compute_create_image())
+     * and is never host-written afterwards - only ever written by
+     * reconstruct.comp's compute-shader stores, so its tracked layout is
+     * updated here using the same real-old-layout pattern render_target
+     * uses above. ctx owns recon_image directly (not a by-value copy), so
+     * this persists correctly across dispatches. */
+    if (ctx->recon_image.y_plane) {
+        transition_image_layout(cmd_buf, ctx->recon_image.y_plane, ctx->recon_image.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    if (ctx->recon_image.uv_plane) {
+        transition_image_layout(cmd_buf, ctx->recon_image.uv_plane, ctx->recon_image.current_layout, VK_IMAGE_LAYOUT_GENERAL);
+    }
+    ctx->recon_image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
+
     /* Stage 1: Color Convert (Skipped: inputs in VA-API are already NV12) */
 
     /* Stage 2: Motion Estimation */
@@ -1200,6 +1268,30 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         vkCmdPushConstants(cmd_buf, ctx->quantize_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
         vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
         insert_compute_barrier(cmd_buf);
+    }
+
+    /* Stage 4.5: Reconstruct (see reconstruct.comp's top-of-file comment) -
+     * dequantizes+inverse-transforms this frame's real quantized residual
+     * (quant_levels_buffer, plus coeff_buffer for the I16x16/chroma DC
+     * Hadamard) and adds it back to the retained prediction (pred_buffer,
+     * written by Stage 2.5 above), writing the clipped result directly into
+     * ctx->recon_image - this REPLACES the old raw vkCmdCopyImage-from-source
+     * population of recon_image, so the NEXT frame's P-slice inter
+     * prediction (referenceImage/referenceUV, set up via ref_view/ref_uv_view
+     * above) sees real reconstructed pixels instead of source pixels. Must
+     * run after Stage 4 (quantize) and Stage 2.5 (predict, for pred_buffer);
+     * ordering relative to deblock/entropy below doesn't matter since it
+     * only needs quantized coefficients + retained prediction. */
+    if (ctx->reconstruct_pipeline && ctx->recon_image.y_view != VK_NULL_HANDLE && ctx->recon_image.uv_view != VK_NULL_HANDLE) {
+        update_storage_image_descriptor(ctx->device, ctx->reconstruct_desc_set, 3, ctx->recon_image.y_view);
+        update_storage_image_descriptor(ctx->device, ctx->reconstruct_desc_set, 4, ctx->recon_image.uv_view);
+
+        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->reconstruct_pipeline);
+        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->reconstruct_layout, 0, 1, &ctx->reconstruct_desc_set, 0, NULL);
+        vkCmdPushConstants(cmd_buf, ctx->reconstruct_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+        insert_compute_barrier(cmd_buf);
+        ctx->has_recon_frame = true;
     }
 
     /* Stage 5: Deblock (Skipped in BC250_FAST_MODE to maximize gaming framerates) */
@@ -1247,41 +1339,10 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     VkBufferCopy mv_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->mv_staging_size };
     vkCmdCopyBuffer(cmd_buf, ctx->mv_buffer, ctx->mv_staging_buffers[ctx->current_buf], 1, &mv_copy_region);
 
-    /* Update GPU reference frame with current picture for subsequent P-frames */
-    if (render_target.y_plane && ctx->recon_image.y_plane) {
-        /* ctx->recon_image is created via gpu_compute_create_image() too, so it
-         * also starts VK_IMAGE_LAYOUT_PREINITIALIZED. Unlike render_target it is
-         * never host-written; it's the destination of the vkCmdCopyImage below.
-         * ctx owns recon_image directly (not a by-value copy), so the tracked
-         * layout can be persisted in place here. Transition it to GENERAL using
-         * its real tracked old layout instead of assuming it is already GENERAL. */
-        transition_image_layout(cmd_buf, ctx->recon_image.y_plane, ctx->recon_image.current_layout, VK_IMAGE_LAYOUT_GENERAL);
-        ctx->recon_image.current_layout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkImageCopy copy_region_y = {
-            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .extent = { (uint32_t)width, (uint32_t)height, 1 }
-        };
-        vkCmdCopyImage(cmd_buf, render_target.y_plane, VK_IMAGE_LAYOUT_GENERAL,
-                       ctx->recon_image.y_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region_y);
-
-        /* Same for chroma - recon_image's UV plane used to be allocated but
-         * never populated (residual_predict.comp's P-slice chroma
-         * prediction was spatial-only, so nothing read it). Now that real
-         * chroma motion compensation reads it via referenceUV, it must
-         * carry the previous frame's real chroma data. */
-        if (render_target.uv_plane && ctx->recon_image.uv_plane) {
-            VkImageCopy copy_region_uv = {
-                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                .extent = { (uint32_t)width / 2, (uint32_t)height / 2, 1 }
-            };
-            vkCmdCopyImage(cmd_buf, render_target.uv_plane, VK_IMAGE_LAYOUT_GENERAL,
-                           ctx->recon_image.uv_plane, VK_IMAGE_LAYOUT_GENERAL, 1, &copy_region_uv);
-        }
-        ctx->has_recon_frame = true;
-    }
+    /* ctx->recon_image is now populated directly by Stage 4.5 (Reconstruct)
+     * above via real dequant+IDCT+add-back+clip - see that stage's comment.
+     * This replaces the old raw vkCmdCopyImage-from-render_target (source
+     * pixels) that used to run here; has_recon_frame is set by Stage 4.5. */
 
     return 0;
 }
@@ -1350,4 +1411,40 @@ int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *siz
     *size = ctx->mv_staging_size;
     *data = ctx->mv_staging_mapped[prev_buf];
     return (*data != NULL) ? 0 : -1;
+}
+
+/* TEMPORARY debug instrumentation for Part A verification (reconstruction
+ * pipeline) - dumps ctx->recon_image's current contents as raw NV12 bytes,
+ * same file-naming convention as bc250_debug_dump_nv12_frame(), gated by
+ * BC250_DUMP_RECON_FRAMES=1 (BC250_DUMP_DIR for the directory, same as that
+ * function). Call after gpu_compute_sync() so the frame's GPU writes are
+ * guaranteed visible on the host. */
+void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height) {
+    if (!getenv("BC250_DUMP_RECON_FRAMES")) return;
+    if (!ctx || ctx->recon_image.y_plane == VK_NULL_HANDLE || width <= 0 || height <= 0) return;
+
+    static int dump_frame_index = 0;
+    const char *dump_dir = getenv("BC250_DUMP_DIR");
+    if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
+
+    size_t y_size = (size_t)width * height;
+    size_t uv_size = (size_t)width * (height / 2);
+    uint8_t *y_buf = malloc(y_size);
+    uint8_t *uv_buf = malloc(uv_size);
+    if (!y_buf || !uv_buf) { free(y_buf); free(uv_buf); return; }
+
+    if (gpu_compute_download_nv12(ctx, &ctx->recon_image, ctx->recon_memory,
+                                   y_buf, width, uv_buf, width, width, height) == 0) {
+        char dump_path[600];
+        snprintf(dump_path, sizeof(dump_path), "%s/recon_%05d.nv12", dump_dir, dump_frame_index);
+        FILE *dumpf = fopen(dump_path, "wb");
+        if (dumpf) {
+            fwrite(y_buf, 1, y_size, dumpf);
+            fwrite(uv_buf, 1, uv_size, dumpf);
+            fclose(dumpf);
+        }
+    }
+    free(y_buf);
+    free(uv_buf);
+    dump_frame_index++;
 }

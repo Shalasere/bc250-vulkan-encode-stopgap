@@ -40,11 +40,17 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
  * DELIBERATE SIMPLIFICATION (neighbor pixel source): a real H.264 decoder
  * reconstructs macroblocks in strict raster order within a slice, so intra
  * prediction reads already-RECONSTRUCTED (post-residual) neighbor pixels.
- * This pipeline has no reconstruction stage at all (no dequant+IDCT+add-back
- * anywhere, on GPU or CPU - "recon_image" is just a copy of source pixels,
- * see gpu_compute.c) and dispatches every MB of the frame in parallel, so
- * there is no notion of "already decoded" neighbor pixels to read even if a
- * reconstruction path existed. This shader instead reads the CURRENT
+ * There IS now a real reconstruction stage (see reconstruct.comp, dispatched
+ * after quantize.comp) that dequantizes+inverse-transforms each MB's
+ * residual and adds it back to the prediction value this shader computed
+ * (retained via PredOut/binding 7 below), and gpu_compute.c populates
+ * recon_image from THAT for the next frame's P-slice inter prediction. But
+ * this shader still dispatches every MB of the frame in parallel with no
+ * cross-MB ordering, so within a single frame there is still no notion of
+ * "already decoded" neighbor pixels for INTRA prediction specifically (that
+ * would require diagonal-wavefront MB ordering - see reconstruct.comp/
+ * gpu_compute.c for whether that has been implemented). This shader instead
+ * reads the CURRENT
  * (source) frame's neighbor MB pixels directly from currentImage/currentUV -
  * not bit-exact with what a real decoder reconstructs (whose neighbors carry
  * quantization error this encoder's neighbor pixels don't), but it is a
@@ -105,6 +111,16 @@ layout(std430, set = 0, binding = 4) writeonly buffer OutputResidual {
 
 layout(std430, set = 0, binding = 5) writeonly buffer PredModeOut {
     uint pred_modes[];
+};
+
+/* Retained prediction value per residual position, same indexing/layout as
+ * OutputResidual (res[]) above: global_block_idx*16 + pos_in_block. Added so
+ * reconstruct.comp can add the EXACT SAME prediction value back to the
+ * dequantized/inverse-transformed residual, instead of recomputing
+ * prediction independently (which would risk the two paths drifting out of
+ * sync - see reconstruct.comp's top-of-file comment). */
+layout(std430, set = 0, binding = 7) writeonly buffer PredOut {
+    int pred_out[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -267,6 +283,7 @@ void main() {
         uint pos_in_block = (py % 4u) * 4u + (px % 4u);
         uint global_block_idx = mb_idx * 24u + block;
         res[global_block_idx * 16u + pos_in_block] = residual;
+        pred_out[global_block_idx * 16u + pos_in_block] = pred_val;
     } else {
         /* P16x16: real motion-compensated luma residual using this MB's
          * actual searched motion vector (integer-pel, no sub-pel filter). */
@@ -281,6 +298,7 @@ void main() {
         uint pos_in_block = (py % 4u) * 4u + (px % 4u);
         uint global_block_idx = mb_idx * 24u + block;
         res[global_block_idx * 16u + pos_in_block] = residual;
+        pred_out[global_block_idx * 16u + pos_in_block] = ref_val;
     }
 
     /* --- Chroma: I-slices use DC-only prediction from current-frame
@@ -368,5 +386,6 @@ void main() {
         }
 
         res[(mb_idx * 24u + block) * 16u + pos_in_block] = src_val - pred_val;
+        pred_out[(mb_idx * 24u + block) * 16u + pos_in_block] = pred_val;
     }
 }
