@@ -811,8 +811,18 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
 
         bs_write_se(&bs, slice_qp_delta);
         bs_write_ue(&bs, (uint32_t)deblock_idc);
-        bs_write_se(&bs, 0);
-        bs_write_se(&bs, 0);
+        /* Per ITU-T H.264 7.3.3: slice_alpha_c0_offset_div2/slice_beta_offset_div2
+         * are only present when disable_deblocking_filter_idc != 1. Writing them
+         * unconditionally (as this used to) inserts two spurious se(v) values into
+         * the slice header whenever BC250_FAST_MODE=1 sets deblock_idc=1, silently
+         * desyncing every bit of macroblock data that follows - confirmed via
+         * real decode: FAST_MODE=1 produced a cascade of varied CAVLC/mb_type/qp
+         * errors from MB 0 onward, while deblock_idc=0 (the default, and the only
+         * value exercised by this session's earlier testing) was always clean. */
+        if (deblock_idc != 1) {
+            bs_write_se(&bs, 0);
+            bs_write_se(&bs, 0);
+        }
 
         /* 4b. Slice Data (Macroblock Layer) using CAVLC per Section 7.3.4 */
         nc_ctx_t nc = {
@@ -1002,8 +1012,18 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
 
         bs_write_se(&bs, slice_qp_delta);
         bs_write_ue(&bs, (uint32_t)deblock_idc);
-        bs_write_se(&bs, 0);
-        bs_write_se(&bs, 0);
+        /* Per ITU-T H.264 7.3.3: slice_alpha_c0_offset_div2/slice_beta_offset_div2
+         * are only present when disable_deblocking_filter_idc != 1. Writing them
+         * unconditionally (as this used to) inserts two spurious se(v) values into
+         * the slice header whenever BC250_FAST_MODE=1 sets deblock_idc=1, silently
+         * desyncing every bit of macroblock data that follows - confirmed via
+         * real decode: FAST_MODE=1 produced a cascade of varied CAVLC/mb_type/qp
+         * errors from MB 0 onward, while deblock_idc=0 (the default, and the only
+         * value exercised by this session's earlier testing) was always clean. */
+        if (deblock_idc != 1) {
+            bs_write_se(&bs, 0);
+            bs_write_se(&bs, 0);
+        }
 
         /* Macroblock layer */
         if (is_idr) {
