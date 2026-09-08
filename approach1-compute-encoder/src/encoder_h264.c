@@ -596,8 +596,61 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
             dc_in[r][c] = coeff_block_ptr(coeff, mb, r * 4 + c)[0];
     int dc_out_raw[16];
     luma_dc_hadamard(dc_in, dc_out_raw);
+    int dc_out_natural[16];
+    for (int i = 0; i < 16; i++) dc_out_natural[i] = quantize_dc_luma(dc_out_raw[i], qp);
+
+    /*
+     * BUG FIX (found via a byte-level "DC shuffle" round-trip test - a single
+     * 16x16 macroblock whose 16 sub-blocks were each a distinct, known flat
+     * shade, so any misassignment of a decoded DC value to the wrong
+     * sub-block would be immediately visible and unambiguous, unlike
+     * aggregate PSNR on real content): luma_dc_hadamard()'s two-pass
+     * butterfly structure (see its own doc comment: "the write pattern into
+     * tmp[] transposes implicitly, so this is the usual 'rows, transpose,
+     * columns' 2D Hadamard without an explicit transpose step") means
+     * dc_out_raw[i*4+j] is not simply "the Hadamard-domain value at row i,
+     * column j" the way a plain 2D transform's output would be - the
+     * function's own forward+inverse pair is self-consistent (which is why
+     * the GPU reconstruction path, whose forward Hadamard and inverse
+     * Hadamard are BOTH driven by this exact same raster block index and
+     * never leave this codebase, was already measured correct to ~50dB even
+     * on real, spatially-varying content), but the array THIS function hands
+     * to cavlc_write_4x4_block() is serialized into the actual bitstream and
+     * must match what a real, independent decoder assumes when it inverse-
+     * scans the same 16 zigzag-coded values back into a 4x4 array and
+     * inverse-Hadamards them - and that assumption is the natural
+     * (non-transposed) row/column labeling. Before this fix, the DC-shuffle
+     * test above showed ffmpeg decoding every one of the 12 off-diagonal
+     * sub-blocks with EXACTLY the value belonging at its (col,row)-transposed
+     * position (a clean transpose, not a scramble - diagonal sub-blocks were
+     * unaffected, e.g. GT=40 for block(row=0,col=2) decoded as GT's own
+     * block(row=2,col=0)=112). Transposing dc_out here - a single extra
+     * array copy local to the CAVLC path, touching neither
+     * luma_dc_hadamard() itself (shared/relied upon by the GPU reconstruction
+     * path's own from-scratch re-derivation, which must keep agreeing with
+     * this file's forward math per its own top-of-file comment) nor any GPU
+     * shader - makes the bitstream's DC array match the natural
+     * row/column labeling a real decoder assumes, and the DC-shuffle test
+     * now reads back bit-exact (0.0 diff) on all 16 sub-blocks. This was, by
+     * far, the dominant remaining cause of quality_test.sh's luma-specific
+     * corruption after the cavlc_write_run_befores() ordering fix above:
+     * every Intra16x16 macroblock's luma DC (i.e. every macroblock's base
+     * brightness distribution across its 16 sub-blocks) was being
+     * transposed, which is invisible on flat content (the transpose of a
+     * constant is itself - exactly why every earlier flat-macroblock
+     * surgical test in this investigation came back clean) but produces
+     * exactly the "blocky, energy-in-the-wrong-place" corruption seen on any
+     * real, spatially-varying image. Chroma DC is unaffected: its own
+     * chroma_dc_hadamard() is a single symmetric closed-form 2x2 transform
+     * (no two-pass butterfly, no implicit transpose - see that function),
+     * and cavlc_write_chroma_dc_block() scans its 4 values directly in
+     * row-major order with no zigzag step at all, so there is no equivalent
+     * indexing hazard for chroma to fix here.
+     */
     int dc_out[16];
-    for (int i = 0; i < 16; i++) dc_out[i] = quantize_dc_luma(dc_out_raw[i], qp);
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            dc_out[r * 4 + c] = dc_out_natural[c * 4 + r];
 
     /* cbp_luma: any nonzero AC (raster positions 1..15) across all 16 luma blocks. */
     int cbp_luma_flag = 0;
@@ -945,6 +998,32 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         }
         if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0) {
             mvs = (const gpu_mv_t *)mv_data;
+        }
+
+        /* TEMPORARY debug instrumentation (BC250_DUMP_QUANT_LEVELS=1): dumps
+         * the exact post-quant coefficient buffer this frame is about to
+         * hand to CAVLC, so an external tool can independently decode the
+         * produced bitstream and diff against known-good ground truth
+         * without guessing at intermediate values. Dumps every frame while
+         * set; caller should limit clip length. */
+        if (quant_levels && getenv("BC250_DUMP_QUANT_LEVELS")) {
+            const char *dump_dir = getenv("BC250_DUMP_DIR");
+            if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
+            char path[600];
+            snprintf(path, sizeof(path), "%s/quant_levels_%05u.bin", dump_dir, encoder->frame_count);
+            FILE *qf = fopen(path, "wb");
+            if (qf) {
+                fwrite(quant_levels, sizeof(int), (size_t)encoder->total_mbs * 24 * 16, qf);
+                fclose(qf);
+            }
+            char meta_path[600];
+            snprintf(meta_path, sizeof(meta_path), "%s/quant_levels_%05u.meta", dump_dir, encoder->frame_count);
+            FILE *mf = fopen(meta_path, "w");
+            if (mf) {
+                fprintf(mf, "width_in_mbs=%u\nheight_in_mbs=%u\ntotal_mbs=%u\nqp=%d\nis_idr=%d\n",
+                        encoder->width_in_mbs, encoder->height_in_mbs, encoder->total_mbs, qp, is_idr ? 1 : 0);
+                fclose(mf);
+            }
         }
 
         /* Opt-in diagnostic (BC250_DEBUG_MV_STATS=1): confirms the sub-pel
