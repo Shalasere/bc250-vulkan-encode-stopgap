@@ -521,8 +521,30 @@ static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
     int pred_x, pred_y;
     mv_predictor(mvs, mbx, mby, nc->width_in_mbs, nc->start_mb, &pred_x, &pred_y);
-    int mvd_x = mvs[mb].mvx - pred_x;
-    int mvd_y = mvs[mb].mvy - pred_y;
+    /* BUG FIX (root cause of the ~13 dB quality_test.sh FAIL - confirmed via
+     * real ffmpeg decode traces on a minimal repro, see commit message):
+     * motion_estimation.comp / gpu_compute_get_mv_staging_data() produce and
+     * return motion vectors in INTEGER-PEL units (this pipeline does no
+     * sub-pel interpolation anywhere - see residual_predict.comp's top-of-
+     * file comment). mv_predictor()'s median-of-neighbors predictor operates
+     * on those same raw integer-pel gpu_mv_t values, so the difference below
+     * is also in integer-pel units. But ITU-T H.264 7.4.5.3 requires
+     * mvd_l0[][][compIdx] to be coded in QUARTER-LUMA-SAMPLE units - the
+     * bitstream field cavlc_write_mb_p16x16_header() writes is unconditionally
+     * interpreted as quarter-pel by any spec-compliant decoder (mv = predictor
+     * (quarter-pel) + mvd_l0, then >>2 for the integer part + fractional
+     * interpolation). Writing the raw integer-pel difference here means every
+     * decoded motion vector for a non-skip P16x16 MB comes out 4x too SMALL
+     * in magnitude - exactly correct-looking bitstream syntax, wildly wrong
+     * motion. This rounds harmlessly for near-zero motion (why flat/low-
+     * motion regions looked fine) and corrupts real, larger motion badly
+     * (why moving/detailed regions showed block corruption) - see the
+     * decode-trace evidence in the commit message. Fix: scale by 4 (the
+     * legacy CPU-heuristic path lower in this file, h264_encoder_encode_raw,
+     * already did `best_dx * 4, best_dy * 4` correctly - this GPU-driven
+     * path was the one missing it). */
+    int mvd_x = (mvs[mb].mvx - pred_x) * 4;
+    int mvd_y = (mvs[mb].mvy - pred_y) * 4;
 
     /* Luma CBP: one bit per 8x8 quadrant (spec blkIdx/4), based on full
      * 16-coefficient (DC+AC) nonzero-anywhere check since P16x16 luma has
@@ -856,7 +878,41 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
             for (uint32_t mb = start_mb; mb < end_mb; mb++) {
                 uint32_t mbx = mb % encoder->width_in_mbs;
                 uint32_t mby = mb / encoder->width_in_mbs;
-                bool mb_changed = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) != 0) : false;
+                /* BUG FIX (second, independent root cause of the ~13 dB
+                 * quality_test.sh FAIL - confirmed via a minimal repro whose
+                 * ffmpeg decode trace showed EVERY single P-frame macroblock
+                 * decoding as skip ('S'), even under a rigid 16px/frame
+                 * moving test box motion_estimation.comp tracked perfectly -
+                 * see commit message): this used to treat "zero luma
+                 * residual" as sufficient, alone, to emit a P_Skip macroblock.
+                 * But per ITU-T H.264 8.4.1.1 / 7.4.5, a decoder reconstructs
+                 * a P_Skip macroblock using mvL0 = the SAME median-of-
+                 * neighbors predictor mv_predictor() computes below - NOT
+                 * the encoder's actual searched motion vector - plus a
+                 * zero residual. Skip is only a legal encoding when the real
+                 * searched MV *equals* that predictor; otherwise the encoder
+                 * MUST code the MB (as P_L0_16x16, mvd != 0) even though its
+                 * residual is zero, purely to transmit the real motion. The
+                 * old check ignored this entirely, so any MB whose optimal
+                 * motion happened to produce a perfect (zero-residual) match
+                 * - overwhelmingly common on this integer-pel-only,
+                 * no-subpel-interpolation pipeline - got silently skipped
+                 * regardless of how large its real motion was, forcing the
+                 * decoder to reuse (0,0)-chained neighbor predictors and
+                 * freeze that content at its previous position. This is
+                 * exactly the "frames barely change despite real motion"
+                 * symptom, independent of the mvd quarter-pel scaling bug
+                 * fixed in encode_mb_p16x16 above (that bug corrupts MBs
+                 * that DO get coded; this one wrongly avoids coding MBs that
+                 * should be). */
+                bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
+                bool mv_matches_predictor = true;
+                if (mvs) {
+                    int pred_x, pred_y;
+                    mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
+                    mv_matches_predictor = (mvs[mb].mvx == pred_x && mvs[mb].mvy == pred_y);
+                }
+                bool mb_changed = quant_levels ? !(zero_luma_residual && mv_matches_predictor) : false;
 
                 if (!mb_changed) {
                     current_skip_run++;
