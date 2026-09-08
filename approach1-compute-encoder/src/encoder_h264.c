@@ -477,7 +477,17 @@ static int chroma_nc(uint8_t (*nz_c)[4], uint32_t mb, uint32_t mbx, uint32_t mby
 /* Real per-MB motion vector, as written back by mv_staging (see
  * gpu_compute_get_mv_staging_data()'s doc comment) - mirrors the GPU's
  * std430 MotionVector struct {ivec2 mv; uint sad;} byte-for-byte (16 bytes:
- * two int32 + one uint32 + 4 bytes of std430 struct-alignment padding). */
+ * two int32 + one uint32 + 4 bytes of std430 struct-alignment padding).
+ *
+ * UNITS: mvx/mvy are in QUARTER-LUMA-SAMPLE units (motion_estimation.comp's
+ * integer-pel diamond search result, refined to half-pel then quarter-pel
+ * via the real H.264 8.4.2.2.1 interpolation filter - see that shader's
+ * top-of-file comment). This is the ONE consistent unit used everywhere
+ * this struct's values flow: mv_predictor()/neighbor_mv()'s median
+ * predictor, encode_mb_p16x16()'s MVD, the P_Skip "matches predictor" check
+ * in h264_encoder_encode_frame(), and residual_predict.comp's P-slice
+ * prediction (which reads the same mv_buffer values directly, no CPU-side
+ * rescaling in between). */
 typedef struct {
     int32_t mvx, mvy;
     uint32_t sad;
@@ -671,30 +681,25 @@ static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
     int pred_x, pred_y;
     mv_predictor(mvs, mbx, mby, nc->width_in_mbs, nc->start_mb, &pred_x, &pred_y);
-    /* BUG FIX (root cause of the ~13 dB quality_test.sh FAIL - confirmed via
-     * real ffmpeg decode traces on a minimal repro, see commit message):
-     * motion_estimation.comp / gpu_compute_get_mv_staging_data() produce and
-     * return motion vectors in INTEGER-PEL units (this pipeline does no
-     * sub-pel interpolation anywhere - see residual_predict.comp's top-of-
-     * file comment). mv_predictor()'s median-of-neighbors predictor operates
-     * on those same raw integer-pel gpu_mv_t values, so the difference below
-     * is also in integer-pel units. But ITU-T H.264 7.4.5.3 requires
-     * mvd_l0[][][compIdx] to be coded in QUARTER-LUMA-SAMPLE units - the
-     * bitstream field cavlc_write_mb_p16x16_header() writes is unconditionally
-     * interpreted as quarter-pel by any spec-compliant decoder (mv = predictor
-     * (quarter-pel) + mvd_l0, then >>2 for the integer part + fractional
-     * interpolation). Writing the raw integer-pel difference here means every
-     * decoded motion vector for a non-skip P16x16 MB comes out 4x too SMALL
-     * in magnitude - exactly correct-looking bitstream syntax, wildly wrong
-     * motion. This rounds harmlessly for near-zero motion (why flat/low-
-     * motion regions looked fine) and corrupts real, larger motion badly
-     * (why moving/detailed regions showed block corruption) - see the
-     * decode-trace evidence in the commit message. Fix: scale by 4 (the
-     * legacy CPU-heuristic path lower in this file, h264_encoder_encode_raw,
-     * already did `best_dx * 4, best_dy * 4` correctly - this GPU-driven
-     * path was the one missing it). */
-    int mvd_x = (mvs[mb].mvx - pred_x) * 4;
-    int mvd_y = (mvs[mb].mvy - pred_y) * 4;
+    /* UNITS (see motion_estimation.comp's sub-pel refinement comment and
+     * gpu_mv_t's doc comment above): mvs[].mvx/mvy are now real QUARTER-
+     * LUMA-SAMPLE-precision motion vectors, computed by an integer-pel
+     * diamond search followed by a half-pel-then-quarter-pel refinement
+     * pass, and stored in quarter-pel units directly - the SAME units ITU-T
+     * H.264 7.4.5.3 requires mvd_l0[][][compIdx] to be coded in. mv_predictor()'s
+     * median-of-neighbors predictor operates on those same quarter-pel
+     * gpu_mv_t values, so pred_x/pred_y are quarter-pel too - the difference
+     * below needs NO further scaling (a prior version of this fix scaled by
+     * 4 here to correct for the search being integer-pel-only at the time;
+     * that scaling is now WRONG and would quadruple every real motion
+     * vector's magnitude, since mvs[] itself already carries the fractional
+     * precision - see git history for that superseded fix's rationale). The
+     * legacy CPU-heuristic path lower in this file (h264_encoder_encode_raw)
+     * is a separate, self-contained integer-pel-only path that does its own
+     * `best_dx * 4` scaling and does NOT read mvs[] - it is unaffected by
+     * this change. */
+    int mvd_x = mvs[mb].mvx - pred_x;
+    int mvd_y = mvs[mb].mvy - pred_y;
 
     /* Luma CBP: one bit per 8x8 quadrant (spec blkIdx/4), based on full
      * 16-coefficient (DC+AC) nonzero-anywhere check since P16x16 luma has
@@ -1047,16 +1052,20 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                  * residual is zero, purely to transmit the real motion. The
                  * old check ignored this entirely, so any MB whose optimal
                  * motion happened to produce a perfect (zero-residual) match
-                 * - overwhelmingly common on this integer-pel-only,
-                 * no-subpel-interpolation pipeline - got silently skipped
-                 * regardless of how large its real motion was, forcing the
-                 * decoder to reuse (0,0)-chained neighbor predictors and
-                 * freeze that content at its previous position. This is
-                 * exactly the "frames barely change despite real motion"
-                 * symptom, independent of the mvd quarter-pel scaling bug
-                 * fixed in encode_mb_p16x16 above (that bug corrupts MBs
-                 * that DO get coded; this one wrongly avoids coding MBs that
-                 * should be). */
+                 * - common when the search was integer-pel-only, since a
+                 * plain per-pixel copy from the previous frame often matched
+                 * exactly - got silently skipped regardless of how large its
+                 * real motion was, forcing the decoder to reuse
+                 * (0,0)-chained neighbor predictors and freeze that content
+                 * at its previous position. This is exactly the "frames
+                 * barely change despite real motion" symptom, independent
+                 * of the mvd quarter-pel scaling bug fixed in
+                 * encode_mb_p16x16 above (that bug corrupted MBs that DO get
+                 * coded; this one wrongly avoided coding MBs that should
+                 * be). UNCHANGED by the later sub-pel motion search update
+                 * (see gpu_mv_t's UNITS note): mvx/mvy and pred_x/pred_y are
+                 * compared in the same quarter-pel units on both sides here,
+                 * so equality still means exactly what it needs to. */
                 bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
                 bool mv_matches_predictor = true;
                 if (mvs) {

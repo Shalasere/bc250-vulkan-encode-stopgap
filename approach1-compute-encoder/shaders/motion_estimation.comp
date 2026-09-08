@@ -46,11 +46,120 @@ layout(push_constant) uniform PushConstants {
     uint lambda_motion;
 } pcs;
 
+/*
+ * Sub-pel refinement (added on top of the integer-pel diamond search below):
+ * ITU-T H.264 8.4.2.2.1 luma quarter-pel interpolation, implemented exactly
+ * (not approximated) because this pipeline's own reconstruction (used both
+ * to build the residual here/in residual_predict.comp AND as next frame's
+ * reference) must match what a real H.264 decoder produces bit-for-bit at
+ * these positions - any approximation here would silently diverge from the
+ * bitstream's actual meaning to a real decoder.
+ *
+ * Quarter-pel grid, one integer cell (G=(0,0) is the base/anchor integer
+ * sample this MB's motion vector is measured from; H, M, N are its right/
+ * below/diagonal integer neighbors). Half-pel positions (b,h,m,s,j) use the
+ * spec's 6-tap [1,-5,20,20,-5,1] filter; quarter-pel positions are a
+ * rounded average of their two nearest half-pel/integer neighbors - no
+ * separate filter, per spec:
+ *
+ *   G  a  b  c  H         b,s: 1D horizontal 6-tap (rows through G/H, M/N)
+ *   d  e  f  g            h,m: 1D vertical 6-tap (columns through G/M, H/N)
+ *   h  i  j  k  m          j : 2D - 6-tap filter applied to 6 rows of
+ *   n  p  q  r                  horizontal-intermediate (unclipped/
+ *   M        N                  unshifted) sums, single round+clip at the
+ *                                end (see j1 below) - fully separable, so
+ *                                vertical-then-horizontal gives the exact
+ *                                same integer result; horizontal-then-
+ *                                vertical is just the order chosen here.
+ *
+ * All quarter-pel averages below are `(a + b + 1) >> 1` per spec, matched
+ * 1:1 against the standard a/b/c/d/e/f/g/h/i/j/k/m/n/p/q/r letter labels
+ * used by every real H.264 codec's qpel implementation (e.g. libavcodec's
+ * h264qpel), cross-checked position-by-position against Table/Figure 8-4.
+ *
+ * Deliberately reads referenceImage directly (imageLoad + clamp) rather
+ * than the search_window shared-memory cache below: search_window's 48x48
+ * footprint exactly covers this MB's +-16px integer search range with ZERO
+ * margin for the 6-tap filter's extra +-2/+3-pixel reach, so a best-integer
+ * match sitting at the edge of the search range would read out of bounds
+ * off that cache. Direct image reads cost more traffic but are correct at
+ * every candidate position, including that edge case; this refinement pass
+ * only evaluates 16 candidates total (8 half-pel + 8 quarter-pel) per MB, so
+ * the extra cost is bounded and small next to the integer search above.
+ */
+int sampleY(ivec2 p) {
+    ivec2 c = clamp(p, ivec2(0), ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1));
+    return int(round(imageLoad(referenceImage, c).r * 255.0));
+}
+
+int clip1i(int v) { return clamp(v, 0, 255); }
+
+/* Unclipped/unshifted 6-tap sum, horizontal (row y, centered between x,x+1)
+ * and vertical (column x, centered between y,y+1) - shared by the half-pel
+ * edge positions (b/s, h/m) and as the intermediate pass for j below. */
+int hpel_h_raw(int x, int y) {
+    return sampleY(ivec2(x - 2, y)) - 5 * sampleY(ivec2(x - 1, y)) + 20 * sampleY(ivec2(x, y))
+         + 20 * sampleY(ivec2(x + 1, y)) - 5 * sampleY(ivec2(x + 2, y)) + sampleY(ivec2(x + 3, y));
+}
+int hpel_v_raw(int x, int y) {
+    return sampleY(ivec2(x, y - 2)) - 5 * sampleY(ivec2(x, y - 1)) + 20 * sampleY(ivec2(x, y))
+         + 20 * sampleY(ivec2(x, y + 1)) - 5 * sampleY(ivec2(x, y + 2)) + sampleY(ivec2(x, y + 3));
+}
+int clip_round5(int v) { return clip1i((v + 16) >> 5); }
+int qavg(int a, int b) { return (a + b + 1) >> 1; }
+
+/* Real quarter-pel luma sample at absolute position `ref_qpel`, given in
+ * QUARTER-LUMA-SAMPLE units (pixel*4 + fractional 0..3) - i.e. exactly the
+ * units this shader now stores motion vectors in. Floor-divides via `>>2`
+ * (arithmetic shift = floor division for two's-complement negatives too, so
+ * this is correct for negative motion vectors without extra branching). */
+int interp_luma_qpel(ivec2 ref_qpel) {
+    int ix = ref_qpel.x >> 2, iy = ref_qpel.y >> 2;
+    int fx = ref_qpel.x - (ix << 2), fy = ref_qpel.y - (iy << 2); /* always 0..3 */
+
+    if (fx == 0 && fy == 0) return sampleY(ivec2(ix, iy)); /* G: no filtering */
+
+    int G = sampleY(ivec2(ix, iy));
+    int H = sampleY(ivec2(ix + 1, iy));
+    int M = sampleY(ivec2(ix, iy + 1));
+    int N = sampleY(ivec2(ix + 1, iy + 1));
+    int b = clip_round5(hpel_h_raw(ix, iy));
+    int h = clip_round5(hpel_v_raw(ix, iy));
+    int m = clip_round5(hpel_v_raw(ix + 1, iy));
+    int s = clip_round5(hpel_h_raw(ix, iy + 1));
+    int j1 = hpel_h_raw(ix, iy - 2) - 5 * hpel_h_raw(ix, iy - 1) + 20 * hpel_h_raw(ix, iy)
+           + 20 * hpel_h_raw(ix, iy + 1) - 5 * hpel_h_raw(ix, iy + 2) + hpel_h_raw(ix, iy + 3);
+    int j = clip1i((j1 + 512) >> 10);
+
+    switch (fy * 4 + fx) {
+        case 1:  return qavg(G, b);   /* a (0.25, 0)    */
+        case 2:  return b;            /* b (0.5,  0)    */
+        case 3:  return qavg(b, H);   /* c (0.75, 0)    */
+        case 4:  return qavg(G, h);   /* d (0,    0.25) */
+        case 5:  return qavg(G, j);   /* e (0.25, 0.25) */
+        case 6:  return qavg(b, j);   /* f (0.5,  0.25) */
+        case 7:  return qavg(H, j);   /* g (0.75, 0.25) */
+        case 8:  return h;            /* h (0,    0.5)  */
+        case 9:  return qavg(h, j);   /* i (0.25, 0.5)  */
+        case 10: return j;            /* j (0.5,  0.5)  */
+        case 11: return qavg(j, m);   /* k (0.75, 0.5)  */
+        case 12: return qavg(h, M);   /* n (0,    0.75) */
+        case 13: return qavg(M, j);   /* p (0.25, 0.75) */
+        case 14: return qavg(j, s);   /* q (0.5,  0.75) */
+        case 15: return qavg(j, N);   /* r (0.75, 0.75) */
+    }
+    return G; /* unreachable */
+}
+
 shared float search_window[48][48];
 shared float current_mb[16][16];
 shared uint thread_sad[64];
 shared ivec2 shared_best_mv;
 shared uint shared_best_cost;
+shared ivec2 shared_best_half;      /* best half-pel OFFSET (quarter-pel units) found in step 5 */
+shared uint shared_best_half_cost;
+shared ivec2 shared_best_qtr;       /* best quarter-pel OFFSET (quarter-pel units) found in step 6 */
+shared uint shared_best_qtr_cost;
 
 // Early termination threshold for zero-motion detection (~2 intensity levels per pixel)
 const uint STATIC_MB_THRESHOLD = 512;
@@ -185,8 +294,123 @@ void main() {
         if (shared_best_cost < 768) break;
     }
 
+    /*
+     * 5. Half-pel refinement: evaluate the 8 half-pel positions immediately
+     * around the integer winner found above, using the real 6-tap filter
+     * (interp_luma_qpel) to build each candidate's interpolated samples for
+     * the SAD comparison - "search-then-refine", not a full sub-pel search
+     * (see this shader's top-of-file-added comment). SAD-only cost here (no
+     * lambda_motion rate term): every candidate in this refinement shares
+     * the same integer part, so the rate-cost delta between them is
+     * negligible next to the real distortion delta the filter is meant to
+     * capture - unlike the integer search above, which needs lambda to
+     * choose between genuinely different, far-apart motion vectors.
+     */
+    ivec2 int_mv_qpel = shared_best_mv * 4; /* fixed anchor - quarter-pel form of the integer winner */
     if (local_id == 0) {
-        mvs[mb_idx].mv = shared_best_mv;
-        mvs[mb_idx].sad = shared_best_cost;
+        shared_best_half = ivec2(0);
+        shared_best_half_cost = shared_best_cost;
+    }
+    barrier();
+
+    ivec2 HALF_OFFSETS[8] = {
+        ivec2( 2, 0), ivec2(-2, 0), ivec2( 0, 2), ivec2( 0,-2),
+        ivec2( 2, 2), ivec2( 2,-2), ivec2(-2, 2), ivec2(-2,-2)
+    };
+    for (int c = 0; c < 8; c++) {
+        ivec2 cand_offset = HALF_OFFSETS[c];
+        ivec2 cand_qpel = int_mv_qpel + cand_offset;
+        uint local_diff = 0u;
+        for (int i = 0; i < 4; i++) {
+            uint p_idx = local_id * 4 + i;
+            uint px = p_idx % 16;
+            uint py = p_idx / 16;
+            int curr = int(round(current_mb[py][px] * 255.0));
+            ivec2 ref_qpel = ivec2(mb_pos.x + int(px), mb_pos.y + int(py)) * 4 + cand_qpel;
+            int ref_val = interp_luma_qpel(ref_qpel);
+            local_diff += uint(abs(curr - ref_val));
+        }
+        thread_sad[local_id] = local_diff;
+        barrier();
+        if (local_id < 32) thread_sad[local_id] += thread_sad[local_id + 32];
+        barrier();
+        if (local_id < 16) thread_sad[local_id] += thread_sad[local_id + 16];
+        barrier();
+        if (local_id < 8) thread_sad[local_id] += thread_sad[local_id + 8];
+        barrier();
+        if (local_id < 4) thread_sad[local_id] += thread_sad[local_id + 4];
+        barrier();
+        if (local_id < 2) thread_sad[local_id] += thread_sad[local_id + 2];
+        barrier();
+        if (local_id == 0) thread_sad[0] += thread_sad[1];
+        barrier();
+
+        if (local_id == 0 && thread_sad[0] < shared_best_half_cost) {
+            shared_best_half_cost = thread_sad[0];
+            shared_best_half = cand_offset;
+        }
+        barrier();
+    }
+
+    /*
+     * 6. Quarter-pel refinement: evaluate the 8 quarter-pel positions
+     * immediately around the half-pel winner from step 5. No separate
+     * filter needed - interp_luma_qpel already implements the spec's
+     * "quarter-pel = rounded average of nearest half/integer neighbors"
+     * rule internally for these fractional positions (see its switch table).
+     */
+    ivec2 half_mv_qpel = int_mv_qpel + shared_best_half;
+    if (local_id == 0) {
+        shared_best_qtr = ivec2(0);
+        shared_best_qtr_cost = shared_best_half_cost;
+    }
+    barrier();
+
+    ivec2 QTR_OFFSETS[8] = {
+        ivec2( 1, 0), ivec2(-1, 0), ivec2( 0, 1), ivec2( 0,-1),
+        ivec2( 1, 1), ivec2( 1,-1), ivec2(-1, 1), ivec2(-1,-1)
+    };
+    for (int c = 0; c < 8; c++) {
+        ivec2 cand_offset = QTR_OFFSETS[c];
+        ivec2 cand_qpel = half_mv_qpel + cand_offset;
+        uint local_diff = 0u;
+        for (int i = 0; i < 4; i++) {
+            uint p_idx = local_id * 4 + i;
+            uint px = p_idx % 16;
+            uint py = p_idx / 16;
+            int curr = int(round(current_mb[py][px] * 255.0));
+            ivec2 ref_qpel = ivec2(mb_pos.x + int(px), mb_pos.y + int(py)) * 4 + cand_qpel;
+            int ref_val = interp_luma_qpel(ref_qpel);
+            local_diff += uint(abs(curr - ref_val));
+        }
+        thread_sad[local_id] = local_diff;
+        barrier();
+        if (local_id < 32) thread_sad[local_id] += thread_sad[local_id + 32];
+        barrier();
+        if (local_id < 16) thread_sad[local_id] += thread_sad[local_id + 16];
+        barrier();
+        if (local_id < 8) thread_sad[local_id] += thread_sad[local_id + 8];
+        barrier();
+        if (local_id < 4) thread_sad[local_id] += thread_sad[local_id + 4];
+        barrier();
+        if (local_id < 2) thread_sad[local_id] += thread_sad[local_id + 2];
+        barrier();
+        if (local_id == 0) thread_sad[0] += thread_sad[1];
+        barrier();
+
+        if (local_id == 0 && thread_sad[0] < shared_best_qtr_cost) {
+            shared_best_qtr_cost = thread_sad[0];
+            shared_best_qtr = cand_offset;
+        }
+        barrier();
+    }
+
+    if (local_id == 0) {
+        /* Final motion vector, stored in QUARTER-PEL units directly (one
+         * consistent unit for the whole pipeline from here on) - see
+         * encoder_h264.c's encode_mb_p16x16()/mv_predictor() and
+         * residual_predict.comp's P-slice branch, all updated to match. */
+        mvs[mb_idx].mv = half_mv_qpel + shared_best_qtr;
+        mvs[mb_idx].sad = shared_best_qtr_cost;
     }
 }

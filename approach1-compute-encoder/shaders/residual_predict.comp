@@ -27,15 +27,26 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
  *    neighbor chroma pixels.
  *
  *  - P-slices (pcs.is_intra==0): real motion-compensated LUMA and CHROMA
- *    residual using the ACTUAL per-MB integer-pel motion vector this
- *    pipeline already computes in motion_estimation.comp (mv_buffer) -
- *    previously computed but never consumed for residual at all,
- *    wastefully duplicated by a separate, much cruder CPU-side heuristic
- *    (encoder_h264.c's old choose_mv_heuristic). No sub-pel interpolation is
- *    done anywhere (matching this encoder's motion search, which is
- *    integer-pel only) - the luma MV is a direct nearest-neighbor pixel
- *    offset into referenceImage, and the chroma offset is luma_mv/2 into
- *    referenceUV (see the chroma motion-compensation note below).
+ *    residual using the ACTUAL per-MB motion vector this pipeline computes
+ *    in motion_estimation.comp (mv_buffer) - previously computed but never
+ *    consumed for residual at all, wastefully duplicated by a separate,
+ *    much cruder CPU-side heuristic (encoder_h264.c's old
+ *    choose_mv_heuristic).
+ *
+ *    SUB-PEL UPDATE: motion_estimation.comp now refines its integer-pel
+ *    diamond-search winner down to real quarter-pel precision (half-pel via
+ *    the spec 6-tap filter, then quarter-pel via averaging - see that
+ *    shader's top-of-file comment) and stores mv_buffer in QUARTER-LUMA-PEL
+ *    units directly. This shader must reconstruct the EXACT same
+ *    interpolated sample a real H.264 decoder would (ITU-T 8.4.2.2.1) at
+ *    that fractional position, since this reconstruction is both what gets
+ *    subtracted to form the transmitted residual AND (via reconstruct.comp)
+ *    what becomes next frame's reference - any mismatch here would corrupt
+ *    every P-frame that follows. See interp_luma_qpel() below (duplicated
+ *    from motion_estimation.comp's identical function - no #include support
+ *    in this build's shader compilation, see that shader's comment for the
+ *    full derivation). Chroma uses direct eighth-pel bilinear interpolation
+ *    (no 6-tap filter - see the chroma motion-compensation note below).
  *
  * DELIBERATE SIMPLIFICATION (neighbor pixel source): a real H.264 decoder
  * reconstructs macroblocks in strict raster order within a slice, so intra
@@ -61,12 +72,13 @@ layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
  * encoder_h264.c).
  *
  * P-slice chroma is now real motion-compensated residual too (see
- * referenceUV below): chroma_mv = luma_mv/2 (integer division, truncating
- * toward zero) since this encoder's motion search is integer-luma-pel only
- * - there is no quarter/eighth-pel chroma derivation and no interpolation
- * anywhere in this pipeline, so a plain half-scaled integer offset is the
- * only precision level consistent with the rest of it. I-slice chroma is
- * unchanged (spatial DC, see 8.3.4.1 below).
+ * referenceUV below), using real eighth-chroma-pel bilinear interpolation
+ * (ITU-T 8.4.1.4 + 8.4.2.2.2): mvCLX = mvLX numerically unchanged for 4:2:0
+ * chroma (no /2, no separate derivation) - since mv_buffer's value is now
+ * in quarter-LUMA-pel units and chroma sits at half the luma resolution,
+ * applying that SAME raw integer value against the chroma pixel grid is
+ * exactly what gives eighth-CHROMA-pel precision there, per spec. I-slice
+ * chroma is unchanged (spatial DC, see 8.3.4.1 below).
  *
  * SLICE BOUNDARIES: this project's own installed environment defaults to
  * BC250_SLICES_PER_FRAME=4 (see encoder_h264.c), so multi-slice is the
@@ -166,6 +178,67 @@ shared ivec2 left_uv[8];
 shared int cb_dc[4], cr_dc[4];
 
 int clip1(int v) { return clamp(v, 0, 255); }
+
+/*
+ * Real ITU-T H.264 8.4.2.2.1 quarter-pel luma interpolation - 1:1 duplicate
+ * of motion_estimation.comp's identical function (see that shader's
+ * top-of-file comment for the full derivation/labeling; no #include support
+ * in this project's shader build, see the SUB-PEL UPDATE note above). Reads
+ * `referenceImage` directly with edge clamping. `ref_qpel` is an absolute
+ * sample position in quarter-luma-sample units (pixel*4 + fractional 0..3).
+ */
+int sampleRefY(ivec2 p) {
+    ivec2 c = clamp(p, ivec2(0), ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1));
+    return int(round(imageLoad(referenceImage, c).r * 255.0));
+}
+int hpel_h_raw(int x, int y) {
+    return sampleRefY(ivec2(x - 2, y)) - 5 * sampleRefY(ivec2(x - 1, y)) + 20 * sampleRefY(ivec2(x, y))
+         + 20 * sampleRefY(ivec2(x + 1, y)) - 5 * sampleRefY(ivec2(x + 2, y)) + sampleRefY(ivec2(x + 3, y));
+}
+int hpel_v_raw(int x, int y) {
+    return sampleRefY(ivec2(x, y - 2)) - 5 * sampleRefY(ivec2(x, y - 1)) + 20 * sampleRefY(ivec2(x, y))
+         + 20 * sampleRefY(ivec2(x, y + 1)) - 5 * sampleRefY(ivec2(x, y + 2)) + sampleRefY(ivec2(x, y + 3));
+}
+int clip_round5(int v) { return clip1((v + 16) >> 5); }
+int qavg(int a, int b) { return (a + b + 1) >> 1; }
+
+int interp_luma_qpel(ivec2 ref_qpel) {
+    int ix = ref_qpel.x >> 2, iy = ref_qpel.y >> 2;
+    int fx = ref_qpel.x - (ix << 2), fy = ref_qpel.y - (iy << 2); /* always 0..3 */
+
+    if (fx == 0 && fy == 0) return sampleRefY(ivec2(ix, iy)); /* G: no filtering */
+
+    int G = sampleRefY(ivec2(ix, iy));
+    int H = sampleRefY(ivec2(ix + 1, iy));
+    int M = sampleRefY(ivec2(ix, iy + 1));
+    int N = sampleRefY(ivec2(ix + 1, iy + 1));
+    int b = clip_round5(hpel_h_raw(ix, iy));
+    int h = clip_round5(hpel_v_raw(ix, iy));
+    int m = clip_round5(hpel_v_raw(ix + 1, iy));
+    int s = clip_round5(hpel_h_raw(ix, iy + 1));
+    int j1 = hpel_h_raw(ix, iy - 2) - 5 * hpel_h_raw(ix, iy - 1) + 20 * hpel_h_raw(ix, iy)
+           + 20 * hpel_h_raw(ix, iy + 1) - 5 * hpel_h_raw(ix, iy + 2) + hpel_h_raw(ix, iy + 3);
+    int j = clip1((j1 + 512) >> 10);
+
+    switch (fy * 4 + fx) {
+        case 1:  return qavg(G, b);   /* a (0.25, 0)    */
+        case 2:  return b;            /* b (0.5,  0)    */
+        case 3:  return qavg(b, H);   /* c (0.75, 0)    */
+        case 4:  return qavg(G, h);   /* d (0,    0.25) */
+        case 5:  return qavg(G, j);   /* e (0.25, 0.25) */
+        case 6:  return qavg(b, j);   /* f (0.5,  0.25) */
+        case 7:  return qavg(H, j);   /* g (0.75, 0.25) */
+        case 8:  return h;            /* h (0,    0.5)  */
+        case 9:  return qavg(h, j);   /* i (0.25, 0.5)  */
+        case 10: return j;            /* j (0.5,  0.5)  */
+        case 11: return qavg(j, m);   /* k (0.75, 0.5)  */
+        case 12: return qavg(h, M);   /* n (0,    0.75) */
+        case 13: return qavg(M, j);   /* p (0.25, 0.75) */
+        case 14: return qavg(j, s);   /* q (0.5,  0.75) */
+        case 15: return qavg(j, N);   /* r (0.75, 0.75) */
+    }
+    return G; /* unreachable */
+}
 
 void main() {
     uint mb_x = gl_WorkGroupID.x;
@@ -286,11 +359,13 @@ void main() {
         pred_out[global_block_idx * 16u + pos_in_block] = pred_val;
     } else {
         /* P16x16: real motion-compensated luma residual using this MB's
-         * actual searched motion vector (integer-pel, no sub-pel filter). */
+         * actual searched motion vector, now real quarter-pel precision
+         * (mb_mv is in quarter-luma-pel units - see the SUB-PEL UPDATE note
+         * above and interp_luma_qpel()). */
         if (local_id == 0u) pred_modes[mb_idx] = MODE_DC; /* unused by the CPU P-path; keep the buffer defined */
 
-        ivec2 ref_coord = clamp(mb_pos + ivec2(px, py) + mb_mv, ivec2(0), frame_max);
-        int ref_val = int(round(imageLoad(referenceImage, ref_coord).r * 255.0));
+        ivec2 ref_qpel = (mb_pos + ivec2(px, py)) * 4 + mb_mv;
+        int ref_val = interp_luma_qpel(ref_qpel);
         int residual = current_mb[py][px] - ref_val;
 
         uint bx = px / 4u, by = py / 4u;
@@ -376,13 +451,31 @@ void main() {
         if (pcs.is_intra == 1u) {
             pred_val = is_cr ? cr_dc[sub] : cb_dc[sub];
         } else {
-            /* chroma_mv = luma_mv/2 - see the chroma motion-compensation
-             * note at the top of this file. GLSL integer division
-             * truncates toward zero, same as C. */
-            ivec2 chroma_mv = mb_mv / 2;
-            ivec2 ref_coord = clamp(mb_pos_uv + ivec2(px_off, py_off) + chroma_mv, ivec2(0), uv_max);
-            vec2 ref_uv = imageLoad(referenceUV, ref_coord).rg;
-            pred_val = int(round((is_cr ? ref_uv.g : ref_uv.r) * 255.0));
+            /* Real eighth-chroma-pel bilinear interpolation (ITU-T 8.4.1.4 +
+             * 8.4.2.2.2) - see the chroma motion-compensation note at the
+             * top of this file. mvCLX = mvLX numerically (mb_mv, unchanged)
+             * for 4:2:0 chroma; applying that same quarter-luma-pel-valued
+             * mv against the half-resolution chroma grid gives eighth-
+             * chroma-pel precision. No 6-tap filter for chroma - direct
+             * bilinear from the 4 nearest integer chroma samples. */
+            ivec2 base_uv = mb_pos_uv + ivec2(px_off, py_off);
+            ivec2 full_uv = base_uv * 8 + mb_mv;
+            int ixc = full_uv.x >> 3, iyc = full_uv.y >> 3;
+            int fxc = full_uv.x - (ixc << 3), fyc = full_uv.y - (iyc << 3); /* 0..7 */
+            ivec2 c00 = clamp(ivec2(ixc, iyc),         ivec2(0), uv_max);
+            ivec2 c10 = clamp(ivec2(ixc + 1, iyc),     ivec2(0), uv_max);
+            ivec2 c01 = clamp(ivec2(ixc, iyc + 1),     ivec2(0), uv_max);
+            ivec2 c11 = clamp(ivec2(ixc + 1, iyc + 1), ivec2(0), uv_max);
+            vec2 uvA = imageLoad(referenceUV, c00).rg;
+            vec2 uvB = imageLoad(referenceUV, c10).rg;
+            vec2 uvC = imageLoad(referenceUV, c01).rg;
+            vec2 uvD = imageLoad(referenceUV, c11).rg;
+            int A = int(round((is_cr ? uvA.g : uvA.r) * 255.0));
+            int B = int(round((is_cr ? uvB.g : uvB.r) * 255.0));
+            int C = int(round((is_cr ? uvC.g : uvC.r) * 255.0));
+            int D = int(round((is_cr ? uvD.g : uvD.r) * 255.0));
+            pred_val = ((8 - fxc) * (8 - fyc) * A + fxc * (8 - fyc) * B
+                      + (8 - fxc) * fyc * C + fxc * fyc * D + 32) >> 6;
         }
 
         res[(mb_idx * 24u + block) * 16u + pos_in_block] = src_val - pred_val;
