@@ -83,9 +83,20 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
                 break;
             case VAConfigAttribEncPackedHeaders:
-                attrib_list[i].value = VA_ENC_PACKED_HEADER_SEQUENCE |
-                                       VA_ENC_PACKED_HEADER_PICTURE |
-                                       VA_ENC_PACKED_HEADER_SLICE;
+                /* bc250_RenderPicture() below treats VAEncPackedHeaderParameterBufferType
+                 * and VAEncPackedHeaderDataBufferType as a silent no-op - whatever SPS/PPS/
+                 * slice-header/SEI bytes a caller (e.g. ffmpeg's h264_vaapi) hands us via
+                 * those buffers are discarded, and encoder_h264.c always emits its own
+                 * AUD/SPS/PPS/slice headers instead. Previously this advertised SEQUENCE |
+                 * PICTURE | SLICE (0x7), which told libva callers we would splice in their
+                 * own header bytes verbatim. That's not true, and it isn't just cosmetic:
+                 * ffmpeg only builds AVCodecContext.extradata from its self-authored SPS/PPS
+                 * when VA_ENC_PACKED_HEADER_SEQUENCE is (falsely) reported present, so an
+                 * MP4/avcC mux could end up with an extradata SPS/PPS that disagrees with
+                 * the in-band one this driver actually writes. Advertise NONE until/unless
+                 * RenderPicture is changed to genuinely consume these buffers.
+                 */
+                attrib_list[i].value = VA_ENC_PACKED_HEADER_NONE;
                 break;
             case VAConfigAttribEncMaxRefFrames:
                 attrib_list[i].value = 1;
