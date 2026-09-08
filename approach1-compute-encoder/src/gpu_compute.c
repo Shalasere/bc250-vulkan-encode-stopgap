@@ -202,6 +202,13 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
 
     /* Update buffer descriptors */
     update_storage_buffer_descriptor(ctx->device, ctx->me_desc_set, 2, ctx->mv_buffer, mv_size);
+    /* residual_buffer is ALSO bound (new binding 3) to the motion-estimation
+     * descriptor set: see motion_estimation.comp's added residual-writing
+     * loop and the me_desc_layout binding-count change in bc250_gpu_init -
+     * this shader is the only stage that already has the current MB's luma
+     * pixels loaded, so it doubles as the (documented-simplified) intra
+     * residual generator. See that shader's top-of-file comment. */
+    update_storage_buffer_descriptor(ctx->device, ctx->me_desc_set, 3, ctx->residual_buffer, residual_size);
 
     update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 0, ctx->residual_buffer, residual_size);
     update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 1, ctx->coeff_buffer, coeff_size);
@@ -466,9 +473,11 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VkDescriptorSetLayoutBinding me_bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 3: residual_buffer - see motion_estimation.comp's residual-writing addition */
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo me_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = me_bindings };
+    VkDescriptorSetLayoutCreateInfo me_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = me_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &me_layout_info, NULL, &ctx->me_desc_layout);
 
     VkDescriptorSetLayoutBinding dct_bindings[] = {
