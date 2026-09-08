@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
@@ -725,11 +726,54 @@ void gpu_compute_destroy_image(gpu_context_t *ctx, gpu_image_t image, gpu_memory
     if (memory.memory) vkFreeMemory(ctx->device, memory.memory, NULL);
 }
 
+/* Test-harness instrumentation (tools/quality_test.sh): dump raw NV12 frame
+ * bytes to disk when BC250_DUMP_INPUT_FRAMES=1 is set, building a
+ * byte-exact ground-truth reference of what the driver actually received
+ * from libva/ffmpeg for later PSNR/SSIM comparison against encoder output.
+ * Called from both known upload paths — gpu_compute_upload_nv12()
+ * (vaPutImage) and bc250_UnmapBuffer() in va_backend.c (the zero-copy
+ * vaDeriveImage+vaMapBuffer path some ffmpeg versions use instead) — so
+ * whichever path a given ffmpeg build takes, the frame gets captured.
+ * Compiled in unconditionally but a no-op (single getenv check) unless the
+ * env var is set, so it costs nothing in normal operation. */
+void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
+                                  const uint8_t *uv_plane, int uv_pitch,
+                                  int width, int height) {
+    if (!getenv("BC250_DUMP_INPUT_FRAMES")) return;
+    if (!y_plane || !uv_plane || width <= 0 || height <= 0) return;
+
+    static int dump_frame_index = 0;
+    const char *dump_dir = getenv("BC250_DUMP_DIR");
+    if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
+    char dump_path[600];
+    snprintf(dump_path, sizeof(dump_path), "%s/frame_%05d.nv12", dump_dir, dump_frame_index);
+    FILE *dumpf = fopen(dump_path, "wb");
+    if (dumpf) {
+        for (int r = 0; r < height; r++) {
+            fwrite(y_plane + (size_t)r * y_pitch, 1, (size_t)width, dumpf);
+        }
+        for (int r = 0; r < height / 2; r++) {
+            fwrite(uv_plane + (size_t)r * uv_pitch, 1, (size_t)width, dumpf);
+        }
+        fclose(dumpf);
+    } else {
+        fprintf(stderr, "[bc250-gpu] BC250_DUMP_INPUT_FRAMES: failed to open %s: %s\n", dump_path, strerror(errno));
+    }
+    dump_frame_index++;
+}
+
 int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                            const uint8_t *y_plane, int y_pitch,
                            const uint8_t *uv_plane, int uv_pitch,
                            int width, int height) {
     if (!ctx || !image || !memory.memory || !y_plane || !uv_plane) return -1;
+
+    /* Test-harness instrumentation (tools/quality_test.sh): capture the
+     * exact raw NV12 bytes libva handed us via the vaPutImage upload path,
+     * before any GPU work touches them. See bc250_debug_dump_nv12_frame()
+     * for the other upload path (zero-copy vaDeriveImage+vaMapBuffer) this
+     * doesn't cover. */
+    bc250_debug_dump_nv12_frame(y_plane, y_pitch, uv_plane, uv_pitch, width, height);
 
     VkImageSubresource subresource_y = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
     VkSubresourceLayout layout_y;
