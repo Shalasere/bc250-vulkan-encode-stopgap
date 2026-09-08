@@ -1520,8 +1520,9 @@ int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *siz
     return (*data != NULL) ? 0 : -1;
 }
 
-/* TEMPORARY debug instrumentation for Part A verification (reconstruction
- * pipeline) - dumps ctx->recon_image's current contents as raw NV12 bytes,
+/* Opt-in debug instrumentation, originally added for Part A verification
+ * (reconstruction pipeline) and kept as a permanent low-risk diagnostic -
+ * dumps ctx->recon_image's current contents as raw NV12 bytes,
  * same file-naming convention as bc250_debug_dump_nv12_frame(), gated by
  * BC250_DUMP_RECON_FRAMES=1 (BC250_DUMP_DIR for the directory, same as that
  * function). Call after gpu_compute_sync() so the frame's GPU writes are
