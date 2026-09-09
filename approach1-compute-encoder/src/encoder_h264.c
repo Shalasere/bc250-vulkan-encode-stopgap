@@ -889,6 +889,51 @@ static int mb_has_any_luma_nonzero(const int *quant_levels, uint32_t mb_idx) {
     return 0;
 }
 
+/* Whole-MB "does this P16x16 MB have any nonzero CHROMA coefficient" -
+ * the skip decision's missing other half (see mb_has_any_luma_nonzero()
+ * above and its two call sites' doc comments). A P_Skip macroblock per
+ * ITU-T 8.4.1.1 carries ZERO residual for the ENTIRE macroblock, chroma
+ * included - not just luma. Before this function existed, the skip
+ * decision at both call sites checked luma alone, so any MB with a
+ * nonzero chroma residual but a zero luma residual (and an MV matching
+ * the predictor) was still wrongly certified skip-legal, silently
+ * dropping its real chroma correction from the transmitted bitstream.
+ *
+ * That mismatch is invisible to this encoder itself: gpu_compute.c's
+ * reconstruct.comp shader (which builds the GPU-side reference image
+ * used for every LATER frame's motion search and skip decisions) applies
+ * the full chroma residual unconditionally, independent of what the CPU
+ * later decides to transmit. So the encoder's own future-frame reference
+ * silently keeps the "corrected" chroma that was never actually sent to
+ * the real decoder - meaning the real client's chroma is now wrong, but
+ * this encoder's own quant_levels for that position keep computing a
+ * near-zero residual on subsequent frames too (relative to its own,
+ * already-"corrected" internal reference), so the missing correction is
+ * never retransmitted. This is a one-way, compounding, chroma-only drift
+ * that only a future IDR (full intra, no skip) can reset - matching the
+ * real-client symptom of a live stream's color slowly collapsing to
+ * grayscale/incorrect color over a GOP, then resetting at the next IDR.
+ *
+ * Mirrors the exact same chroma-DC-Hadamard-then-nonzero-check /
+ * chroma-AC-nonzero-check used everywhere else in this file to derive
+ * cbp_chroma (see encode_mb_p16x16/encode_mb_i16x16 and their CABAC
+ * counterparts) - this is not a new heuristic, just applying the same
+ * existing test to the skip decision. */
+static int mb_has_any_chroma_nonzero(const int *quant_levels, const int *coeff, uint32_t mb_idx) {
+    int cb_dc_raw[4], cr_dc_raw[4];
+    for (int i = 0; i < 4; i++) cb_dc_raw[i] = coeff_block_ptr(coeff, mb_idx, 16 + i)[0];
+    for (int i = 0; i < 4; i++) cr_dc_raw[i] = coeff_block_ptr(coeff, mb_idx, 20 + i)[0];
+    int cb_dc[4], cr_dc[4];
+    chroma_dc_hadamard(cb_dc_raw, cb_dc);
+    chroma_dc_hadamard(cr_dc_raw, cr_dc);
+    for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) return 1;
+
+    for (int b = 16; b < 24; b++) {
+        if (block_any_nonzero(quant_levels, mb_idx, b, 1, 16)) return 1;
+    }
+    return 0;
+}
+
 /*
  * encode_mb_i16x16 - Encode one Intra 16x16 macroblock: header, luma DC
  * (Hadamard), luma AC (16 blocks, spec order), chroma DC (Hadamard x2) and
@@ -1635,7 +1680,23 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
-        encoder->pps.pic_init_qp = qp;
+        /* encoder->pps.pic_init_qp's own contract (bitstream.h: "Initial QP
+         * - 26") is to already hold QP-26, matching bitstream.c's direct
+         * signed exp-Golomb write of this field as pic_init_qp_minus26 -
+         * NOT the raw QP. Storing raw `qp` here (as this line previously
+         * did) made a real decoder compute SliceQPY's base as qp+26 instead
+         * of qp, and for any qp >= 26 pushed pic_init_qp_minus26 itself
+         * outside its legal ITU-T range of [-26,25] entirely (confirmed
+         * on-hardware: a real Sunshine session sending pic_init_qp=26 wrote
+         * an SPS/PPS with pic_init_qp_minus26=26, which ffmpeg's own h264
+         * bitstream reader correctly rejected as out of range, corrupting
+         * the very first frame of the stream). This code path is only
+         * reachable when a caller explicitly sets a nonzero pic_init_qp in
+         * VAEncPictureParameterBufferH264 - this project's own synthetic
+         * ffmpeg-testsrc testing never has, which is why this went
+         * uncaught all session until a real VA-API consumer (Sunshine)
+         * exercised it for the first time. */
+        encoder->pps.pic_init_qp = qp - 26;
     }
 }
 
@@ -2132,13 +2193,16 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                  * away from, the originally-reported gradient-boundary pixel
                  * defect at mbx=21/mby=59. See docs/DEVLOG.md. */
                 bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
+                /* See mb_has_any_chroma_nonzero()'s doc comment: a P_Skip MB
+                 * must have zero residual for chroma too, not just luma. */
+                bool zero_chroma_residual = (quant_levels && coeff) ? (mb_has_any_chroma_nonzero(quant_levels, coeff, mb) == 0) : true;
                 bool mv_matches_predictor = true;
                 if (mvs) {
                     int pred_x, pred_y;
                     skip_mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
                     mv_matches_predictor = (mvs[mb].mvx == pred_x && mvs[mb].mvy == pred_y);
                 }
-                bool mb_changed = quant_levels ? !(zero_luma_residual && mv_matches_predictor) : false;
+                bool mb_changed = quant_levels ? !(zero_luma_residual && zero_chroma_residual && mv_matches_predictor) : false;
 
                 if (!mb_changed) {
                     current_skip_run++;
@@ -2234,13 +2298,17 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                      * mb_skip_flag per MB, ITU-T 9.3.3.1.1.1, instead of an
                      * accumulated mb_skip_run). */
                     bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
+                    /* See mb_has_any_chroma_nonzero()'s doc comment: a P_Skip
+                     * MB must have zero residual for chroma too, not just
+                     * luma. */
+                    bool zero_chroma_residual = (quant_levels && coeff) ? (mb_has_any_chroma_nonzero(quant_levels, coeff, mb) == 0) : true;
                     bool mv_matches_predictor = true;
                     if (mvs) {
                         int pred_x, pred_y;
                         skip_mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
                         mv_matches_predictor = (mvs[mb].mvx == pred_x && mvs[mb].mvy == pred_y);
                     }
-                    bool mb_changed = quant_levels ? !(zero_luma_residual && mv_matches_predictor) : false;
+                    bool mb_changed = quant_levels ? !(zero_luma_residual && zero_chroma_residual && mv_matches_predictor) : false;
                     bool skip = !mb_changed;
 
                     int ctx_skip = ((mbx > 0 && (mb - 1) >= nc.start_mb && !encoder->skip_flag[mb - 1]) ? 1 : 0) +
