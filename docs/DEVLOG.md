@@ -785,6 +785,107 @@ question, not investigated here), and the `pic_init_qp_minus26` bug.
 Connecting a real Moonlight client (item 3 of §10's original plan) is
 the next actual milestone, not yet attempted.
 
+### 10.7 First real Moonlight client connection — two real bugs found and fixed
+
+`encoder = vaapi` was left on and a real Moonlight client connected to
+the live Sunshine service for the first time. This immediately surfaced
+two genuine, previously-latent encoder bugs — both invisible to every
+synthetic `ffmpeg testsrc` test run so far this project, because neither
+a real VA-API consumer negotiating its own encode parameters nor real
+captured desktop content had ever been exercised end-to-end before.
+
+**Bug 1 — `pic_init_qp_minus26` out of range, broke the very first
+connection.** This is the bug flagged but not fixed in §10.6. Root
+cause: `h264_encoder_set_qp()` wrote the raw application QP straight
+into `pps.pic_init_qp`, but that field's real contract (per
+`bitstream.h`'s own comment and `bitstream.c`'s direct signed
+exp-Golomb write) is to already hold `QP-26`. Sunshine's real
+negotiated QP (~26) produced `pic_init_qp_minus26=26`, one past the
+legal ITU-T maximum of 25 — confirmed via the client-side log:
+`pic_init_qp_minus26 out of range: 26, but must be in [-26,25]` /
+`Invalid data found when processing input`, immediately after
+`CLIENT CONNECTED`, corrupting the very first frame the client ever
+saw. No prior test in this project's history had ever driven this
+code path: it's only reached when a real caller sets a nonzero
+`pic_init_qp` in `VAEncPictureParameterBufferH264`, which only
+Sunshine's real negotiation does. **Fixed** with
+`encoder->pps.pic_init_qp = qp - 26` in `encoder_h264.c`. Verified via
+`ctest` (no regression) and a new targeted repro
+(`ffmpeg -c:v h264_vaapi -qp 30 ...` — the `-qp` flag is what forces a
+nonzero `pic_init_qp`) showing clean `I,P,P,P,P` frames with no decode
+error. Confirmed on a real client connect/disconnect cycle after the
+fix: clean session, no recurrence.
+
+**Bug 2 — P-slice skip decision ignored chroma residual, causing a
+one-way compounding chroma drift on real content.** After bug 1 was
+fixed, the user's next connect/disconnect cycle was clean, but a
+longer live session showed real, visible corruption: the picture
+started good, then showed color-blocking artifacts, then progressively
+lost color fidelity, ending as a "black and white corroded mess" —
+resetting to good again at the next IDR, then repeating. This pattern
+(luma staying legible while chroma specifically decays, compounding
+over a GOP, periodic reset) pointed at a chroma-specific reference
+mismatch rather than a bitstream-validity bug.
+
+Root cause, found by reading the actual skip-decision code
+(`h264_encoder_encode_frame()`'s P-slice loop, both the CAVLC and CABAC
+variants): the skip-legality check, `mb_has_any_luma_nonzero()`, only
+ever inspected the macroblock's 16 luma blocks. Per ITU-T 8.4.1.1, a
+P_Skip macroblock must carry **zero residual for the whole
+macroblock, chroma included** — but this codebase certified a
+macroblock skip-legal (and so transmitted zero residual for it) as
+long as luma was zero and the motion vector matched the predictor,
+even when that macroblock's chroma residual (blocks 16–23, per this
+file's 24-block-per-MB raster convention) was genuinely nonzero. That
+real chroma correction was silently dropped from the bitstream.
+
+Crucially, this divergence was invisible to the encoder's own
+self-checks: `gpu_compute.c`'s `reconstruct.comp` shader — which
+builds the GPU-side reference image used for every later frame's
+motion search and skip decisions — applies the full chroma residual
+unconditionally, with no knowledge of what the CPU side later decides
+to transmit. So the encoder's own future-frame reference kept the
+"corrected" chroma that never actually reached the real client. On
+every subsequent frame, the encoder's own residual computation for
+that position (computed against its own already-corrected internal
+reference) also trended toward zero, so the missing correction was
+never resent — a one-way, compounding, chroma-only drift that only a
+full IDR (no skip, complete retransmission) could reset. This maps
+exactly onto the observed real-client symptom.
+
+**Fixed** by adding `mb_has_any_chroma_nonzero()` — mirroring the
+identical chroma-DC-Hadamard-then-nonzero-check / chroma-AC-nonzero-check
+this file already uses everywhere else to derive `cbp_chroma` — and
+requiring it (alongside the existing luma and MV-predictor checks) at
+both skip-decision call sites (CAVLC and CABAC). **Verified via
+`quality_test.sh`**: average PSNR jumped from this project's prior
+best of ~51 dB (§9) to **59.60 dB** (Y:59.59 U:59.64 V:59.60),
+SSIM 0.99939 — a real, board-measured, chroma-specific quality gain,
+confirming the diagnosis rather than just plausibly explaining it.
+Both fixes committed together (`encoder_h264.c`), driver rebuilt,
+reinstalled to `/opt/bc250-driver`, and Sunshine restarted to pick up
+the fix — `Found H.264 encoder: h264_vaapi [vaapi]` confirmed again
+post-restart. A further live client test to confirm the real-content
+corruption is gone is the next step, not yet completed as of this
+writing.
+
+**Diagnostic note**: a separate `kmsgrab`+`hwmap` ffmpeg-based capture
+script used earlier in this same investigation (to try to reproduce
+the corruption locally) turned up a *third*, distinct latent bug:
+`bc250_CreateSurfaces2()` ignores its `attrib_list`/`num_attribs`
+entirely and always allocates a fresh internal GPU image, rather than
+importing an externally-supplied DRM-PRIME buffer when one is
+requested (`VASurfaceAttribExternalBuffers`/DRM-PRIME memory type) —
+producing a solid, blank flat-color surface instead of the real
+imported framebuffer. This is real and worth fixing, but it is
+**not** what caused the corruption described above (Sunshine's own
+KMS screencasting path logs `Screencasting with KMS` and does not
+appear to hit this code path in practice) — it was caught only because
+the diagnostic script happened to exercise a code path
+(`vaCreateSurfaces2` with external-buffer import attributes) that
+nothing else in this project has ever used. **Not fixed here** —
+tracked as a known, real, separate defect.
+
 ---
 
 ## 11. Process notes worth preserving
