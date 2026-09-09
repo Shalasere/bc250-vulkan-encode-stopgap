@@ -23,7 +23,12 @@ which itself requires GPL-compatible licensing for loadable modules.
 
 ---
 
-NOTE: this GPL-2.0 license applies only to this audio-fix/ subdirectory
-(the DKMS kernel module). The rest of this repository (the userspace
-VA-API driver, shaders, and tools) is licensed separately under MIT —
-see the top-level LICENSE file.
+NOTE: this GPL-2.0-only license applies only to this audio-fix/
+subdirectory (the DKMS kernel module) and is unchanged from how this
+module's own source (MODULE_LICENSE("GPL v2") in bc250_audio_fix.c) has
+always declared itself. The rest of this repository (the userspace
+VA-API driver, Vulkan compute shaders, and tools) is licensed separately
+under GPL-3.0-only — see the top-level LICENSE file. GPL-2.0 and GPL-3.0
+are not compatible for a single combined/linked binary, but no such
+combination exists here: this kernel module and the userspace driver are
+separate, unlinked binaries, so there is no conflict.
