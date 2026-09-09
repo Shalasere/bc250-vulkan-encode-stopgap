@@ -2047,7 +2047,29 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
         uint32_t end_mb = (uint32_t)((s + 1) * encoder->total_mbs / num_slices);
 
-        size_t rbsp_buf_size = (end_mb - start_mb) * 64 + 4096;
+        /* 64 bytes/MB was sized against this project's only tested content
+         * (synthetic ffmpeg testsrc: flat gradients/simple motion, which
+         * never has much real per-block AC energy) and was never enough for
+         * real, busy content at a real client's negotiated QP - confirmed
+         * on-hardware via a real live Sunshine/Moonlight session: a 2560x1440
+         * real desktop capture at QP=12 overflowed this buffer partway
+         * through a P-frame, and both bs_write_*() (bitstream.c's own
+         * bs->overflow check) and cabac_encode_flush() (cabac.c's
+         * cb->overflow check, see its "CABAC slice buffer overflow" log)
+         * correctly detected it and stopped writing rather than corrupting
+         * memory - but the resulting bitstream was silently truncated
+         * exactly at that point, desyncing any real decoder from there
+         * onward (reproduced offline: "error while decoding MB 72 73,
+         * bytestream -59" then error-concealment bleeding stale reference
+         * content into every subsequent P-frame, matching the real-client
+         * corruption reports this was root-caused from). 768 bytes/MB gives
+         * real headroom above a real near-lossless macroblock's worst case
+         * (24 4x4 blocks/MB, each block's CABAC bypass-coded coefficients
+         * bounded well under 32 bytes even at high magnitude) while still
+         * being a trivial, transient per-slice allocation (~11MB for a full
+         * 2560x1440 frame in one slice, freed immediately after this loop
+         * body). See docs/DEVLOG.md for the full investigation. */
+        size_t rbsp_buf_size = (end_mb - start_mb) * 768 + 4096;
         uint8_t *slice_rbsp = malloc(rbsp_buf_size);
         if (!slice_rbsp) return -1;
 
