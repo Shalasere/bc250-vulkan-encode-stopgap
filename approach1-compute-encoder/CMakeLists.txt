@@ -10,6 +10,50 @@ if(ENABLE_DEBUG)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -fsanitize=address,undefined")
 endif()
 
+# Target-CPU codegen: this driver only ever runs on one exact piece of
+# silicon, the AMD BC-250 ("Cyan Skillfish", Zen 2) - see README. The
+# documented `-DCMAKE_BUILD_TYPE=Release` build leaves CMake's default
+# CMAKE_C_FLAGS_RELEASE ("-O3 -DNDEBUG", appended after the -O2 above, so
+# -O3 is what actually wins) at the generic x86-64 baseline: GCC/Clang do
+# NOT emit BMI2 (pdep/pext/bzhi/shlx/shrx) or AVX2 there even though the
+# real hardware supports them - those need an explicit -march.
+#
+# Measured effect (board, tools/perf_test.sh, 1280x720, 90 frames, 2 runs
+# each, SKIP_BUILD builds diffing only this flag): baseline 5.95-5.98 fps /
+# 163-165 ms CAVLC+bitstream per frame -> -march=znver2 6.33-6.37 fps /
+# 152-153 ms, a reproducible ~6% wall-clock win. objdump confirms real
+# codegen change (shlx/shrx/bzhi appear in bitstream.c.o and cavlc.c.o with
+# the flag, absent without it) - this is not just a passed-but-inert flag.
+# -flto was also measured (alone, and stacked with -march) and made no
+# further difference either way, so it is deliberately NOT added here.
+# This does not close the real-time gap by itself - CAVLC's O(n) bit-loop
+# behavior still dominates total frame time - but it is a free, additive
+# win that stacks with that fix, with no correctness or portability cost
+# on the one machine this ever runs on.
+#
+# Auto-detected, not hardcoded: unconditionally forcing -march=znver2 would
+# break CI (.github/workflows/build.yml builds AND RUNS ctest/test_encode
+# on a generic ubuntu-22.04 runner, which is not znver2 hardware - a
+# binary using Zen-2-only instructions there can SIGILL). Only opt in when
+# actually configuring directly on real BC-250 hardware (which is also how
+# this project is always actually built/installed - see tools/setup_bazzite.sh
+# and tools/setup_steamos.sh, both of which run cmake straight on-device).
+include(CheckCCompilerFlag)
+execute_process(
+    COMMAND grep -q "AMD BC-250" /proc/cpuinfo
+    RESULT_VARIABLE BC250_IS_TARGET_HW
+    OUTPUT_QUIET ERROR_QUIET
+)
+if(BC250_IS_TARGET_HW EQUAL 0)
+    check_c_compiler_flag("-march=znver2" COMPILER_SUPPORTS_ZNVER2)
+    if(COMPILER_SUPPORTS_ZNVER2)
+        message(STATUS "Detected AMD BC-250 hardware: enabling -march=znver2 -mtune=znver2 (measured ~6% CAVLC/bitstream speedup, see CMakeLists.txt comment)")
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=znver2 -mtune=znver2")
+    else()
+        message(WARNING "Running on AMD BC-250 hardware but this compiler doesn't support -march=znver2 - building generic x86-64 codegen instead")
+    endif()
+endif()
+
 # Find dependencies
 find_package(Vulkan REQUIRED)
 find_package(PkgConfig REQUIRED)
