@@ -214,10 +214,24 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
              * partially-initialized/invalid gpu_image_t - any later use
              * (encode, GetImage/PutImage, DestroySurfaces) would operate on
              * garbage Vulkan handles. Skip publishing this surface on
-             * failure instead. */
+             * failure instead.
+             *
+             * Stop the whole loop here rather than `continue`-ing to the
+             * next slot: confirmed on-hardware (gdb) that under real GPU
+             * contention (a live desktop compositor also driving this
+             * GPU), once one vkBindImageMemory call has already failed
+             * with VK_ERROR_UNKNOWN, an immediate retry on the very next
+             * surface segfaults *inside* radv_BindImageMemory2() itself -
+             * i.e. the failure leaves RADV's own allocator state for this
+             * memory type in a condition that a same-loop-iteration retry
+             * cannot safely probe further. Bailing out immediately and
+             * surfacing VA_STATUS_ERROR_MAX_NUM_EXCEEDED to the caller
+             * (via the `allocated < num_surfaces` check below) is the
+             * failure this driver can actually recover from; hammering
+             * the allocator again cannot be made safe from here. */
             if (gpu_compute_create_image(&data->gpu, width, height, format, &surf->image, &surf->memory) != 0) {
                 memset(surf, 0, sizeof(*surf));
-                continue;
+                break;
             }
 
             surf->allocated = 1;
@@ -921,10 +935,29 @@ VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         int y_pitch = img->image.pitches[0] > 0 ? (int)img->image.pitches[0] : surf->width;
         int uv_pitch = img->image.pitches[1] > 0 ? (int)img->image.pitches[1] : surf->width;
 
+        /* Copy extent must be the image's OWN allocated width/height
+         * (img->image.width/height - what bc250_CreateImage() actually
+         * sized buf->data for), not the surface's: surf->width/height is
+         * this driver's internal macroblock-padded encode size (e.g. 1088
+         * for a 1080-tall frame), which is >= the real display size a
+         * plain vaCreateImage()+vaGetImage() caller asked for. Using
+         * surf->height here walked this copy past the end of buf->data's
+         * real allocation (confirmed on-hardware via gdb: SIGSEGV in the
+         * UV-plane memcpy at r=540 for a 1080-tall image, where
+         * height/2=544 from surf->height=1088 overran a buffer sized for
+         * only 1080/2=540 UV rows). bc250_DeriveImage() is unaffected -
+         * there, img->image.width/height are set to surf->width/height by
+         * construction (see bc250_DeriveImage() above), so this is the
+         * same value in that case, not a behavior change. */
+        int copy_width = img->image.width > 0 ? (int)img->image.width : surf->width;
+        int copy_height = img->image.height > 0 ? (int)img->image.height : surf->height;
+        if (copy_width > surf->width) copy_width = surf->width;
+        if (copy_height > surf->height) copy_height = surf->height;
+
         gpu_compute_download_nv12(&data->gpu, &surf->image, surf->memory,
                                   dst_y, y_pitch,
                                   dst_uv, uv_pitch,
-                                  surf->width, surf->height);
+                                  copy_width, copy_height);
     }
     return VA_STATUS_SUCCESS;
 }
@@ -947,10 +980,21 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
         int y_pitch = img->image.pitches[0] > 0 ? (int)img->image.pitches[0] : surf->width;
         int uv_pitch = img->image.pitches[1] > 0 ? (int)img->image.pitches[1] : surf->width;
 
+        /* Same fix as bc250_GetImage() above, mirrored: the copy extent
+         * must be img->image.width/height (what buf->data was actually
+         * allocated for), not surf->width/height (this driver's internal
+         * macroblock-padded encode size) - otherwise this reads past the
+         * end of buf->data whenever the surface's padded height exceeds
+         * the image's real height (e.g. 1088 vs 1080). */
+        int copy_width = img->image.width > 0 ? (int)img->image.width : surf->width;
+        int copy_height = img->image.height > 0 ? (int)img->image.height : surf->height;
+        if (copy_width > surf->width) copy_width = surf->width;
+        if (copy_height > surf->height) copy_height = surf->height;
+
         gpu_compute_upload_nv12(&data->gpu, &surf->image, surf->memory,
                                 src_y, y_pitch,
                                 src_uv, uv_pitch,
-                                surf->width, surf->height);
+                                copy_width, copy_height);
     }
     return VA_STATUS_SUCCESS;
 }

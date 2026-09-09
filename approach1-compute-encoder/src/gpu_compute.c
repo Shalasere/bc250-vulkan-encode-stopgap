@@ -1069,6 +1069,27 @@ void gpu_compute_terminate(gpu_context_t *ctx) {
     bc250_gpu_destroy(ctx);
 }
 
+/* gpu_compute_create_image()'s allocate+bind step (below) can fail
+ * transiently under real concurrent GPU contention - confirmed on-hardware
+ * (gdb) that this GPU's non-device-local memory type becomes unstable
+ * under repeated back-to-back allocation pressure from multiple real
+ * Vulkan/GL clients (e.g. a live desktop compositor): a bind that fails
+ * cleanly (VK_ERROR_UNKNOWN) once or twice can, on a later attempt made
+ * immediately afterward, segfault *inside* RADV's own
+ * radv_BindImageMemory2() instead of returning another clean error. This
+ * isn't fixable from our side (it's inside Mesa), but retrying with a
+ * short backoff instead of failing (or being retried) immediately is a
+ * standard, well-precedented workaround for exactly this class of
+ * transient-allocator-failure-under-contention issue - e.g. AMD's own
+ * Vulkan Memory Allocator library exists in part because per-resource
+ * vkAllocateMemory/vkBindImageMemory calls are known to be fragile under
+ * contention on real GPU drivers, and DXVK retries transient allocation
+ * failures rather than treating the first one as fatal. Giving the
+ * contention a moment to clear between attempts is what actually matters
+ * here: an immediate retry is exactly the pattern that reproduced the
+ * segfault above. */
+#define BC250_ALLOC_MAX_ATTEMPTS 7
+
 int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int format, gpu_image_t *image, gpu_memory_t *memory) {
     (void)format;
     image->width = width;
@@ -1076,48 +1097,104 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
     /* Matches the real initialLayout used below for both y_plane and uv_plane. */
     image->current_layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
 
-    VkImageCreateInfo y_info = {
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8_UNORM,
-        .extent = { (uint32_t)width, (uint32_t)height, 1 },
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_LINEAR,
-        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-        .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED
-    };
-    VK_CHECK(vkCreateImage(ctx->device, &y_info, NULL, &image->y_plane));
+    VkResult result = VK_ERROR_UNKNOWN;
+    for (int attempt = 0; attempt < BC250_ALLOC_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            long backoff_ms = 20L << (attempt - 1); /* 20, 40, 80 ms */
+            struct timespec ts = { .tv_sec = backoff_ms / 1000, .tv_nsec = (backoff_ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+            fprintf(stderr, "[bc250-gpu] Retrying image allocation (attempt %d/%d) after %ldms backoff\n",
+                    attempt + 1, BC250_ALLOC_MAX_ATTEMPTS, backoff_ms);
+        }
 
-    VkImageCreateInfo uv_info = y_info;
-    uv_info.format = VK_FORMAT_R8G8_UNORM;
-    uv_info.extent.width = width / 2;
-    uv_info.extent.height = height / 2;
-    VK_CHECK(vkCreateImage(ctx->device, &uv_info, NULL, &image->uv_plane));
+        VkImageCreateInfo y_info = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R8_UNORM,
+            .extent = { (uint32_t)width, (uint32_t)height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_LINEAR,
+            .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED
+        };
+        result = vkCreateImage(ctx->device, &y_info, NULL, &image->y_plane);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d\n", result, __FILE__, __LINE__);
+            continue;
+        }
 
-    VkMemoryRequirements y_req, uv_req;
-    vkGetImageMemoryRequirements(ctx->device, image->y_plane, &y_req);
-    vkGetImageMemoryRequirements(ctx->device, image->uv_plane, &uv_req);
+        VkImageCreateInfo uv_info = y_info;
+        uv_info.format = VK_FORMAT_R8G8_UNORM;
+        uv_info.extent.width = width / 2;
+        uv_info.extent.height = height / 2;
+        result = vkCreateImage(ctx->device, &uv_info, NULL, &image->uv_plane);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d\n", result, __FILE__, __LINE__);
+            vkDestroyImage(ctx->device, image->y_plane, NULL);
+            image->y_plane = VK_NULL_HANDLE;
+            continue;
+        }
 
-    VkDeviceSize align = uv_req.alignment > y_req.alignment ? uv_req.alignment : y_req.alignment;
-    VkDeviceSize uv_offset = (y_req.size + align - 1) & ~(align - 1);
-    VkDeviceSize total_size = uv_offset + uv_req.size;
+        VkMemoryRequirements y_req, uv_req;
+        vkGetImageMemoryRequirements(ctx->device, image->y_plane, &y_req);
+        vkGetImageMemoryRequirements(ctx->device, image->uv_plane, &uv_req);
 
-    memory->size = total_size;
+        VkDeviceSize align = uv_req.alignment > y_req.alignment ? uv_req.alignment : y_req.alignment;
+        VkDeviceSize uv_offset = (y_req.size + align - 1) & ~(align - 1);
+        VkDeviceSize total_size = uv_offset + uv_req.size;
 
-    uint32_t mem_bits = y_req.memoryTypeBits & uv_req.memoryTypeBits;
-    if (mem_bits == 0) mem_bits = y_req.memoryTypeBits | uv_req.memoryTypeBits;
+        memory->size = total_size;
 
-    VkMemoryAllocateInfo alloc_info = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize = total_size,
-        .memoryTypeIndex = find_memory_type(ctx->physical_device, mem_bits,
-                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    VK_CHECK(vkAllocateMemory(ctx->device, &alloc_info, NULL, &memory->memory));
-    VK_CHECK(vkBindImageMemory(ctx->device, image->y_plane, memory->memory, 0));
-    VK_CHECK(vkBindImageMemory(ctx->device, image->uv_plane, memory->memory, uv_offset));
+        uint32_t mem_bits = y_req.memoryTypeBits & uv_req.memoryTypeBits;
+        if (mem_bits == 0) mem_bits = y_req.memoryTypeBits | uv_req.memoryTypeBits;
+        if (getenv("BC250_DEBUG_MEMTYPE")) {
+            uint32_t chosen = find_memory_type(ctx->physical_device, mem_bits,
+                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &mp);
+            fprintf(stderr, "[bc250-gpu] DEBUG mem_bits=0x%x chosen_type=%u heap=%u type_flags=0x%x heap_size=%zu\n",
+                    mem_bits, chosen, mp.memoryTypes[chosen].heapIndex, mp.memoryTypes[chosen].propertyFlags,
+                    (size_t)mp.memoryHeaps[mp.memoryTypes[chosen].heapIndex].size);
+        }
+
+        VkMemoryAllocateInfo alloc_info = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = total_size,
+            .memoryTypeIndex = find_memory_type(ctx->physical_device, mem_bits,
+                                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        };
+        result = vkAllocateMemory(ctx->device, &alloc_info, NULL, &memory->memory);
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d\n", result, __FILE__, __LINE__);
+            vkDestroyImage(ctx->device, image->y_plane, NULL);
+            vkDestroyImage(ctx->device, image->uv_plane, NULL);
+            image->y_plane = VK_NULL_HANDLE;
+            image->uv_plane = VK_NULL_HANDLE;
+            continue;
+        }
+
+        result = vkBindImageMemory(ctx->device, image->y_plane, memory->memory, 0);
+        if (result == VK_SUCCESS) {
+            result = vkBindImageMemory(ctx->device, image->uv_plane, memory->memory, uv_offset);
+        }
+        if (result != VK_SUCCESS) {
+            fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d\n", result, __FILE__, __LINE__);
+            vkFreeMemory(ctx->device, memory->memory, NULL);
+            vkDestroyImage(ctx->device, image->y_plane, NULL);
+            vkDestroyImage(ctx->device, image->uv_plane, NULL);
+            memory->memory = VK_NULL_HANDLE;
+            image->y_plane = VK_NULL_HANDLE;
+            image->uv_plane = VK_NULL_HANDLE;
+            continue;
+        }
+
+        break; /* success */
+    }
+    if (result != VK_SUCCESS) {
+        return -1;
+    }
 
     VkImageViewCreateInfo view_info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
