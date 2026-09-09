@@ -818,6 +818,66 @@ static void mv_predictor(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
     *py = median3(ay, by, cy);
 }
 
+/*
+ * skip_mv_predictor - ITU-T H.264 8.4.1.1 "Derivation process for luma
+ * motion vector prediction for skipped macroblocks in P slices". This is a
+ * DIFFERENT rule from mv_predictor()'s plain 8.4.1.3 median, and a real
+ * decoder uses THIS rule - not 8.4.1.3 - to reconstruct the motion vector of
+ * any macroblock whose mb_skip_flag/P_Skip run says "skipped".
+ *
+ * Per spec: both components of mvL0 are forced to (0,0) if EITHER of the
+ * left (A) or top (B) neighbors is unavailable, OR if an available A or B
+ * has refIdxL0==0 and mvL0==(0,0). This project always uses a single
+ * reference frame and never mixes Intra into P slices (see mv_predictor()'s
+ * doc comment), so every available P-slice neighbor always has refIdxL0==0
+ * - the spec's "refIdxL0==0 && mv==(0,0)" condition therefore reduces to
+ * simply "mv==(0,0)" here. Only when NONE of the zero-forcing conditions
+ * hold does 8.4.1.1 fall back to the plain 8.4.1.3 median (mv_predictor()).
+ *
+ * THE BUG THIS FIXES: prior to this function existing, the P_Skip
+ * legality check in h264_encoder_encode_frame() (both the CAVLC
+ * mb_skip_run path and the CABAC mb_skip_flag path) compared the real
+ * searched motion vector against mv_predictor()'s plain median - not this
+ * zero-forcing rule - to decide whether a macroblock could legally be
+ * skipped. Whenever the zero-forcing condition actually applied (e.g. this
+ * MB's left or top neighbor itself has zero motion, or is off-picture) but
+ * the plain median happened to be nonzero AND equal to this MB's own real
+ * searched motion, the old check wrongly certified the MB as skip-legal.
+ * The bitstream then encoded it as skip, but a real decoder - applying THIS
+ * zero-forcing rule - reconstructs mvL0=(0,0), not the plain median the
+ * encoder matched against. That silently diverges the decoder's motion (and,
+ * because mv_predictor() unconditionally treats every neighbor's raw
+ * committed mv[] as truth without re-deriving whatever a decoder would
+ * actually have reconstructed for a skipped neighbor, this wrong value then
+ * poisons the median-of-neighbors predictor of every later macroblock that
+ * looks at this one as A, B, C, or D) - even though the transmitted MVD of
+ * every OTHER, explicitly-coded macroblock was always individually correct
+ * in isolation. Confirmed via BC250_DEBUG_MV_ROW cross-referenced against
+ * ffmpeg's own decoded per-MB motion vectors (-debug mv / codecview=mv=pf):
+ * see docs/DEVLOG.md for the concrete before/after macroblock trace.
+ */
+static void skip_mv_predictor_ex(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
+                                  uint32_t width_in_mbs, uint32_t start_mb, int *px, int *py,
+                                  bool *out_zero_force) {
+    int ax, ay, bx, by;
+    bool a_ok, b_ok;
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, -1, 0, &ax, &ay, &a_ok);  /* A: left */
+    neighbor_mv(mvs, mbx, mby, width_in_mbs, start_mb, 0, -1, &bx, &by, &b_ok);  /* B: top */
+
+    bool zero_force = !a_ok || !b_ok || (a_ok && ax == 0 && ay == 0) || (b_ok && bx == 0 && by == 0);
+    if (out_zero_force) *out_zero_force = zero_force;
+    if (zero_force) {
+        *px = 0; *py = 0;
+        return;
+    }
+    mv_predictor(mvs, mbx, mby, width_in_mbs, start_mb, px, py);
+}
+
+static void skip_mv_predictor(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
+                               uint32_t width_in_mbs, uint32_t start_mb, int *px, int *py) {
+    skip_mv_predictor_ex(mvs, mbx, mby, width_in_mbs, start_mb, px, py, NULL);
+}
+
 /* Whole-MB "does this P16x16 MB have any nonzero luma coefficient" skip
  * decision. Previously this read the lossy packed entropy summary
  * (mb_blocks[b]&0xFF); it now reads the real quant_levels data directly -
@@ -1798,10 +1858,26 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                     mv_predictor(mvs, mbx, (uint32_t)dbg_row, encoder->width_in_mbs, 0, &pred_x, &pred_y);
                     int mvd_x = mvs[mb].mvx - pred_x;
                     int mvd_y = mvs[mb].mvy - pred_y;
+                    /* Cross-check against the REAL P_Skip derivation
+                     * (ITU-T 8.4.1.1, skip_mv_predictor() above) - see that
+                     * function's doc comment for why this can legitimately
+                     * differ from the plain median (pred_x/pred_y) used for
+                     * MVD, and how that divergence corrupts downstream
+                     * macroblocks whenever the OLD (pre-fix) skip-legality
+                     * check certified this MB as skip using the wrong rule. */
+                    int skip_pred_x, skip_pred_y;
+                    bool zero_force = false;
+                    skip_mv_predictor_ex(mvs, mbx, (uint32_t)dbg_row, encoder->width_in_mbs, 0,
+                                          &skip_pred_x, &skip_pred_y, &zero_force);
+                    bool old_skip_legal = (mvs[mb].mvx == pred_x && mvs[mb].mvy == pred_y);
+                    bool new_skip_legal = (mvs[mb].mvx == skip_pred_x && mvs[mb].mvy == skip_pred_y);
                     fprintf(stderr, "[BC250_DEBUG_MV_ROW] frame=%u row=%d mbx=%u mb=%u "
-                                    "mv=(%d,%d) sad=%u pred=(%d,%d) mvd=(%d,%d)\n",
+                                    "mv=(%d,%d) sad=%u pred=(%d,%d) mvd=(%d,%d) "
+                                    "zero_force=%d skip_pred=(%d,%d) old_skip_legal=%d new_skip_legal=%d%s\n",
                             encoder->frame_count, dbg_row, mbx, mb,
-                            mvs[mb].mvx, mvs[mb].mvy, mvs[mb].sad, pred_x, pred_y, mvd_x, mvd_y);
+                            mvs[mb].mvx, mvs[mb].mvy, mvs[mb].sad, pred_x, pred_y, mvd_x, mvd_y,
+                            zero_force, skip_pred_x, skip_pred_y, old_skip_legal, new_skip_legal,
+                            (old_skip_legal != new_skip_legal) ? "  <== SKIP-LEGALITY DIVERGES" : "");
                 }
             }
         }
@@ -2029,12 +2105,37 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                  * be). UNCHANGED by the later sub-pel motion search update
                  * (see gpu_mv_t's UNITS note): mvx/mvy and pred_x/pred_y are
                  * compared in the same quarter-pel units on both sides here,
-                 * so equality still means exactly what it needs to. */
+                 * so equality still means exactly what it needs to.
+                 *
+                 * SECOND, INDEPENDENT BUG FIX (P-slice MV predictor/decoder
+                 * mismatch investigation): "that predictor" a decoder
+                 * actually uses for a SKIPPED macroblock is NOT
+                 * mv_predictor()'s plain 8.4.1.3 median - it is the P_Skip-
+                 * specific 8.4.1.1 derivation (skip_mv_predictor(), see its
+                 * doc comment), which zero-forces mvL0 whenever the left or
+                 * top neighbor is unavailable or has mv==(0,0). Comparing
+                 * against the plain median here (as this comment previously
+                 * described and the code previously did) let a macroblock
+                 * whose real motion matched the *plain* median, but which
+                 * ALSO met the 8.4.1.1 zero-forcing condition, get certified
+                 * skip-legal even though a real decoder reconstructs
+                 * mvL0=(0,0) for it, not the real motion. That silently
+                 * diverges the decoder's reference frame from the encoder's
+                 * own at exactly that macroblock, which then poisons every
+                 * later macroblock (in this frame and, via the P-chain,
+                 * every subsequent frame) whose own median predictor reads
+                 * this position as a neighbor - confirmed via
+                 * BC250_DEBUG_MV_ROW showing real, on-the-wire wrong-skip
+                 * events (e.g. frame=139 mbx=22 mby=58: real motion (35,0)
+                 * wrongly certified skip-legal because a neighbor's mv was
+                 * (0,0)) a few dozen frames upstream of, and one macroblock
+                 * away from, the originally-reported gradient-boundary pixel
+                 * defect at mbx=21/mby=59. See docs/DEVLOG.md. */
                 bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
                 bool mv_matches_predictor = true;
                 if (mvs) {
                     int pred_x, pred_y;
-                    mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
+                    skip_mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
                     mv_matches_predictor = (mvs[mb].mvx == pred_x && mvs[mb].mvy == pred_y);
                 }
                 bool mb_changed = quant_levels ? !(zero_luma_residual && mv_matches_predictor) : false;
@@ -2127,15 +2228,16 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
 
                     /* Same skip decision as the CAVLC path above (see that
                      * branch's extensive doc comment on why zero-residual
-                     * alone is not sufficient) - CABAC just codes the
-                     * decision differently (an explicit mb_skip_flag per MB,
-                     * ITU-T 9.3.3.1.1.1, instead of an accumulated
-                     * mb_skip_run). */
+                     * alone is not sufficient, AND on the second,
+                     * independent skip_mv_predictor()/8.4.1.1 fix below) -
+                     * CABAC just codes the decision differently (an explicit
+                     * mb_skip_flag per MB, ITU-T 9.3.3.1.1.1, instead of an
+                     * accumulated mb_skip_run). */
                     bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
                     bool mv_matches_predictor = true;
                     if (mvs) {
                         int pred_x, pred_y;
-                        mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
+                        skip_mv_predictor(mvs, mbx, mby, nc.width_in_mbs, nc.start_mb, &pred_x, &pred_y);
                         mv_matches_predictor = (mvs[mb].mvx == pred_x && mvs[mb].mvy == pred_y);
                     }
                     bool mb_changed = quant_levels ? !(zero_luma_residual && mv_matches_predictor) : false;

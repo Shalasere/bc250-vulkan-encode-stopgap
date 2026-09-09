@@ -378,7 +378,95 @@ confirmed, not fixed — an honest non-finding, not a resolved bug.**
 
 ---
 
-## 9. Planned: real-world (non-synthetic) validation
+## 9. Fixed: P-slice MV predictor/decoder mismatch (the real remaining defect from §8)
+
+Follow-on to §8. That investigation falsified the chroma-DC/intra-prediction
+hypothesis and characterized the real remaining defect as a P-slice motion
+vector problem at macroblock mbx=21/mby=59 (mb 7101), frame 159 of the exact
+repro in §8/below: this macroblock's own true motion is (0,0), but its
+transmitted MVD went large because its fast-moving top neighbor dominated
+the median predictor, and ffmpeg's own decode (`codecview=mv=pf`) showed a
+distinct, nonzero reconstructed MV there. CABAC/CAVLC and deblock on/off
+made no difference, and hand-verification of the MVD binarization,
+Exp-Golomb suffix coder, skip-legality check, and predictor math (each
+checked in isolation) found no discrepancy — but never cross-checked the
+encoder's own computed predictor against what a real decoder independently
+derives from its own reconstructed neighbor MVs.
+
+**Root cause, confirmed on real hardware**: `h264_encoder_encode_frame()`'s
+P_Skip legality check (both the CAVLC `mb_skip_run` path and the CABAC
+`mb_skip_flag` path) certified a macroblock as skip-legal by comparing its
+real searched motion vector against `mv_predictor()` - the plain ITU-T
+8.4.1.3 median-of-neighbors predictor. That is the WRONG rule for a skipped
+macroblock: a real decoder reconstructs a P_Skip MB's motion using the
+*different* ITU-T 8.4.1.1 derivation, which forces mvL0=(0,0) whenever the
+left or top neighbor is unavailable, or an available neighbor's own MV is
+exactly (0,0) (this project's single-reference-frame, no-intra-in-P design
+means the spec's "refIdxL0==0 && mv==0" reduces to just "mv==0"). Whenever
+that zero-forcing condition applied but the plain median happened to be
+nonzero and equal to the real motion, the old check wrongly certified skip:
+the bitstream encoded zero bits, but a real decoder reconstructs mvL0=(0,0)
+- not the real motion - silently diverging its reference frame from the
+encoder's own at that exact macroblock. That wrong value then poisons the
+median predictor (and the same flawed skip check) of every later macroblock
+that reads this position as a neighbor, and the divergence persists and
+compounds through the P-frame reference chain across subsequent frames.
+
+**Real evidence, gathered via a widened `BC250_DEBUG_MV_ROW`** (now also
+prints each MB's zero-forcing condition, the correct ITU-T 8.4.1.1
+predictor, and whether the old plain-median check and the correct rule
+disagree): running the exact 1920x1080/8M/200-frame repro below found a
+genuine on-the-wire wrong-skip event at **frame=139, mbx=22, mby=58** (mb
+6982) - real motion (35,0) quarter-pel, certified skip-legal by the old
+check purely because it matched the plain median, even though a left/top
+neighbor's mv==(0,0) triggered 8.4.1.1's zero-forcing and a real decoder
+reconstructs (0,0) there instead. That macroblock is one column and 21
+frames upstream of the originally-reported defect at mbx=21/mby=59/frame
+159 - consistent with the "wrong upstream neighbor propagates forward"
+mechanism suspected but not confirmed in §8. Dozens of similar wrong-skip
+events were found tracking the moving gradient bar's trailing edge
+throughout the clip (wherever a "static" zero-motion neighbor sits next to
+a macroblock whose real motion matches the region's general motion) -
+exactly the "static color-bar content dragged into the gradient" symptom
+originally reported.
+
+**Fix**: added `skip_mv_predictor()` (ITU-T 8.4.1.1) alongside the existing
+`mv_predictor()` (8.4.1.3) in `encoder_h264.c`, and pointed both the CAVLC
+and CABAC P_Skip legality checks at it. `mv_predictor()` itself is
+unchanged and still used for real (non-skip) MVD, which is correct per
+spec. No GPU shader change was needed - `residual_predict.comp` and the
+reconstruction shaders already operate on each macroblock's real searched
+motion vector; the only thing that was wrong was which macroblocks were
+allowed to omit that real motion via skip.
+
+**Validated on real hardware**, exact repro from §8/task brief
+(`ffmpeg testsrc=1920x1080 -frames:v 200 ... -c:v h264_vaapi -b:v 8M`,
+`BC250_DUMP_INPUT_FRAMES=1` ground truth vs. real ffmpeg software decode):
+
+  | | before (pre-fix) | after (fixed) |
+  |---|---|---|
+  | Full-clip PSNR (1920x1080, 200 fr) | avg 28.85 dB (Y 28.41 / U 32.03 / V 28.45) | avg 51.01 dB (Y 55.36 / U 47.85 / V 47.11) |
+  | Full-clip SSIM | All 0.9893 | All 0.9989 |
+  | Frame 159 PSNR | 33.16 dB | 55.46 dB |
+  | mb(21,59) frame 159 luma block | max\|diff\| 90, mean\|diff\| 78.6 (whole MB frozen at ~81-89, the static-bar level, vs. real ~170 gradient level) | max\|diff\| 2, mean\|diff\| 0.22 (ordinary quant/DCT rounding) |
+  | 8x-amplified difference crop (blend=difference,eq=contrast=8) | clear hard-edged red rectangle at the macroblock | uniform green, no visible defect |
+
+  Multi-slice (`BC250_SLICES_PER_FRAME=4`) re-run of the same repro: PSNR
+  avg 50.98 dB - matches the single-slice fixed result, confirming the fix
+  does not regress slice-boundary neighbor availability. Default
+  `tools/quality_test.sh` (640x480/2s, doesn't exercise this defect as
+  severely at that small scale/short clip, but still improves): PASS
+  before (PSNR avg 48.48 dB / SSIM 0.9989) and PASS after (PSNR avg 59.49
+  dB / SSIM 0.9994). `ctest`: 4/4 pass, both before this fix and after.
+
+  This closes out §8's "inconclusive" status - the gradient-boundary
+  artifact was real, and its actual mechanism was a P-slice motion vector
+  predictor/decoder rule mismatch (ITU-T 8.4.1.1 vs 8.4.1.3), not the
+  originally-suspected intra prediction or chroma path.
+
+---
+
+## 10. Planned: real-world (non-synthetic) validation
 
 Agreed sequence, not yet started:
 
