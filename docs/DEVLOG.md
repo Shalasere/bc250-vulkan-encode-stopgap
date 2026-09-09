@@ -12,8 +12,18 @@ This is a real, actively-used gaming console, not a disposable test rig —
 every change below was validated with that in mind.
 
 **Repos**: upstream `simpmix/bc250-vcn-driver` (origin), fork
-`Shalasere/bc250-encoding-decoding-fix` (fork remote). All work below
-happened on the fork; nothing has been proposed upstream yet.
+`Shalasere/bc250-vulkan-encode-stopgap` (fork remote — renamed from
+`bc250-encoding-decoding-fix` partway through this project to better
+reflect what this actually is: a Vulkan-compute stopgap for a VCN block
+that isn't usable, not a fix to VCN itself). All work below happened on
+the fork; nothing has been proposed upstream yet.
+
+**License**: GPL-3.0-only (relicensed from the original MIT placeholder),
+specifically so this can't be privatized into a closed derivative — see
+the top-level `LICENSE` for the short-form notice. `audio-fix/` is a
+separate, pre-existing module that keeps its own inherited GPL-2.0-only
+license unchanged; the two licenses are compatible but intentionally not
+merged into one.
 
 ---
 
@@ -326,6 +336,30 @@ something.
 testsrc`) and offline (no real capture, no real streaming client, no
 real concurrent game). That gap is the next phase (§9).
 
+**Update — since this entry was written**, several more real,
+board-verified changes landed on `main` (77 commits ahead of the fork's
+`main` as of §10 below, all still local/unpushed pending explicit
+go-ahead):
+
+- **GPL-3.0 relicensing** (see License note above).
+- **CABAC**: a real, selectable, board-measured ~10-13%-more-efficient
+  alternative to CAVLC (`cabac.c`/`hevc_cabac.c`, adapted from x264/x265
+  with their original copyright headers retained per GPL §5).
+- **Rate control accuracy**: fixed a real bug where VBR's actual ffmpeg
+  invocation (`-b:v X`, no explicit `-rc_mode`) sends
+  `target_percentage=50` of `2X`, and this driver was reading only
+  `bits_per_second` and treating the raw `2X` as the real target — a 2x
+  error before this driver's own rate control even ran. Also added real
+  `filler_data_rbsp()` CBR padding (previously silently absent), gated on
+  a real CBR-intent signal (`target_percentage==100`, matching the VA-API
+  spec's own definition), verified byte-identical content after
+  NAL-strip against the unpadded stream.
+- **HEVC**: was a non-functional stub (see §6) that has never encoded a
+  single real byte; now a real, board-validated intra-only Main-profile
+  encoder (own CABAC engine, prediction/transform/quantization) — but
+  still flat-content-only, tracked as ongoing work on
+  `feature/hevc-h265`, not a claim of full HEVC support.
+
 ---
 
 ## 8. Inconclusive: gradient-boundary motion-compensation artifact
@@ -466,26 +500,193 @@ allowed to omit that real motion via skip.
 
 ---
 
-## 10. Planned: real-world (non-synthetic) validation
+## 10. Real-world (non-synthetic) validation — item 1 in progress
 
-Agreed sequence, not yet started:
+Agreed sequence: (1) real content capture through the real encode
+pipeline, (2) real concurrent GPU load in place of the synthetic
+`vkmark` contention test, (3) a real Moonlight client. This entry covers
+the first real attempt at (1) — genuinely difficult, several real
+findings, one real integration breakthrough, one open blocker. (2) and
+(3) are still not started.
 
-1. **Real content streaming test** — capture actual desktop/screen
-   content (not `ffmpeg testsrc`) through the real encode pipeline.
-2. **Concurrent real GPU load** — replace the synthetic `vkmark` headless
-   contention test with something closer to real game load (`glmark2`,
-   or an actual installed title) for a more convincing number than a
-   synthetic compute benchmark gives.
-3. **Real Moonlight client test** — an actual Moonlight client (project
-   owner has real hardware for this) connecting to Sunshine on this
-   board, once 1 and 2 are done.
+### 10.1 The live environment turned out to be real, not idle
 
-No upstream PR has been opened, and none will be without an explicit
-go-ahead — see the standing note under §10.
+The board runs a live `gamescope` session (Steam Big Picture, real
+Wayland compositor, DP-1 physical panel) with Sunshine already running
+underneath it — this is a real, in-use console, not a headless test rig,
+for the whole of this investigation.
+
+### 10.2 Capture path survey — most of the obvious options are dead ends here
+
+- **`ffmpeg -f kmsgrab`**: correctly grabs the real, active scanout
+  plane (confirmed via `/sys/kernel/debug/dri/*/state` — `plane-1`,
+  zpos 0, owned by `gamescope-xwm`) — but the framebuffer's DRM modifier
+  (`0x200000000801b02`, an AMD tiled/compressed layout, not
+  `DRM_FORMAT_MOD_LINEAR`) is not understood by the generic
+  `hwmap`+`hwdownload` CPU readback path, which corrupts the image (a
+  solid flat-color frame, not real content).
+- **`ffmpeg -f x11grab`** against gamescope's nested Xwayland (both root
+  window and the real "Steam Big Picture Mode" window,
+  `xwininfo`-confirmed 1920x1080) returns solid black — gamescope's
+  Xwayland clients are GPU-composited via DRI3/Present with no
+  CPU-readable X11 backing store, a known limitation of legacy X11
+  screen-grab tools against modern compositors.
+- **PipeWire**: gamescope does expose a real, correctly-named
+  `Video/Source` node (`node.name=gamescope`) via `pw-cli list-objects` —
+  the sanctioned capture integration point, confirmed working
+  mechanically (`gst-launch-1.0 pipewiresrc` produces real-sized,
+  correctly-timed raw NV12 frames) — but this system's `ffmpeg` build has
+  no `pipewire` demuxer, so it needs GStreamer as an intermediate step,
+  not a direct `ffmpeg` input.
+- Confirmed the desktop really was near-idle at the moment of testing
+  (not a capture bug): `gamescopectl screenshot` — gamescope's own
+  built-in, authoritative screenshot command — showed the same
+  near-black frame, just with a small stray Chromium/CEF context menu.
+
+### 10.3 VRAM/GTT heap: a wrong claim, caught and corrected before it shipped
+
+While chasing an intermittent crash in the kmsgrab path (below), this
+investigation first wrongly attributed it to "the driver uses the small
+512MB VRAM heap instead of the 7.45GB GTT pool, which gets contended by
+the live desktop." That explanation was never actually verified before
+being stated, and turned out to be wrong on re-check:
+
+- Live instrumentation (`BC250_DEBUG_MEMTYPE=1`, kept as a permanent
+  diagnostic — see §11) confirmed every image allocation this driver
+  makes lands on `heapIndex=0`, the non-device-local (GTT-backed) type —
+  never the 512MB VRAM heap — with `mem_info_vram_used` measured
+  bit-identical before and after a real encode run.
+- The real ceiling for that heap, per `vulkaninfo`'s own
+  `memoryHeaps[0].size`, is **2.65GiB** — not the raw kernel
+  `mem_info_gtt_total` figure of 7.45GiB. RADV re-partitions the same
+  physical pool differently for its own Vulkan-facing heap accounting
+  than what `amdgpu`'s kernel driver reports at
+  `/sys/class/drm/*/device/mem_info_*` — the two Vulkan heap sizes
+  (2.65GiB + 5.30GiB) sum to within 0.03GB of the kernel's VRAM+GTT total
+  (0.5GB + 7.45GB), so nothing is missing, it's just labeled/split
+  differently between the two reporting layers.
+- Net effect: neither the original wrong claim ("small VRAM heap, real
+  contention exhausts it") nor byte-size exhaustion of any kind explains
+  the crash below — ~36MB of real allocations is nowhere close to either
+  512MB or 2.65GB. Recorded here specifically as a caution: a plausible,
+  even measured-sounding explanation for a crash is not the same as
+  having verified which code path the crash's own allocations actually
+  took.
+
+### 10.4 Two real crashes found and fixed (committed to `main`)
+
+Real, reproducible SIGSEGVs surfaced only by kmsgrab-based capture (the
+first time this driver had ever been exercised outside synthetic
+`testsrc` encode-only traffic). Both root-caused via `gdb` with real
+debug symbols (`-g -O0`, no sanitizer runtime available on this image)
+and fixed on `main` — see that commit for full detail:
+
+1. **`bc250_GetImage`/`bc250_PutImage` buffer overflow.** Both used
+   `surf->width/height` (this driver's own macroblock-padded internal
+   encode size, e.g. 1088 for a 1080-tall frame) as the copy extent,
+   instead of the image's own real allocated size. Confirmed via gdb
+   locals: the UV-plane copy loop walked past a buffer sized for
+   1080-tall content using a height/2 count derived from 1088, and the
+   SIGSEGV landed exactly where that overflow would land. Only
+   exercised by `vaGetImage`/`vaPutImage` — a code path nothing in this
+   project's synthetic testing had ever called, since that testing is
+   upload-to-encode only. Fixed: use the image's own allocated
+   width/height.
+2. **A real Mesa RADV robustness issue under real GPU contention**,
+   mitigated (not fixed — this is Mesa, not this repo) by (a) not
+   retrying a bind into the next surface immediately after one already
+   failed, and (b) retrying the whole allocate+bind sequence with
+   real backoff (20ms doubling to 640ms) before giving up. Confirmed via
+   gdb that an immediate retry after one clean `VK_ERROR_UNKNOWN` can
+   segfault *inside* `radv_BindImageMemory2()` on the very next call,
+   under real contention from the live desktop compositor sharing this
+   GPU. Board-measured: crash rate dropped from ~40-80% (several small
+   samples, no fix) to ~12-20% (with the retry/backoff mitigation) —
+   real, substantial, not full elimination. A precedented mitigation for
+   this exact class of problem (this is part of why AMD ships its own
+   Vulkan Memory Allocator, and why DXVK retries transient allocation
+   failures rather than treating the first one as fatal) — not something
+   fixable from this repo's side, since the actual fault is inside Mesa.
+
+### 10.5 Sunshine integration: a real breakthrough, one open blocker
+
+Once Sunshine (already running live on this board, `sunshine.conf`
+originally `encoder = software`) became the actual integration target,
+several more real findings, in the order discovered:
+
+- **Sunshine really does use KMS capture** (`capture = kms`, confirmed
+  via its own log: "Screencasting with KMS") — the same class of
+  mechanism this session's own tests used, not PipeWire (that node
+  stayed `suspended`/unconnected throughout).
+- **Sunshine runs as UID 1000, not root** — but its real binary
+  (`/usr/bin/sunshine-2026.419.214410`, a symlink target — `which
+  sunshine` alone resolves to the wrong path) has `cap_sys_admin=p` set
+  via `setcap`, confirmed matching the running process's own
+  `/proc/PID/status` capability set exactly.
+- **`LIBVA_DRIVER_NAME`/`LIBVA_DRIVERS_PATH` don't reach Sunshine's own
+  `vaInitialize()` call**, even though they're demonstrably present at
+  exec time (`/proc/PID/environ`) and the *exact same* `libva.so.2`
+  Sunshine links correctly honors both variables for an independent
+  `vainfo` run in the identical environment. Ruled out via
+  `gh search code` against Sunshine's own real source
+  (`LizardByte/Sunshine`): no `LD_PRELOAD`, `secure_getenv`,
+  `getauxval`, or even `LIBVA_DRIVER_NAME` reference anywhere in it —
+  so this is not Sunshine detecting or reacting to anything, and not
+  fixable by chasing Sunshine's own code.
+- **An LD_PRELOAD `dlopen()`-redirect shim** (the first fix attempt —
+  intercept the specific `dlopen("...radeonsi_drv_video.so")` call and
+  redirect it to this driver) never actually got called for that
+  specific request, confirmed by extending the shim to log every
+  `dlopen`/`open`/`openat` call — none of them ever request that path
+  under the shim. A large chunk of this was a **self-inflicted control
+  problem, not a real finding**: several comparison runs during this
+  investigation used different `sudo` invocations (`sudo -n` vs.
+  `sudo -n -u user`) without controlling for that as a variable, which
+  independently changes `$HOME` and therefore which `sunshine.conf`
+  gets read at all — a real lesson on isolating one variable at a time
+  before drawing a conclusion from a behavior difference.
+- **Real fix: a private mount namespace bind-mount**
+  (`unshare --mount` + `mount --bind
+  /opt/bc250-driver/bc250_drv_video.so /usr/lib64/dri/radeonsi_drv_video.so`),
+  tested as the real `user` UID with the real config. This is a
+  filesystem/kernel-level redirect, not a dynamic-linker one, so it
+  doesn't depend on how or whether libva's driver-name resolution reads
+  any environment variable at all. **Confirmed working: native,
+  completely unmodified Sunshine loads and initializes this driver** —
+  `va_openDriver() returns 0`, this driver's own log lines
+  (`[bc250-gpu] Found AMD BC-250 APU...`) present in Sunshine's own
+  process. No Sunshine patch, no system file touched (the bind-mount is
+  private to that one process tree and vanishes on exit).
+- Two blockers surfaced past that point, neither yet resolved:
+  - A pre-existing, unrelated Mesa issue on this system: Sunshine's own
+    GBM device creation (used for its EGL/OpenGL cursor-overlay/color
+    conversion path) fails with `undefined symbol: dri_flush, version
+    libgallium-26.0.4.so` even though that exact symbol is present in
+    the installed `libgallium-26.0.4.so` (confirmed via `nm -D`/
+    `objdump -T`) — likely specific to the incomplete manual-SSH-session
+    test context (no real `WAYLAND_DISPLAY`, no real D-Bus session), not
+    yet confirmed either way inside a real graphical session.
+  - Doing the same bind-mount via systemd's own `BindPaths=` (the
+    declarative, native equivalent of the manual `unshare`, needed to
+    test inside the real `systemd --user` service rather than a manual
+    shell) hits a *different*, earlier failure: `Couldn't get handle
+    for DRM Framebuffer [102]: Probably not permitted` — Sunshine's own
+    KMS capture failing on a capability/permission error that never
+    appeared in the manual `unshare` test. `BindPaths=` implicitly gives
+    a unit its own sandboxed mount namespace, and systemd sandboxing
+    directives are known to interact with capability retention in ways
+    that could plausibly block a `setcap`-granted capability like
+    Sunshine's own `cap_sys_admin` — not yet confirmed as the actual
+    mechanism.
+
+**Net state**: the core goal (native Sunshine, unmodified, loading and
+initializing this driver) is proven achievable, board-verified, right
+now, via a manual mount-namespace bind-mount. Making that survive inside
+the *real* systemd service is the open next step, not yet done.
 
 ---
 
-## 10. Process notes worth preserving
+## 11. Process notes worth preserving
 
 - **A README/CI green checkmark is a claim, not evidence.** Nearly every
   major finding this session came from refusing to trust an existing
