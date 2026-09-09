@@ -112,6 +112,7 @@ struct h264_encoder {
     h264_sps_t sps;
     h264_pps_t pps;
     rate_control_t rc;
+    bool cbr_intent;             /* see h264_encoder_set_cbr_intent's doc comment */
 
     /* DPB */
     dpb_entry_t dpb[16];
@@ -196,6 +197,80 @@ static size_t write_aud(uint8_t *buf, size_t buf_size, bool is_idr) {
     buf[4] = 0x09; /* NAL header: forbidden=0, ref_idc=0, type=9 (AUD) */
     buf[5] = is_idr ? 0x10 : 0x30; /* primary_pic_type: 0 for I, 1 for P (shifted) + stop bit */
     return 6;
+}
+
+/*
+ * maybe_append_filler - close the gap between what real coded slice data
+ * (plus AUD/SPS/PPS) actually used and rate_control.c's per-frame target,
+ * by appending a spec-defined filler_data_rbsp() NAL (bs_write_filler(),
+ * NAL unit type 12) - but ONLY when the caller has signaled genuine CBR
+ * intent (h264_encoder_set_cbr_intent()).
+ *
+ * This is the fix for the gap docs/rate_control_audit.md and the
+ * fix(rate_control) commit before this one both documented and explicitly
+ * left open: once rate_control.c's feedback loop drives QP down to its
+ * floor (qp_min=12) and the content still doesn't need as many bits as a
+ * high requested bitrate calls for, there was previously nothing to make
+ * up the difference - the encoder just produced whatever bits the content
+ * actually cost and stopped, so e.g. an 8 Mbps and a 20 Mbps request for
+ * the same content converged to the exact same real output size. Filler
+ * NALs are the standard way real encoders (x264 included - see
+ * bs_write_filler()'s doc comment) manufacture the remaining bytes to
+ * actually reach a constant-bitrate target.
+ *
+ * Deliberately NOT applied when cbr_intent is false (VBR, or a caller that
+ * never set it): the same audit correctly identified that VBR content
+ * legitimately using fewer bits than a loose ceiling is correct behavior,
+ * not a bug, and padding it would manufacture bits nobody asked for.
+ *
+ * `total_written` on entry is the frame's real byte count so far (AUD +
+ * SPS/PPS on IDR + all coded slice NAL(s)), already sitting in
+ * encoder->output_buf. Returns the (possibly unchanged) new total_written;
+ * never writes past encoder->output_buf_size.
+ */
+static size_t maybe_append_filler(h264_encoder_t *encoder, size_t total_written) {
+    if (!encoder->cbr_intent || encoder->rc.mode != RC_CBR) {
+        return total_written;
+    }
+
+    /* rate_control.c's target_bits_per_frame already accounts for
+     * target_bitrate/framerate (and va_backend.c's target_percentage
+     * scaling for whatever buffer last called h264_encoder_set_bitrate) -
+     * reuse it directly rather than recomputing anything here. Round up:
+     * an encoder that pads should err toward meeting the target, not
+     * quietly falling half a byte short of it every frame. */
+    uint32_t target_bytes = (encoder->rc.target_bits_per_frame + 7) / 8;
+    if (target_bytes <= total_written) {
+        return total_written; /* content already met or exceeded the target */
+    }
+
+    size_t shortfall = (size_t)target_bytes - total_written;
+
+    /* A filler NAL's minimum possible size (zero 0xFF payload bytes) is
+     * BS_FILLER_MIN_NAL_SIZE - see that macro's doc comment. A shortfall
+     * smaller than that can't be closed without overshooting the target,
+     * so it's left alone (this is a real, but small and expected, residual
+     * - not the multi-Mbps gap this change targets). */
+    if (shortfall < BS_FILLER_MIN_NAL_SIZE) {
+        return total_written;
+    }
+
+    /* By construction, a filler NAL of exactly `shortfall` total bytes
+     * needs (shortfall - BS_FILLER_MIN_NAL_SIZE) 0xFF payload bytes. */
+    size_t filler_ff_count = shortfall - BS_FILLER_MIN_NAL_SIZE;
+
+    if (total_written + shortfall > encoder->output_buf_size) {
+        /* Not enough room in the frame's own scratch buffer - extremely
+         * unlikely given output_buf_size's width*height*2+65536 sizing,
+         * but fail safe (skip padding) rather than ever writing OOB or
+         * emitting a truncated, non-byte-aligned filler NAL. */
+        return total_written;
+    }
+
+    size_t written = bs_write_filler(encoder->output_buf + total_written,
+                                     encoder->output_buf_size - total_written,
+                                     filler_ff_count);
+    return total_written + written;
 }
 
 /*
@@ -992,6 +1067,20 @@ void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps) {
     }
 }
 
+void h264_encoder_set_cbr_intent(h264_encoder_t *encoder, bool cbr_intent) {
+    /* Deliberately NOT routed through rc_init() and not touched by
+     * h264_encoder_set_bitrate(): this is VA-API session intent (does the
+     * caller want a real constant-bitrate contract, independent of the
+     * bitrate number itself changing), not rate-controller numeric state.
+     * Sticky across calls for the same reason set_bitrate's own comment
+     * gives for preserving rc state across resends - see this function's
+     * header-comment doc for how va_backend.c derives the value it passes
+     * here and how often it's expected to be called. */
+    if (encoder) {
+        encoder->cbr_intent = cbr_intent;
+    }
+}
+
 void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size) {
     if (encoder && gop_size > 0) {
         encoder->gop_size = gop_size;
@@ -1482,6 +1571,14 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         free(slice_rbsp);
     }
 
+    /* CBR filler padding - see maybe_append_filler()'s doc comment. Applied
+     * after all real slice data is written and before the perf/size/copy
+     * bookkeeping below, so BC250_PERF_STATS' bytes=%zu, the output_size
+     * guard, the memcpy, and rc_update_stats() all see the real final
+     * (possibly padded) frame size - exactly what a downstream consumer
+     * would actually receive. */
+    total_written = maybe_append_filler(encoder, total_written);
+
     if (perf_stats) {
         struct timespec cavlc_t1;
         clock_gettime(CLOCK_MONOTONIC, &cavlc_t1);
@@ -1731,6 +1828,12 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
         }
         free(slice_rbsp);
     }
+
+    /* CBR filler padding - see maybe_append_filler()'s doc comment. Same
+     * placement rationale as h264_encoder_encode_frame: before the
+     * output_size guard/memcpy/rc_update_stats below, so they all see the
+     * real final (possibly padded) frame size. */
+    total_written = maybe_append_filler(encoder, total_written);
 
     if (encoder->prev_y_frame) {
         for (uint32_t r = 0; r < encoder->height; r++) {

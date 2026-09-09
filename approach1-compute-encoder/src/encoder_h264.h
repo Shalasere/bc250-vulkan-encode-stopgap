@@ -65,6 +65,37 @@ void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps);
 void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size);
 
 /**
+ * h264_encoder_set_cbr_intent - Tell the encoder whether the caller has
+ * requested a genuine constant-bitrate contract (as opposed to VBR, where a
+ * requested bitrate is a loose ceiling and using fewer bits than that
+ * ceiling when content doesn't need them is correct, not a bug - see
+ * docs/rate_control_audit.md).
+ *
+ * Only when this is true, and only for the shortfall between what real
+ * coded content used and rate_control.c's per-frame target, does the
+ * encoder emit spec-defined filler_data_rbsp() padding NALs
+ * (encoder_h264.c's maybe_append_filler()) to actually reach the target.
+ * Defaults to false at h264_encoder_create() - a caller that never calls
+ * this (or an intermediate layer that doesn't wire it up) gets today's
+ * pre-existing behavior: no padding, ever.
+ *
+ * va_backend.c is the only real caller: it derives this from
+ * VAEncMiscParameterRateControl.target_percentage (real CBR requests -
+ * VA_RC_CBR mode - are the case ffmpeg's h264_vaapi signals with
+ * target_percentage=100 and the recent rate-control-accuracy fix's own
+ * board logs confirmed as "RC target: 100% of X bps"; its default VBR
+ * invocation sends 50%) and honors
+ * VAEncMiscParameterRateControl.rc_flags.bits.disable_bit_stuffing (the
+ * VA-API's own explicit "don't pad" signal) when set. This is a narrower,
+ * additive signal, not a fix for docs/rate_control_audit.md section 4
+ * point 5 (this driver still hardcodes rate_control_t.mode to RC_CBR
+ * everywhere and never actually negotiates VA_RC_VBR from the VAConfig) -
+ * see that function's own comment for why target_percentage was chosen
+ * over plumbing the VAConfig's negotiated rate-control mode through.
+ */
+void h264_encoder_set_cbr_intent(h264_encoder_t *encoder, bool cbr_intent);
+
+/**
  * h264_encoder_set_fps - Dynamically update framerate
  */
 void h264_encoder_set_fps(h264_encoder_t *encoder, uint32_t fps);

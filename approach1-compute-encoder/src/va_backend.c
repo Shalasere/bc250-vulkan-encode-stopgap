@@ -591,6 +591,41 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                             uint32_t target_bps = (uint32_t)(((uint64_t)rc->bits_per_second * pct) / 100);
                             if (target_bps == 0) target_bps = rc->bits_per_second;
                             h264_encoder_set_bitrate(c->h264_enc, target_bps);
+
+                            /* CBR-intent signal for filler/padding (see
+                             * h264_encoder_set_cbr_intent's doc comment and
+                             * docs/rate_control_audit.md's "no filler data"
+                             * finding). This driver has no code path today
+                             * that reads back the VAConfigAttribRateControl
+                             * value an application chose at vaCreateConfig()
+                             * time (bc250_CreateConfig stores the attrib
+                             * list, but bc250_CreateContext never reads it
+                             * back out - docs/rate_control_audit.md section
+                             * 4 point 5, still open, out of this change's
+                             * scope), so that isn't available here as a
+                             * signal. What *is* already real, already read,
+                             * and already board-confirmed (this buffer's own
+                             * handling above, and the audit's ffmpeg -v
+                             * verbose logs) is target_percentage itself:
+                             * real CBR (`-rc_mode CBR`) sends exactly 100
+                             * ("RC target: 100% of X bps"); ffmpeg's actual
+                             * VBR default sends 50 ("RC target: 50% of
+                             * 2X bps"). The VA-API spec text for this field
+                             * (va.h) even says as much: "In CBR mode this
+                             * value is ignored (treated as 100%)" - a raw,
+                             * unclamped 100 is specifically the CBR
+                             * signature, not just a coincidentally-loose
+                             * VBR ceiling. Require the RAW field (not the
+                             * `pct` fallback above, which also maps 0/
+                             * out-of-range to 100 for the arithmetic above -
+                             * an absent field is not an explicit CBR
+                             * request, so it must not enable padding).
+                             * Also honor rc_flags.bits.disable_bit_stuffing,
+                             * the VA-API's own explicit "don't insert
+                             * filler" signal, when the caller sets it. */
+                            bool cbr_intent = (rc->target_percentage == 100) &&
+                                              !rc->rc_flags.bits.disable_bit_stuffing;
+                            h264_encoder_set_cbr_intent(c->h264_enc, cbr_intent);
                         }
                     } else if (misc->type == VAEncMiscParameterTypeFrameRate && c->h264_enc) {
                         VAEncMiscParameterFrameRate *fr = (VAEncMiscParameterFrameRate*)misc->data;
