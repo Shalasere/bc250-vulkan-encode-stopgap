@@ -1826,8 +1826,19 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * chroma DC/quant path itself. Kept as a safe, no-op-unless-set
          * diagnostic in case a future investigation wants it, but do not
          * treat its original chroma hypothesis as confirmed - see this
-         * branch's final report for the corrected methodology and numbers. */
-        if (quant_levels && coeff && !is_idr &&
+         * branch's final report for the corrected methodology and numbers.
+         *
+         * WIDENED (fix/chroma-boundary-residual): dropped the `!is_idr`
+         * guard this originally shipped with. The gradient-boundary chroma
+         * defect being investigated here is present at full severity on the
+         * very first IDR frame already (see f7c478c's commit message,
+         * confirmed via BC250_DUMP_RECON_FRAMES) - excluding IDR frames made
+         * this diagnostic unusable for exactly the frame that matters. The
+         * mvs printout below is separately still guarded on `mvs` being
+         * non-NULL, which is naturally false on an IDR frame (no motion
+         * vectors), so this is a strict widening, not a behavior change for
+         * P-frame callers. */
+        if (quant_levels && coeff &&
             getenv("BC250_DEBUG_MB") && getenv("BC250_DEBUG_FRAME")) {
             uint32_t dbg_mb = (uint32_t)atoi(getenv("BC250_DEBUG_MB"));
             uint32_t dbg_frame = (uint32_t)atoi(getenv("BC250_DEBUG_FRAME"));
