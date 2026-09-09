@@ -575,7 +575,22 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (misc->type == VAEncMiscParameterTypeRateControl && c->h264_enc) {
                         VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*)misc->data;
                         if (rc->bits_per_second > 0) {
-                            h264_encoder_set_bitrate(c->h264_enc, rc->bits_per_second);
+                            /* docs/rate_control_audit.md section 2: ffmpeg's actual
+                             * default h264_vaapi invocation (-b:v X, no -rc_mode) is
+                             * VBR with target_percentage=50 and bits_per_second=2X -
+                             * i.e. the real intended target is X, encoded as "50% of
+                             * 2X". Previously this only ever read bits_per_second and
+                             * ignored target_percentage entirely, so the driver was
+                             * handed 2X and treated it as if it were the real target -
+                             * a 2x error before rate_control.c even runs. Apply the
+                             * percentage here, falling back to 100% when it's unset/
+                             * out of range (0 or >100), matching common VA-API driver
+                             * convention for an absent/invalid percentage field. */
+                            unsigned int pct = rc->target_percentage;
+                            if (pct == 0 || pct > 100) pct = 100;
+                            uint32_t target_bps = (uint32_t)(((uint64_t)rc->bits_per_second * pct) / 100);
+                            if (target_bps == 0) target_bps = rc->bits_per_second;
+                            h264_encoder_set_bitrate(c->h264_enc, target_bps);
                         }
                     } else if (misc->type == VAEncMiscParameterTypeFrameRate && c->h264_enc) {
                         VAEncMiscParameterFrameRate *fr = (VAEncMiscParameterFrameRate*)misc->data;
