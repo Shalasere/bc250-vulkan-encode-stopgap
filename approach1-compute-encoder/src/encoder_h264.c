@@ -252,13 +252,21 @@ static size_t write_aud(uint8_t *buf, size_t buf_size, bool is_idr) {
  * legitimately using fewer bits than a loose ceiling is correct behavior,
  * not a bug, and padding it would manufacture bits nobody asked for.
  *
+ * RC_LOW_LATENCY is treated the same as RC_CBR here (not excluded the way
+ * true VBR is) - it's a tighter-buffer variant of hitting a bitrate target,
+ * not a different rate-control philosophy, so a caller that asked for CBR
+ * intent under low-latency mode should still get real bitrate-target
+ * padding. See rc_init()'s call site for why this driver now defaults to
+ * RC_LOW_LATENCY instead of RC_CBR.
+ *
  * `total_written` on entry is the frame's real byte count so far (AUD +
  * SPS/PPS on IDR + all coded slice NAL(s)), already sitting in
  * encoder->output_buf. Returns the (possibly unchanged) new total_written;
  * never writes past encoder->output_buf_size.
  */
 static size_t maybe_append_filler(h264_encoder_t *encoder, size_t total_written) {
-    if (!encoder->cbr_intent || encoder->rc.mode != RC_CBR) {
+    if (!encoder->cbr_intent ||
+        (encoder->rc.mode != RC_CBR && encoder->rc.mode != RC_LOW_LATENCY)) {
         return total_written;
     }
 
@@ -1569,7 +1577,25 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
     h264_sps_default(&encoder->sps, width, height, encoder->fps, prof_idc);
     h264_pps_default(&encoder->pps, encoder->sps.sps_id, use_cabac, 26);
 
-    rc_init(&encoder->rc, RC_CBR, bitrate, (double)encoder->fps, width, height);
+    /* RC_LOW_LATENCY, not RC_CBR: this driver's only real consumer is
+     * real-time game streaming (Sunshine/Moonlight), which is exactly what
+     * RC_LOW_LATENCY's 2-frame buffer (vs. RC_CBR's 1-second buffer) is
+     * documented in rate_control.h to be for - it was implemented but never
+     * actually selected here. Real-world effect measured on-hardware
+     * (docs/DEVLOG.md §10.8): a single legitimate bitrate spike (e.g. a
+     * large real screen change) saturates a 1-second buffer, and
+     * rc_get_frame_qp()'s deliberately-clamped max QP step then takes many
+     * frames - up to a full GOP, since nothing else resets it sooner - to
+     * walk QP back down as that buffer slowly drains. A 2-frame buffer
+     * reaches the same proportional error immediately but drains back to
+     * its 50% target within a couple of normal frames, so the same clamped
+     * per-frame QP step recovers in a couple of frames instead of several
+     * seconds. See maybe_append_filler()'s mode check just above this
+     * function for the one other place RC_CBR was special-cased - updated
+     * to treat RC_LOW_LATENCY as CBR-intent-compatible too, since it is
+     * still fundamentally a bitrate-target mode, just tuned for faster
+     * reaction, not an opt-out of hitting the target the way real VBR is. */
+    rc_init(&encoder->rc, RC_LOW_LATENCY, bitrate, (double)encoder->fps, width, height);
 
     encoder->output_buf_size = width * height * 2 + 65536;
     encoder->output_buf = malloc(encoder->output_buf_size);
