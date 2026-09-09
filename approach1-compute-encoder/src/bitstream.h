@@ -140,8 +140,50 @@ typedef struct h264_pps {
 /** Initialize a bitstream writer over the given buffer. */
 void bs_init(bitstream_t *bs, uint8_t *buf, size_t size);
 
-/** Write `bits` bits of `val` into the stream (1-32 bits, MSB-first). */
-void bs_write_u(bitstream_t *bs, int bits, uint32_t val);
+/**
+ * Write `bits` bits of `val` into the stream (1-32 bits, MSB-first).
+ *
+ * PERF NOTE (perf/openh264-bitwriter-fallback): defined `static inline`
+ * here, in the header, rather than out-of-line in bitstream.c. Measured on
+ * real board hardware: making the accumulator rewrite in bitstream.c
+ * (see that file's top-of-file comment) an out-of-line function produced
+ * ~0% measured speedup end-to-end, despite a 20,000+-session differential
+ * fuzz test confirming it does strictly less work per call. Root cause,
+ * confirmed by this inlining change actually moving the number (see the
+ * branch's commit log / final report for before/after figures): this
+ * project's CMakeLists.txt does not build with -flto (measured previously
+ * and found not to help - see that file's comment), so cavlc.c's
+ * extremely hot per-bit call sites (cavlc_write_one_level()'s unary
+ * zero-run loops, trailing-one sign bits - millions of calls per second
+ * at real-time frame rates) were paying a full cross-translation-unit
+ * call/return (parameter marshaling, prologue/epilogue) on every single
+ * bit, which dominated over whatever arithmetic happened inside the
+ * function body - so a faster function body alone was invisible until the
+ * call boundary itself was removed by letting the compiler inline this
+ * function directly into cavlc.c's loops. */
+static inline void bs_write_u(bitstream_t *bs, int bits, uint32_t val) {
+    if (bs->overflow || bits <= 0) return;
+    if (bits < 32) {
+        val &= (1u << bits) - 1;
+    }
+
+    uint64_t combined = ((uint64_t)bs->accum << bits) | val;
+    int total_bits = bs->bit_offset + bits;
+    int nbytes = total_bits >> 3;
+    int rem = total_bits & 7;
+
+    for (int i = 0; i < nbytes; i++) {
+        if (bs->byte_offset >= bs->size) {
+            bs->overflow = true;
+            return;
+        }
+        int shift = (nbytes - 1 - i) * 8 + rem;
+        bs->buffer[bs->byte_offset] = (uint8_t)(combined >> shift);
+        bs->byte_offset++;
+    }
+    bs->accum = (rem == 0) ? 0u : (uint32_t)(combined & ((1u << rem) - 1));
+    bs->bit_offset = rem;
+}
 
 /** Write a single bit. */
 static inline void bs_write1(bitstream_t *bs, uint32_t val) {

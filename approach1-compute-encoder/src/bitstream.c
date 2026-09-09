@@ -123,35 +123,10 @@ void bs_init(bitstream_t *bs, uint8_t *buf, size_t size) {
      * there is nothing to pre-zero. */
 }
 
-void bs_write_u(bitstream_t *bs, int bits, uint32_t val) {
-    if (bs->overflow || bits <= 0) return;
-    if (bits < 32) {
-        val &= (1u << bits) - 1;
-    }
-
-    /* Append the new `bits` bits below whatever's already pending in
-     * `accum` (the older bits stay more-significant, matching MSB-first
-     * stream order). Widened to 64 bits purely so this shift (by up to 32)
-     * and the up-to-39-bit intermediate (7 old pending bits + 32 new ones)
-     * are always well-defined - no UB, unlike shifting a 32-bit value by
-     * its own full width. */
-    uint64_t combined = ((uint64_t)bs->accum << bits) | val;
-    int total_bits = bs->bit_offset + bits;
-    int nbytes = total_bits >> 3;   /* whole bytes now ready to commit (0-4) */
-    int rem = total_bits & 7;       /* bits still pending afterward (0-7) */
-
-    for (int i = 0; i < nbytes; i++) {
-        if (bs->byte_offset >= bs->size) {
-            bs->overflow = true;
-            return;
-        }
-        int shift = (nbytes - 1 - i) * 8 + rem;
-        bs->buffer[bs->byte_offset] = (uint8_t)(combined >> shift);
-        bs->byte_offset++;
-    }
-    bs->accum = (rem == 0) ? 0u : (uint32_t)(combined & ((1u << rem) - 1));
-    bs->bit_offset = rem;
-}
+/* bs_write_u() itself now lives in bitstream.h as a `static inline`
+ * function - see that header's comment on it for why (cross-TU call
+ * overhead, without LTO, was masking the accumulator rewrite's actual
+ * per-call savings on cavlc.c's hot per-bit loops). */
 
 void bs_write_ue(bitstream_t *bs, uint32_t val) {
     /* code_num = val+1, computed in 64-bit so val==UINT32_MAX can't wrap
