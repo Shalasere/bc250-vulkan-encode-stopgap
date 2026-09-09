@@ -45,9 +45,18 @@ jobs:
         cmake --build approach1-compute-encoder/build --parallel $(nproc)
 
     - name: Run Test Suite
-      continue-on-error: true
       run: |
-        ctest --test-dir approach1-compute-encoder/build --output-on-failure || echo "Note: some tests may require GPU/Vulkan (skipped in headless CI)"
+        # No continue-on-error / fallback here on purpose: a real test failure
+        # must fail this job. This step used to tolerate failure under the
+        # theory that some tests need GPU/Vulkan unavailable in headless CI -
+        # verified false by reproducing this exact environment locally
+        # (mesa-vulkan-drivers software Vulkan, no /dev/dri): all 4 test
+        # binaries, including VaApiDriverTest and EncodeBitstreamTest, pass
+        # cleanly headless. See enable_testing() fix in
+        # approach1-compute-encoder/CMakeLists.txt for the separate, earlier
+        # bug (ctest silently discovering zero tests) this masking was
+        # hiding on top of.
+        ctest --test-dir approach1-compute-encoder/build --output-on-failure
 
     - name: Verify Bitstream with FFmpeg Reference Decoder (External Oracle)
       run: |
