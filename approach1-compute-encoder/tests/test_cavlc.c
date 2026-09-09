@@ -241,7 +241,7 @@ static void test_macroblock_headers(void) {
     const int modes[] = {H264_I16x16_VERT, H264_I16x16_HORIZ, H264_I16x16_DC, H264_I16x16_PLANE};
     for (int m = 0; m < 4; m++) {
         bs_init(&bs, buf, sizeof(buf));
-        cavlc_write_mb_i16x16_header(&bs, modes[m], 0, 0, 0);
+        cavlc_write_mb_i16x16_header(&bs, modes[m], 0, 0, 0, 0);
         bs_flush(&bs);
         assert(bs_bytes_written(&bs) > 0);
     }

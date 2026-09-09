@@ -647,7 +647,18 @@ typedef struct {
  * heuristic did, because the GPU's mode decision already didn't either).
  */
 static int gpu_pred_mode_i16(const uint32_t *pred_modes, uint32_t mb_idx) {
-    return pred_modes ? (int)pred_modes[mb_idx] : H264_I16x16_DC;
+    return pred_modes ? (int)(pred_modes[mb_idx] & 0x3u) : H264_I16x16_DC;
+}
+
+/* Real per-MB chroma intra prediction mode (ITU-T 8.3.4/Table 8-3), packed by
+ * residual_predict.comp into bits 2-3 of the same pred_modes[] word the luma
+ * I16x16 mode (bits 0-1) already uses - see that shader's chroma mode-
+ * decision comment for why chroma needs its own real SAD-based mode decision
+ * (DC-only unconditionally produced badly wrong chroma for any macroblock
+ * whose top spatial neighbor is very different content from its own - the
+ * root cause of the gradient-boundary row artifact this fixes). */
+static int gpu_chroma_pred_mode(const uint32_t *pred_modes, uint32_t mb_idx) {
+    return pred_modes ? (int)((pred_modes[mb_idx] >> 2) & 0x3u) : H264_CHROMA_DC;
 }
 
 /* Neighbor MV lookup for the P16x16 MVD predictor below: (dx,dy) is a
@@ -723,6 +734,14 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
                               const uint32_t *pred_modes,
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
     int pred_mode = gpu_pred_mode_i16(pred_modes, mb);
+    int chroma_pred_mode = gpu_chroma_pred_mode(pred_modes, mb);
+    {
+        const char *dbg = getenv("BC250_DEBUG_I16_MB");
+        if (dbg && (uint32_t)atoi(dbg) == mb) {
+            fprintf(stderr, "[BC250_DEBUG_I16_MB] mb=%u mbx=%u mby=%u raw_pred_modes=%u luma_mode=%d chroma_mode=%d\n",
+                    mb, mbx, mby, pred_modes ? pred_modes[mb] : 0xFFFFFFFFu, pred_mode, chroma_pred_mode);
+        }
+    }
 
     /* Luma DC: gather PRE-quant DC (coeff buffer, position 0) of the 16
      * raster blocks into the natural 4x4 grid, then forward-Hadamard,
@@ -751,6 +770,21 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
     for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
 
+    {
+        const char *dbg = getenv("BC250_DEBUG_I16_MB");
+        if (dbg && (uint32_t)atoi(dbg) == mb) {
+            fprintf(stderr, "[BC250_DEBUG_I16_MB] qp=%d cb_dc_raw=(%d,%d,%d,%d) cr_dc_raw=(%d,%d,%d,%d) cb_dc_tx=(%d,%d,%d,%d) cr_dc_tx=(%d,%d,%d,%d)\n",
+                    qp, cb_dc_raw[0],cb_dc_raw[1],cb_dc_raw[2],cb_dc_raw[3],
+                    cr_dc_raw[0],cr_dc_raw[1],cr_dc_raw[2],cr_dc_raw[3],
+                    cb_dc[0],cb_dc[1],cb_dc[2],cb_dc[3], cr_dc[0],cr_dc[1],cr_dc[2],cr_dc[3]);
+            for (int blk = 16; blk < 24; blk++) {
+                const int *b = quant_block_ptr(quant_levels, mb, blk);
+                fprintf(stderr, "[BC250_DEBUG_I16_MB]   quant_block=%d dc=%d vals=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+                        blk, b[0], b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+            }
+        }
+    }
+
     int chroma_dc_nonzero = 0;
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
     int chroma_ac_nonzero = 0;
@@ -761,7 +795,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
 
     /* Header first (mb_type encodes pred_mode/cbp_chroma/cbp_luma_flag,
      * followed by intra_chroma_pred_mode and mb_qp_delta), THEN residual. */
-    cavlc_write_mb_i16x16_header(bs, pred_mode, cbp_chroma, cbp_luma_flag ? 15 : 0, 0);
+    cavlc_write_mb_i16x16_header(bs, pred_mode, chroma_pred_mode, cbp_chroma, cbp_luma_flag ? 15 : 0, 0);
 
     /* Luma DC block (always present for I16x16, first in residual order).
      * nC uses luma4x4BlkIdx=0's neighbor chain (see dc_nc's replacement
@@ -1290,6 +1324,23 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                             b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
                             b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
                 }
+                /* TEMPORARY: also dump the 16 LUMA blocks' real transmitted
+                 * quant_levels + this MB's committed motion vector, to check
+                 * real coefficient magnitude/count against CAVLC's escape-code
+                 * thresholds for the gradient-row investigation. */
+                if (mvs) {
+                    fprintf(stderr, "[BC250_DEBUG_MB] mv=(%d,%d) sad=%u\n",
+                            mvs[mb].mvx, mvs[mb].mvy, mvs[mb].sad);
+                }
+                for (int blk = 0; blk < 16; blk++) {
+                    const int *b = quant_block_ptr(quant_levels, mb, blk);
+                    int nz = 0, maxabs = 0;
+                    for (int p = 0; p < 16; p++) { if (b[p] != 0) nz++; if (abs(b[p]) > maxabs) maxabs = abs(b[p]); }
+                    fprintf(stderr, "[BC250_DEBUG_MB]   luma_block=%d nz=%d maxabs=%d vals=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+                            blk, nz, maxabs,
+                            b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+                            b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+                }
             }
         }
     }
@@ -1378,7 +1429,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                     /* No GPU residual data available (e.g. gpu_ctx==NULL) -
                      * fall back to an all-zero-residual I16x16 MB so the
                      * bitstream stays structurally valid. */
-                    cavlc_write_mb_i16x16_header(&bs, H264_I16x16_DC, 0, 0, 0);
+                    cavlc_write_mb_i16x16_header(&bs, H264_I16x16_DC, H264_CHROMA_DC, 0, 0, 0);
                     int zero16[16] = {0};
                     cavlc_write_4x4_block(&bs, zero16, luma_nc(&nc, mb, mbx, mby, 0));
                     memset(nc.nz_luma[mb], 0, sizeof(nc.nz_luma[mb]));
@@ -1637,7 +1688,7 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                 int mode = H264_I16x16_DC;
                 if (v_diff * 3 < h_diff * 2) mode = H264_I16x16_VERT;
                 else if (h_diff * 3 < v_diff * 2) mode = H264_I16x16_HORIZ;
-                cavlc_write_mb_i16x16_header(&bs, mode, 0, 0, 0);
+                cavlc_write_mb_i16x16_header(&bs, mode, H264_CHROMA_DC, 0, 0, 0);
             }
         } else {
             uint32_t current_skip_run = 0;
