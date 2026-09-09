@@ -999,6 +999,83 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
     return VA_STATUS_SUCCESS;
 }
 
+/* Exports a surface as a real DRM-PRIME/DMA-BUF handle, for zero-copy
+ * sharing with an external API - e.g. Sunshine's own GL/EGL import of this
+ * driver's encode surfaces for its cursor-overlay/color-conversion
+ * pipeline, confirmed on real hardware to call exactly this
+ * (`vaExportSurfaceHandle()` -> "the requested function is not
+ * implemented" before this was added; see docs/DEVLOG.md §10.5).
+ *
+ * Only VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 (VADRMPRIMESurfaceDescriptor)
+ * is supported - the older VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME (single
+ * object, VASurfaceAttribExternalBuffers) is a different, legacy
+ * descriptor shape this driver doesn't produce.
+ *
+ * Defaults to composed layers (one layer, two planes - real NV12) unless
+ * the caller explicitly asks for VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+ * matching the convention other real VA-API drivers (Intel's iHD, Mesa's
+ * own radeonsi VAAPI driver) use for this same choice. */
+VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor) {
+    bc250_driver_data *data = get_driver_data(ctx);
+    if (!data || !VALID_ID(surface_id, MAX_SURFACES) || !data->surfaces[surface_id].allocated ||
+        data->surfaces[surface_id].pending_destroy || !descriptor) {
+        return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    if (mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) {
+        return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+    }
+    bc250_surface *surf = &data->surfaces[surface_id];
+
+    gpu_nv12_layout_t layout;
+    if (gpu_compute_get_nv12_layout(&data->gpu, &surf->image, surf->memory, &layout) != 0) {
+        return VA_STATUS_ERROR_OPERATION_FAILED;
+    }
+
+    int fd;
+    if (gpu_compute_export_nv12_dmabuf(&data->gpu, surf->memory, &fd) != 0) {
+        /* Most likely VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf
+         * weren't available at device creation - see bc250_gpu_init(). */
+        return VA_STATUS_ERROR_UNIMPLEMENTED;
+    }
+
+    VADRMPRIMESurfaceDescriptor *desc = (VADRMPRIMESurfaceDescriptor *)descriptor;
+    memset(desc, 0, sizeof(*desc));
+    desc->fourcc = VA_FOURCC_NV12;
+    desc->width = (uint32_t)surf->width;
+    desc->height = (uint32_t)surf->height;
+    desc->num_objects = 1;
+    desc->objects[0].fd = fd;
+    desc->objects[0].size = (uint32_t)layout.total_size;
+    desc->objects[0].drm_format_modifier = DRM_FORMAT_MOD_LINEAR;
+
+    if (flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS) {
+        desc->num_layers = 2;
+        desc->layers[0].drm_format = DRM_FORMAT_R8;
+        desc->layers[0].num_planes = 1;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].offset[0] = (uint32_t)layout.y_offset;
+        desc->layers[0].pitch[0] = layout.y_pitch;
+
+        desc->layers[1].drm_format = DRM_FORMAT_GR88;
+        desc->layers[1].num_planes = 1;
+        desc->layers[1].object_index[0] = 0;
+        desc->layers[1].offset[0] = (uint32_t)layout.uv_offset;
+        desc->layers[1].pitch[0] = layout.uv_pitch;
+    } else {
+        desc->num_layers = 1;
+        desc->layers[0].drm_format = DRM_FORMAT_NV12;
+        desc->layers[0].num_planes = 2;
+        desc->layers[0].object_index[0] = 0;
+        desc->layers[0].object_index[1] = 0;
+        desc->layers[0].offset[0] = (uint32_t)layout.y_offset;
+        desc->layers[0].offset[1] = (uint32_t)layout.uv_offset;
+        desc->layers[0].pitch[0] = layout.y_pitch;
+        desc->layers[0].pitch[1] = layout.uv_pitch;
+    }
+
+    return VA_STATUS_SUCCESS;
+}
+
 VAStatus bc250_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette) {
     (void)ctx; (void)image; (void)palette;
     return VA_STATUS_ERROR_UNIMPLEMENTED;
@@ -1202,6 +1279,7 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     ctx->vtable->vaDeriveImage = bc250_DeriveImage;
     ctx->vtable->vaGetImage = bc250_GetImage;
     ctx->vtable->vaPutImage = bc250_PutImage;
+    ctx->vtable->vaExportSurfaceHandle = bc250_ExportSurfaceHandle;
     ctx->vtable->vaSetImagePalette = bc250_SetImagePalette;
     ctx->vtable->vaQuerySubpictureFormats = bc250_QuerySubpictureFormats;
     ctx->vtable->vaCreateSubpicture = bc250_CreateSubpicture;
