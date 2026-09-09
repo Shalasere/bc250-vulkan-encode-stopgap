@@ -217,6 +217,15 @@ void bs_flush(bitstream_t *bs);
 size_t bs_write_nal_header(bitstream_t *bs, int nal_ref_idc, int nal_type);
 
 /**
+ * Write an H.265/HEVC NAL start code + 2-byte HEVC NAL unit header (ITU-T
+ * H.265 7.3.1.2): forbidden_zero_bit(1) + nal_unit_type(6) + nuh_layer_id(6,
+ * always 0 - no scalable/multiview layers here) + nuh_temporal_id_plus1(3,
+ * always 1 - no temporal sublayers). Returns the byte offset where the NAL
+ * payload (RBSP) begins, same contract as bs_write_nal_header() above.
+ */
+size_t bs_write_nal_header_hevc(bitstream_t *bs, int nal_unit_type);
+
+/**
  * Perform RBSP-to-EBSP emulation prevention (stuffs 0x03 bytes).
  * Takes raw RBSP data, outputs EBSP. Returns output size.
  */

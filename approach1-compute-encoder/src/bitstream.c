@@ -220,6 +220,15 @@ size_t bs_write_nal_header(bitstream_t *bs, int nal_ref_idc, int nal_type) {
     return bs_bytes_written(bs);
 }
 
+size_t bs_write_nal_header_hevc(bitstream_t *bs, int nal_unit_type) {
+    bs_write_u(bs, 32, 0x00000001);
+    bs_write1(bs, 0);                       /* forbidden_zero_bit */
+    bs_write_u(bs, 6, (uint32_t)nal_unit_type & 0x3f);
+    bs_write_u(bs, 6, 0);                   /* nuh_layer_id */
+    bs_write_u(bs, 3, 1);                   /* nuh_temporal_id_plus1 */
+    return bs_bytes_written(bs);
+}
+
 size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size) {
     size_t i, j = 0;
     int zero_count = 0;
