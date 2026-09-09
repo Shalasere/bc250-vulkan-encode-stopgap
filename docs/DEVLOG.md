@@ -657,32 +657,79 @@ several more real findings, in the order discovered:
   (`[bc250-gpu] Found AMD BC-250 APU...`) present in Sunshine's own
   process. No Sunshine patch, no system file touched (the bind-mount is
   private to that one process tree and vanishes on exit).
-- Two blockers surfaced past that point, neither yet resolved:
-  - A pre-existing, unrelated Mesa issue on this system: Sunshine's own
-    GBM device creation (used for its EGL/OpenGL cursor-overlay/color
-    conversion path) fails with `undefined symbol: dri_flush, version
-    libgallium-26.0.4.so` even though that exact symbol is present in
-    the installed `libgallium-26.0.4.so` (confirmed via `nm -D`/
-    `objdump -T`) — likely specific to the incomplete manual-SSH-session
-    test context (no real `WAYLAND_DISPLAY`, no real D-Bus session), not
-    yet confirmed either way inside a real graphical session.
-  - Doing the same bind-mount via systemd's own `BindPaths=` (the
-    declarative, native equivalent of the manual `unshare`, needed to
-    test inside the real `systemd --user` service rather than a manual
-    shell) hits a *different*, earlier failure: `Couldn't get handle
-    for DRM Framebuffer [102]: Probably not permitted` — Sunshine's own
-    KMS capture failing on a capability/permission error that never
-    appeared in the manual `unshare` test. `BindPaths=` implicitly gives
-    a unit its own sandboxed mount namespace, and systemd sandboxing
-    directives are known to interact with capability retention in ways
-    that could plausibly block a `setcap`-granted capability like
-    Sunshine's own `cap_sys_admin` — not yet confirmed as the actual
-    mechanism.
+- **A real mistake, caught and fixed live**: `/usr/lib64/dri/radeonsi_drv_video.so`
+  turned out to be a *symlink* to `/usr/lib64/libgallium-26.0.4.so` — Mesa's real,
+  shared, 52MB core Gallium3D library, used system-wide (GL, GBM, other
+  VAAPI-via-gallium consumers), not a private VAAPI-only file. `mount --bind`
+  follows symlinks on its target path, so **every bind-mount onto that path
+  this session, including the earlier "breakthrough" one, actually landed on
+  the real shared library, not a separate file.** Inside the private
+  `unshare --mount` test this was harmless (silently scoped to that one
+  process tree, discarded on exit) — but it fully explains the
+  "GBM device creation fails: undefined symbol dri_flush" error blamed on
+  "a pre-existing, unrelated Mesa issue" in an earlier version of this entry.
+  **That attribution was wrong**: there never was a pre-existing Mesa bug —
+  `dri_flush` was "undefined" because the file exporting it had been silently
+  replaced by this driver's own (unrelated) `.so`, confirmed via `rpm -V`
+  (`S` size mismatch, `5` checksum mismatch) the moment it happened live via
+  a real, system-wide (not namespace-private) `mount --bind` run against
+  this exact path. Caught immediately, unmounted, verified restored
+  (checksum, `rpm -V`, live desktop/`amdgpu` health) — no lasting damage, but
+  a real live-system incident, not just a test-harness curiosity. Lesson: check
+  whether a bind-mount *target* is a symlink before mounting through it — the
+  syscall does not distinguish "redirect this VAAPI driver" from "redirect
+  whatever this symlink secretly resolves to".
+- **`BindPaths=` and `ExecStartPre=+mount` both fail for the same underlying
+  reason, confirmed architectural rather than configurable**: a plain,
+  directive-free `systemctl --user restart` with `encoder = vaapi` (no
+  redirect at all) was tested as its own control and cleanly reaches
+  `Found monitor for DRM screencasting` — so the earlier
+  `Couldn't get handle for DRM Framebuffer: Probably not permitted` failure
+  under `BindPaths=` was *not* inherent to real KMS capture under systemd,
+  narrowing it to `BindPaths=` itself. Comparing the unit's real
+  `NoNewPrivileges`/`RestrictNamespaces`/`SecureBits`/capability-bitmask
+  properties with and without `BindPaths=` found them identical (`CapPrm`
+  unchanged; only an unrelated `CAP_WAKE_ALARM` bit moved in the inheritable
+  set) — ruling out a simple capability-stripping explanation. The real
+  mechanism: **`systemctl --user` units can never obtain true root for any
+  step, including via the `+` prefix on `ExecStartPre=`** — `+` bypasses a
+  *unit's own* dropped privileges within a system-manager-launched unit; it
+  cannot grant privileges the managing systemd instance itself doesn't have,
+  and a `--user` instance always runs as the calling UID with no path to
+  root. Confirmed directly: `ExecStartPre=+mount --bind ...` failed with
+  `mount: ...: must be superuser to use mount` even with the `+` prefix.
+  This is why Sunshine's own `cap_sys_admin` (via `setcap` on its binary, a
+  kernel exec-time grant independent of the spawning parent's privilege)
+  works at all here, and why no per-unit systemd directive can substitute
+  for it for an operation as privileged as a bind-mount.
+- **Working fix**: `rpm-ostree usroverlay` (the sanctioned, built-in,
+  session-only writable overlay for `/usr` on this ostree/immutable system —
+  changes are automatically discarded on next reboot, no manual cleanup
+  needed) to get write access, then **swap the symlink itself** —
+  `ln -sfn /opt/bc250-driver/bc250_drv_video.so /usr/lib64/dri/radeonsi_drv_video.so`
+  — instead of bind-mounting through it. This never touches
+  `libgallium-26.0.4.so` at all (confirmed: identical size/checksum
+  throughout), since the symlink now simply points somewhere else entirely.
+- **Confirmed working end-to-end, past every earlier blocker**: real,
+  unmodified Sunshine, via the real `systemctl --user` service, with
+  `encoder = vaapi`: KMS capture succeeds, this driver loads
+  (`vaapi vendor: AMD BC-250 RDNA2 Compute VA-API Driver` in Sunshine's own
+  log), GBM succeeds (the real Mesa library was never touched this time),
+  and Sunshine actually creates an encode session against this driver —
+  rate control negotiates, packed-header capability is queried. The **one
+  remaining gap is real, specific, and squarely in this repo**: Sunshine
+  calls `vaExportSurfaceHandle()` (exports a VA surface as a DRM-PRIME/
+  DMA-BUF handle, for zero-copy sharing with its own GL/EGL
+  cursor-overlay/compositing path) and this driver returns
+  "the requested function is not implemented" — `bc250_ExportSurfaceHandle`
+  (or the vtable slot for it) does not exist in `va_backend.c` yet.
 
-**Net state**: the core goal (native Sunshine, unmodified, loading and
-initializing this driver) is proven achievable, board-verified, right
-now, via a manual mount-namespace bind-mount. Making that survive inside
-the *real* systemd service is the open next step, not yet done.
+**Net state**: every integration blocker found so far — driver loading,
+KMS capture permissions, and the GBM/symlink incident — is now understood
+and resolved. What's left is a single, real, unimplemented VA-API entry
+point in this driver's own code (`vaExportSurfaceHandle`), not a
+Mesa/systemd/Sunshine mystery. That's the next concrete task, not yet
+started.
 
 ---
 
