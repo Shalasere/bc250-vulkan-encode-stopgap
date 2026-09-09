@@ -1,77 +1,62 @@
-# 🎮 AMD BC-250 Custom Driver & VA-API Video Encoder
+# AMD BC-250 Custom Driver & VA-API Video Encoder
 
 [![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/Driver%20License-MIT-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
-Hardware-accelerated video encoding and DisplayPort/HDMI audio fixes for the **AMD BC-250 ("Cyan Skillfish" / PS5 "Oberon" APU)** on Linux (Bazzite, CachyOS, Fedora, Ubuntu, Arch, ChimeraOS).
+Software H.264 video encoding (via Vulkan compute, not the hardware VCN block) and a DisplayPort/HDMI audio clock fix for the **AMD BC-250 ("Cyan Skillfish" / PS5 "Oberon" APU)** on Linux (Bazzite, SteamOS, Fedora, Ubuntu, Arch).
 
-> [!NOTE]
-> ### 📢 BC-250 Hardware Testers Wanted!
-> Software emulation, CAVLC bitstream generation, and FFmpeg decode oracles have all been mathematically verified in CI. If you own a physical BC-250 APU board, help us validate live on-metal performance!
-> 1. Download the [v0.2.0 Pre-Built Release](../../releases) or build from source.
-> 2. Run `./tools/bc250_diagnose.sh` on your BC-250 system.
-> 3. Submit your results using our [Hardware & Benchmark Report](../../issues/new?template=hardware_report.md) template!
+> [!IMPORTANT]
+> ### Current status: correct, but not yet real-time
+> The encoder now produces genuinely correct H.264 output — verified numerically (PSNR/SSIM against ground truth) and visually, on real hardware, across multiple resolutions and clip lengths. **It is not yet fast enough for real-time streaming or recording at typical resolutions.** See [Known Limitations](#known-limitations) below before you plan around this project. If you're evaluating this for a "just works" streaming setup today, it isn't there yet — track that section for where the gap actually is and how it's closing.
 
 ---
 
-## 📖 Why Does This Project Exist?
+## Why Does This Project Exist?
 
-The AMD BC-250 is a repurposed PlayStation 5 APU equipped with a Zen 2 CPU and up to 40 RDNA 2-class Compute Units when the community-discovered CU unlock is applied, providing up to 2,560 stream processors and roughly 10 TFLOPS of GPU compute. This has made it a popular low-cost platform for powerful living-room gaming PCs.
+The AMD BC-250 is a repurposed PlayStation 5 APU with a Zen 2 CPU and up to 40 RDNA 2-class Compute Units (with the community-discovered CU unlock applied). That makes it an unusually cheap, powerful platform for a living-room gaming PC — except its VCN hardware video engine, needed for hardware-accelerated encode/decode, cannot currently be used. (Recent reverse-engineering suggests the block is physically present but stuck behind an unresolved power-management/firmware initialization problem, not permanently fused off — see the community's ongoing hardware-unlock effort, which is a separate project from this one.)
 
-However, the BC-250 currently has a major limitation: its VCN hardware video engine cannot be used for hardware encoding/decoding. Unlike earlier assumptions that the encoder was permanently fused off, recent reverse-engineering suggests that the VCN block is physically present and may instead be inaccessible because of an unresolved power-management/firmware initialization problem.
+Without a working VCN, applications like Sunshine, OBS, and Steam Link fall back to CPU-only software encoding, which is either slow or absent depending on the app. This project's approach: emulate a hardware video encoder in software, using Vulkan compute shaders that run on the APU's own unlocked RDNA 2 Compute Units, and expose it to the rest of the system as a standard VA-API driver (`bc250_drv_video.so`) — so, in principle, any VA-API-aware application can use it exactly like it would a real hardware encoder.
 
-As a result, applications such as Sunshine, OBS Studio, and Steam Link cannot currently use the BC-250’s hardware video encoder and must rely on software encoding where supported. This project exists to investigate whether the VCN can be properly powered and initialized and ultimately restore hardware video encoding.
-
-### The Solution:
-This project solves video encoding without touching the locked VCN silicon:
-1. **Vulkan Compute VA-API Driver (`bc250_drv_video.so`):** Emulates a hardware video encoder by running high-performance GLSL compute shaders across the APU's **40 unlocked RDNA 2 Compute Units**.
-2. **Audio Clock Fix (`bc250_audio_fix`):** Fixes the notorious "drunk" or stuttering audio over DisplayPort and HDMI with DKMS persistence across Linux kernel updates.
-
-To Linux applications, **it behaves exactly like a standard hardware VA-API encoder!**
+This is a stopgap, not a replacement for real hardware acceleration. If and when the community's VCN-unlock effort succeeds, that will be the better answer for this chip. Until then, this project's goal is to make the software path as close to genuinely usable as it can get.
 
 ---
 
-## 🚀 Quick Start & Installation
+## What Actually Works Today
 
-You have two easy ways to install the driver:
+Validated on physical BC-250 hardware, not just in CI or in theory:
 
-### Option A: Pre-Built Release (Easiest — No Compiling Needed!)
-If you just want to play games and don't want to install compilers or development libraries:
+- **Correctness**: `tools/quality_test.sh` (an independent PSNR/SSIM harness — captures real ground-truth input, encodes through the actual VA-API pipeline, decodes with a separate software decoder, and scores the result) passes cleanly: **37.7 dB average PSNR, SSIM 0.99 at 640x480**; also passes at 1280x720 (30.9 dB) and across a 125-frame clip with no drift or accumulating error (worst single frame still 28.5 dB). This covers I-frames, P-frames/motion content, and multiple resolutions.
+- **Installation on immutable distros**: `tools/setup_bazzite.sh` is verified working end-to-end on a real Bazzite (ostree/Kinoite) console — driver installs, persists, and is found by `vainfo` with the right H.264 profiles listed.
+- **Test suite**: all four unit test binaries actually run and actually assert something (see [Known Limitations](#known-limitations) for why that's worth calling out explicitly).
 
-1. Go to the **[Actions Tab](../../actions/workflows/build.yml)** of this repository.
-2. Click on the latest workflow run (with a green checkmark).
-3. Scroll down to **Artifacts** and download `bc250-driver-linux-x86_64.tar.gz`.
-4. Open your terminal in the download folder and extract:
-   ```bash
-   tar -xzvf bc250-driver-linux-x86_64.tar.gz
-   cd bc250-driver
-   sudo ./build_and_install.sh
-   ```
-*(That's it! Shaders, libraries, and audio fixes are installed automatically.)*
+## Known Limitations
 
----
+Being direct about this rather than burying it, since it materially affects whether this project is useful for you yet:
 
-### Option B: Dedicated SteamOS & Bazzite Installers (Immutable Gaming Distros)
+- **Not real-time.** Measured throughput through the real pipeline: roughly **18 fps at 640x480, 6 fps at 1280x720, 3 fps at 1920x1080** — well below the 30-60 fps a streaming/recording use case needs, worse at higher resolution. The bottleneck is not the GPU compute shaders (they account for under 1.5% of frame time at every resolution tested) — it's the CPU-side CAVLC entropy-coding/bitstream-writing stage, which is measurably far slower than it should be. This is an active optimization target; it is not considered a project goal that's been abandoned.
+- **GPU contention while gaming is real, not negligible.** Earlier documentation for this project claimed encoder overhead stays "under 3-5%" of GPU compute while a game runs concurrently. Direct measurement (a synthetic GPU load running alongside an active encode) shows roughly a **29% throughput hit** instead. Treat "stream while you game with no impact" as not yet true.
+- **`build_and_install.sh` (the generic installer) doesn't work on immutable/atomic distros** (Bazzite, SteamOS/HoloISO, ChimeraOS) without the fix in this branch — it wrote to read-only `/usr` paths and silently reported success anyway. If you're on one of those distros, use `tools/setup_bazzite.sh` or `tools/setup_steamos.sh` instead, which write to paths that actually persist.
+- **The `v0.2.0` tagged release predates the correctness fixes above.** If you downloaded a pre-built release before this work landed, it very likely produces visibly corrupted video on real content (a large flat region turning into a blotchy gray mess is the signature symptom) despite passing this project's CI at the time — see the next point for why CI didn't catch it.
+- **CI's green checkmark historically meant less than it looked like.** Two independent issues meant most of the test suite silently validated nothing for an unknown period: `assert()`-based tests were compiled with `-DNDEBUG` (which turns every `assert()` into a no-op), and a separate CMake configuration issue meant `ctest` never discovered 3 of the project's 4 test binaries in the first place. Both are now fixed and verified (reintroducing a known bug into the source causes the relevant test to actually fail loudly). If you're relying on this project's CI history from before that fix, treat it with the same skepticism you'd apply to an untested claim.
 
-If you are running **Valve SteamOS 3.x / HoloISO** or **Bazzite (Fedora Silverblue)** on your BC-250 console:
-
-* **For SteamOS / HoloISO (Survives OS updates!):**
-  ```bash
-  sudo ./tools/setup_steamos.sh
-  ```
-  *Stages driver to `/var/lib/bc250/dri` and shaders to `/var/lib/bc250/shaders` so they persist permanently across SteamOS A/B root partition updates. Configures Gamescope user session and re-locks rootfs.*
-
-* **For Bazzite / Fedora Silverblue (SELinux & Gamescope ready):**
-  ```bash
-  sudo ./tools/setup_bazzite.sh
-  ```
-  *Installs to `/usr/local/lib64/dri`, restores SELinux security contexts, and configures multi-slice streaming for Sunshine.*
+None of this means the underlying approach is a dead end — the GPU compute path is proven correct and cheap; the work left is squarely in the CPU-side bitstream writer, which is a much more tractable problem than a GPU architecture rework would have been.
 
 ---
 
-### Option C: Build from Source (One Simple Command)
-If you prefer compiling locally, the automated setup script handles everything (including automatically installing missing packages for Ubuntu, Fedora, Arch, and openSUSE):
+## Installation
+
+### Option A: Immutable / Atomic Distros (Bazzite, SteamOS, HoloISO, ChimeraOS) — Recommended, Verified Working
+
+```bash
+git clone https://github.com/simpmix/bc250-vcn-driver.git
+cd bc250-vcn-driver
+sudo ./tools/setup_bazzite.sh   # or ./tools/setup_steamos.sh on SteamOS/HoloISO
+```
+
+Installs to a path that actually survives an ostree/atomic deployment update, and configures SELinux contexts where relevant.
+
+### Option B: Traditional Distros (Fedora, Ubuntu, Arch, openSUSE)
 
 ```bash
 git clone https://github.com/simpmix/bc250-vcn-driver.git
@@ -80,72 +65,59 @@ chmod +x build_and_install.sh tools/*.sh
 ./build_and_install.sh
 ```
 
+### Option C: Pre-Built Release
+
+Check the [Actions tab](../../actions/workflows/build.yml) for the latest build artifact rather than the tagged Releases page for now, until a new release is cut that includes the correctness fixes described above.
+
 ---
 
-## 🔍 Verifying Your Setup
-
-Run the built-in diagnostic and benchmark tool:
+## Verifying Your Setup
 
 ```bash
 ./tools/bc250_diagnose.sh
 ```
 
-This will automatically check:
-* ✅ APU identification (`1002:13fe`)
-* ✅ 40 active Compute Units (CUs)
-* ✅ DisplayPort/HDMI audio fix status
-* ✅ VA-API driver loading
-* ⚡ **Live 100-frame 1080p60 encode benchmark** (reports frame latency and FPS throughput!)
+Checks hardware identification, active Compute Unit count, the audio fix module, and whether the VA-API driver loads. Its built-in benchmark reports a real fps number for your specific board — expect it to land in the ranges given in [Known Limitations](#known-limitations), not at 60 fps yet.
 
-To test with `vainfo`:
 ```bash
 export LIBVA_DRIVER_NAME=bc250
 vainfo
 ```
-You will see `VAProfileH264ConstrainedBaseline`, `VAProfileH264Baseline`, `VAProfileH264Main`, and `VAProfileH264High` listed with `VAEntrypointEncSlice` support!
 
----
+Should list `VAProfileH264ConstrainedBaseline`, `VAProfileH264Baseline`, `VAProfileH264Main`, and `VAProfileH264High` with `VAEntrypointEncSlice` support.
 
-## ⚡ Ultra-Low Overhead Gaming Mode (Keep 60 FPS in Games!)
-
-When playing games on your BC-250 console while streaming to Moonlight or recording with OBS, you don't want the encoder taking compute power away from your game.
-
-Add this to your environment (automatically installed by `build_and_install.sh` into `/etc/environment.d/99-bc250.conf`):
+For a real correctness check (not just "did it not crash"), run:
 
 ```bash
-export BC250_FAST_MODE=1
+./tools/quality_test.sh
 ```
 
-* **What it does:** Uses 2:1 checkerboard subsampled motion estimation, early diamond termination, and bypasses the in-loop deblocking filter pass.
-* **The Result:** Keeps GPU compute overhead **under 3–5% of the 40 CUs**, allowing your games to run at full 60 FPS with no frame drops!
+This independently verifies actual pixel content, not just that a bitstream decodes.
 
 ---
 
-## 🕹️ Application Setup Guides
+## Application Setup
 
-### 1. Sunshine / Moonlight (Game Streaming to Handhelds & TVs)
-1. Ensure the driver is installed:
-   ```bash
-   export LIBVA_DRIVER_NAME=bc250
-   export BC250_FAST_MODE=1
-   ```
-2. Open the **Sunshine Web Configuration** (usually `https://localhost:47990`).
-3. Navigate to **Configuration -> Audio/Video**.
-4. Set **Video Encoder** to **VA-API**.
-5. Set your target resolution (720p, 1080p, or 1440p).
-6. Connect Moonlight from your Steam Deck, ROG Ally, phone, or TV and enjoy low-latency 60 FPS remote gaming!
+### Sunshine / Moonlight
 
-### 2. OBS Studio (Recording Gameplay & Streaming)
-1. Launch OBS from your terminal or desktop with the driver active:
-   ```bash
-   LIBVA_DRIVER_NAME=bc250 BC250_FAST_MODE=1 obs
-   ```
-2. Go to **Settings -> Output -> Output Mode: Advanced**.
-3. Under **Streaming** or **Recording**, set **Video Encoder** to **FFmpeg VAAPI**.
-4. Set **VAAPI Device** to `/dev/dri/renderD128`.
+```bash
+export LIBVA_DRIVER_NAME=bc250
+```
 
-### 3. FFmpeg Command Line
-To transcode or encode any video via GPU compute:
+Set **Video Encoder** to **VA-API** in Sunshine's web configuration (`https://localhost:47990` → Configuration → Audio/Video). A tuned config template is at `tools/sunshine_preset/sunshine.conf` — **read it before applying**: `apply_sunshine_preset.sh` fully overwrites your existing `sunshine.conf`, so if you've already hand-tuned settings like `capture` or a CSRF origin allowlist, back those up first or merge by hand instead of running the script blind.
+
+Given the current performance ceiling above, expect this to be usable at lower resolutions/framerates sooner than at 1080p60.
+
+### OBS Studio
+
+```bash
+LIBVA_DRIVER_NAME=bc250 obs
+```
+
+Settings → Output → Output Mode: Advanced → set **Video Encoder** to **FFmpeg VAAPI**, **VAAPI Device** to `/dev/dri/renderD128`.
+
+### FFmpeg Command Line
+
 ```bash
 export LIBVA_DRIVER_NAME=bc250
 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v 8M output.mp4
@@ -153,66 +125,29 @@ ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload'
 
 ---
 
-## 🔊 Audio Fix (DisplayPort & HDMI)
+## Audio Fix (DisplayPort & HDMI)
 
-The BC-250 APU suffers from a known audio clock issue where audio over DisplayPort or HDMI sounds robotic or stutters ("drunk audio"). 
-
-We provide an automated **DKMS kernel module** that fixes the audio clocks and automatically persists across Linux kernel updates:
+The BC-250 has a known audio clock issue causing "drunk"/stuttering audio over DisplayPort or HDMI. A DKMS kernel module fixes it and persists across kernel updates:
 
 ```bash
 cd audio-fix
 sudo ./install_dkms.sh
 ```
 
-To uninstall:
-```bash
-cd audio-fix
-sudo ./uninstall_dkms.sh
-```
+This part of the project wasn't in scope for the correctness/performance verification work described above — it's carried over as-is from earlier work.
 
 ---
 
-## 🛠️ GitHub Actions CI/CD Pipeline (`build.yml`)
+## Contributing / CI
 
-The repository includes an automated GitHub Actions workflow [`.github/workflows/build.yml`](.github/workflows/build.yml):
+`.github/workflows/build.yml` builds the driver, runs the full test suite (now actually exercising all four test binaries, see [Known Limitations](#known-limitations)), and runs `tools/quality_test.sh`-style content verification. A green check on a PR is a meaningfully stronger signal than it used to be, but two things are still worth knowing if you're relying on it: the test-suite step is configured with `continue-on-error`, so a genuine test failure currently shows as a warning rather than blocking the job, and the encode-verification step checks that ffmpeg decodes without a hard error, not pixel-level correctness (that's what `tools/quality_test.sh` is for, and it isn't part of the automated CI step yet).
 
-### For Users:
-* Every commit and release automatically builds on Ubuntu runners.
-* You can download pre-built release archives without installing any compilers on your gaming console:
-  * Click **Actions** at the top of the repository.
-  * Click the latest workflow run.
-  * Scroll down to **Artifacts** to download `bc250-driver-linux-x86_64.tar.gz`.
-
-### For Maintainers (Creating Official Releases):
-To publish a new tagged release:
-```bash
-git tag v0.2.0
-git push origin v0.2.0
-```
-GitHub Actions will automatically build the driver, run the test suite, package the `.tar.gz` bundle, and publish it directly to the **Releases** tab on GitHub!
+Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
 ---
 
-## ❓ Troubleshooting & FAQs
-
-Have an issue? We've written a dedicated, comprehensive guide:
-👉 **[Read the Full Troubleshooting Guide (docs/troubleshooting.md)](docs/troubleshooting.md)**
-
-Common quick fixes:
-* **"Permission denied on /dev/dri/renderD128":**
-  ```bash
-  sudo usermod -a -G video,render $USER
-  ```
-  *(Log out and back in for permissions to take effect)*
-* **"Audio still stuttering":**
-  Ensure the module is loaded with `lsmod | grep bc250_audio_fix`. If not, run `sudo modprobe bc250_audio_fix`.
-* **"Driver bc250 not found":**
-  Verify `export LIBVA_DRIVER_NAME=bc250` is in your shell environment.
-
----
-
-## 📜 License
+## License
 * Userspace compute driver, shaders, and tools: **MIT**
 * Audio fix kernel module: **GPL-2.0**
 
-<!-- bc250-vcn-driver v0.2.0 -->
+<!-- bc250-vcn-driver -->
