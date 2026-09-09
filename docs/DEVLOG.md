@@ -724,12 +724,66 @@ several more real findings, in the order discovered:
   "the requested function is not implemented" — `bc250_ExportSurfaceHandle`
   (or the vtable slot for it) does not exist in `va_backend.c` yet.
 
-**Net state**: every integration blocker found so far — driver loading,
-KMS capture permissions, and the GBM/symlink incident — is now understood
-and resolved. What's left is a single, real, unimplemented VA-API entry
-point in this driver's own code (`vaExportSurfaceHandle`), not a
-Mesa/systemd/Sunshine mystery. That's the next concrete task, not yet
-started.
+### 10.6 `vaExportSurfaceHandle` implemented — real Sunshine now selects this driver
+
+Fixed for real, not stubbed — Sunshine needs a genuine DRM-PRIME/DMA-BUF
+handle it can actually import into its own GL/EGL pipeline, so this
+required the surface's backing Vulkan memory to actually be exportable,
+not just adding one vtable entry:
+
+- `bc250_gpu_init()` now opportunistically enables `VK_KHR_external_memory_fd`
+  and `VK_EXT_external_memory_dma_buf` (checked via
+  `vkEnumerateDeviceExtensionProperties` first; device creation still
+  succeeds without them, matching this file's existing pattern for every
+  other optional capability) and resolves `vkGetMemoryFdKHR`.
+- `gpu_compute_create_image()` chains `VkExternalMemoryImageCreateInfo`/
+  `VkExportMemoryAllocateInfo` (handle type `DMA_BUF`) so every surface
+  this driver creates is exportable from here on.
+- New `gpu_compute_export_nv12_dmabuf()` + `bc250_ExportSurfaceHandle()`
+  fill a real `VADRMPRIMESurfaceDescriptor` using this driver's own
+  already-validated real Vulkan layout (`gpu_compute_get_nv12_layout()` -
+  the same pitch/offset math `GetImage`/`PutImage`/upload/download already
+  use), composed by default (one NV12 layer, two planes) or separate
+  layers on request, matching Intel iHD/Mesa radeonsi convention.
+
+**Board-validated against real, unmodified Sunshine, via the real
+`systemctl --user` service**: `encoder = vaapi` now reaches
+`Found H.264 encoder: h264_vaapi [vaapi]` and the service is genuinely
+`active (running)` — not falling through to software, not crash-looping.
+`ctest` unaffected (5/5), a synthetic `testsrc` encode re-verified
+byte-size-identical to before this change (no regression to the
+already-shipped encode path).
+
+One real, separate, minor bug surfaced during Sunshine's own encoder
+probe, **not fixed here**: `pic_init_qp_minus26 out of range: 26, but
+must be in [-26,25]` - this driver hands back an SPS QP field outside
+the ITU-T-legal range for some QP value this probe path exercises. Did
+not block Sunshine from ultimately selecting `h264_vaapi` in this same
+test, but is a real bug worth its own fix.
+
+**Important caveat on reproducing this**: the symlink redirect
+(`/usr/lib64/dri/radeonsi_drv_video.so` → this driver's `.so`) lives in
+an `rpm-ostree usroverlay` — session-only by design, and **does not
+survive a reboot**. Reproducing this working state after any reboot
+needs the full sequence again: `rpm-ostree usroverlay`, then
+`ln -sfn /opt/bc250-driver/bc250_drv_video.so /usr/lib64/dri/radeonsi_drv_video.so`
+(never `mount --bind` onto that path directly - see §10.5's symlink
+incident). `sunshine.conf`'s `encoder` was deliberately left at
+`software` (its original value) after this test, specifically so a
+reboot doesn't silently reintroduce Sunshine's own pre-existing
+Vulkan-encode-probe crash (see §10.4) by falling through to `vaapi`
+against a since-reverted symlink.
+
+**Net state**: every integration blocker this investigation found —
+driver loading, KMS capture permissions, the GBM/symlink incident, and
+the missing `vaExportSurfaceHandle` - is now understood, and all but the
+symlink's reboot-persistence are genuinely fixed. Real, unmodified
+Sunshine, through its real systemd service, selects this driver as its
+active H.264 encoder. What's left for full production use: making the
+driver redirect survive a reboot (a real package-layering or install
+question, not investigated here), and the `pic_init_qp_minus26` bug.
+Connecting a real Moonlight client (item 3 of §10's original plan) is
+the next actual milestone, not yet attempted.
 
 ---
 
