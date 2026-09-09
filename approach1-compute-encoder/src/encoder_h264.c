@@ -1195,6 +1195,87 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                             "mvx_range=[%d,%d] mvy_range=[%d,%d] (units: quarter-luma-pel)\n",
                     encoder->frame_count, total, subpel_x, subpel_y, subpel_any, min_x, max_x, min_y, max_y);
         }
+
+        /* TEMPORARY investigation diagnostic (BC250_DEBUG_MV_ROW=<mby>) for
+         * the gradient-boundary block-displacement artifact task: dumps the
+         * per-MB raw searched MV (as read back from mv_staging - i.e.
+         * exactly what mv_predictor()/encode_mb_p16x16() will see) AND the
+         * median predictor + resulting MVD for every macroblock in ONE
+         * requested row, on every P frame. Lets a specific boundary row be
+         * cross-referenced frame-by-frame against BC250_DUMP_RECON_FRAMES
+         * output without eyeballing full aggregate stats. Not wired to any
+         * permanent feature flag - safe to leave (no-op unless the env var
+         * is set), but intended to be removed or promoted after the
+         * investigation concludes. */
+        if (mvs && !is_idr && getenv("BC250_DEBUG_MV_ROW")) {
+            int dbg_row = atoi(getenv("BC250_DEBUG_MV_ROW"));
+            if (dbg_row >= 0 && (uint32_t)dbg_row < encoder->height_in_mbs) {
+                for (uint32_t mbx = 0; mbx < encoder->width_in_mbs; mbx++) {
+                    uint32_t mb = (uint32_t)dbg_row * encoder->width_in_mbs + mbx;
+                    int pred_x, pred_y;
+                    mv_predictor(mvs, mbx, (uint32_t)dbg_row, encoder->width_in_mbs, 0, &pred_x, &pred_y);
+                    int mvd_x = mvs[mb].mvx - pred_x;
+                    int mvd_y = mvs[mb].mvy - pred_y;
+                    fprintf(stderr, "[BC250_DEBUG_MV_ROW] frame=%u row=%d mbx=%u mb=%u "
+                                    "mv=(%d,%d) sad=%u pred=(%d,%d) mvd=(%d,%d)\n",
+                            encoder->frame_count, dbg_row, mbx, mb,
+                            mvs[mb].mvx, mvs[mb].mvy, mvs[mb].sad, pred_x, pred_y, mvd_x, mvd_y);
+                }
+            }
+        }
+
+        /* TEMPORARY investigation diagnostic (BC250_DEBUG_MB=<mb_index>,
+         * BC250_DEBUG_FRAME=<frame_count>) for the gradient-boundary
+         * artifact task: dumps the exact chroma DC/AC data one MB will
+         * transmit (pre-Hadamard raw values, post-quant transmitted levels,
+         * and the raw quant_levels AC content for its 8 chroma blocks), to
+         * inspect the actual residual data at a specific macroblock/frame.
+         *
+         * CAUTION - a per-plane PSNR comparison that motivated adding this
+         * (GPU recon_image, via BC250_DUMP_RECON_FRAMES, vs. real decoded
+         * output) initially looked chroma-specific (Y~40dB vs U~20dB/
+         * V~18.5dB) and pointed straight at this code path. That comparison
+         * turned out to be comparing against the WRONG reference: repeating
+         * it against the true source frames (BC250_DUMP_INPUT_FRAMES, the
+         * same ground truth tools/quality_test.sh uses) instead of the GPU
+         * recon dump showed decoded chroma is actually fine (U/V in the high
+         * 30s dB, matching quality_test.sh's own healthy board-validated
+         * numbers) - so this data dump did not end up implicating the
+         * chroma DC/quant path itself. Kept as a safe, no-op-unless-set
+         * diagnostic in case a future investigation wants it, but do not
+         * treat its original chroma hypothesis as confirmed - see this
+         * branch's final report for the corrected methodology and numbers. */
+        if (quant_levels && coeff && !is_idr &&
+            getenv("BC250_DEBUG_MB") && getenv("BC250_DEBUG_FRAME")) {
+            uint32_t dbg_mb = (uint32_t)atoi(getenv("BC250_DEBUG_MB"));
+            uint32_t dbg_frame = (uint32_t)atoi(getenv("BC250_DEBUG_FRAME"));
+            if (encoder->frame_count == dbg_frame && dbg_mb < encoder->total_mbs) {
+                uint32_t mb = dbg_mb;
+                int cb_dc_raw[4], cr_dc_raw[4];
+                for (int i = 0; i < 4; i++) cb_dc_raw[i] = coeff_block_ptr(coeff, mb, 16 + i)[0];
+                for (int i = 0; i < 4; i++) cr_dc_raw[i] = coeff_block_ptr(coeff, mb, 20 + i)[0];
+                int cb_dc[4], cr_dc[4];
+                chroma_dc_hadamard(cb_dc_raw, cb_dc);
+                chroma_dc_hadamard(cr_dc_raw, cr_dc);
+                for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
+                fprintf(stderr, "[BC250_DEBUG_MB] frame=%u mb=%u qp=%d cb_dc_raw=(%d,%d,%d,%d) cr_dc_raw=(%d,%d,%d,%d) "
+                                "cb_dc_tx=(%d,%d,%d,%d) cr_dc_tx=(%d,%d,%d,%d)\n",
+                        dbg_frame, mb, qp,
+                        cb_dc_raw[0], cb_dc_raw[1], cb_dc_raw[2], cb_dc_raw[3],
+                        cr_dc_raw[0], cr_dc_raw[1], cr_dc_raw[2], cr_dc_raw[3],
+                        cb_dc[0], cb_dc[1], cb_dc[2], cb_dc[3],
+                        cr_dc[0], cr_dc[1], cr_dc[2], cr_dc[3]);
+                for (int blk = 16; blk < 24; blk++) {
+                    const int *b = quant_block_ptr(quant_levels, mb, blk);
+                    int any_ac = 0;
+                    for (int p = 1; p < 16; p++) if (b[p] != 0) any_ac = 1;
+                    fprintf(stderr, "[BC250_DEBUG_MB]   quant_block=%d dc=%d any_ac=%d vals=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+                            blk, b[0], any_ac,
+                            b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],
+                            b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+                }
+            }
+        }
     }
 
     /* 4. Encode Slices */
