@@ -1013,6 +1013,74 @@ average / SSIM 0.9994 (640x480) - identical to the pre-fix baseline,
 confirming the mode change affects spike recovery dynamics only, not
 steady-state correctness.
 
+### 10.10 The real remaining defect: a silently-failed GPU submit encoding stale data as if it were new
+
+Two more real live sessions after §10.9's fix, both with the fix
+confirmed genuinely active (binary md5sum matched, and a
+`fps updated: 30 -> 60` log line confirmed the fps-recalibration fix
+also engaged correctly), reported the identical symptom: "exact same
+issue, no change." An offline replay of the exact real frames captured
+from one such session encoded cleanly (51.9 dB, zero decode errors,
+visually correct) - ruling out every bitstream-generation bug found so
+far as the cause of what was still being seen live, and pointing at
+something specific to real-time concurrent execution that a batch
+offline replay can't reproduce.
+
+Enabling `BC250_PERF_STATS=1` alongside `BC250_DUMP_REAL_INPUT=1` for
+a live session found it directly: **40+ consecutive real frames all
+encoded to the exact same byte count, 64559 bytes, byte-for-byte
+identical**, spanning a real ~2-second window. Real content essentially
+never encodes to an identical size run after run. Checking the raw
+*input* frames captured over that same window (via the same
+`BC250_DUMP_REAL_INPUT` hook, independent of the encode path) found 21
+distinct checksums across those 40 frames - the source content was
+genuinely, verifiably changing. Identical encoder output against
+verified-different input is only possible if the encoder isn't actually
+processing each frame's real data.
+
+Root cause: `gpu_compute_end_picture()`'s `vkQueueSubmit()` call had its
+return value completely discarded, with no error handling at all. This
+is the same compute queue that `gpu_compute_create_image()` already has
+documented, retry-with-backoff logic for (real GPU contention from a
+concurrently running desktop compositor/game transiently failing
+`vkBindImageMemory2` with `VK_ERROR_UNKNOWN`) - the same contention can
+transiently fail a *submission*, not just an allocation. Per the Vulkan
+spec, a failed `vkQueueSubmit` leaves fence signaling undefined; on this
+hardware the fence still read as signaled, so `gpu_compute_sync()`'s
+unconditional `vkWaitForFences()` returned immediately without the GPU
+having done any new work. `quant_buffer`/`coeff_buffer`/
+`pred_mode_buffer`/`mv_buffer`, and their staging copies, silently kept
+whatever the previous *successful* dispatch had left in them - and the
+CPU-side CAVLC/CABAC encoder deterministically re-emitted that stale
+data as though it were the current frame's, producing exactly the
+byte-identical run observed. This explains why the defect never
+reproduced offline (no other GPU consumer contending for the queue in
+an isolated batch replay) and why neither of §10.8/§10.9's fixes
+touched it - a rate-control tuning fix cannot affect a code path that
+never checks whether the GPU dispatch it's reporting on actually ran.
+
+Fixed the same way as the existing allocation-retry precedent: check
+`vkQueueSubmit()`'s result, retry with the identical short-backoff
+schedule `gpu_compute_create_image()` already uses (same failure class,
+same recovery policy), and - unlike a bare retry - propagate failure to
+the caller if every attempt is exhausted, instead of proceeding to
+toggle buffers and let the caller wait forever on a fence that was
+reset but will now never be signaled. `h264_encoder_encode_frame()`
+treats that failure exactly like `gpu_ctx` being NULL: `quant_levels`/
+`coeff`/`pred_modes`/`mvs` stay NULL, and the existing skip-decision
+logic (already present for the ordinary no-GPU case) certifies the
+whole frame P_Skip - the same thing a real decoder does when it
+receives no new information, repeating its last reference picture. That
+is the correct, safe behavior for "nothing new to send this frame"
+(visually a single held frame at worst under real contention), in place
+of silently sending fabricated stale content as if it were genuinely
+current.
+
+No regression: `ctest` 5/5, `quality_test.sh` unchanged at 59.60 dB
+average / SSIM 0.9994 (640x480). A further live session to confirm the
+"frozen" symptom is actually gone is the next step, not yet completed
+as of this writing.
+
 ---
 
 ## 11. Process notes worth preserving
