@@ -325,6 +325,20 @@ int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *siz
  * see gpu_compute.c for details. No-op unless BC250_DUMP_RECON_FRAMES=1. */
 void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height);
 
+/* Real-content investigation instrumentation: dumps the ACTUAL surface Y/UV
+ * pixel data at encode-dispatch time, reading it back from the Vulkan image
+ * itself rather than relying on being called from a known upload path (see
+ * bc250_debug_dump_nv12_frame()'s doc comment - that hook only fires for
+ * vaPutImage/vaDeriveImage+vaMapBuffer, which real Sunshine sessions never
+ * use: Sunshine instead writes directly into the surface's exported DMA-BUF
+ * via its own GL blit, bypassing both of those paths entirely). Call right
+ * before gpu_compute_dispatch_encode() so it sees exactly what the encoder
+ * is about to encode, regardless of how the surface's contents got there.
+ * No-op unless BC250_DUMP_REAL_INPUT=1 is set (BC250_DUMP_DIR for the
+ * directory, default /tmp/bc250_dump_frames, same as the other dump hooks -
+ * files are named real_NNNNN.nv12 to disambiguate from frame_/recon_). */
+void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

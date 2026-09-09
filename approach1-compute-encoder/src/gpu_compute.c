@@ -2066,3 +2066,40 @@ void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height) {
     free(uv_buf);
     dump_frame_index++;
 }
+
+/* See gpu_compute.h's doc comment: reads back whatever is ACTUALLY in the
+ * surface right before encode, independent of how it got written there -
+ * unlike bc250_debug_dump_nv12_frame(), which only fires from the two known
+ * upload-path call sites and so never sees real Sunshine sessions (which
+ * write into the surface's exported DMA-BUF via their own GL blit). */
+void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, int width, int height) {
+    if (!getenv("BC250_DUMP_REAL_INPUT")) return;
+    if (!ctx || !image || image->y_plane == VK_NULL_HANDLE || width <= 0 || height <= 0) return;
+
+    static int dump_frame_index = 0;
+    const char *dump_dir = getenv("BC250_DUMP_DIR");
+    if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
+
+    size_t y_size = (size_t)width * height;
+    size_t uv_size = (size_t)width * (height / 2);
+    uint8_t *y_buf = malloc(y_size);
+    uint8_t *uv_buf = malloc(uv_size);
+    if (!y_buf || !uv_buf) { free(y_buf); free(uv_buf); return; }
+
+    if (gpu_compute_download_nv12(ctx, image, memory,
+                                   y_buf, width, uv_buf, width, width, height) == 0) {
+        char dump_path[600];
+        snprintf(dump_path, sizeof(dump_path), "%s/real_%05d.nv12", dump_dir, dump_frame_index);
+        FILE *dumpf = fopen(dump_path, "wb");
+        if (dumpf) {
+            fwrite(y_buf, 1, y_size, dumpf);
+            fwrite(uv_buf, 1, uv_size, dumpf);
+            fclose(dumpf);
+        } else {
+            fprintf(stderr, "[bc250-gpu] BC250_DUMP_REAL_INPUT: failed to open %s: %s\n", dump_path, strerror(errno));
+        }
+    }
+    free(y_buf);
+    free(uv_buf);
+    dump_frame_index++;
+}

@@ -689,6 +689,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         size_t max_payload = (size_t)coded_buf->size * coded_buf->num_elements;
 
         int written = -1;
+        gpu_compute_debug_dump_real_input(&data->gpu, &surf->image, surf->memory, surf->width, surf->height);
         if (c->h264_enc) {
             written = h264_encoder_encode_frame(c->h264_enc, &data->gpu, surf->image, dest, max_payload);
         } else if (c->hevc_enc) {
