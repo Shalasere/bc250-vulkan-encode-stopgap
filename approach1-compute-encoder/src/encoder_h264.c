@@ -1696,9 +1696,43 @@ void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size) {
 }
 
 void h264_encoder_set_fps(h264_encoder_t *encoder, uint32_t fps) {
-    if (encoder && fps > 0) {
+    /* h264_encoder_create() is always called with a hardcoded fps=30
+     * (va_backend.c's bc250_CreateContext) regardless of what the real
+     * VA-API caller actually negotiates - the real value, when a caller
+     * sends VAEncMiscParameterTypeFrameRate, only arrives here, later, via
+     * bc250_RenderPicture(). Previously this only updated encoder->fps and
+     * rc.framerate (a display-only field never read by rc_get_frame_qp()/
+     * rc_update_stats()) - rc.target_bits_per_frame and rc.buffer_size,
+     * the fields that actually gate every QP/buffer decision, are computed
+     * once by rc_init() from framerate and were never recomputed here. For
+     * a real 60fps session (encoder created assuming 30fps, real frames
+     * arriving twice as fast), that leaves target_bits_per_frame at double
+     * its correct value: at 60 real fps against a 30fps-sized per-frame
+     * budget, the encoder emits roughly 2x the intended real bitrate
+     * before rate control's own feedback (itself measuring error against
+     * that same wrong per-frame target) has any correct target to
+     * converge toward. This is a real, independent contributor to the
+     * "same issue, no change" real-client report after the RC_LOW_LATENCY
+     * fix above - that fix corrects recovery *speed* under a correctly-
+     * calibrated budget, not a budget calibrated for the wrong framerate
+     * in the first place.
+     *
+     * Fixed the same way h264_encoder_set_bitrate() already handles a
+     * genuine bitrate change just below: a full rc_init() (which also
+     * updates rc.framerate) whenever fps actually changes, guarded so a
+     * caller resending the same value every frame doesn't repeatedly reset
+     * the feedback loop's accumulated state. */
+    if (encoder && fps > 0 && fps != encoder->fps) {
+        /* Permanent, low-risk diagnostic: whether a real VA-API caller ever
+         * actually sends this at all, and what real value, was previously
+         * unconfirmed (the encoder's own "Encoder initialized" log only
+         * ever shows the hardcoded creation-time 30). Real fps mismatches
+         * of this kind are silent otherwise. */
+        fprintf(stderr, "[bc250-h264] fps updated: %u -> %u (rate control re-initialized)\n",
+                encoder->fps, fps);
         encoder->fps = fps;
-        encoder->rc.framerate = (double)fps;
+        rc_init(&encoder->rc, encoder->rc.mode, encoder->rc.target_bitrate,
+                (double)fps, encoder->width, encoder->height);
     }
 }
 
@@ -1810,7 +1844,24 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         gpu_compute_begin_picture(gpu_ctx, input_surface);
         gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
                                      qp, is_idr ? 1 : 0, num_slices);
-        gpu_compute_end_picture(gpu_ctx);
+        /* gpu_compute_end_picture() now retries vkQueueSubmit internally
+         * (real GPU contention can transiently fail a submit the same way
+         * it can transiently fail an allocation - see that function's doc
+         * comment) and only returns nonzero if every retry failed. In that
+         * case the GPU never actually did new work this frame: calling
+         * gpu_compute_sync() would wait on a fence that was reset but will
+         * now never be signaled (a permanent hang), and every staging
+         * buffer below would still hold whatever the last *successful*
+         * dispatch left in it - stale data that must not be read back and
+         * treated as this frame's real residual/MV/mode data. Skipping
+         * straight past this block leaves quant_levels/coeff/pred_modes/mvs
+         * at their NULL default, which the skip-decision logic below
+         * already handles correctly and safely: a NULL quant_levels
+         * certifies the whole frame P_Skip, matching what a real decoder
+         * does when it receives no new information - the frame repeats the
+         * last reference picture, rather than fabricated stale content
+         * being sent as if it were genuinely this frame's. */
+        if (gpu_compute_end_picture(gpu_ctx) == 0) {
         gpu_compute_sync(gpu_ctx);
         gpu_compute_debug_dump_recon(gpu_ctx, (int)encoder->width, (int)encoder->height);
 
@@ -2049,6 +2100,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                 }
             }
         }
+        } /* gpu_compute_end_picture() == 0 */
     }
 
     /* 4. Encode Slices */

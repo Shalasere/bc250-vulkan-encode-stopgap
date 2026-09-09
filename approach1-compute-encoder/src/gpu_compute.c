@@ -1926,7 +1926,62 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
         .pCommandBuffers = &ctx->cmd_bufs[ctx->current_buf]
     };
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &s0);
-    vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->fences[ctx->current_buf]);
+    /* vkQueueSubmit()'s return value was previously discarded entirely.
+     * Confirmed on real hardware (see the real-content investigation in
+     * docs/DEVLOG.md - "the encoder appears stuck/frozen" report,
+     * root-caused via BC250_PERF_STATS + BC250_DUMP_REAL_INPUT showing 40+
+     * consecutive real, genuinely-different-content frames all encoding to
+     * the exact same byte count): this queue is the same one that already
+     * needed a documented retry-with-backoff workaround in
+     * gpu_compute_create_image() for real GPU contention (a concurrently
+     * running desktop compositor/game) causing VK_ERROR_UNKNOWN - the exact
+     * same contention can make a *submission*, not just an allocation,
+     * transiently fail. Per the Vulkan spec, a failed vkQueueSubmit leaves
+     * fence signaling undefined; on real hardware this fence still read as
+     * signaled, so the previous code's unconditional vkWaitForFences()
+     * right after (in gpu_compute_sync(), called unconditionally by every
+     * caller) returned immediately without the GPU having done any new
+     * work - meaning quant_buffer/coeff_buffer/pred_mode_buffer/mv_buffer,
+     * and the staging copies vkCmdCopyBuffer'd from them, silently kept
+     * whatever the previous *successful* dispatch had left in them. The
+     * CPU-side CAVLC/CABAC encoder then deterministically re-emitted that
+     * stale residual/MV/mode data - producing bitstream output identical
+     * to a previous frame despite genuinely different real input, which is
+     * exactly the "frozen" pattern found. This is a systemic transient
+     * failure, not a mode-specific one, so this queue itself hasn't
+     * changed relative to a synthetic-content encode - it just was never
+     * seen because no synthetic test runs an encode alongside a real,
+     * concurrently-contending desktop compositor/game.
+     *
+     * Fixed the same way as the allocation case: check the result, retry
+     * with the identical short-backoff schedule (this is the same
+     * transient-contention class of failure, so there is no reason for a
+     * different recovery policy), and - critically, unlike simply retrying
+     * - report failure to the caller if every attempt fails, instead of
+     * proceeding to toggle buffers and let the caller wait on a fence that
+     * was reset but will now never be signaled. h264_encoder_encode_frame()
+     * treats that failure as "no new GPU data this frame" (the same state
+     * as gpu_ctx being NULL), which already has real, correct, spec-legal
+     * handling: quant_levels/coeff/etc. stay NULL, and the existing
+     * skip-decision logic (mb_has_any_luma_nonzero() etc. under a NULL
+     * quant_levels) certifies the whole frame P_Skip - a real decoder
+     * simply repeats its last reference picture for that frame, which is
+     * the correct, safe behavior for "the encoder had nothing new to send
+     * this frame," rather than sending fabricated stale data as if it were
+     * this frame's real content. */
+    VkResult submit_result = VK_ERROR_UNKNOWN;
+    for (int attempt = 0; attempt < BC250_ALLOC_MAX_ATTEMPTS; attempt++) {
+        if (attempt > 0) {
+            long backoff_ms = 20L << (attempt - 1); /* 20, 40, 80... ms - same schedule as gpu_compute_create_image() */
+            struct timespec ts = { .tv_sec = backoff_ms / 1000, .tv_nsec = (backoff_ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+            fprintf(stderr, "[bc250-gpu] Retrying queue submit (attempt %d/%d) after %ldms backoff\n",
+                    attempt + 1, BC250_ALLOC_MAX_ATTEMPTS, backoff_ms);
+        }
+        submit_result = vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->fences[ctx->current_buf]);
+        if (submit_result == VK_SUCCESS) break;
+        fprintf(stderr, "[bc250-gpu] vkQueueSubmit failed: %d\n", submit_result);
+    }
     if (ctx->perf_stats_enabled) {
         clock_gettime(CLOCK_MONOTONIC, &s1);
         fprintf(stderr, "[BC250_PERF_SUBMIT] buf=%d end_cmdbuf_ms=%.3f queue_submit_ms=%.3f\n",
@@ -1934,7 +1989,7 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
     }
 
     ctx->current_buf = (ctx->current_buf + 1) % 2;
-    return 0;
+    return (submit_result == VK_SUCCESS) ? 0 : -1;
 }
 
 int gpu_compute_sync(gpu_context_t *ctx) {
