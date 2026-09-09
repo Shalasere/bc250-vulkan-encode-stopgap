@@ -367,6 +367,12 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     update_storage_buffer_descriptor(ctx->device, ctx->quant_desc_set, 1, ctx->quant_levels_buffer, quant_levels_size);
     update_storage_buffer_descriptor(ctx->device, ctx->quant_desc_set, 2, ctx->nz_count_buffer, nz_count_size);
 
+    /* deblock_filter.comp binding 1 is declared "QuantLevels" there (it used
+     * to be misleadingly declared "QPMap" while never actually being read -
+     * see that shader's top-of-file comment): real per-4x4-block quantized
+     * coefficient levels, used for the ITU-T 8.7.2.1 nonzero-coefficient
+     * boundary-strength test. Binding 2 is the real per-macroblock motion
+     * vectors, used for that section's motion-vector-difference test. */
     update_storage_buffer_descriptor(ctx->device, ctx->deblock_desc_set, 1, ctx->quant_levels_buffer, quant_levels_size);
     update_storage_buffer_descriptor(ctx->device, ctx->deblock_desc_set, 2, ctx->mv_buffer, mv_size);
 
@@ -805,11 +811,15 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     vkCreateDescriptorPool(ctx->device, &pool_info_desc, NULL, &ctx->desc_pool);
 
     /* Push constants. 9th word (num_slices) is only read by
-     * residual_predict.comp (see its SLICE BOUNDARIES comment); 10th word
-     * (diagonal) is only read by intra_wavefront.comp (see its DISPATCH
-     * SHAPE comment) - every other shader still only declares the first 8
-     * (or 9) words in its own PushConstants block, which is fine, they just
-     * don't read the extra tail byte range this layout now allows. */
+     * residual_predict.comp (see its SLICE BOUNDARIES comment) - and is
+     * separately repurposed as deblock_filter.comp's `pass` flag
+     * (0=vertical edges, 1=horizontal edges - see that shader's
+     * PushConstants comment and gpu_compute_dispatch_encode()'s Stage 5);
+     * 10th word (diagonal) is only read by intra_wavefront.comp (see its
+     * DISPATCH SHAPE comment) - every other shader still only declares the
+     * first 8 (or 9) words in its own PushConstants block, which is fine,
+     * they just don't read the extra tail byte range this layout now
+     * allows. */
     VkPushConstantRange pc_range = {
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
         .offset = 0,
@@ -1452,7 +1462,38 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     if (render_target.y_view && render_target.uv_view) {
         update_storage_image_descriptor(ctx->device, ctx->me_desc_set, 0, render_target.y_view);
         update_storage_image_descriptor(ctx->device, ctx->me_desc_set, 1, ref_view);
-        update_storage_image_descriptor(ctx->device, ctx->deblock_desc_set, 0, render_target.y_view);
+    }
+    /*
+     * BUG FIX (reconciled from fix/gradient-boundary-mc-v2's independent
+     * finding): deblock_desc_set binding 0 (deblock_filter.comp's
+     * `frameImage`) was bound to render_target.y_view - the CURRENT INPUT
+     * SURFACE's own pixels, already fully consumed by ME/residual
+     * generation earlier in this same dispatch and about to be discarded -
+     * instead of ctx->recon_image.y_view, the actual reconstruction buffer
+     * Stage 4.5 (reconstruct.comp) / the intra-wavefront loop populates a
+     * few lines below and that becomes next frame's ME reference (ref_view
+     * above) and what BC250_DUMP_RECON_FRAMES reads back. Net effect: the
+     * real ITU-T deblocking filter (see deblock_filter.comp's top-of-file
+     * comment) ran on a dead buffer nothing downstream ever reads -
+     * provably inert, since recon_image is fully finalized by Stage 4.5/the
+     * wavefront loop before Stage 5 (below) even dispatches, and nothing
+     * after Stage 5 copies its output anywhere. A real H.264 decoder DOES
+     * deblock its reference every frame (disable_deblocking_filter_idc=0
+     * here by default), so the encoder's own assumed reference silently
+     * diverged from the decoder's actual one from the second frame of every
+     * GOP onward - invisible on near-zero-residual (flat/static) content,
+     * real and compounding wherever genuine per-frame residual energy
+     * exists. frameImage (binding 0) is a plain read-write image2D with no
+     * semantic dependency on which buffer backs it, so retargeting is a
+     * drop-in change - the real bS/alpha-beta/tc0 algorithm itself is
+     * unchanged, it just now actually reaches the reference chain.
+     * ctx->recon_image.y_view is a stable handle allocated once at context
+     * creation (only its CONTENTS become valid at Stage 4.5/the wavefront
+     * loop below), so binding it here, before either has run this frame,
+     * is safe - Vulkan descriptor updates only need a valid image view
+     * handle, not populated contents, at update time. */
+    if (ctx->recon_image.y_view != VK_NULL_HANDLE) {
+        update_storage_image_descriptor(ctx->device, ctx->deblock_desc_set, 0, ctx->recon_image.y_view);
     }
 
     /* Transition recon_image to GENERAL up front, before reconstruct.comp's
@@ -1638,9 +1679,32 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     int fast_mode = (fm && (strcmp(fm, "1") == 0 || strcmp(fm, "true") == 0)) ? 1 : 0;
 
     if (!fast_mode && ctx->deblock_pipeline) {
+        /* Two whole-frame dispatches - all vertical edges, THEN (after a
+         * real vkCmdPipelineBarrier via insert_compute_barrier(), not just
+         * an intra-workgroup barrier()) all horizontal edges - matching
+         * ITU-T H.264 8.7's required "vertical edges of the whole picture
+         * before any horizontal edge" ordering. See deblock_filter.comp's
+         * top-of-file comment for the full race-condition rationale: a
+         * single dispatch cannot guarantee this ordering across different
+         * macroblocks' independently-scheduled workgroups, since the
+         * horizontal pass for one macroblock reads pixels a NEIGHBORING
+         * macroblock's vertical pass may or may not have written yet.
+         * pc[8] (num_slices for other stages, unused by this shader) is
+         * repurposed here as pcs.pass (0=vertical, 1=horizontal) - see
+         * deblock_filter.comp's PushConstants comment. */
         vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->deblock_pipeline);
         vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->deblock_layout, 0, 1, &ctx->deblock_desc_set, 0, NULL);
-        vkCmdPushConstants(cmd_buf, ctx->deblock_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+
+        uint32_t pc_deblock[9];
+        memcpy(pc_deblock, pc, sizeof(uint32_t) * 8);
+
+        pc_deblock[8] = 0; /* pass 0: vertical edges */
+        vkCmdPushConstants(cmd_buf, ctx->deblock_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_deblock), pc_deblock);
+        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
+        insert_compute_barrier(cmd_buf);
+
+        pc_deblock[8] = 1; /* pass 1: horizontal edges */
+        vkCmdPushConstants(cmd_buf, ctx->deblock_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc_deblock), pc_deblock);
         vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
         insert_compute_barrier(cmd_buf);
     }

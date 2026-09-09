@@ -72,18 +72,20 @@ static uint32_t map_inter_cbp(int cbp) {
     return (uint32_t)cbp;
 }
 
-void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int cbp_chroma, int cbp_luma, int qp_delta) {
+void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int chroma_pred_mode, int cbp_chroma, int cbp_luma, int qp_delta) {
     if (!bs) return;
     if (pred_mode < 0 || pred_mode > 3) pred_mode = 2; /* DC default */
     if (cbp_chroma < 0 || cbp_chroma > 2) cbp_chroma = 0;
+    if (chroma_pred_mode < 0 || chroma_pred_mode > 3) chroma_pred_mode = 0; /* DC default */
     int cbp_luma_flag = (cbp_luma != 0) ? 1 : 0;
 
     /* Table 7-11: mb_type 1..24 */
     int mb_type = 1 + pred_mode + (cbp_chroma * 4) + (cbp_luma_flag * 12);
     bs_write_ue(bs, (uint32_t)mb_type);
 
-    /* Intra chroma prediction mode: 0 (DC) */
-    bs_write_ue(bs, 0);
+    /* Intra chroma prediction mode (ITU-T 8.3.4 / Table 8-3) - a real
+     * per-MB decision now, see this function's doc comment. */
+    bs_write_ue(bs, (uint32_t)chroma_pred_mode);
 
     /* mb_qp_delta: per ITU-T H.264 7.3.5, present whenever
      * "CodedBlockPatternLuma>0 || CodedBlockPatternChroma>0 ||
