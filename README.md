@@ -1,7 +1,7 @@
 # AMD BC-250 Custom Driver & VA-API Video Encoder
 
 [![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/Driver%20License-MIT-blue.svg)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/Driver%20License-GPL--3.0-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
 Software H.264 video encoding (via Vulkan compute, not the hardware VCN block) and a DisplayPort/HDMI audio clock fix for the **AMD BC-250 ("Cyan Skillfish" / PS5 "Oberon" APU)** on Linux (Bazzite, SteamOS, Fedora, Ubuntu, Arch).
@@ -148,7 +148,9 @@ Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 ---
 
 ## License
-* Userspace compute driver, shaders, and tools: **MIT**
-* Audio fix kernel module: **GPL-2.0**
+* Userspace compute driver, shaders, and tools: **GPL-3.0-only**
+* Audio fix kernel module: **GPL-2.0-only** (inherited as-is from its original source; see `audio-fix/LICENSE`)
+
+Chosen deliberately as copyleft, not a permissive license: anyone distributing a modified or combined version must release their source under the same terms, and GPL-3.0's anti-tivoization provisions specifically prevent shipping this code inside a locked-down device that blocks the end user from installing their own modified build.
 
 <!-- bc250-vcn-driver -->

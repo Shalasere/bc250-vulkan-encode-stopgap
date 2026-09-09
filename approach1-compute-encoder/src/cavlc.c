@@ -1,7 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-3.0-only
  *
  * cavlc.c - Spec-compliant H.264 CAVLC entropy encoder
  *           ITU-T Recommendation H.264 (04/2017) Section 9.2
