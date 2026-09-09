@@ -249,6 +249,37 @@ size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t
     return j;
 }
 
+size_t bs_write_filler(uint8_t *buf, size_t buf_size, size_t filler_ff_count) {
+    if (!buf) return 0;
+
+    bitstream_t bs;
+    bs_init(&bs, buf, buf_size);
+
+    /* Per ITU-T H.264 7.4.1.2.4 (Table 7-1's General NAL unit semantics):
+     * nal_ref_idc SHALL be 0 for nal_unit_type in {6,9,10,11,12} - filler
+     * data is never a reference picture, same as SEI/AUD/end-of-seq/
+     * end-of-stream. */
+    bs_write_nal_header(&bs, NAL_REF_IDC_NONE, NAL_TYPE_FILLER);
+
+    /* filler_data_rbsp(): while( next_bits(8) == 0xFF ) ff_byte - i.e. just
+     * `filler_ff_count` literal 0xFF bytes, MSB-first single-byte writes
+     * (no Exp-Golomb, no escaping needed mid-loop: seeing bs_write_u()
+     * write a whole aligned 0xFF byte at a time keeps this loop O(1)/byte,
+     * same cost class as the AUD/SPS/PPS writers above). */
+    for (size_t i = 0; i < filler_ff_count; i++) {
+        if (bs.overflow) break;
+        bs_write_u(&bs, 8, 0xFF);
+    }
+
+    /* rbsp_trailing_bits(): stop bit + zero-pad to the byte boundary. The
+     * ff_byte loop above always leaves the stream byte-aligned, so this is
+     * exactly one more byte (0x80). See bs_write_filler()'s header comment
+     * for why this payload never needs bs_rbsp_to_ebsp(). */
+    bs_rbsp_trailing_bits(&bs);
+
+    return bs_bytes_written(&bs);
+}
+
 size_t bs_write_sps(uint8_t *buf, size_t buf_size, const h264_sps_t *sps) {
     if (!buf || !sps) return 0;
     uint8_t rbsp[1024];

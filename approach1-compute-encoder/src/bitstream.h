@@ -232,6 +232,58 @@ size_t bs_write_nal_header_hevc(bitstream_t *bs, int nal_unit_type);
 size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size,
                        const uint8_t *src, size_t src_size);
 
+/**
+ * A filler_data_rbsp() NAL (see bs_write_filler()'s doc comment) with zero
+ * 0xFF payload bytes is still 4 (start code) + 1 (NAL header) + 1
+ * (rbsp_trailing_bits' single stop-bit byte) = 6 bytes. A caller wanting to
+ * close a real, positive shortfall smaller than this can't do so with a
+ * filler NAL without overshooting the target - see encoder_h264.c's
+ * maybe_append_filler().
+ */
+#define BS_FILLER_MIN_NAL_SIZE 6
+
+/**
+ * bs_write_filler - write one filler_data_rbsp() NAL unit (ITU-T H.264
+ * SS7.3.2.7 / SS7.4.2.7, nal_unit_type 12) directly into `buf`.
+ *
+ * Spec syntax is: repeated ff_byte (each == 0xFF) for as many bytes as the
+ * caller wants, then rbsp_trailing_bits() (a single '1' stop bit, then
+ * zero-padding to the next byte boundary - since the ff_byte run already
+ * ends byte-aligned, this is exactly one more byte, 0x80). A real decoder
+ * is required (7.4.2.7) to parse and discard this NAL without it affecting
+ * any decoded picture - it exists purely to let an encoder manufacture
+ * bytes it has no coded content for, to hit a genuine constant-bitrate
+ * target. x264 (GPL-2.0-or-later, compatible with this project's
+ * GPL-3.0-only license per "or any later version") does exactly this in
+ * encoder/set.c's x264_filler_write(): a loop of bs_write(s, 8, 0xff)
+ * followed by bs_rbsp_trailing(s) - confirming this is the real mechanism
+ * production encoders use, not an invented alternative. This function was
+ * written independently against the spec text and that confirmation, not
+ * by copying x264's code (its bitstream writer has a different internal
+ * contract than this project's bitstream_t).
+ *
+ * Unlike bs_write_sps()/bs_write_pps()/a coded slice, this NAL's RBSP is
+ * never passed through bs_rbsp_to_ebsp(): every payload byte is either
+ * 0xFF or (the final trailing-bits byte) 0x80, so the "two zero bytes
+ * followed by 0x00-0x03" pattern bs_rbsp_to_ebsp() escapes can never occur
+ * here - RBSP and EBSP are byte-identical for this specific payload shape,
+ * by construction, not by omission.
+ *
+ * @param buf              Destination (start code onward).
+ * @param buf_size         Bytes available at `buf`.
+ * @param filler_ff_count  Number of 0xFF payload bytes to emit (0 is legal:
+ *                         a bare 6-byte filler NAL). Total bytes written is
+ *                         exactly BS_FILLER_MIN_NAL_SIZE + filler_ff_count,
+ *                         or less if `buf_size` is too small (silently
+ *                         truncated the same way every other bs_write_*
+ *                         NAL helper in this file behaves on overflow -
+ *                         callers that can't tolerate truncation must
+ *                         check buf_size themselves first).
+ * @return Total bytes written (may be 0 if buf/buf_size can't even hold
+ *         the NAL header).
+ */
+size_t bs_write_filler(uint8_t *buf, size_t buf_size, size_t filler_ff_count);
+
 /* ===== H.264 parameter set serialization ===== */
 
 /** Write a complete SPS NAL unit. Returns bytes written. */
