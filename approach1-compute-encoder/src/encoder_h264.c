@@ -935,7 +935,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
     h264_sps_default(&encoder->sps, width, height, encoder->fps, prof_idc);
     h264_pps_default(&encoder->pps, encoder->sps.sps_id, false, 26);
 
-    rc_init(&encoder->rc, RC_CBR, bitrate, (double)encoder->fps);
+    rc_init(&encoder->rc, RC_CBR, bitrate, (double)encoder->fps, width, height);
 
     encoder->output_buf_size = width * height * 2 + 65536;
     encoder->output_buf = malloc(encoder->output_buf_size);
@@ -971,8 +971,24 @@ void h264_encoder_force_idr(h264_encoder_t *encoder) {
 }
 
 void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps) {
-    if (encoder && bitrate_bps > 0) {
-        rc_init(&encoder->rc, RC_CBR, bitrate_bps, (double)encoder->fps);
+    /* Guard against reinitializing when the requested bitrate hasn't
+     * actually changed. rc_init() is a full reset of the feedback loop's
+     * accumulated state (buffer_fullness back to 50%, current_qp back to
+     * base_qp, error_integral back to 0) - appropriate when the bitrate
+     * genuinely changes, but this is called from bc250_RenderPicture()
+     * (va_backend.c) for both VAEncSequenceParameterBufferType and
+     * VAEncMiscParameterTypeRateControl, and docs/rate_control_audit.md
+     * section 4 point 6 flags that it was never confirmed whether a real
+     * VA-API caller resends one of those buffers with an unchanged value
+     * every frame. If it does, resetting on every call would silently
+     * throw away the integral term's whole reason for existing (letting
+     * *sustained* error accumulate across frames) every single frame.
+     * Preserving the already-selected mode (rather than hardcoding RC_CBR
+     * again here) is likewise just "don't reset state that didn't need to
+     * change." */
+    if (encoder && bitrate_bps > 0 && bitrate_bps != encoder->rc.target_bitrate) {
+        rc_init(&encoder->rc, encoder->rc.mode, bitrate_bps, (double)encoder->fps,
+                encoder->width, encoder->height);
     }
 }
 
