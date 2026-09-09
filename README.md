@@ -1,14 +1,14 @@
 # AMD BC-250 Custom Driver & VA-API Video Encoder
 
-[![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml)
+[![Build & Release BC-250 Drivers](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml/badge.svg)](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/Driver%20License-GPL--3.0-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
 Software H.264 video encoding (via Vulkan compute, not the hardware VCN block) and a DisplayPort/HDMI audio clock fix for the **AMD BC-250 ("Cyan Skillfish" / PS5 "Oberon" APU)** on Linux (Bazzite, SteamOS, Fedora, Ubuntu, Arch).
 
 > [!IMPORTANT]
-> ### Current status: correct and real-time (H.264 only — H.265/HEVC is not yet real)
-> The H.264 encoder produces genuinely correct output — verified numerically (PSNR/SSIM against ground truth) and visually, on real hardware, across multiple resolutions and clip lengths — and now runs well above real-time at every resolution tested, up to and including 1440p60. **H.265/HEVC support is currently a non-functional stub** (see [Known Limitations](#known-limitations)) — do not select HEVC in any app pointed at this driver yet. See that section for the full, current picture before you plan around this project.
+> ### Current status: correct and real-time on synthetic content; real-client-validated with one open issue (H.264 only — H.265/HEVC is not yet real)
+> The H.264 encoder produces correct output against synthetic test content (PSNR/SSIM against ground truth, all resolutions tested) and runs well above real-time up to and including 1440p60. As of `v0.2.1`, it has also been validated against real live Sunshine/Moonlight sessions on real captured desktop content, which surfaced and fixed three real defects synthetic content never exercised (see [Known Limitations](#known-limitations) and `docs/DEVLOG.md`). One defect remains open: a rate-control gap that produces a visible, sustained quality drop after a large content-complexity spike. **H.265/HEVC support is currently a non-functional stub** — do not select HEVC in any app pointed at this driver yet. See [Known Limitations](#known-limitations) for the full, current picture before you plan around this project.
 
 ---
 
@@ -26,7 +26,8 @@ This is a stopgap, not a replacement for real hardware acceleration. If and when
 
 Validated on physical BC-250 hardware, not just in CI or in theory:
 
-- **Correctness (H.264)**: `tools/quality_test.sh` (an independent PSNR/SSIM harness — captures real ground-truth input, encodes through the actual VA-API pipeline, decodes with a separate software decoder, and scores the result) passes cleanly at every resolution tested: 640x480 (37.7 dB), 1280x720 (30.9 dB), 1920x1080 (36.1 dB), 2560x1440 (37.6 dB), and across a 125-frame clip with no drift or accumulating error. This covers I-frames, P-frames/motion content, and multiple resolutions.
+- **Correctness (H.264, synthetic content)**: `tools/quality_test.sh` (an independent PSNR/SSIM harness — captures real ground-truth input, encodes through the actual VA-API pipeline, decodes with a separate software decoder, and scores the result) currently passes at 61.65 dB average (2560x1440) and 59.60 dB average (640x480, default resolution) as of `v0.2.1`; per-resolution numbers move as fixes land, so treat any single figure here as a snapshot, not a guarantee — re-run the script for a current number on your own build.
+- **Correctness (H.264, real content)**: as of `v0.2.1`, also validated against real captured frames from a live Sunshine/Moonlight session (2560x1440, real desktop/UI content, not synthetic test patterns) — 52.1 dB average against real ground truth, zero decode errors. This is a materially different and harder test than the synthetic gate above; three of the four `v0.2.1` fixes were found only by this kind of test (see `docs/DEVLOG.md` §10.7-10.8).
 - **Performance (H.264)**: real, board-measured throughput now well exceeds real-time at every tested resolution — roughly **267 fps at 640x480, 179 fps at 1280x720, 100-134 fps at 1920x1080, and 67-80 fps at 2560x1440** (the last comfortably clears even a 60fps target, not just 30fps). The GPU compute shaders were never the bottleneck (under 1.5% of frame time); the real fixes were all CPU/memory-side — see `docs/DEVLOG.md` for the full investigation. A byproduct: the earlier-measured GPU-contention-while-gaming hit dropped from ~29% to **~8.4%** once the encoder stopped occupying the GPU for as much wall-clock time per frame.
 - **Installation on immutable distros**: `tools/setup_bazzite.sh` is verified working end-to-end on a real Bazzite (ostree/Kinoite) console — driver installs, persists, and is found by `vainfo` with the right H.264 profiles listed.
 - **Test suite**: all four unit test binaries actually run and actually assert something (see [Known Limitations](#known-limitations) for why that's worth calling out explicitly).
@@ -38,8 +39,9 @@ Being direct about this rather than burying it, since it materially affects whet
 
 - **H.265/HEVC is real but incomplete — do not enable it for real use yet.** `encoder_h265.c` was a total non-functional stub earlier in this project's history; it's now a genuine intra-only HEVC Main-profile encoder with a real CABAC entropy coder (adapted from x265, GPL-2.0-or-later, verified license-compatible with this project's GPL-3.0-only) and real prediction/transform/quantization, validated with an independent from-scratch CABAC decoder cross-check and ffmpeg's own header parser. It correctly encodes and decodes **flat/low-detail content** (~56 dB PSNR on near-flat test frames). **It does not yet correctly encode real, high-frequency, directional-mode-heavy content** — the failure is far smaller than the old stub's "zero picture content" and is not a full bitstream desync, but it is real and unresolved. No inter-prediction (P-frames), SAO, or WPP yet either — every frame is coded as an independent IDR. **Do not enable HEVC anywhere pointed at this driver for real video yet** (Sunshine's config has an `hevc_mode` setting, and many streaming clients prefer HEVC automatically for bandwidth — leave it off). See `docs/hevc_scope_note.md` for the detailed status and what's left. Stick to H.264 (`encoder=vaapi`, not `hevc_mode=1`) for real use.
 - **GPU contention while gaming, while much improved, is not zero.** See the ~8.4% figure above — real, if far smaller than the ~29% earlier documentation implied was already the honest number, and much smaller than that same documentation's own "under 3-5%" original claim.
+- **Rate control does not recover quickly from a large content-complexity spike.** A single frame that legitimately requires far more bits than the target (e.g. a large real screen change) saturates the current `RC_CBR` mode's 1-second leaky-bucket buffer, holding QP elevated for up to a full GOP interval rather than the couple of frames a tighter buffer would need. `RC_LOW_LATENCY` (a 2-frame buffer, documented in `rate_control.h` as intended for exactly this streaming use case) already exists in the code but is never selected — `rc_init()` hardcodes `RC_CBR` unconditionally. Root-caused and reproduced offline; not fixed as of `v0.2.1`. See `docs/DEVLOG.md` §10.8 and the `v0.2.1` release notes.
 - **`build_and_install.sh` (the generic installer) doesn't work on immutable/atomic distros** (Bazzite, SteamOS/HoloISO, ChimeraOS) without the fix in this branch — it wrote to read-only `/usr` paths and silently reported success anyway. If you're on one of those distros, use `tools/setup_bazzite.sh` or `tools/setup_steamos.sh` instead, which write to paths that actually persist.
-- **The `v0.2.0` tagged release predates the correctness fixes above.** If you downloaded a pre-built release before this work landed, it very likely produces visibly corrupted video on real content (a large flat region turning into a blotchy gray mess is the signature symptom) despite passing this project's CI at the time — see the next point for why CI didn't catch it.
+- **Releases before `v0.2.1` predate real-client validation.** `v0.2.0` and earlier were only ever tested against synthetic content; on real desktop/UI content they hit at least three now-fixed defects (an out-of-range QP field that broke the first client connection outright, a P-slice skip-decision bug that dropped chroma corrections, and an undersized bitstream buffer that silently truncated frames under real content). Use `v0.2.1` or later, or current `main`.
 - **CI's green checkmark historically meant less than it looked like.** Two independent issues meant most of the test suite silently validated nothing for an unknown period: `assert()`-based tests were compiled with `-DNDEBUG` (which turns every `assert()` into a no-op), and a separate CMake configuration issue meant `ctest` never discovered 3 of the project's 4 test binaries in the first place. Both are now fixed and verified (reintroducing a known bug into the source causes the relevant test to actually fail loudly). If you're relying on this project's CI history from before that fix, treat it with the same skepticism you'd apply to an untested claim.
 
 None of this means the underlying approach is a dead end — the GPU compute path is proven correct and cheap; the work left is squarely in the CPU-side bitstream writer, which is a much more tractable problem than a GPU architecture rework would have been.
@@ -51,8 +53,8 @@ None of this means the underlying approach is a dead end — the GPU compute pat
 ### Option A: Immutable / Atomic Distros (Bazzite, SteamOS, HoloISO, ChimeraOS) — Recommended, Verified Working
 
 ```bash
-git clone https://github.com/simpmix/bc250-vcn-driver.git
-cd bc250-vcn-driver
+git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
+cd bc250-vulkan-encode-stopgap
 sudo ./tools/setup_bazzite.sh   # or ./tools/setup_steamos.sh on SteamOS/HoloISO
 ```
 
@@ -61,15 +63,15 @@ Installs to a path that actually survives an ostree/atomic deployment update, an
 ### Option B: Traditional Distros (Fedora, Ubuntu, Arch, openSUSE)
 
 ```bash
-git clone https://github.com/simpmix/bc250-vcn-driver.git
-cd bc250-vcn-driver
+git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
+cd bc250-vulkan-encode-stopgap
 chmod +x build_and_install.sh tools/*.sh
 ./build_and_install.sh
 ```
 
 ### Option C: Pre-Built Release
 
-Check the [Actions tab](../../actions/workflows/build.yml) for the latest build artifact rather than the tagged Releases page for now, until a new release is cut that includes the correctness fixes described above.
+Download `bc250_drv_video.so` and its matching `shaders/*.spv` from the [Releases page](../../releases) (`v0.2.1` or later — see [Known Limitations](#known-limitations) for why earlier releases are not recommended), place both at the repository root, then run the Option A or B installer for your distro. Both installers verify that compiled shaders actually landed and fail rather than silently reporting success if they didn't.
 
 ---
 
