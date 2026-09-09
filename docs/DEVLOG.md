@@ -960,6 +960,59 @@ Sunshine restarted, `Found H.264 encoder: h264_vaapi [vaapi]` confirmed
 live again. A further live client test to confirm the real-content
 corruption is gone for good is the next step.
 
+### 10.9 Rate control fixed and verified with a fully offline, repeatable A/B
+
+The §10.8-era live testing that followed also surfaced the rate-control
+issue flagged in the `v0.2.1` release notes: real content occasionally
+showed a sudden, sustained quality drop with no recovery for several
+seconds. Root cause (found by reading `rate_control.c` rather than
+guessing): `h264_encoder_create()` hardcoded `rc_init(..., RC_CBR, ...)`
+unconditionally. `RC_LOW_LATENCY` - a 2-frame buffer, vs. `RC_CBR`'s
+1-second buffer, already carrying the doc comment "Low latency mode for
+Sunshine / Moonlight streaming" (this driver's only real consumer) -
+existed in the same file and was never actually selected anywhere.
+
+Rather than needing another live client session to verify a fix for
+this, this investigation built a fully offline, repeatable test: 100
+frames of synthetic content (30 low-complexity frames, a 10-frame
+*real* incompressible-noise spike via ffmpeg's `geq=random(1)*255`, 60
+recovery frames) encoded through the real pipeline with
+`BC250_PERF_STATS=1`, comparing real per-frame output byte counts. To
+get a true A/B, the pre-fix `encoder_h264.c` was rebuilt from git
+history into a second binary and run through the identical content:
+
+```
+RC_CBR (before):        spike ends frame 40; recovery unstable through
+                         frame 59 (19 frames), including two secondary
+                         re-spikes (59 KB at frame 52, 105 KB at frame 55)
+RC_LOW_LATENCY (after): spike ends frame 40; recovery monotonic,
+                         settles by frame 47 (7 frames), no re-spikes
+```
+
+~2.7x faster recovery - and, the more significant finding, the old
+controller wasn't merely slow, it was genuinely unstable after a large
+frame (the two re-spikes at 52/55), which the new mode eliminates
+entirely. This synthetic spike (a hard cut to real noise, unrelated to
+any specific desktop content) is a general enough reproduction that it
+doesn't depend on capturing another real session to re-test in the
+future - the same script can re-run against any future rate-control
+change.
+
+One real interaction had to be handled, not just the mode swap:
+`maybe_append_filler()` (the CBR bitrate-target padding logic added
+earlier - see the `fix(rate_control)` filler commit) gated specifically
+on `rc.mode == RC_CBR`. Switching the default mode without also
+updating that check would have silently disabled real bitrate-target
+padding for every encode. Fixed by treating `RC_LOW_LATENCY` as
+CBR-intent-compatible in that check too, since it's a tighter-buffer
+variant of hitting a bitrate target, not an opt-out of it the way real
+VBR is.
+
+No regression: `ctest` 5/5, `quality_test.sh` unchanged at 59.60 dB
+average / SSIM 0.9994 (640x480) - identical to the pre-fix baseline,
+confirming the mode change affects spike recovery dynamics only, not
+steady-state correctness.
+
 ---
 
 ## 11. Process notes worth preserving
