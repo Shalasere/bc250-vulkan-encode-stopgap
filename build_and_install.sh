@@ -186,7 +186,7 @@ fi
 # Optional: Install Audio Fix via DKMS if available
 if [ -d "$SCRIPT_DIR/audio-fix" ] && command -v dkms &> /dev/null; then
     echo -e "\n${BLUE}Configuring Audio Fix with DKMS...${NC}"
-    (cd "$SCRIPT_DIR/audio-fix" && $SUDO ./install_dkms.sh) || echo -e "${YELLOW}DKMS setup skipped.${NC}"
+    (cd "$SCRIPT_DIR/audio-fix" && $SUDO bash ./install_dkms.sh) || echo -e "${YELLOW}DKMS setup skipped.${NC}"
 fi
 
 # Configuration summary

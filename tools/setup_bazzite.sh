@@ -179,7 +179,7 @@ echo -e "\n${BOLD}[5/5] Setting Up DisplayPort Audio Fix...${NC}"
 if [ -d "$REPO_ROOT/audio-fix" ]; then
     cd "$REPO_ROOT/audio-fix"
     if command -v dkms &> /dev/null; then
-        if $SUDO ./install_dkms.sh; then
+        if $SUDO bash ./install_dkms.sh; then
             echo -e "  ${GREEN}✓ Audio fix installed via DKMS (persists across kernel updates).${NC}"
         else
             echo -e "  ${YELLOW}! DKMS build encountered an issue (kernel headers may be missing).${NC}"

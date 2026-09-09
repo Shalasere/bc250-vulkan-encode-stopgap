@@ -199,7 +199,7 @@ echo -e "\n${BOLD}[5/5] Setting Up Audio Clock Fix...${NC}"
 if [ -d "$REPO_ROOT/audio-fix" ]; then
     cd "$REPO_ROOT/audio-fix"
     if command -v dkms &> /dev/null; then
-        if $SUDO ./install_dkms.sh; then
+        if $SUDO bash ./install_dkms.sh; then
             echo -e "  ${GREEN}✓ Audio fix installed via DKMS (auto-rebuilds on kernel updates).${NC}"
         else
             echo -e "  ${YELLOW}! DKMS setup encountered an issue (kernel headers may be needed).${NC}"
