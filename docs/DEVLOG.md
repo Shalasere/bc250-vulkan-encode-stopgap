@@ -886,6 +886,80 @@ the diagnostic script happened to exercise a code path
 nothing else in this project has ever used. **Not fixed here** —
 tracked as a known, real, separate defect.
 
+### 10.8 Root-caused and fixed: slice RBSP buffer too small for real content (the real remaining corruption)
+
+After §10.7's two fixes, real live testing continued and the user kept
+seeing real, visible corruption on real content across several more
+sessions - a shifting set of symptoms (blocky/noisy on busy regions
+only, then uniform blockiness across the whole frame, then a real
+decode error) that made it clear something was still fundamentally
+wrong with real content specifically, not just an edge case. The
+investigation this time deliberately avoided guessing from compressed
+client screenshots and instead built a way to capture and replay real
+session data with no live client involved at all:
+
+**Instrumentation**: `gpu_compute_debug_dump_real_input()`
+(`BC250_DUMP_REAL_INPUT=1`), added to read back the actual Vulkan
+surface content at encode-dispatch time rather than relying on the
+existing `BC250_DUMP_INPUT_FRAMES` hook - which turned out to never
+fire for real Sunshine sessions at all (confirmed: zero frames captured
+over a real ~3-minute connection). Sunshine writes into the surface's
+exported DMA-BUF directly via its own GL blit (using this driver's
+`vaExportSurfaceHandle`), bypassing both `vaPutImage` and
+`vaDeriveImage`+`vaMapBuffer`, the only two paths the old hook
+instrumented. The new hook reads back the real Vulkan image content
+regardless of how it got written, and captured 1127 real frames from a
+genuine ~62s live session.
+
+**Isolating resolution vs. content**: the real session ran at
+2560x1440, while every quality validation all project had only ever
+tested 640x480 - a 12x difference in macroblock count. Re-running
+`quality_test.sh` at 2560x1440 with synthetic content ruled resolution
+out immediately (61.65 dB, PASS, even better than 640x480). The defect
+needed real content specifically, not just a bigger frame.
+
+**Reproduced deterministically, offline, with zero live client
+involvement**: concatenated 50 consecutive real captured frames
+(`real_00500.nv12` .. `real_00549.nv12`) into one raw YUV file and fed
+it through the exact same encode pipeline via a plain ffmpeg
+invocation. This alone reproduced the bug - `[bc250-h264] CABAC slice
+buffer overflow (frame=38 slice=0)` in the encoder's own log, and
+ffmpeg's software decoder reporting `error while decoding MB 72 73,
+bytestream -59` followed by `concealing 2697 DC, 2697 AC, 2697 MV
+errors in P frame`. Decoded frame 50 visibly showed stale content from
+an entirely different, much earlier screen (the Brotato library grid)
+ghosted into the current picture - the decoder's error concealment
+bleeding a wrong reference forward after losing bitstream sync partway
+through frame 30. PSNR against the real captured ground truth: 22.3 dB
+average (min 17.96 dB, luma-dominated) - a severe, real defect.
+
+**Root cause**: `rbsp_buf_size = (end_mb - start_mb) * 64 + 4096` in
+`h264_encoder_encode_frame()` - 64 bytes/macroblock, sized against the
+only content this project had ever tested (synthetic testsrc gradients,
+which never carry much real per-block AC energy). Real, busy content at
+a real client's negotiated low QP (12, near-lossless) needs far more
+than that per macroblock. Both `bitstream.c`'s `bs->overflow` check and
+`cabac.c`'s `cb->overflow` check correctly detected the overflow and
+stopped writing rather than corrupting memory (never a memory-safety
+bug), but the resulting bitstream was silently truncated exactly at
+that point, desyncing any real decoder from there onward - exactly
+matching every real-client corruption report across every session in
+§10.7 and this section, including the two _different-looking_ symptoms
+(the shift from "busy regions only" to "everywhere" was consistent with
+overflow point drifting frame-to-frame with real content changes, not
+two different bugs).
+
+**Fix**: raised the budget to 768 bytes/MB - real headroom above a real
+near-lossless macroblock's worst case, while remaining a trivial,
+transient per-slice allocation (~11MB for a full 2560x1440 frame in one
+slice, freed immediately after the loop body). Verified against the
+exact same real captured frames that reproduced the bug: no overflow
+log, no decode error, no error concealment, PSNR 22.3 dB -> 52.1 dB
+average (Y:51.5 U:53.6 V:53.8), SSIM 0.996. Rebuilt, reinstalled,
+Sunshine restarted, `Found H.264 encoder: h264_vaapi [vaapi]` confirmed
+live again. A further live client test to confirm the real-content
+corruption is gone for good is the next step.
+
 ---
 
 ## 11. Process notes worth preserving
