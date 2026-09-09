@@ -60,13 +60,27 @@ extern "C" {
  * Writes bits MSB-first into a byte buffer. Tracks current byte/bit
  * position for sequential writes. Callers should ensure the buffer
  * is large enough before writing (or use bs_bytes_remaining()).
+ *
+ * PERF NOTE (perf/openh264-bitwriter-fallback): bit-level writes are
+ * accumulated in `accum` (an in-register bit buffer, right-justified,
+ * holding exactly `bit_offset` valid pending bits, 0-7) and only stored to
+ * `buffer` once a full byte is available - a single plain store, never a
+ * read-modify-write. This is the same accumulate-then-batch-store technique
+ * Cisco's openh264 uses in its encoder bitstream writer
+ * (codec/common/inc/golomb_common.h, BsWriteBits()/SBitStringAux), adapted
+ * here at byte granularity (openh264 batches to a 32-bit word) - see
+ * bitstream.c's top-of-file comment for the full writeup, including why
+ * byte granularity was chosen for this codebase specifically. `byte_offset`
+ * and `bit_offset` keep their original external meaning/range (0-7); only
+ * the internal write path changed.
  */
 typedef struct bitstream {
     uint8_t *buffer;       /* Output byte buffer */
     size_t   size;         /* Total buffer capacity in bytes */
-    size_t   byte_offset;  /* Current byte position */
-    int      bit_offset;   /* Current bit position within current byte (0-7, 0=MSB) */
+    size_t   byte_offset;  /* Bytes already physically committed to `buffer` */
+    int      bit_offset;   /* Valid pending bits held in `accum`, not yet flushed to `buffer` (0-7, 0=MSB-aligned/empty) */
     bool     overflow;     /* Set if any write exceeded buffer capacity */
+    uint32_t accum;        /* In-register pending-bit accumulator, right-justified low `bit_offset` bits */
 } bitstream_t;
 
 /**
