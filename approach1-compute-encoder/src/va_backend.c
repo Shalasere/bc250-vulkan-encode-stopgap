@@ -464,7 +464,24 @@ VAStatus bc250_UnmapBuffer(VADriverContextP ctx, VABufferID buf_id) {
 
 VAStatus bc250_DestroyBuffer(VADriverContextP ctx, VABufferID buffer_id) {
     bc250_driver_data *data = get_driver_data(ctx);
-    if (!data || !VALID_ID(buffer_id, MAX_BUFFERS) || !data->buffers[buffer_id].allocated) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!data) return VA_STATUS_ERROR_INVALID_BUFFER;
+    /* A genuinely out-of-range ID is a real caller bug - keep erroring on
+     * that. An in-range ID that's simply not currently allocated (already
+     * destroyed, or never allocated) is treated as a harmless no-op instead
+     * of an error: observed in practice (ffmpeg's vaapi_encode.c, e.g.
+     * "Failed to destroy param buffer 0x1: invalid VABufferID" on the very
+     * first frame) calling vaDestroyBuffer a second time on an ID it
+     * believes it owns - this driver's own CreateBuffer/RenderPicture/
+     * DestroyContext never proactively frees a buffer out from under the
+     * caller (checked directly: RenderPicture only reads param data,
+     * DestroyContext doesn't touch the buffer table at all), so the double
+     * call is on the caller's side, most likely tied to how this driver
+     * advertises VA_ENC_PACKED_HEADER_NONE (see bc250_GetConfigAttributes).
+     * Several real VA-API drivers (including Mesa's) treat a destroy-again
+     * on an already-gone buffer as success for the same reason - the
+     * resource the caller wanted gone is, in fact, gone. */
+    if (!VALID_ID(buffer_id, MAX_BUFFERS)) return VA_STATUS_ERROR_INVALID_BUFFER;
+    if (!data->buffers[buffer_id].allocated) return VA_STATUS_SUCCESS;
     bc250_buffer *b = &data->buffers[buffer_id];
     if (b->is_derived) {
         if (b->gpu_mem) {
