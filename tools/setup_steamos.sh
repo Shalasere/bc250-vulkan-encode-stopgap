@@ -94,11 +94,12 @@ else
             $SUDO pacman -Sy --noconfirm base-devel cmake libva libdrm vulkan-devel glslang libva-utils || true
         else
             echo -e "${RED}Error: 'cmake' not found and pre-built binary was not provided.${NC}"
-            echo -e "Get a pre-built bc250_drv_video.so (plus its compiled shaders/ directory"
-            echo -e "- see the shader-install step below) from whoever gave you this copy of"
-            echo -e "the repo, and place both at the repository root before re-running this"
-            echo -e "script, or install build tools (cmake, gcc, libva, libdrm, vulkan-devel,"
-            echo -e "glslang) to build from source."
+            echo -e "Download bc250_drv_video.so and the shaders/ directory of compiled"
+            echo -e "shaders from:"
+            echo -e "  ${BOLD}https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases${NC}"
+            echo -e "and place both at the repository root before re-running this script,"
+            echo -e "or install build tools (cmake, gcc, libva, libdrm, vulkan-devel, glslang)"
+            echo -e "to build from source."
             exit 1
         fi
     fi
@@ -155,7 +156,8 @@ if [ "$SPV_COUNT" -eq 0 ]; then
     echo -e "  ${BOLD}$REPO_ROOT/shaders/${NC}          (pre-built release package)"
     echo -e "  ${BOLD}$REPO_ROOT/approach1-compute-encoder/build/${NC}  (local from-source build)"
     echo -e "If you only have bc250_drv_video.so, you also need its matching compiled"
-    echo -e "shaders/ directory from the same build - ask whoever provided the .so for it,"
+    echo -e "shaders/ directory from the same build - get both from:"
+    echo -e "  ${BOLD}https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases${NC}"
     echo -e "or build from source (requires cmake, gcc, libva, libdrm, vulkan-devel, glslang)."
     exit 1
 fi
