@@ -73,10 +73,14 @@ else
     if ! command -v cmake &> /dev/null; then
         echo -e "${RED}Error: 'cmake' not found and pre-built binary was not provided.${NC}"
         echo -e "To resolve this:"
-        echo -e "  Option A (Recommended): Download the pre-built release package from:"
-        echo -e "    ${BOLD}https://github.com/Kai/bc250-vcn-driver/releases${NC}"
+        echo -e "  Option A (Recommended): Get a pre-built bc250_drv_video.so (plus its"
+        echo -e "    compiled shaders/ directory - see this script's shader-install step"
+        echo -e "    below) from whoever gave you this copy of the repo, and place both"
+        echo -e "    at the repository root before re-running this script."
         echo -e "  Option B: Install development tools on Bazzite via:"
-        echo -e "    ${BOLD}ujust dev-tools${NC} (or layered via rpm-ostree install cmake gcc)"
+        echo -e "    ${BOLD}ujust dev-tools${NC} (or layered via rpm-ostree install cmake gcc"
+        echo -e "    libva-devel libdrm-devel vulkan-loader-devel glslang) - a reboot is"
+        echo -e "    required after layering packages on rpm-ostree."
         exit 1
     fi
     mkdir -p "$BUILD_DIR"
@@ -96,19 +100,40 @@ $SUDO cp -f "$DRIVER_BIN" "$INSTALL_LIB_FALLBACK/bc250_drv_video.so"
 $SUDO chmod 755 "$INSTALL_LIB_DIR" "$INSTALL_LIB_FALLBACK"
 $SUDO chmod 755 "$INSTALL_LIB_DIR/bc250_drv_video.so" "$INSTALL_LIB_FALLBACK/bc250_drv_video.so"
 
-# Copy compute shaders
+# Copy compute shaders. The driver loads compiled SPIR-V (.spv) at runtime -
+# the raw .comp GLSL sources under approach1-compute-encoder/shaders/ are
+# build-time input only and are useless to the running driver on their own.
+# A pre-built release package (matching build_and_install.sh's own
+# convention) ships its compiled .spv files in a top-level shaders/
+# directory alongside bc250_drv_video.so; a local from-source build instead
+# produces them in approach1-compute-encoder/build/. Check both - checking
+# only the local build/ directory (as this script previously did) meant
+# installing from a pre-built .so with no local build/ present copied *only*
+# the non-functional .comp sources and still reported success.
+echo -e "  -> Installing compiled shaders to $INSTALL_SHADER_DIR/"
 if [ -d "$REPO_ROOT/shaders" ]; then
-    echo -e "  -> Copying shaders from $REPO_ROOT/shaders to $INSTALL_SHADER_DIR/"
-    $SUDO cp -f "$REPO_ROOT/shaders"/* "$INSTALL_SHADER_DIR/" 2>/dev/null || true
-elif [ -d "$REPO_ROOT/approach1-compute-encoder/shaders" ]; then
-    echo -e "  -> Copying shaders to $INSTALL_SHADER_DIR/"
-    if [ -d "$REPO_ROOT/approach1-compute-encoder/build" ]; then
-        $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/build"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
-    fi
-    $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/shaders"/*.comp "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+    $SUDO cp -f "$REPO_ROOT/shaders"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+fi
+if [ -d "$REPO_ROOT/approach1-compute-encoder/build" ]; then
+    $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/build"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
 fi
 $SUDO chmod 755 "$INSTALL_SHADER_DIR"
 $SUDO chmod 644 "$INSTALL_SHADER_DIR"/* 2>/dev/null || true
+
+SPV_COUNT=$(find "$INSTALL_SHADER_DIR" -maxdepth 1 -name '*.spv' 2>/dev/null | wc -l)
+if [ "$SPV_COUNT" -eq 0 ]; then
+    echo -e "\n${RED}Error: no compiled .spv shaders were found to install.${NC}"
+    echo -e "${RED}A driver install with no compiled shaders will fail at runtime.${NC}"
+    echo -e "Expected compiled .spv files in one of:"
+    echo -e "  ${BOLD}$REPO_ROOT/shaders/${NC}          (pre-built release package)"
+    echo -e "  ${BOLD}$REPO_ROOT/approach1-compute-encoder/build/${NC}  (local from-source build)"
+    echo -e "If you only have bc250_drv_video.so, you also need its matching compiled"
+    echo -e "shaders/ directory from the same build - ask whoever provided the .so for it,"
+    echo -e "or build from source (requires cmake, gcc, libva-devel, libdrm-devel,"
+    echo -e "vulkan-loader-devel, glslang - see [2/5] above)."
+    exit 1
+fi
+echo -e "  ${GREEN}✓ Installed $SPV_COUNT compiled shader(s)${NC}"
 
 # Restore SELinux security contexts on Bazzite / Fedora Silverblue
 if command -v restorecon &> /dev/null; then
