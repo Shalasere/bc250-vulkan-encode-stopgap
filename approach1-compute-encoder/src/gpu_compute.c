@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
@@ -58,6 +59,50 @@ static uint32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t type
     return 0;
 }
 
+/* Like find_memory_type(), but tries `preferred` first (which must be a
+ * superset of `required`) and only falls back to a plain `required`-only
+ * match if this device exposes no type satisfying `preferred` at all.
+ *
+ * WHY THIS EXISTS: the GPU-readback staging buffers this driver bulk-copies
+ * every frame (quant_staging_buffers/coeff_staging_buffers/pred_mode_staging_
+ * buffers/mv_staging_buffers - see encoder_h264.c's shadow_copy() doc
+ * comment) were being bound to a HOST_VISIBLE|HOST_COHERENT memory type
+ * WITHOUT HOST_CACHED, on the reasoning that the GPU's one-shot
+ * vkCmdCopyBuffer write into them doesn't care about CPU cacheability. That
+ * reasoning only accounted for the write side. On real BC-250 hardware this
+ * driver was measured (BC250_PERF_STATS=1, real board run, 1280x720) paying
+ * ~81ms/frame - the entire real-time-throughput gap between ~1ms of actual
+ * GPU compute + ~1ms of CPU CAVLC and the ~83ms real wall-clock time per
+ * frame - inside shadow_copy()'s bulk memcpy() itself, i.e. the CPU
+ * *reading* ~10.6MB/frame back out of that same memory. Uncached/
+ * write-combined memory has notoriously poor CPU read bandwidth (routinely
+ * an order of magnitude or more below normal cached RAM) even for a single
+ * fully sequential streaming pass - confirmed by the shadow_copy_ms
+ * diagnostic bracket landing within noise of the entire unaccounted gap.
+ * vkGetPhysicalDeviceMemoryProperties() on this device confirms a
+ * HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type exists on the same heap as the
+ * uncached one currently selected (both are system-memory-backed on this
+ * APU, not a discrete-GPU BAR), so preferring it costs nothing in
+ * portability: find_memory_type()'s original required-only search is kept
+ * as the fallback for any device that doesn't expose a cached type at all.
+ * This only changes which physical memory type backs these buffers - not
+ * their VkBufferUsageFlags, not HOST_COHERENT (still required both passes,
+ * so Vulkan still guarantees the CPU sees the GPU's writes after the
+ * existing fence wait with no added vkInvalidateMappedMemoryRanges/
+ * vkFlushMappedMemoryRanges calls needed), and not a single byte of what
+ * either side reads or writes - purely a CPU-read-speed optimization. */
+static uint32_t find_memory_type_preferred(VkPhysicalDevice physical_device, uint32_t type_filter,
+                                            VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags required) {
+    VkPhysicalDeviceMemoryProperties mem_props;
+    vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        if ((type_filter & (1 << i)) && (mem_props.memoryTypes[i].propertyFlags & preferred) == preferred) {
+            return i;
+        }
+    }
+    return find_memory_type(physical_device, type_filter, required);
+}
+
 static int create_buffer_with_memory(gpu_context_t *ctx, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer *buffer, VkDeviceMemory *memory) {
     VkBufferCreateInfo buffer_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -74,6 +119,35 @@ static int create_buffer_with_memory(gpu_context_t *ctx, VkDeviceSize size, VkBu
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize = mem_reqs.size,
         .memoryTypeIndex = find_memory_type(ctx->physical_device, mem_reqs.memoryTypeBits, properties)
+    };
+    VK_CHECK(vkAllocateMemory(ctx->device, &alloc_info, NULL, memory));
+    VK_CHECK(vkBindBufferMemory(ctx->device, *buffer, *memory, 0));
+    return 0;
+}
+
+/* Same as create_buffer_with_memory(), but selects the memory type via
+ * find_memory_type_preferred() instead of find_memory_type() - see that
+ * function's doc comment. Used only for the GPU-readback staging buffers
+ * that encoder_h264.c's shadow_copy() bulk-reads every frame, where CPU read
+ * bandwidth (not GPU write bandwidth) is what actually matters. */
+static int create_buffer_with_memory_preferred(gpu_context_t *ctx, VkDeviceSize size, VkBufferUsageFlags usage,
+                                                VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags required,
+                                                VkBuffer *buffer, VkDeviceMemory *memory) {
+    VkBufferCreateInfo buffer_info = {
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = usage,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    VK_CHECK(vkCreateBuffer(ctx->device, &buffer_info, NULL, buffer));
+
+    VkMemoryRequirements mem_reqs;
+    vkGetBufferMemoryRequirements(ctx->device, *buffer, &mem_reqs);
+
+    VkMemoryAllocateInfo alloc_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = find_memory_type_preferred(ctx->physical_device, mem_reqs.memoryTypeBits, preferred, required)
     };
     VK_CHECK(vkAllocateMemory(ctx->device, &alloc_info, NULL, memory));
     VK_CHECK(vkBindBufferMemory(ctx->device, *buffer, *memory, 0));
@@ -242,14 +316,23 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[0], &ctx->staging_memories[0]);
     create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[1], &ctx->staging_memories[1]);
 
-    create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->quant_staging_buffers[0], &ctx->quant_staging_memories[0]);
-    create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->quant_staging_buffers[1], &ctx->quant_staging_memories[1]);
-    create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->coeff_staging_buffers[0], &ctx->coeff_staging_memories[0]);
-    create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->coeff_staging_buffers[1], &ctx->coeff_staging_memories[1]);
-    create_buffer_with_memory(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->pred_mode_staging_buffers[0], &ctx->pred_mode_staging_memories[0]);
-    create_buffer_with_memory(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
-    create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
-    create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
+    /* These four staging-buffer pairs are the ones encoder_h264.c's
+     * shadow_copy() bulk-reads from the CPU every single frame (quant_levels/
+     * coeff/pred_modes/mvs) - see find_memory_type_preferred()'s doc comment
+     * for why they request HOST_CACHED as a preference, not a requirement.
+     * staging_buffers[]/entropy_buffer above are a separate, currently-dead
+     * GPU-entropy-coding path (nothing reads gpu_compute_get_staging_data())
+     * and are deliberately left on plain create_buffer_with_memory(). */
+    VkMemoryPropertyFlags cached_pref = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    VkMemoryPropertyFlags visible_req = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[0], &ctx->quant_staging_memories[0]);
+    create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[1], &ctx->quant_staging_memories[1]);
+    create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[0], &ctx->coeff_staging_memories[0]);
+    create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[1], &ctx->coeff_staging_memories[1]);
+    create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[0], &ctx->pred_mode_staging_memories[0]);
+    create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
+    create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
+    create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
 
     /* Persistently map all staging buffers to eliminate per-frame map/unmap syscall overhead */
     vkMapMemory(ctx->device, ctx->staging_memories[0], 0, entropy_size, 0, &ctx->staging_mapped[0]);
@@ -461,6 +544,27 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         fprintf(stderr, "[bc250-gpu] Using primary Vulkan device: %s\n", ctx->dev_props.deviceName);
     }
     free(devices);
+
+    /* DIAGNOSTIC ONLY (BC250_PERF_STATS=1), one-time at init: dump every
+     * Vulkan memory type this device exposes, to check whether a
+     * HOST_VISIBLE|HOST_COHERENT|HOST_CACHED type exists (which would let
+     * the GPU-readback staging buffers - see encoder_h264.c's shadow_copy()
+     * doc comment - be bulk-read by the CPU at normal cached-RAM speed
+     * instead of the current uncached/write-combined type's speed). */
+    if (getenv("BC250_PERF_STATS")) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+            VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+            fprintf(stderr, "[bc250-gpu] memtype[%u] heap=%u flags=0x%x%s%s%s%s%s\n",
+                    i, mp.memoryTypes[i].heapIndex, f,
+                    (f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? " DEVICE_LOCAL" : "",
+                    (f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? " HOST_VISIBLE" : "",
+                    (f & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? " HOST_COHERENT" : "",
+                    (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? " HOST_CACHED" : "",
+                    (f & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) ? " LAZILY_ALLOCATED" : "");
+        }
+    }
 
     ctx->max_workgroup_size = ctx->dev_props.limits.maxComputeWorkGroupSize[0];
 
@@ -1222,9 +1326,32 @@ static void insert_compute_barrier(VkCommandBuffer cmd_buf) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
+/* Diagnostic-only (BC250_PERF_STATS=1): millisecond delta between two
+ * CLOCK_MONOTONIC timespecs. Used below to isolate vkQueueSubmit() and
+ * vkWaitForFences() as their own real wall-clock brackets - see the
+ * "[BC250_PERF_SUBMIT]"/"[BC250_PERF_WAIT]" lines this enables. This exists
+ * because the pre-existing GPU-timestamp-query instrumentation
+ * (BC250_PERF_NUM_TIMESTAMPS / "[BC250_PERF_GPU]") only measures GPU
+ * *execution* time between the first and last command in a submitted
+ * command buffer; it cannot see time spent before the GPU starts executing
+ * that command buffer at all (scheduling/dispatch latency between
+ * vkQueueSubmit returning and the GPU actually beginning the work), which
+ * is exactly the gap this diagnostic was added to find. */
+static double bc250_diag_delta_ms(const struct timespec *t0, const struct timespec *t1) {
+    return (double)(t1->tv_sec - t0->tv_sec) * 1000.0 +
+           (double)(t1->tv_nsec - t0->tv_nsec) / 1e6;
+}
+
 int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
     (void)render_target;
+    struct timespec w0, w1;
+    if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &w0);
     vkWaitForFences(ctx->device, 1, &ctx->fences[ctx->current_buf], VK_TRUE, UINT64_MAX);
+    if (ctx->perf_stats_enabled) {
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        fprintf(stderr, "[BC250_PERF_WAIT] site=begin_picture buf=%d wait_ms=%.3f\n",
+                ctx->current_buf, bc250_diag_delta_ms(&w0, &w1));
+    }
     vkResetFences(ctx->device, 1, &ctx->fences[ctx->current_buf]);
 
     VkCommandBufferBeginInfo begin_info = {
@@ -1570,14 +1697,23 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
 }
 
 int gpu_compute_end_picture(gpu_context_t *ctx) {
+    struct timespec e0, e1, s0, s1;
+    if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &e0);
     vkEndCommandBuffer(ctx->cmd_bufs[ctx->current_buf]);
+    if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &e1);
 
     VkSubmitInfo submit_info = {
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount = 1,
         .pCommandBuffers = &ctx->cmd_bufs[ctx->current_buf]
     };
+    if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &s0);
     vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->fences[ctx->current_buf]);
+    if (ctx->perf_stats_enabled) {
+        clock_gettime(CLOCK_MONOTONIC, &s1);
+        fprintf(stderr, "[BC250_PERF_SUBMIT] buf=%d end_cmdbuf_ms=%.3f queue_submit_ms=%.3f\n",
+                ctx->current_buf, bc250_diag_delta_ms(&e0, &e1), bc250_diag_delta_ms(&s0, &s1));
+    }
 
     ctx->current_buf = (ctx->current_buf + 1) % 2;
     return 0;
@@ -1585,7 +1721,14 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
 
 int gpu_compute_sync(gpu_context_t *ctx) {
     int prev_buf = (ctx->current_buf + 1) % 2;
+    struct timespec w0, w1;
+    if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &w0);
     vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, UINT64_MAX);
+    if (ctx->perf_stats_enabled) {
+        clock_gettime(CLOCK_MONOTONIC, &w1);
+        fprintf(stderr, "[BC250_PERF_WAIT] site=sync buf=%d wait_ms=%.3f\n",
+                prev_buf, bc250_diag_delta_ms(&w0, &w1));
+    }
 
     /* Opt-in GPU per-stage timing readback (BC250_PERF_STATS=1). Safe to
      * read now: the fence above just confirmed this exact command buffer's

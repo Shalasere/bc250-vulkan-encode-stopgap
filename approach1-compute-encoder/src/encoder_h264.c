@@ -1107,6 +1107,15 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * CAVLC bit-writing). Every subsequent use of quant_levels/coeff/
          * pred_modes/mvs in this function reads the copy, not the raw
          * uncached mapped buffer. */
+        /* DIAGNOSTIC ONLY (BC250_PERF_STATS=1): isolate the four shadow_copy()
+         * bulk-memcpy calls as their own wall-clock bracket, to test whether
+         * reading FROM the uncached/write-combined GPU staging memory (even
+         * as one linear sequential pass) is itself the dominant per-frame
+         * cost, separate from the per-MB CAVLC access pattern shadow_copy was
+         * originally written to fix. See shadow_copy()'s doc comment above. */
+        struct timespec shadow_t0, shadow_t1;
+        if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &shadow_t0);
+
         quant_levels = (const int *)shadow_copy((void **)&encoder->quant_levels_shadow,
                                                  &encoder->quant_levels_shadow_cap,
                                                  quant_levels, quant_size);
@@ -1119,6 +1128,16 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         mvs = (const gpu_mv_t *)shadow_copy((void **)&encoder->mvs_shadow,
                                              &encoder->mvs_shadow_cap,
                                              mvs, mv_size);
+
+        if (perf_stats) {
+            clock_gettime(CLOCK_MONOTONIC, &shadow_t1);
+            double shadow_ms = (double)(shadow_t1.tv_sec - shadow_t0.tv_sec) * 1000.0 +
+                                (double)(shadow_t1.tv_nsec - shadow_t0.tv_nsec) / 1e6;
+            fprintf(stderr, "[BC250_PERF_SHADOW] frame=%u type=%s shadow_copy_ms=%.3f "
+                            "quant_bytes=%zu coeff_bytes=%zu pred_mode_bytes=%zu mv_bytes=%zu\n",
+                    encoder->frame_count, is_idr ? "I" : "P", shadow_ms,
+                    quant_size, coeff_size, pred_mode_size, mv_size);
+        }
 
         /* Opt-in debug instrumentation (BC250_DUMP_QUANT_LEVELS=1), kept as
          * a permanent low-risk diagnostic: dumps the exact post-quant
