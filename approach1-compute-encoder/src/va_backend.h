@@ -13,6 +13,8 @@
 #include <va/va_enc_h264.h>
 #include <va/va_enc_hevc.h>
 #include <va/va_vpp.h>
+#include <va/va_drmcommon.h>
+#include <drm_fourcc.h>
 #include "gpu_compute.h"
 #include "encoder_h264.h"
 #include "encoder_h265.h"
@@ -180,6 +182,7 @@ VAStatus bc250_DestroyImage(VADriverContextP ctx, VAImageID image);
 VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image);
 VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image);
 VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height);
+VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor);
 VAStatus bc250_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette);
 
 /* Subpictures (unsupported - stubs required by the libva driver contract) */

@@ -619,14 +619,56 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         .timelineSemaphore = VK_TRUE
     };
 
+    /* VK_KHR_external_memory_fd (provides vkGetMemoryFdKHR) and
+     * VK_EXT_external_memory_dma_buf (adds the DMA_BUF handle type these
+     * NV12 images are created/allocated with - see gpu_compute_create_image())
+     * are what let gpu_compute_export_nv12_dmabuf() hand out a real DMA-BUF
+     * fd for vaExportSurfaceHandle(), needed by real VA-API consumers (e.g.
+     * Sunshine's own GL/EGL zero-copy import of the encoder's surfaces) that
+     * this driver had no way to satisfy before. Requested opportunistically:
+     * if the device doesn't report them (shouldn't happen on RADV, but this
+     * driver only ever targets one real piece of silicon - see README - so
+     * there's no second real device to have observed this on), device
+     * creation still succeeds without them and
+     * gpu_compute_export_nv12_dmabuf() simply reports failure via a NULL
+     * ctx->get_memory_fd_khr, exactly like every other opportunistic
+     * capability check in this file. */
+    uint32_t ext_count = 0;
+    vkEnumerateDeviceExtensionProperties(ctx->physical_device, NULL, &ext_count, NULL);
+    VkExtensionProperties *ext_props = malloc(ext_count * sizeof(VkExtensionProperties));
+    vkEnumerateDeviceExtensionProperties(ctx->physical_device, NULL, &ext_count, ext_props);
+
+    bool have_memory_fd = false, have_dma_buf = false;
+    for (uint32_t i = 0; i < ext_count; i++) {
+        if (strcmp(ext_props[i].extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) have_memory_fd = true;
+        if (strcmp(ext_props[i].extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) have_dma_buf = true;
+    }
+    free(ext_props);
+
+    const char *device_extensions[2];
+    uint32_t device_ext_count = 0;
+    if (have_memory_fd && have_dma_buf) {
+        device_extensions[device_ext_count++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+        device_extensions[device_ext_count++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+    } else {
+        fprintf(stderr, "[bc250-gpu] VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf not available - "
+                        "vaExportSurfaceHandle() will report unimplemented\n");
+    }
+
     VkDeviceCreateInfo dev_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features12,
         .queueCreateInfoCount = 1,
-        .pQueueCreateInfos = &q_info
+        .pQueueCreateInfos = &q_info,
+        .enabledExtensionCount = device_ext_count,
+        .ppEnabledExtensionNames = device_ext_count > 0 ? device_extensions : NULL
     };
     VK_CHECK(vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device));
     vkGetDeviceQueue(ctx->device, ctx->compute_queue_family, 0, &ctx->compute_queue);
+
+    if (device_ext_count > 0) {
+        ctx->get_memory_fd_khr = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(ctx->device, "vkGetMemoryFdKHR");
+    }
 
     /* Command Pool */
     VkCommandPoolCreateInfo pool_info = {
@@ -1107,8 +1149,22 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
                     attempt + 1, BC250_ALLOC_MAX_ATTEMPTS, backoff_ms);
         }
 
+        /* Chained onto both planes' VkImageCreateInfo (only when the device
+         * actually enabled the extensions - see bc250_gpu_init()) so the
+         * memory they get bound to below is created as DMA_BUF-exportable.
+         * Required for gpu_compute_export_nv12_dmabuf()/
+         * vaExportSurfaceHandle(): a real external-API consumer (e.g.
+         * Sunshine's own GL/EGL import of this surface) needs a real
+         * DMA-BUF fd, and Vulkan requires images that will ever be bound to
+         * externally-exportable memory to declare that up front here, not
+         * just at vkAllocateMemory time. */
+        VkExternalMemoryImageCreateInfo ext_image_info = {
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+        };
         VkImageCreateInfo y_info = {
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = ctx->get_memory_fd_khr ? &ext_image_info : NULL,
             .imageType = VK_IMAGE_TYPE_2D,
             .format = VK_FORMAT_R8_UNORM,
             .extent = { (uint32_t)width, (uint32_t)height, 1 },
@@ -1159,8 +1215,13 @@ int gpu_compute_create_image(gpu_context_t *ctx, int width, int height, int form
                     (size_t)mp.memoryHeaps[mp.memoryTypes[chosen].heapIndex].size);
         }
 
+        VkExportMemoryAllocateInfo ext_mem_info = {
+            .sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+        };
         VkMemoryAllocateInfo alloc_info = {
             .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = ctx->get_memory_fd_khr ? &ext_mem_info : NULL,
             .allocationSize = total_size,
             .memoryTypeIndex = find_memory_type(ctx->physical_device, mem_bits,
                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
@@ -1218,6 +1279,22 @@ void gpu_compute_destroy_image(gpu_context_t *ctx, gpu_image_t image, gpu_memory
     if (image.y_plane) vkDestroyImage(ctx->device, image.y_plane, NULL);
     if (image.uv_plane) vkDestroyImage(ctx->device, image.uv_plane, NULL);
     if (memory.memory) vkFreeMemory(ctx->device, memory.memory, NULL);
+}
+
+int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd) {
+    if (!ctx || !ctx->get_memory_fd_khr || !memory.memory || !out_fd) return -1;
+
+    VkMemoryGetFdInfoKHR get_fd_info = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
+        .memory = memory.memory,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT
+    };
+    VkResult result = ctx->get_memory_fd_khr(ctx->device, &get_fd_info, out_fd);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d (vkGetMemoryFdKHR)\n", result, __FILE__, __LINE__);
+        return -1;
+    }
+    return 0;
 }
 
 /* Test-harness instrumentation (tools/quality_test.sh): dump raw NV12 frame

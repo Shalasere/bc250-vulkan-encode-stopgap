@@ -231,6 +231,11 @@ typedef struct bc250_gpu_context {
      * right after gpu_compute_dispatch_encode() resets+writes this buffer's
      * queries; cleared after the first successful readback. */
     bool perf_result_pending[2];
+
+    /* VK_KHR_external_memory_fd's vkGetMemoryFdKHR, resolved once at device
+     * creation via vkGetDeviceProcAddr() - see gpu_compute_export_nv12_dmabuf().
+     * NULL if the device extension wasn't available (callers must check). */
+    PFN_vkGetMemoryFdKHR get_memory_fd_khr;
 } bc250_gpu_context_t;
 
 typedef bc250_gpu_context_t gpu_context_t;
@@ -261,6 +266,18 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
                              uint8_t *y_plane, int y_pitch,
                              uint8_t *uv_plane, int uv_pitch,
                              int width, int height);
+
+/* Exports `memory` (the packed Y+UV allocation gpu_compute_create_image()
+ * bound both planes into) as a real DMA-BUF file descriptor, for
+ * vaExportSurfaceHandle() - see va_backend.c's bc250_ExportSurfaceHandle().
+ * Requires gpu_compute_create_image() to have been called on a device where
+ * VK_EXT_external_memory_dma_buf was available (bc250_gpu_init() enables it
+ * opportunistically; ctx->get_memory_fd_khr is NULL if it wasn't present,
+ * and this returns -1 in that case). The returned fd is a new, independent
+ * reference each call (the caller owns it and must close() it - VA-API's
+ * own contract for vaExportSurfaceHandle() says the same: "backend driver
+ * will not close the file descriptor"). Returns 0 on success. */
+int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd);
 
 /* Test-harness instrumentation (tools/quality_test.sh): dumps raw NV12
  * frame bytes to BC250_DUMP_DIR (default /tmp/bc250_dump_frames) when
