@@ -258,7 +258,55 @@ verified the same way, on the same real board:
 
 ---
 
-## 6. Current state of `main`
+## 6. Discovered, deliberately not fixed here: H.265/HEVC is a non-functional stub
+
+Found while looking for other candidates during an idle-time audit pass
+(not part of the correctness or performance investigations above).
+`approach1-compute-encoder/src/encoder_h265.c` (196 lines, vs. 1675 for
+the real, heavily-worked H.264 path) is advertised as a working
+`VAProfileHEVCMain` capability but is not one:
+
+- Its VPS/SPS/PPS writers are missing large numbers of mandatory HEVC
+  syntax fields — a real decoder will very likely fail to parse the SPS
+  at all.
+- Its slice writer emits exactly one flag bit
+  (`first_slice_segment_in_pic_flag`) and stops. No slice type, no QP, no
+  reference picture set, no picture content of any kind.
+- It *does* dispatch the real GPU compute pipeline
+  (`gpu_compute_dispatch_encode`, same shaders the H.264 path uses) — and
+  then discards the result completely. The motion vectors, quantized
+  coefficients, everything computed, never make it into the bitstream.
+  This is exactly the "syntactically-present-but-content-free" class of
+  bug `tools/quality_test.sh` exists to catch (see §2) — except that
+  harness only ever exercises `-c:v h264_vaapi`, so this path has never
+  been tested by anything, this whole session or before it.
+
+This matters because it's reachable, not dead code: Sunshine's own config
+schema has an `hevc_mode` setting (verified during the system-integration
+audit, §5), and several real streaming clients prefer HEVC automatically
+when a server advertises it, for bandwidth reasons. Anyone who ends up on
+this path — by choice or by an app's own codec-preference logic — gets
+silent, unusable garbage from a project whose whole premise is being a
+trustworthy stopgap.
+
+**Not fixed here, deliberately.** HEVC always uses CABAC — H.264's
+CAVLC/entropy-coding fixes (§1, bugs 7-8, the dominant PSNR win of the
+whole session) do not carry over at all. A real HEVC encoder is
+comparable in scope to the entire H.264 correctness effort above, redone
+for a structurally harder entropy-coding scheme. This is tracked as
+future work on `feature/hevc-h265` (currently just a branch marker off
+`main`, no implementation yet) rather than attempted as an ad-hoc fix.
+README's Known Limitations section carries the same warning for anyone
+not reading this log. The quick, cheap alternative (stop advertising
+`VAProfileHEVCMain` until it's real, the same honesty principle already
+applied to `VAConfigAttribEncPackedHeaders` — see `va_backend.c`) was
+considered and explicitly deferred at the project owner's direction in
+favor of tracking it as a real feature to build, not just a capability to
+hide.
+
+---
+
+## 7. Current state of `main`
 
 As of this entry: `main` has every fix above merged (33+ commits since
 the original PR #3 baseline). Locally 11 commits ahead of the fork's
@@ -276,34 +324,61 @@ something.
 
 **What's not yet proven**: everything below is synthetic (`ffmpeg
 testsrc`) and offline (no real capture, no real streaming client, no
-real concurrent game). That gap is the next phase (§8).
+real concurrent game). That gap is the next phase (§9).
 
 ---
 
-## 7. In progress: gradient-boundary motion-compensation artifact
+## 8. Inconclusive: gradient-boundary motion-compensation artifact
 
-Not a PSNR-visible defect — a specific, human-spotted one:
-in `quality_test.sh`'s test clip, content from the static color bars
-appears to get dragged into the horizontally-scrolling gradient bar below
-them as a **hard-edged block displacement, not a blur or blend**
-(explicitly distinguished from a separately-considered, unrelated
-deblocking-blur theory that turned out not to be what was being described).
-Points at motion estimation/compensation, not filtering — a macroblock
-straddling that content boundary has no single motion vector that
-correctly describes both halves of its content.
+Not a PSNR-visible defect — a specific, human-spotted one: in
+`quality_test.sh`'s test clip, content from the static color bars
+appeared (on visual inspection by the project owner) to get dragged into
+the horizontally-scrolling gradient bar below them as a **hard-edged
+block displacement, not a blur or blend** — pointing at motion
+compensation, not filtering.
 
-Under investigation on `fix/gradient-boundary-mc` as of this entry:
-reproducing with real consecutive-frame extraction, isolating GPU
-reconstruction vs. final output via `BC250_DUMP_RECON_FRAMES`, inspecting
-real per-macroblock motion vectors via `BC250_DEBUG_MV_STATS`, and
-checking whether the motion search has (or lacks) any bias toward
-small/zero motion when its best match is still a poor one. *This section
-will be updated once that investigation reports back — do not treat it as
-resolved.*
+Investigated on `fix/gradient-boundary-mc`, real result: **not
+confirmed, not fixed — an honest non-finding, not a resolved bug.**
+
+- The investigation's own first-pass visual read *overinterpreted* the
+  defect: what looked like dramatic black-rectangle intrusions at casual
+  inspection turned out, under careful 4x-zoomed re-inspection, to be a
+  much milder macroblock-grid quantization/blocking pattern — real, and
+  worsening somewhat over the clip, but not the rigid "content dragged
+  with no bleed" artifact as originally described. This is presented as
+  a caution about trusting a quick visual read, not as evidence the
+  original report was wrong.
+- **A real methodology bug was caught mid-investigation**: an early
+  GPU-reconstruction-vs-decoded comparison suggested a dramatic
+  chroma-specific defect (Y ≈ 40 dB vs. U/V ≈ 18-20 dB). Repeating the
+  same comparison against true source frames (`BC250_DUMP_INPUT_FRAMES`,
+  the same ground truth `quality_test.sh` itself uses, rather than the
+  GPU's own recon dump) showed chroma is actually fine (high 30s dB) —
+  the first comparison was against the wrong reference. Recorded here so
+  a future investigation doesn't repeat it.
+- **One real, unexplained anomaly, not tied to a confirmed visible
+  defect**: macroblocks at the exact color-bar/gradient boundary row show
+  genuine sporadic, erratic *vertical* motion vectors (e.g. `mv=(1,-30)`,
+  `mv=(0,-32)`) among otherwise sensible horizontally-tracking neighbors.
+  Worth a future look with this specifically in mind.
+- **Ruled out with real evidence**: non-determinism (repeat encodes
+  SHA256-identical), the chroma bilinear interpolation formula (bisected
+  to nearest-neighbor — output unchanged), and — cross-checked by hand
+  against ITU-T §9.2.x and an x264 reference — the MV predictor, MVD
+  Exp-Golomb coding, the bit-writer, CBP tables, zigzag/block-index
+  tables, and chroma DC quant/dequant. All matched spec.
+- Two new opt-in diagnostics (`BC250_DEBUG_MV_ROW`, `BC250_DEBUG_MB`)
+  were committed for whoever picks this up next. `ctest` 4/4 pass,
+  `quality_test.sh` unaffected (37.66 dB default, 36-38 dB at 1080p
+  @4M/8M) — no regression from the diagnostics themselves.
+- **Next step identified by the investigation itself**: the exact encode
+  settings that produced the originally-described severity weren't
+  reproduced (1080p@8M and 480p@4M/300K didn't show it as severely) — get
+  the project owner's exact repro settings before continuing.
 
 ---
 
-## 8. Planned: real-world (non-synthetic) validation
+## 9. Planned: real-world (non-synthetic) validation
 
 Agreed sequence, not yet started:
 
@@ -318,31 +393,40 @@ Agreed sequence, not yet started:
    board, once 1 and 2 are done.
 
 No upstream PR has been opened, and none will be without an explicit
-go-ahead — see the standing note under §9.
+go-ahead — see the standing note under §10.
 
 ---
 
-## 9. Process notes worth preserving
+## 10. Process notes worth preserving
 
 - **A README/CI green checkmark is a claim, not evidence.** Nearly every
   major finding this session came from refusing to trust an existing
   claim (the encoder's own correctness, the test suite's pass/fail
   signal, the install scripts' success messages, the GPU-contention
   percentage) and instead reproducing it directly on real hardware.
-- **Aggregate PSNR has blind spots.** It caught the big CAVLC bugs but
-  didn't flag the gradient-boundary artifact at all — a human watching
-  real output found something a numeric gate missed.
+- **Aggregate PSNR has blind spots — but so does a quick visual read.**
+  §1's CAVLC bugs were PSNR-invisible until isolated by byte-level tests;
+  §8's gradient-boundary investigation found the opposite failure mode,
+  a first-pass visual impression that overstated a real but milder
+  defect. Neither a number nor a glance is enough on its own — both
+  investigations needed a slower, more deliberate second look.
 - **A plausible-sounding theory is not a finding.** GPU power-state wake
   latency was a good hypothesis for the pipelining investigation and was
   *wrong* — directly tested and refuted rather than designed around.
-  Several other "obvious" culprits (deblocking, motion compensation, the
-  wavefront intra path) were each cleared the same way before the real
-  cause was found elsewhere.
+  Several other "obvious" culprits (deblocking, the wavefront intra path,
+  an early GPU-recon-vs-decoded chroma comparison in §8) were each
+  cleared, or caught as a methodology error, the same way before trusting
+  a conclusion.
 - **Performance fixes must stay bit-exact; correctness fixes must not
   be held to that bar.** Every perf fix in §4 was verified
   SHA-256-identical to the pre-fix output before its speed number was
-  trusted. The in-progress artifact fix (§7) is explicitly *not* held to
-  that standard, since the current output is exactly what's wrong.
+  trusted. The (still-open) artifact investigation in §8 was explicitly
+  *not* held to that standard, since the current output is exactly what's
+  in question.
+- **"Inconclusive" is a valid, honest result — not a failure to report as
+  one.** §8's investigation didn't find or fix the reported defect. It's
+  recorded in full (including its own self-caught methodology error and
+  what to try next) rather than glossed over or quietly dropped.
 - **Nothing gets pushed or opened upstream without an explicit go-ahead**,
   even when a task description implies it's the eventual goal — this was
   violated once, early on (an unrequested PR + issue comment), and
