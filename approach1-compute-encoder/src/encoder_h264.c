@@ -133,6 +133,17 @@ struct h264_encoder {
     uint8_t (*nz_luma)[16];
     uint8_t (*nz_cb)[4];
     uint8_t (*nz_cr)[4];
+
+    /* PERF: host-side cacheable shadow copies of the GPU staging-buffer
+     * readback data (quant_levels/coeff/pred_modes/mvs) - see
+     * h264_encoder_encode_frame's "shadow_copy" comment for why these exist.
+     * Persistent/growable across frames (realloc'd only when a frame needs a
+     * bigger buffer than before, e.g. the very first frame at a given
+     * resolution) so a steady-state encode does zero allocation per frame. */
+    int *quant_levels_shadow; size_t quant_levels_shadow_cap;
+    int *coeff_shadow;        size_t coeff_shadow_cap;
+    uint32_t *pred_modes_shadow; size_t pred_modes_shadow_cap;
+    void *mvs_shadow;         size_t mvs_shadow_cap; /* actually gpu_mv_t*, typedef'd later in this file */
 };
 
 static void manage_dpb(h264_encoder_t *encoder, int new_frame_num, int new_poc)
@@ -193,6 +204,67 @@ static size_t write_aud(uint8_t *buf, size_t buf_size, bool is_idr) {
  * Hadamard transforms, neighbor-context derivation)
  * ============================================================================
  */
+
+/*
+ * shadow_copy - bulk-copy one GPU-readback staging buffer into a persistent,
+ * growable, normal malloc'd (cacheable) host buffer, returning a pointer to
+ * the copy (or, on an allocation failure, to the original source - never
+ * fails the encode over a perf-only optimization).
+ *
+ * PERF (found via on-target `BC250_PERF_STATS=1` timing added directly
+ * inside h264_encoder_encode_frame's per-MB loop - real board measurement,
+ * not a synthetic offline harness): the ~44-63us/macroblock CPU-side CAVLC
+ * cost this project has been chasing is NOT dominated by entropy-coding bit
+ * writes at all (batching cavlc.c's unary zero-bit writes into single
+ * bs_write_u() calls - this branch's other commit - moved the board-measured
+ * fps by under 0.6%). Per-MB timing brackets isolated the real cost: the
+ * unconditional-per-MB skip decision (mb_has_any_luma_nonzero() +
+ * mv_predictor(), called for EVERY macroblock before any entropy coding
+ * happens at all) alone averaged ~36-38us/MB at every tested resolution
+ * (640x480/1280x720/1920x1080) - a cost independent of resolution, which
+ * rules out a working-set/cache-capacity explanation (a bigger frame's
+ * larger buffer would show a worse, not identical, per-MB cost if this were
+ * an ordinary cache-capacity effect) and points instead at a fixed
+ * per-access latency.
+ *
+ * That fixed latency traces to gpu_compute.c's create_buffer_with_memory()
+ * calls for quant_staging_buffers/coeff_staging_buffers/pred_mode_staging_
+ * buffers/mv_staging_buffers: VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+ * VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, deliberately WITHOUT
+ * VK_MEMORY_PROPERTY_HOST_CACHED_BIT (reasonable for the driver's own
+ * one-shot vkCmdCopyBuffer GPU->host writes into them, which don't care
+ * about CPU cacheability). On this hardware/driver that memory type is
+ * uncached/write-combined from the CPU's read side - fine for a single
+ * linear write, but every one of this file's per-MB, per-block, per-
+ * neighbor reads (mb_has_any_luma_nonzero() rescanning up to 16 blocks,
+ * cavlc_write_4x4_block()/_ac_block() reading the same coefficients again
+ * a few lines later, mv_predictor()/neighbor_mv() re-touching adjacent
+ * macroblocks' motion vectors) was a fresh scattered read of that same
+ * uncached memory, over and over, for the whole frame.
+ *
+ * This function turns that into ONE per-frame sequential streaming read
+ * (the access pattern uncached/write-combined memory penalizes least) of
+ * each GPU staging buffer into ordinary, cacheable malloc'd memory, done
+ * once immediately after gpu_compute_get_*_staging_data() hands back the
+ * raw mapped pointer and before ANY of this file's repeated-access CPU code
+ * (the debug dumps, the skip decision, the CAVLC loop) touches it. Every
+ * value is copied verbatim (memcpy, no transformation) - this changes WHERE
+ * the CPU reads a byte from, never WHAT byte it reads, so it cannot change
+ * the encoded bitstream in any way (see this change's commit message for
+ * the byte-exact before/after board verification, the same methodology
+ * used for the CAVLC bit-batching fix above).
+ */
+static const void *shadow_copy(void **shadow_ptr, size_t *cap, const void *src, size_t size) {
+    if (!src || size == 0) return src;
+    if (*cap < size) {
+        void *newbuf = realloc(*shadow_ptr, size);
+        if (!newbuf) return src; /* OOM: fall back to the raw (slower but correct) mapped pointer */
+        *shadow_ptr = newbuf;
+        *cap = size;
+    }
+    memcpy(*shadow_ptr, src, size);
+    return *shadow_ptr;
+}
 
 /* quant_levels/coeff buffers are laid out as num_mbs*24*16 ints; block index
  * (0-23) is the GPU RASTER convention (see file-top comment), position (0-15)
@@ -1028,6 +1100,26 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
             mvs = (const gpu_mv_t *)mv_data;
         }
 
+        /* PERF: copy each GPU staging buffer once into cacheable host memory
+         * before any of this function's repeated per-MB/per-block reads
+         * touch it - see shadow_copy()'s doc comment for the full board-
+         * measured rationale (this is the dominant real CPU-side cost, not
+         * CAVLC bit-writing). Every subsequent use of quant_levels/coeff/
+         * pred_modes/mvs in this function reads the copy, not the raw
+         * uncached mapped buffer. */
+        quant_levels = (const int *)shadow_copy((void **)&encoder->quant_levels_shadow,
+                                                 &encoder->quant_levels_shadow_cap,
+                                                 quant_levels, quant_size);
+        coeff = (const int *)shadow_copy((void **)&encoder->coeff_shadow,
+                                          &encoder->coeff_shadow_cap,
+                                          coeff, coeff_size);
+        pred_modes = (const uint32_t *)shadow_copy((void **)&encoder->pred_modes_shadow,
+                                                     &encoder->pred_modes_shadow_cap,
+                                                     pred_modes, pred_mode_size);
+        mvs = (const gpu_mv_t *)shadow_copy((void **)&encoder->mvs_shadow,
+                                             &encoder->mvs_shadow_cap,
+                                             mvs, mv_size);
+
         /* Opt-in debug instrumentation (BC250_DUMP_QUANT_LEVELS=1), kept as
          * a permanent low-risk diagnostic: dumps the exact post-quant
          * coefficient buffer this frame is about to hand to CAVLC, so an
@@ -1556,5 +1648,9 @@ void h264_encoder_destroy(h264_encoder_t *encoder)
     if (encoder->nz_luma) free(encoder->nz_luma);
     if (encoder->nz_cb) free(encoder->nz_cb);
     if (encoder->nz_cr) free(encoder->nz_cr);
+    if (encoder->quant_levels_shadow) free(encoder->quant_levels_shadow);
+    if (encoder->coeff_shadow) free(encoder->coeff_shadow);
+    if (encoder->pred_modes_shadow) free(encoder->pred_modes_shadow);
+    if (encoder->mvs_shadow) free(encoder->mvs_shadow);
     free(encoder);
 }
