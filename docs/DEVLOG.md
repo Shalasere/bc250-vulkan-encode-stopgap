@@ -2080,7 +2080,7 @@ headroom left, not a ceiling.
   `bc250-keep-display-awake.service` (systemd `--user`, enabled) plus
   PowerDevil `idleTime=999999`. Worth folding into the install scripts.
 
-### 16.6 Method note
+### 16.6 Method note (see also §17.4)
 
 Five hypotheses were investigated and discarded before this one: chroma
 QP (§12, a real fix but not this bug), the 10-bit capture path (§13.1),
@@ -2091,3 +2091,87 @@ in under an hour once the question changed from "what does the output
 look like?" to "**what decisions is the encoder actually making?**",
 i.e. logging QP per frame beside the byte count. Prefer instrumenting
 the encoder's own state over reasoning about its output.
+
+---
+
+## 17. Removed the LD_PRELOAD shim: +64% end-to-end throughput, quality unchanged
+
+With §16's real fix in place there was finally a known-good baseline to
+A/B the §13.1 `LD_PRELOAD` shim against. It was removed
+(`/etc/ld.so.preload` deleted; the `.so` left at
+`/opt/bc250-driver/bc250_sunshine_shim.so` so reverting is one line),
+returning Sunshine to its **zero-copy VRAM capture path** — confirmed by
+the absence of `Reverting back to GPU -> RAM -> GPU` in the log.
+
+### 17.1 Measured
+
+Real remote client, 2560×1440, 31 Mbps requested:
+
+| | encoder `wall_ms` | encoder ceiling | QP avg | end-to-end achieved |
+|---|---|---|---|---|
+| shim active (RAM path) | 15.02 ms | 66.6 fps | 12.0 | **33.6 fps** |
+| shim removed (zero-copy) | 15.57 ms | 64.2 fps | 12.1 | **~55 fps** (60 static / ~45 under motion, user-observed) |
+
+**This driver's own encode time per frame did not change** (15.0 vs
+15.6 ms). That is the expected result once stated plainly:
+`BC250_PERF_FRAME`'s `wall_ms` brackets only
+`h264_encoder_encode_frame()`, and the shim affects *Sunshine's
+capture*, not this driver's encode. So the encoder was **never the
+bottleneck** — it has been capable of ~65 fps throughout. The shim's
+GPU→CPU→GPU capture round-trip (a ~5.5 MB readback plus reupload per
+1440p frame) was throttling the pipeline to roughly half that.
+
+Quality is unaffected: QP stayed pinned at the `qp_min=12` floor
+(12.0 → 12.1) and average frame size barely moved (69,703 → 68,305
+bytes).
+
+### 17.2 The 10-bit hypothesis is now definitively dead
+
+§13.1 established as fact that this compositor scans out at 10 bits
+(`XRGB2101010`/`ABGR2101010`, never 8-bit), and inferred that Sunshine's
+zero-copy shader path mishandled it. §14.2 showed that inference was
+scored on the feedback-loop harness and therefore unproven. §17.1 closes
+it: the zero-copy path is both **correct** (quality identical at the same
+QP) and **substantially faster**. The 10-bit scanout is real and
+harmless.
+
+Net cost of that hypothesis: the shim was carried as production
+configuration for most of a day, at roughly a 40% frame-rate penalty, as
+a workaround for a defect that was actually §16's rate-control bug. It
+was never load-bearing. It is kept in-tree (`tools/bc250_sunshine_shim.c`)
+only as a documented technique for preloading into an `AT_SECURE`
+binary, which is genuinely reusable and hard to rediscover — **not** as
+something anyone should install.
+
+### 17.3 Revised optimization picture
+
+The previous session note argued against lowering `qp_min` on the
+grounds that frame rate was the scarce resource. §17.1 inverts that:
+
+- Encoder capability: ~65 fps at 1440p; now achieving 45–60 end-to-end.
+- Quality: pinned at the `qp_min=12` floor.
+- Bitrate: ~15–19 Mbps used of 31 Mbps requested.
+
+So the encoder currently has headroom in *both* directions, and the
+plainly-wasted resource is bitrate, not time. `qp_min` is the next
+lever after all. Sizing note for whoever does it: at QP 12 on real
+1440p desktop content the largest frame measured was 148,542 bytes
+against an `output_buf_size` of `width*height*2 + 65536` (7.4 MB at
+1440p), so there is ample internal headroom — but the *caller's*
+VA-API coded buffer is the real constraint, and a `BC250_FORCE_QP=12`
+encode of pathological 1440p random noise has already been observed to
+produce an empty output file, so the guard path is reachable.
+
+### 17.4 Method note
+
+Both of this section's numbers were nearly misread. The first
+end-to-end figure computed for the zero-copy session was "25.4 fps" —
+worse than baseline — because the measurement window spanned two
+sessions plus the idle gap between them. The apples-to-apples metric
+(`wall_ms`, per-frame, session-independent) then showed *no* encoder
+change at all, which initially looked like the shim removal had done
+nothing, until the distinction between "encode time" and "end-to-end
+pipeline rate" was made explicit. Two different framings of the same
+data, two wrong readings, both caught only by asking what the metric
+actually brackets. Consistent with §12.1, §14.2 and §16.6: **know what
+your number measures before believing what it says.**
