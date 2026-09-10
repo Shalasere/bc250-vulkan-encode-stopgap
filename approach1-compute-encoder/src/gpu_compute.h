@@ -163,10 +163,29 @@ typedef struct bc250_gpu_context {
     void *quant_staging_mapped[2];
     VkDeviceSize quant_staging_size;
 
-    VkBuffer coeff_staging_buffers[2];
-    VkDeviceMemory coeff_staging_memories[2];
-    void *coeff_staging_mapped[2];
-    VkDeviceSize coeff_staging_size;
+    /* Compact per-4x4-block PRE-quantization DC term (one int per block,
+     * num_mbs*24 entries) - the only part of coeff_buffer the CPU ever reads.
+     *
+     * PERF: coeff_buffer used to be staged to the host in full so
+     * encoder_h264.c could do the I16x16 luma DC and chroma DC Hadamards.
+     * Every one of its 13 read sites was coeff_block_ptr(coeff, mb, blk)[0] -
+     * position 0 only, 24 of the 384 ints per macroblock - so the staging
+     * pair, the per-frame vkCmdCopyBuffer and the per-frame shadow_copy() were
+     * all moving 16x more data than anything consumed. At 1440p that is 44.2 MB
+     * of staging (of a 512 MB VRAM heap that RADV also uses for HOST_VISIBLE
+     * allocations, shared with the display - see DEVLOG §19.7) and 22.1 MB of
+     * copy + 22.1 MB of memcpy per frame, for 1.4 MB of actually-used values.
+     *
+     * dct_transform.comp (P/inter) and intra_wavefront.comp (I) now write this
+     * alongside their full coeff output. coeff_buffer itself stays device-local
+     * - quantize.comp consumes it as input and reconstruct.comp reads it - it
+     * just no longer crosses to the host. */
+    VkBuffer dc_coeff_buffer;
+    VkDeviceMemory dc_coeff_memory;
+    VkBuffer dc_staging_buffers[2];
+    VkDeviceMemory dc_staging_memories[2];
+    void *dc_staging_mapped[2];
+    VkDeviceSize dc_staging_size;
 
     /* Per-MB chosen I16x16 prediction mode (see residual_predict.comp),
      * device buffer + host-visible readback, same double-buffer contract as
@@ -381,14 +400,19 @@ int gpu_compute_sync(gpu_context_t *ctx);
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 int gpu_compute_release_staging_data(gpu_context_t *ctx);
 
-/* Real per-coefficient residual readback (see quant_staging_buffers/coeff_staging_buffers
- * above). Both follow the same double-buffer contract as gpu_compute_get_staging_data():
+/* Real per-coefficient residual readback (see quant_staging_buffers above).
+ * Follows the same double-buffer contract as gpu_compute_get_staging_data():
  * call after gpu_compute_sync(), data points at the buffer that was written by the
  * frame BEFORE the one just submitted (fence-safe to read from the CPU). Layout is
  * num_mbs*24*16 ints, int index = (mb_idx*24+block_idx)*16+pos (raster position within
  * the 4x4 block, NOT zigzag). */
 int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *size);
-int gpu_compute_get_coeff_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+
+/* Compact PRE-quantization DC readback: one int per 4x4 block, num_mbs*24
+ * entries, index = mb_idx*24 + block_idx. Replaces the former full-coeff
+ * staging buffer, of which only these values were ever read - see
+ * dc_coeff_buffer's comment above. Same fence-safe contract. */
+int gpu_compute_get_dc_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 
 /* Real per-MB I16x16 prediction mode (see residual_predict.comp), one uint32
  * per MB, values match cavlc.h's H264_I16x16_* constants. Only meaningful for

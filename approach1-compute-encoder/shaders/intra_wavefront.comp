@@ -157,6 +157,14 @@ layout(std430, set = 0, binding = 6) writeonly buffer PredModeOut {
 layout(std430, set = 0, binding = 7) writeonly buffer NonZeroMask {
     uint nzc[];
 };
+/* Compact per-4x4-block DC (position 0 only), same buffer and meaning as
+ * dct_transform.comp's OutputDcCoeffs. This is the only part of `coeffs` that
+ * still reaches the host, so - exactly as with the nonzero mask at binding 7 -
+ * this I-slice-only shader has to maintain it, or every I-frame's luma and
+ * chroma DC would be whatever the last P-frame left behind. */
+layout(std430, set = 0, binding = 8) writeonly buffer OutputDcCoeffs {
+    int dc[];
+};
 
 layout(push_constant) uniform PushConstants {
     uint frame_width;
@@ -518,6 +526,7 @@ void main() {
 
         uint global_block_idx = mb_idx * 24u + block_id;
         for (int p = 0; p < 16; p++) coeffs[global_block_idx * 16u + uint(p)] = coeff_block[p];
+        dc[global_block_idx] = coeff_block[0];
         s_dc_in[block_id] = coeff_block[0];
 
         levels[global_block_idx * 16u + 0u] = 0; /* DC handled separately below; AC quantizer's own position-0 output is unused */
@@ -659,6 +668,8 @@ void main() {
             coeffs[cb_global * 16u + uint(p)] = cb_coeff[p];
             coeffs[cr_global * 16u + uint(p)] = cr_coeff[p];
         }
+        dc[cb_global] = cb_coeff[0];
+        dc[cr_global] = cr_coeff[0];
         s_cb_dc_in[sub] = cb_coeff[0];
         s_cr_dc_in[sub] = cr_coeff[0];
 

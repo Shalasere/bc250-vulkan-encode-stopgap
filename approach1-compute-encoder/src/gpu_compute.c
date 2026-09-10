@@ -67,7 +67,7 @@ static uint32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t type
  * match if this device exposes no type satisfying `preferred` at all.
  *
  * WHY THIS EXISTS: the GPU-readback staging buffers this driver bulk-copies
- * every frame (quant_staging_buffers/coeff_staging_buffers/pred_mode_staging_
+ * every frame (quant_staging_buffers/dc_staging_buffers/pred_mode_staging_
  * buffers/mv_staging_buffers - see encoder_h264.c's shadow_copy() doc
  * comment) were being bound to a HOST_VISIBLE|HOST_COHERENT memory type
  * WITHOUT HOST_CACHED, on the reasoning that the GPU's one-shot
@@ -222,6 +222,11 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
         vkFreeMemory(ctx->device, ctx->coeff_memory, NULL);
         ctx->coeff_buffer = VK_NULL_HANDLE;
     }
+    if (ctx->dc_coeff_buffer) {
+        vkDestroyBuffer(ctx->device, ctx->dc_coeff_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->dc_coeff_memory, NULL);
+        ctx->dc_coeff_buffer = VK_NULL_HANDLE;
+    }
     if (ctx->quant_levels_buffer) {
         vkDestroyBuffer(ctx->device, ctx->quant_levels_buffer, NULL);
         vkFreeMemory(ctx->device, ctx->quant_levels_memory, NULL);
@@ -263,15 +268,15 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
             ctx->quant_staging_buffers[i] = VK_NULL_HANDLE;
             ctx->quant_staging_memories[i] = VK_NULL_HANDLE;
         }
-        if (ctx->coeff_staging_mapped[i]) {
-            vkUnmapMemory(ctx->device, ctx->coeff_staging_memories[i]);
-            ctx->coeff_staging_mapped[i] = NULL;
+        if (ctx->dc_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->dc_staging_memories[i]);
+            ctx->dc_staging_mapped[i] = NULL;
         }
-        if (ctx->coeff_staging_buffers[i]) {
-            vkDestroyBuffer(ctx->device, ctx->coeff_staging_buffers[i], NULL);
-            vkFreeMemory(ctx->device, ctx->coeff_staging_memories[i], NULL);
-            ctx->coeff_staging_buffers[i] = VK_NULL_HANDLE;
-            ctx->coeff_staging_memories[i] = VK_NULL_HANDLE;
+        if (ctx->dc_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->dc_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->dc_staging_memories[i], NULL);
+            ctx->dc_staging_buffers[i] = VK_NULL_HANDLE;
+            ctx->dc_staging_memories[i] = VK_NULL_HANDLE;
         }
         if (ctx->pred_mode_staging_mapped[i]) {
             vkUnmapMemory(ctx->device, ctx->pred_mode_staging_memories[i]);
@@ -320,9 +325,11 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     VkDeviceSize pred_mode_size = num_mbs * sizeof(uint32_t);
     VkDeviceSize entropy_size = width * height * 2; /* Generous */
 
+    VkDeviceSize dc_coeff_size = num_mbs * 24 * sizeof(int);
+
     ctx->staging_size = entropy_size;
     ctx->quant_staging_size = quant_levels_size;
-    ctx->coeff_staging_size = coeff_size;
+    ctx->dc_staging_size = dc_coeff_size;
     ctx->pred_mode_staging_size = pred_mode_size;
     ctx->mv_staging_size = mv_size;
     ctx->nz_staging_size = nz_count_size;
@@ -340,7 +347,12 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     rc |= create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
     rc |= create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->residual_buffer, &ctx->residual_memory);
     rc |= create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_buffer, &ctx->pred_memory);
-    rc |= create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->coeff_buffer, &ctx->coeff_memory);
+    /* coeff_buffer no longer needs TRANSFER_SRC: it is consumed on the GPU
+     * (quantize.comp's input, reconstruct.comp's DC source) and no longer
+     * crosses to the host - dc_coeff_buffer carries the only part the CPU
+     * reads. See gpu_compute.h's dc_coeff_buffer comment. */
+    rc |= create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->coeff_buffer, &ctx->coeff_memory);
+    rc |= create_buffer_with_memory(ctx, dc_coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->dc_coeff_buffer, &ctx->dc_coeff_memory);
     rc |= create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->quant_levels_buffer, &ctx->quant_levels_memory);
     /* TRANSFER_SRC added so the per-block nonzero mask can be read back - see
      * gpu_compute.h's nz_staging_buffers and quantize.comp's NonZeroMask. */
@@ -374,8 +386,8 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     }
     rc |= create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[0], &ctx->quant_staging_memories[0]);
     rc |= create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[1], &ctx->quant_staging_memories[1]);
-    rc |= create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[0], &ctx->coeff_staging_memories[0]);
-    rc |= create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[1], &ctx->coeff_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, dc_coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->dc_staging_buffers[0], &ctx->dc_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, dc_coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->dc_staging_buffers[1], &ctx->dc_staging_memories[1]);
     rc |= create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[0], &ctx->pred_mode_staging_memories[0]);
     rc |= create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
     rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
@@ -415,8 +427,8 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     vkMapMemory(ctx->device, ctx->staging_memories[1], 0, entropy_size, 0, &ctx->staging_mapped[1]);
     vkMapMemory(ctx->device, ctx->quant_staging_memories[0], 0, quant_levels_size, 0, &ctx->quant_staging_mapped[0]);
     vkMapMemory(ctx->device, ctx->quant_staging_memories[1], 0, quant_levels_size, 0, &ctx->quant_staging_mapped[1]);
-    vkMapMemory(ctx->device, ctx->coeff_staging_memories[0], 0, coeff_size, 0, &ctx->coeff_staging_mapped[0]);
-    vkMapMemory(ctx->device, ctx->coeff_staging_memories[1], 0, coeff_size, 0, &ctx->coeff_staging_mapped[1]);
+    vkMapMemory(ctx->device, ctx->dc_staging_memories[0], 0, dc_coeff_size, 0, &ctx->dc_staging_mapped[0]);
+    vkMapMemory(ctx->device, ctx->dc_staging_memories[1], 0, dc_coeff_size, 0, &ctx->dc_staging_mapped[1]);
     vkMapMemory(ctx->device, ctx->pred_mode_staging_memories[0], 0, pred_mode_size, 0, &ctx->pred_mode_staging_mapped[0]);
     vkMapMemory(ctx->device, ctx->pred_mode_staging_memories[1], 0, pred_mode_size, 0, &ctx->pred_mode_staging_mapped[1]);
     vkMapMemory(ctx->device, ctx->mv_staging_memories[0], 0, mv_size, 0, &ctx->mv_staging_mapped[0]);
@@ -440,6 +452,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
 
     update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 0, ctx->residual_buffer, residual_size);
     update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 1, ctx->coeff_buffer, coeff_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->dct_desc_set, 2, ctx->dc_coeff_buffer, dc_coeff_size);
 
     update_storage_buffer_descriptor(ctx->device, ctx->quant_desc_set, 0, ctx->coeff_buffer, coeff_size);
     update_storage_buffer_descriptor(ctx->device, ctx->quant_desc_set, 1, ctx->quant_levels_buffer, quant_levels_size);
@@ -476,6 +489,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 5, ctx->coeff_buffer, coeff_size);
     update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 6, ctx->pred_mode_buffer, pred_mode_size);
     update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 7, ctx->nz_count_buffer, nz_count_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 8, ctx->dc_coeff_buffer, dc_coeff_size);
 
     return 0;
 }
@@ -880,9 +894,12 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     VkDescriptorSetLayoutBinding dct_bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 2 = dc_coeff_buffer, the compact per-block DC the CPU reads
+         * instead of the full coeff readback (gpu_compute.h's dc_coeff_buffer). */
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo dct_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = dct_bindings };
+    VkDescriptorSetLayoutCreateInfo dct_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = dct_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &dct_layout_info, NULL, &ctx->dct_desc_layout);
 
     VkDescriptorSetLayoutBinding quant_bindings[] = {
@@ -948,15 +965,26 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
          * mask would be a stale P-frame's on every I-frame. Measured: a
          * BC250_NZ_AUDIT run caught exactly that - 13443 of 345600 blocks
          * mismatched on frame 0 and zero mismatches on every P frame. */
-        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 8 = dc_coeff_buffer. Same reason as binding 7: this shader
+         * is the I-slice path and bypasses dct_transform.comp entirely, so it
+         * has to maintain the compact DC buffer itself or every I-frame's DC
+         * would be a leftover from the previous P-frame. */
+        {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 8, .pBindings = intra_wavefront_bindings };
+    VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 9, .pBindings = intra_wavefront_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &intra_wavefront_layout_info, NULL, &ctx->intra_wavefront_desc_layout);
 
     /* Descriptor Pool */
+    /* Headroom, not a tight fit. The nine layouts above bind 24 storage
+     * buffers and 14 storage images today; adding the nonzero mask and the
+     * compact DC buffer used 3 of the old 32-descriptor margin in one sitting.
+     * vkAllocateDescriptorSets()'s result is not checked at its call sites, so
+     * exhausting this pool would fail the same silent way an exhausted memory
+     * heap did (DEVLOG §19.7) - cheaper to keep the ceiling far away. */
     VkDescriptorPoolSize pool_sizes[] = {
-        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 32},
-        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32}
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64}
     };
     VkDescriptorPoolCreateInfo pool_info_desc = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1180,6 +1208,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->residual_buffer) { vkDestroyBuffer(ctx->device, ctx->residual_buffer, NULL); vkFreeMemory(ctx->device, ctx->residual_memory, NULL); }
     if (ctx->pred_buffer) { vkDestroyBuffer(ctx->device, ctx->pred_buffer, NULL); vkFreeMemory(ctx->device, ctx->pred_memory, NULL); }
     if (ctx->coeff_buffer) { vkDestroyBuffer(ctx->device, ctx->coeff_buffer, NULL); vkFreeMemory(ctx->device, ctx->coeff_memory, NULL); }
+    if (ctx->dc_coeff_buffer) { vkDestroyBuffer(ctx->device, ctx->dc_coeff_buffer, NULL); vkFreeMemory(ctx->device, ctx->dc_coeff_memory, NULL); }
     if (ctx->quant_levels_buffer) { vkDestroyBuffer(ctx->device, ctx->quant_levels_buffer, NULL); vkFreeMemory(ctx->device, ctx->quant_levels_memory, NULL); }
     if (ctx->nz_count_buffer) { vkDestroyBuffer(ctx->device, ctx->nz_count_buffer, NULL); vkFreeMemory(ctx->device, ctx->nz_count_memory, NULL); }
     if (ctx->pred_mode_buffer) { vkDestroyBuffer(ctx->device, ctx->pred_mode_buffer, NULL); vkFreeMemory(ctx->device, ctx->pred_mode_memory, NULL); }
@@ -1201,13 +1230,13 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
             vkDestroyBuffer(ctx->device, ctx->quant_staging_buffers[i], NULL);
             vkFreeMemory(ctx->device, ctx->quant_staging_memories[i], NULL);
         }
-        if (ctx->coeff_staging_mapped[i]) {
-            vkUnmapMemory(ctx->device, ctx->coeff_staging_memories[i]);
-            ctx->coeff_staging_mapped[i] = NULL;
+        if (ctx->dc_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->dc_staging_memories[i]);
+            ctx->dc_staging_mapped[i] = NULL;
         }
-        if (ctx->coeff_staging_buffers[i]) {
-            vkDestroyBuffer(ctx->device, ctx->coeff_staging_buffers[i], NULL);
-            vkFreeMemory(ctx->device, ctx->coeff_staging_memories[i], NULL);
+        if (ctx->dc_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->dc_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->dc_staging_memories[i], NULL);
         }
         if (ctx->pred_mode_staging_mapped[i]) {
             vkUnmapMemory(ctx->device, ctx->pred_mode_staging_memories[i]);
@@ -2135,8 +2164,10 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
      * allocation and must not be carried forward here). */
     VkBufferCopy quant_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->quant_staging_size };
     vkCmdCopyBuffer(cmd_buf, ctx->quant_levels_buffer, ctx->quant_staging_buffers[ctx->current_buf], 1, &quant_copy_region);
-    VkBufferCopy coeff_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->coeff_staging_size };
-    vkCmdCopyBuffer(cmd_buf, ctx->coeff_buffer, ctx->coeff_staging_buffers[ctx->current_buf], 1, &coeff_copy_region);
+    /* Only the compact per-block DC crosses to the host, not all of
+     * coeff_buffer - 1/16th the copy. See gpu_compute.h's dc_coeff_buffer. */
+    VkBufferCopy dc_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->dc_staging_size };
+    vkCmdCopyBuffer(cmd_buf, ctx->dc_coeff_buffer, ctx->dc_staging_buffers[ctx->current_buf], 1, &dc_copy_region);
 
     /* Same for the real per-MB I16x16 pred mode and motion vectors residual_predict.comp
      * / motion_estimation.comp computed this frame - see gpu_compute_get_pred_mode_staging_data()
@@ -2341,11 +2372,11 @@ int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *
     return (*data != NULL) ? 0 : -1;
 }
 
-int gpu_compute_get_coeff_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
+int gpu_compute_get_dc_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
     if (!ctx || !data || !size) return -1;
     int prev_buf = (ctx->current_buf + 1) % 2;
-    *size = ctx->coeff_staging_size;
-    *data = ctx->coeff_staging_mapped[prev_buf];
+    *size = ctx->dc_staging_size;
+    *data = ctx->dc_staging_mapped[prev_buf];
     return (*data != NULL) ? 0 : -1;
 }
 

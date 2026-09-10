@@ -10,6 +10,15 @@ layout(std430, set = 0, binding = 1) writeonly buffer OutputCoeffs {
     int coeffs[];
 };
 
+/* Compact per-4x4-block DC (position 0 only), one int per block. The CPU needs
+ * exactly these values - for the I16x16 luma DC and the chroma DC Hadamards -
+ * and nothing else out of `coeffs`, so this is what gets staged to the host
+ * instead of the full coefficient buffer: 1/16th the readback. See
+ * gpu_compute.h's dc_coeff_buffer. */
+layout(std430, set = 0, binding = 2) writeonly buffer OutputDcCoeffs {
+    int dc[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint frame_width;
     uint frame_height;
@@ -85,4 +94,5 @@ void main() {
     for (int i = 0; i < 16; i++) {
         coeffs[global_block_idx * 16 + i] = transformed[i];
     }
+    dc[global_block_idx] = transformed[0];
 }

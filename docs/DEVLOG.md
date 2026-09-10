@@ -2478,3 +2478,145 @@ A/B, an exactness audit and the PSNR gate can still be undeployable**, because
 none of those exercise 20 concurrent contexts against a 512 MB heap. The
 deploy step is part of the test, and "it works under ffmpeg" was not evidence
 that it works under Sunshine.
+
+---
+
+## 20. The coefficient readback was a 16× overcopy. Removing it: +30% throughput, and CAVLC got 30-37% faster without being touched.
+
+§19.1 established that the CPU was moving ~66 MB/frame at 1440p to emit a
+14 KB frame. §19.3 removed most of the *scanning*. This removes most of the
+*moving*.
+
+### 20.1 The observation
+
+`coeff_buffer` — the pre-quantization transform coefficients,
+`num_mbs*24*16` ints, 22.1 MB at 1440p — was staged to the host in full every
+frame. Enumerating every CPU read of it found **13 sites, all of the form
+`coeff_block_ptr(coeff, mb, blk)[0]`**: position 0 of a block, and nothing
+else, for the I16x16 luma DC and the two chroma DC Hadamards. That is 24 of
+the 384 ints per macroblock.
+
+So the staging pair, the per-frame `vkCmdCopyBuffer` and the per-frame
+`shadow_copy()` were each moving **16× more data than anything consumed**.
+
+### 20.2 The change
+
+`dct_transform.comp` (P/inter) and `intra_wavefront.comp` (I) now write a
+compact `dc_coeff_buffer` — one int per 4×4 block, `num_mbs*24` — alongside
+their full coefficient output, and only that crosses to the host.
+`coeff_buffer` stays device-local, because `quantize.comp` consumes it as
+input and `reconstruct.comp` reads it for its own DC path; it simply no
+longer gets staged, copied or shadow-copied. `coeff_buffer` also lost its
+now-pointless `TRANSFER_SRC` usage flag.
+
+Both producing shaders had to be changed for the same reason the nonzero mask
+did (§19.4): `intra_wavefront.comp` is the I-slice path and bypasses
+`dct_transform.comp` entirely, so a P-path-only implementation would leave
+every I-frame's luma and chroma DC holding leftovers from the previous
+P-frame. Having just been burned by exactly that, binding 8 went in at the
+same time as binding 7 rather than being rediscovered.
+
+Per encoder context at 1440p:
+
+| | before | after |
+|---|---|---|
+| host-visible staging | 44.2 MB | 2.8 MB |
+| GPU→host copy per frame | 22.1 MB | 1.4 MB |
+| `shadow_copy()` per frame | ~46 MB | 24 MB |
+
+That gives back roughly **17× more staging memory than §19.3's mask buffer
+consumed**, which matters directly against the 512 MB heap of §19.7.
+
+The descriptor pool went from 32 to 64 descriptors of each type at the same
+time: the nine layouts bind 24 storage buffers, and the mask plus the DC
+buffer had eaten 3 of the old 8-descriptor margin in one sitting.
+`vkAllocateDescriptorSets()`'s result is not checked at its call sites, so
+exhausting that pool would have failed the same silent way the memory heap
+did.
+
+### 20.3 Verification
+
+`coeff` is no longer readable from the CPU, so the §19.4 trick — recompute on
+the CPU and require an exact match — is not available. Instead: **raw H.264
+output compared byte-for-byte against the previous commit** on `testsrc`,
+which §19.6 established is reproducible, across five configurations. Any
+wrong DC value changes a Hadamard and diverges.
+
+| case | result |
+|---|---|
+| 1440p, GOP 120, 300 frames | byte-identical |
+| 1440p, **`-g 1` all-intra**, 60 frames | byte-identical |
+| 1440p, GOP 10, 100 frames | byte-identical |
+| 1080p, GOP 120, 300 frames | byte-identical |
+| 640x480, GOP 10, 100 frames | byte-identical |
+
+The all-intra case is the one that matters most — it exercises nothing but
+`intra_wavefront.comp`'s DC path. All four unit-test binaries pass; the PSNR
+gate gives 58.387 / 58.358 dB, SSIM 0.99924, both PASS, in family with the
+58.4–58.6 dB range measured across earlier runs.
+
+### 20.4 Result, and a mechanism worth knowing
+
+1440p, mean over P-frames, 300 frames:
+
+| content | before | after | |
+|---|---|---|---|
+| `testsrc2` (moving) | 19.532 ms → 51.2 fps | **14.998 ms → 66.7 fps** | **+30%** |
+| `testsrc` (static) | 14.100 ms → 70.9 fps | **10.835 ms → 92.3 fps** | **+30%** |
+
+The interesting part is where the time went. Full stage breakdown:
+
+| | shadow | cavlc | gpu copy | P_wall |
+|---|---|---|---|---|
+| `testsrc` before | 3.182 | 5.604 | 0.247 | 14.100 |
+| `testsrc` after | 2.120 | **3.525** | 0.143 | 10.835 |
+| `testsrc2` before | 3.096 | 11.254 | 0.242 | 19.532 |
+| `testsrc2` after | 1.985 | **7.927** | 0.139 | 14.998 |
+
+The deltas sum to −3.245 and −4.541 ms against measured −3.265 and −4.534, so
+the budget closes. But only ~1.2 ms of it is the copy that was actually
+removed. **The larger share is CAVLC running 37% / 30% faster despite not
+being touched by this diff at all.**
+
+Every GPU stage is unchanged to three decimals (`me` 1.514→1.513, `predict`
+0.495→0.494, `deblock` 0.639→0.640, …), which is a useful cross-check that
+this only altered the readback path. The inferred mechanism for the CAVLC
+gain is cache residency: a 22 MB/frame `memcpy` was streaming through and
+evicting the `quant_levels` + nonzero-mask working set that CAVLC reads
+immediately afterwards. Removing that traffic leaves CAVLC's data resident.
+This is consistent with §19.2's finding that this workload is dominated by
+memory behaviour rather than arithmetic, and with §19.1's "batching bit
+writes moved fps by under 0.6%" — but it is an inference from the stage
+budget, not something separately proven with cache counters.
+
+Cumulative since `v0.3.0`, 1440p moving content: **45.7 → 66.7 fps (+46%)**.
+Static content: 64.9 → 92.3 fps (+42%). Quality unchanged throughout.
+
+### 20.5 A deploy gate that rejected a healthy build
+
+The first deploy attempt rolled this change back, on a gate that required
+zero `SEGV` lines in the journal window around the restart. Sunshine does
+SEGV around that restart — but in its own teardown path, not the driver.
+Two crashes, two different stacks, neither touching VA-API:
+
+- `libevdev_uinput_destroy` ← `_Sp_counted_deleter<libevdev_uinput*>` ←
+  `inputtino::KeyboardState` dispose — destroying a virtual input device on a
+  worker thread.
+- `_dl_fini` ← `__run_exit_handlers` ← `exit` — a static destructor, after
+  "Terminate handler called".
+
+Both happen on essentially every `systemctl stop` on this box, on the old
+driver as much as the new one — which is why §19.7's bisect reported
+`segv_lines=1` for the driver it simultaneously judged healthy. The run that
+got rolled back had already logged `Found H.264 encoder: h264_vaapi`.
+
+What resolved it was reading the two stack traces instead of the counter.
+The gate now keys on the currently-running pid — encoder found, no
+`Vulkan error -2`, no `allocate_encoding_buffers` failure, unit active —
+rather than on a count of a string in a time window. Deploys also now keep a
+`.prev` copy of the driver, which the earlier deploy did not.
+
+The general form, which §19.6 already stated for verification oracles and
+which applies just as well to health checks: **a signal that fires on both
+the good and the bad case carries no information.** The SEGV count was
+measuring Sunshine's exit behaviour, not this driver's viability.
