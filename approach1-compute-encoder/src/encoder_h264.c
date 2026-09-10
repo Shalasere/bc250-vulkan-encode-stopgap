@@ -2518,9 +2518,24 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     /* CBR filler padding - see maybe_append_filler()'s doc comment. Applied
      * after all real slice data is written and before the perf/size/copy
      * bookkeeping below, so BC250_PERF_STATS' bytes=%zu, the output_size
-     * guard, the memcpy, and rc_update_stats() all see the real final
-     * (possibly padded) frame size - exactly what a downstream consumer
-     * would actually receive. */
+     * guard and the memcpy all see the real final (possibly padded) frame
+     * size - exactly what a downstream consumer would actually receive.
+     *
+     * rc_update_stats() is the ONE consumer that must NOT see the padded
+     * size: filler is manufactured to make bits_used equal the per-frame
+     * target, so feeding the padded total back into the buffer model makes
+     * bits_used cancel the drain exactly and buffer_fullness can never
+     * fall. Measured consequence on real hardware (docs/DEVLOG.md §16): a
+     * large opening IDR pins buffer_fullness at its clamp, error stays
+     * positive forever, the integral term winds to full range, and QP
+     * sticks at qp_max=51 for the entire session while every frame is
+     * padded back up to the target - i.e. the picture is coded at the
+     * worst possible quality and the bitrate is spent on padding, which no
+     * amount of extra requested bitrate can improve. Real coded bits are
+     * what the feedback loop has to see; with them, QP 51 produces a tiny
+     * frame, the buffer drains, and QP recovers the way a rate controller
+     * is supposed to. */
+    size_t real_coded_bytes = total_written;
     total_written = maybe_append_filler(encoder, total_written);
 
     if (perf_stats) {
@@ -2539,7 +2554,8 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     }
     memcpy(output_buf, encoder->output_buf, total_written);
 
-    rc_update_stats(&encoder->rc, (int)(total_written * 8));
+    /* Real coded bits only - see the maybe_append_filler() comment above. */
+    rc_update_stats(&encoder->rc, (int)(real_coded_bytes * 8));
     manage_dpb(encoder, encoder->frame_num, encoder->poc);
 
     encoder->frame_num++;
@@ -2551,8 +2567,10 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         clock_gettime(CLOCK_MONOTONIC, &frame_t1);
         double wall_ms = (double)(frame_t1.tv_sec - frame_t0.tv_sec) * 1000.0 +
                          (double)(frame_t1.tv_nsec - frame_t0.tv_nsec) / 1e6;
-        fprintf(stderr, "[BC250_PERF_FRAME] frame=%u type=%s wall_ms=%.3f bytes=%zu\n",
-                encoder->frame_count - 1, is_idr ? "I" : "P", wall_ms, total_written);
+        fprintf(stderr, "[BC250_PERF_FRAME] frame=%u type=%s wall_ms=%.3f bytes=%zu qp=%d "
+                        "meas_fps=%.1f target_bpf=%u\n",
+                encoder->frame_count - 1, is_idr ? "I" : "P", wall_ms, total_written,
+                qp, encoder->rc.measured_fps, encoder->rc.target_bits_per_frame);
     }
 
     return (int)total_written;
@@ -2775,8 +2793,11 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
 
     /* CBR filler padding - see maybe_append_filler()'s doc comment. Same
      * placement rationale as h264_encoder_encode_frame: before the
-     * output_size guard/memcpy/rc_update_stats below, so they all see the
-     * real final (possibly padded) frame size. */
+     * output_size guard/memcpy below, so they see the real final (possibly
+     * padded) frame size - but rc_update_stats() below is fed the
+     * pre-filler size, for the reason documented at the corresponding
+     * point in h264_encoder_encode_frame(). */
+    size_t real_coded_bytes = total_written;
     total_written = maybe_append_filler(encoder, total_written);
 
     if (encoder->prev_y_frame) {
@@ -2793,7 +2814,8 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     }
     memcpy(output_buf, encoder->output_buf, total_written);
 
-    rc_update_stats(&encoder->rc, (int)(total_written * 8));
+    /* Real coded bits only - see the maybe_append_filler() comment above. */
+    rc_update_stats(&encoder->rc, (int)(real_coded_bytes * 8));
     manage_dpb(encoder, encoder->frame_num, encoder->poc);
 
     encoder->frame_num++;

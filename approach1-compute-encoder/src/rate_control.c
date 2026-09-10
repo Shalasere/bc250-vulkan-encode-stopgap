@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <math.h>
+#include <time.h>
 
 /*
  * rc_estimate_base_qp - derive a starting QP from the requested bitrate and
@@ -82,6 +83,11 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     rc->current_qp = base_qp;
     rc->prev_frame_sad = 0;
     rc->error_integral = 0;
+    /* Wall-clock drain state: a re-init is a fresh bucket, so forget the
+     * previous frame's timestamp rather than charging this frame for the
+     * gap across the re-init (see rc_update_stats). */
+    rc->last_frame_ns = 0;
+    rc->measured_fps = 0.0;
 
     /* Diagnostic (BC250_DEBUG_RC=1): every rc_init with the target it was
      * actually handed and the base QP that fell out of it. Added while
@@ -175,7 +181,51 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
     if (!rc) return;
 
     rc->buffer_fullness += bits_used;
-    rc->buffer_fullness -= rc->target_bits_per_frame;
+
+    /* Drain by REAL elapsed time, not a fixed per-frame quota.
+     *
+     * The bucket used to drain exactly target_bits_per_frame each call,
+     * which makes the controller enforce target_bitrate ONLY if frames
+     * actually arrive at the framerate rc_init() was given. They don't:
+     * a 1440p Sunshine session negotiates 60 fps, this compute encoder
+     * sustains ~40 fps, and the result was a measured 20.91 Mbps against
+     * a 30.99 Mbps request - with per-frame output matching
+     * target_bits_per_frame to 0.01%, i.e. rate control was tracking its
+     * target faithfully and the target itself was a third too small.
+     *
+     * Draining target_bitrate * elapsed_seconds instead is correct at any
+     * achieved frame rate: slower frames each get a proportionally larger
+     * share, so the long-run output rate converges on target_bitrate
+     * rather than on target_bitrate * (achieved_fps / negotiated_fps).
+     *
+     * The elapsed clamp keeps the first frame (no previous timestamp) and
+     * any pathological gap (a stall, a paused stream, a suspended session)
+     * from injecting a huge one-shot drain that would slam QP to qp_min;
+     * outside those cases it is a no-op. Falls back to the old fixed quota
+     * when no timestamp is available yet. See docs/DEVLOG.md §16. */
+    struct timespec now;
+    uint64_t now_ns = 0;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
+    }
+
+    int64_t drain = rc->target_bits_per_frame;   /* fallback: previous behaviour */
+    if (now_ns != 0 && rc->last_frame_ns != 0 && now_ns > rc->last_frame_ns) {
+        double elapsed = (double)(now_ns - rc->last_frame_ns) / 1e9;
+        /* Clamp to a sane inter-frame window: 1ms (1000fps) .. 250ms (4fps). */
+        if (elapsed < 0.001) elapsed = 0.001;
+        if (elapsed > 0.250) elapsed = 0.250;
+        drain = (int64_t)((double)rc->target_bitrate * elapsed);
+
+        /* Diagnostics only: EMA of achieved frame rate. */
+        double inst_fps = 1.0 / elapsed;
+        rc->measured_fps = (rc->measured_fps > 0.0)
+                             ? (rc->measured_fps * 0.95 + inst_fps * 0.05)
+                             : inst_fps;
+    }
+    if (now_ns != 0) rc->last_frame_ns = now_ns;
+
+    rc->buffer_fullness -= drain;
 
     if (rc->buffer_fullness < 0) {
         rc->buffer_fullness = 0;

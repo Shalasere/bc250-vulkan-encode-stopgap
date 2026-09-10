@@ -1948,3 +1948,146 @@ a WSL VM reconfiguration, two full fix-build-deploy-test cycles, an
 instrument that could not resolve them. **Validate the instrument
 before spending anything on what it appears to show** — §12.1 said
 this, and it needed saying twice more.
+
+---
+
+## 16. FIXED — the real cause: CBR filler was fed back into rate control, pinning QP at 51 for the whole session
+
+**User-confirmed resolved.** This is the actual root cause of the live
+quality complaint that §12–§15 chased through five wrong hypotheses.
+
+### 16.1 The bug
+
+`maybe_append_filler()` (`encoder_h264.c`) pads each frame with a
+spec-legal `filler_data_rbsp()` NAL up to the per-frame bit target when
+`cbr_intent` is set. Both encode paths then did:
+
+```c
+total_written = maybe_append_filler(encoder, total_written);
+...
+rc_update_stats(&encoder->rc, (int)(total_written * 8));   /* padded size! */
+```
+
+Filler is manufactured *precisely so that the frame hits
+`target_bits_per_frame`* — so feeding the padded total back into the
+buffer model makes reported `bits_used` cancel the bucket drain exactly,
+and `buffer_fullness` can never fall. The encoder was lying to its own
+rate controller about how many bits it had spent.
+
+Consequence, measured on hardware: the large opening IDR pushes
+`buffer_fullness` to its clamp; `error = fullness - target_level` stays
+positive forever; the integral term (§ RC_INTEGRAL_QP_RANGE = 40) winds
+to full range; and **QP saturates at `qp_max` = 51 and stays there for
+the entire session**, with every frame padded back up to the target so
+the bitrate *looks* correct. The picture is coded at the worst
+quantization the encoder permits and the bandwidth is spent on padding.
+
+### 16.2 The smoking gun, and why it was invisible for so long
+
+Per-frame instrumentation (`BC250_PERF_FRAME`, extended here to log
+`qp`, `meas_fps` and `target_bpf` alongside `bytes`):
+
+```
+frame=39   bytes=64559  qp=29
+frame=79   bytes=64559  qp=39
+frame=119  bytes=64559  qp=49
+frame=159  bytes=64559  qp=51
+frame=679  bytes=64559  qp=51        <- unchanged for the rest of the session
+```
+
+QP climbing 29→51 while the frame size never moves is impossible for a
+functioning encoder. And 64,559 bytes = 516,472 bits ≈
+`target_bits_per_frame` (516,466) — the frames were pure padding by
+construction.
+
+**This is why nothing else helped.** Every fix attempted in §13–§15 was
+downstream of a controller locked at maximum quantization, so none of
+them could produce a visible change — including this session's own
+earlier rate-control work, which correctly increased *delivered*
+bitrate (20.91 → 28.23 Mbps) and bought nothing but more filler. The
+decisive datum was per-frame **QP logged next to bytes**; bytes alone
+(available since the first instrumented session) looked like a
+correctly-tracking CBR encoder.
+
+### 16.3 The fix
+
+Feed `rc_update_stats()` the **pre-filler** byte count in both encode
+paths (`h264_encoder_encode_frame()` and `h264_encoder_encode_raw()`);
+the `output_size` guard, the `memcpy` and the perf `bytes=` field still
+see the real padded size a downstream consumer receives. With real
+coded bits in the loop, QP 51 produces a small frame, the buffer
+drains, and QP recovers — the loop is self-correcting again.
+
+Offline verification (1440p `testsrc2`, 150 frames, `-b:v 20M`):
+
+| | before | after |
+|---|---|---|
+| QP | pinned 51 | min 12, avg 30.6, max 35 |
+| frame bytes | constant 64,559 | 36,834 – 177,217 (content-adaptive) |
+
+Live verification (real remote client, 2560×1440, 31 Mbps requested,
+74 s, 2490 frames):
+
+| | before | after |
+|---|---|---|
+| QP | pinned **51** | **avg 12.0** (at `qp_min`, near-lossless) |
+| frame bytes | constant 64,559 (padding) | 2,084 – 148,542 (real picture) |
+| delivered | 28.2 Mbps, mostly filler | 18.7 Mbps of real content |
+
+A remote-client screen recording confirms it visually: sharp text
+throughout, clean QR code, smooth gradients, none of the mottling that
+motivated the whole investigation. Note the encoder now uses only ~19
+of the 31 Mbps available while sitting at the QP floor — there is
+headroom left, not a ceiling.
+
+### 16.4 Also fixed in the same pass (real, smaller)
+
+- **Wall-clock bucket drain** (`rate_control.c`): `rc_update_stats()`
+  drained a fixed `target_bits_per_frame` per call, which enforces the
+  *negotiated* frame rate rather than the achieved one. A 1440p session
+  negotiates 60 fps while this encoder sustains ~40, so the budget was
+  a third too small — measured 20.91 Mbps against a 30.99 Mbps request,
+  with bits/frame matching the target to **0.01%** (the controller was
+  tracking faithfully; the target was wrong). Now drains
+  `target_bitrate × elapsed_seconds`, correct at any achieved fps.
+- **`target_percentage` on the sequence-parameter path**
+  (`va_backend.c`, §15.5): real bug under ffmpeg's `-b:v` CLI default
+  (2× RC target), but **not** exercised by Sunshine, which sends
+  `target_percentage=100`. Kept; it was not the user's bug.
+- **`BC250_DEBUG_RC=1`** diagnostic retained (`rc_init` target/base_qp,
+  both VA-API bitrate paths) — it is how §15 and §16 were found.
+
+### 16.5 Still open
+
+- The encoder sits at `qp_min=12` and spends only ~19 of 31 Mbps, so
+  quality is now limited by the QP floor rather than by bandwidth.
+  Lowering `qp_min`, or letting the controller exploit the remaining
+  headroom, is the next quality lever.
+- `rc_estimate_base_qp()` saturates at `qp_min` for any target ≳31 Mbps
+  at 1440p30, so it cannot differentiate high targets (§15.5).
+- Two genuine spec-conformance defects, both contributing to the
+  measured ~3.7 dB per-GOP drift sawtooth, unfixed and non-urgent:
+  in-loop deblocking is **luma-only** (`deblock_filter.comp` binding 0
+  is `r8`, no chroma binding) while the bitstream signals `idc=0`
+  (§14.3); and intra prediction reads **source** rather than
+  reconstructed neighbours (`residual_predict.comp`'s own header) —
+  note this affects I-slices only, since P-slices here are pure-inter.
+- `intra_period=32767` from Sunshine means ~no periodic IDR (§13.5);
+  harmless now that drift is bounded, but it removes any mid-session
+  recovery mechanism.
+- Display blanking must be prevented for Sunshine's KMS capture to
+  initialize at all (§14.4); handled on this board by
+  `bc250-keep-display-awake.service` (systemd `--user`, enabled) plus
+  PowerDevil `idleTime=999999`. Worth folding into the install scripts.
+
+### 16.6 Method note
+
+Five hypotheses were investigated and discarded before this one: chroma
+QP (§12, a real fix but not this bug), the 10-bit capture path (§13.1),
+a GPU-sync gap (§13.2), luma-only deblocking (§14.3), and bitrate
+plumbing (§15). Four of the five were argued from *images* — how the
+corruption looked — and every one of those was wrong. The bug was found
+in under an hour once the question changed from "what does the output
+look like?" to "**what decisions is the encoder actually making?**",
+i.e. logging QP per frame beside the byte count. Prefer instrumenting
+the encoder's own state over reasoning about its output.
