@@ -60,6 +60,27 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     rc->mode = mode;
     rc->target_bitrate = bitrate > 0 ? bitrate : 5000000;
     rc->max_bitrate = rc->target_bitrate * 3 / 2;
+    /* Stays at 12. Lowering it was tried and measured as a net LOSS, so
+     * this constant is deliberate, not an oversight (docs/DEVLOG.md §18).
+     *
+     * The reasoning for lowering it looked sound: on real 1440p desktop
+     * content the controller pins at this floor with roughly a third of
+     * the requested bitrate unspent and frame-time headroom to spare
+     * (§17.3), i.e. quality appeared bounded by this constant rather than
+     * by bandwidth or throughput. Measured at qp_min=8 on a real remote
+     * client, though:
+     *
+     *   QP avg          12.0  -> 9.45   (56% of frames at the new floor)
+     *   bytes/frame   ~69,000 -> 78,842 (+14%)
+     *   encode ceiling  64.2  -> 50.1 fps (-22%)
+     *   visible quality change: none, per the user watching the stream
+     *
+     * A fifth of the encode throughput for bits nobody can see. QP 12 is
+     * already past the point of visible return on desktop content, so the
+     * unspent bitrate is genuinely spare capacity rather than a deficit to
+     * close. If a future change makes the encoder markedly cheaper per
+     * coefficient, this is worth re-measuring - but re-measure, don't
+     * assume. */
     rc->qp_min = 12;
     rc->qp_max = 51;
     rc->framerate = fps > 0 ? fps : 60.0;

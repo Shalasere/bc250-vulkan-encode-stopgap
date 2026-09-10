@@ -1612,7 +1612,16 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
      * reaction, not an opt-out of hitting the target the way real VBR is. */
     rc_init(&encoder->rc, RC_LOW_LATENCY, bitrate, (double)encoder->fps, width, height);
 
-    encoder->output_buf_size = width * height * 2 + 65536;
+    /* 4 bytes/pixel + slack. Was 2 bytes/pixel, which is ~50x more than
+     * real 1440p desktop content needs at QP 12 (measured max 148,542
+     * bytes) but NOT enough for worst-case incompressible content: 1440p
+     * random noise overflowed the old 7.4 MB at both QP 12 and QP 8 (the
+     * latter wanting ~13.5 MB/frame), and an overflow means the frame is
+     * refused outright rather than silently truncated (see slice_overflow
+     * below). At 1440p this is 14.8 MB vs 7.4 MB - an irrelevant amount of
+     * host memory for one encoder instance - and it took the pathological
+     * case from 12-of-12 frames refused to 0. */
+    encoder->output_buf_size = width * height * 4 + 65536;
     encoder->output_buf = malloc(encoder->output_buf_size);
     if (!encoder->output_buf) {
         free(encoder);
@@ -1809,6 +1818,8 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     }
 
     int qp = rc_get_frame_qp(&encoder->rc, 0);
+    /* Must track rate_control.c's rc->qp_min - see the comment there for
+     * why 12 is deliberate and what lowering it measured. */
     if (qp < 12) qp = 12;
     if (qp > 51) qp = 51;
     qp = apply_qp_override(qp);
@@ -2146,6 +2157,13 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
      * bookkeeping (which stay outside this bracket). */
     struct timespec cavlc_t0;
     if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &cavlc_t0);
+
+    /* Set if any slice did not fit output_buf - see the else branch on the
+     * NAL-assembly guard below. A frame missing a slice is not a smaller
+     * frame, it is a corrupt one (with the default BC250_SLICES_PER_FRAME=4
+     * a quarter of the picture is absent, and the gap propagates through the
+     * P-frame chain), so the frame is abandoned rather than shipped. */
+    bool slice_overflow = false;
 
     for (int s = 0; s < num_slices; s++) {
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
@@ -2511,8 +2529,23 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                                               slice_rbsp,
                                               rbsp_len);
             total_written += 5 + ebsp_len;
+        } else {
+            /* Previously this guard had no else: the slice was dropped in
+             * silence, producing a frame with valid SPS/PPS/AUD and no
+             * picture data (observed as a 1,535-byte "successful" encode on
+             * pathological content). Fail the frame loudly instead. */
+            fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
+                            "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
+                    s, num_slices, encoder->output_buf_size, total_written,
+                    (size_t)(5 + rbsp_len * 2), encoder->frame_count, qp);
+            slice_overflow = true;
         }
         free(slice_rbsp);
+        if (slice_overflow) break;
+    }
+
+    if (slice_overflow) {
+        return -1;
     }
 
     /* CBR filler padding - see maybe_append_filler()'s doc comment. Applied
@@ -2595,6 +2628,8 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     }
 
     int qp = rc_get_frame_qp(&encoder->rc, 0);
+    /* Must track rate_control.c's rc->qp_min - see the comment there for
+     * why 12 is deliberate and what lowering it measured. */
     if (qp < 12) qp = 12;
     if (qp > 51) qp = 51;
     qp = apply_qp_override(qp);
@@ -2629,6 +2664,8 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
     int slice_type = is_idr ? SLICE_TYPE_I : SLICE_TYPE_P;
     int poc_bits = encoder->sps.log2_max_poc_lsb + 4;
     int slice_qp_delta = qp - 26 - encoder->pps.pic_init_qp;
+    /* See h264_encoder_encode_frame()'s slice_overflow. */
+    bool raw_slice_overflow = false;
 
     for (int s = 0; s < num_slices; s++) {
         uint32_t start_mb = (uint32_t)(s * encoder->total_mbs / num_slices);
@@ -2787,8 +2824,21 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                                               slice_rbsp,
                                               rbsp_len);
             total_written += 5 + ebsp_len;
+        } else {
+            /* Same silent-drop hazard as h264_encoder_encode_frame() - see
+             * that function's else branch. */
+            fprintf(stderr, "[bc250-h264] slice %d/%d does not fit output_buf "
+                            "(have %zu, used %zu, need %zu) - abandoning frame %u at qp=%d\n",
+                    s, num_slices, encoder->output_buf_size, total_written,
+                    (size_t)(5 + rbsp_len * 2), encoder->frame_count, qp);
+            raw_slice_overflow = true;
         }
         free(slice_rbsp);
+        if (raw_slice_overflow) break;
+    }
+
+    if (raw_slice_overflow) {
+        return -1;
     }
 
     /* CBR filler padding - see maybe_append_filler()'s doc comment. Same

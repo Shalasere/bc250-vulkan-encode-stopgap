@@ -2175,3 +2175,87 @@ pipeline rate" was made explicit. Two different framings of the same
 data, two wrong readings, both caught only by asking what the metric
 actually brackets. Consistent with §12.1, §14.2 and §16.6: **know what
 your number measures before believing what it says.**
+
+---
+
+## 18. Tried and reverted: lowering `qp_min` is a net loss. Two real robustness fixes found on the way.
+
+§17.3 argued that with the encoder pinned at the `qp_min=12` floor,
+~16 Mbps of the requested 31 unspent, and frame-time headroom to spare,
+`qp_min` was the obvious next quality lever. Measured, it is not.
+
+### 18.1 The measurement
+
+Real remote client, 2560×1440, 31 Mbps requested, `qp_min` 12 → 8:
+
+| | `qp_min`=12 | `qp_min`=8 |
+|---|---|---|
+| QP avg | 12.0 | **9.45** (56% of frames at the new floor) |
+| bytes/frame | ~69,000 | 78,842 (+14%) |
+| encode ceiling (`wall_ms`) | 64.2 fps | **50.1 fps** (−22%) |
+| achieved under motion | ~45 fps | ~42 fps |
+| visible quality change | — | **none**, per the user watching the stream |
+
+The change engaged exactly as intended and is still a loss: a fifth of
+the encode throughput for bits that make no visible difference.
+**Reverted to 12** (`rate_control.c`'s `rc->qp_min` plus the two
+hardcoded clamps in `encoder_h264.c`, which must move together), with
+the numbers recorded at the constant so it reads as a deliberate choice
+rather than an untested default.
+
+The correction to §17.3: unspent bitrate is not automatically a deficit
+to close. QP 12 is already past the point of visible return on desktop
+content, so that headroom is spare capacity, not waste. §17.3's earlier
+reasoning — that frame rate was the scarce resource and `qp_min` should
+be left alone — was right the first time, and was talked out of itself
+by the observation that bitrate was "obviously" being wasted.
+
+### 18.2 Kept: slice overflow now fails loudly instead of shipping a corrupt frame
+
+Found while assessing whether lowering `qp_min` was safe. The
+NAL-assembly guard in both encode paths was:
+
+```c
+if (total_written + 5 + rbsp_len * 2 <= encoder->output_buf_size) {
+    /* ...write slice... */
+}          /* <- no else */
+free(slice_rbsp);
+```
+
+No `else`. An oversized slice was dropped **in silence**, shipping a
+frame with valid SPS/PPS/AUD and missing picture data. With the default
+`BC250_SLICES_PER_FRAME=4` that is a quarter of the image absent, and
+the gap propagates through the P-frame chain. This is what produced the
+1,535-byte "successful" encode observed in §15.3's noise probe.
+
+Now logs the exact shortfall and abandons the frame:
+
+```
+[bc250-h264] slice 0/1 does not fit output_buf (have 7438336, used 46,
+             need 13510785) - abandoning frame 0 at qp=8
+```
+
+Refusing a frame is strictly better than emitting a structurally-valid
+one with a hole in it: the former is a visible, diagnosable hiccup, the
+latter is silent corruption that propagates and looks like an encoder
+quality bug — precisely the class of symptom that cost §12–§16 a day.
+
+### 18.3 Kept: `output_buf_size` 2 → 4 bytes/pixel
+
+The same investigation showed the buffer was genuinely undersized for
+worst-case content. 1440p random noise overflowed the old
+`width*height*2 + 65536` (7.4 MB) at **both** QP 12 and QP 8, the latter
+wanting ~13.5 MB/frame. Real 1440p desktop content needs ~150 KB at
+QP 12, so this only bites on pathological input — but 14.8 MB vs 7.4 MB
+is an irrelevant amount of host memory for one encoder instance, and it
+took the noise case from **12-of-12 frames refused to 0**.
+
+### 18.4 Method note
+
+This is the first experiment today that was designed to be falsifiable
+before it was run — predicted effect (more bits, lower QP), predicted
+cost (encode time), and a decision rule (visible quality change or it
+gets reverted). It failed its own test and was reverted in minutes
+rather than defended. Both keepers (§18.2, §18.3) came from asking "what
+breaks if this works?" rather than from the change itself, which is a
+better return than the change would have been.
