@@ -91,6 +91,15 @@ typedef struct {
     uint8_t (*nz_cr)[4];     /* [total_mbs][4] */
     uint32_t width_in_mbs;
     uint32_t start_mb;       /* current slice's first_mb_in_slice */
+    /* PERF: quantize.comp/intra_wavefront.comp's per-4x4-block nonzero
+     * bitmask, [total_mbs*24] uint32, bit p set iff that block's raster
+     * position p quantized nonzero (see gpu_compute.h's nz_staging_buffers).
+     * block_any_nonzero() answers from this instead of reading the block, so
+     * the ~90-96% of blocks that are entirely zero are never touched in the
+     * 22MB (at 1440p) quant_levels buffer at all. NULL is legal and means
+     * "fall back to scanning" - the mask is purely an accelerator, never a
+     * source of truth the encoder cannot do without. */
+    const uint32_t *nz_mask;
 } nc_ctx_t;
 
 /* H.264 encoder state */
@@ -174,6 +183,11 @@ struct h264_encoder {
     int *coeff_shadow;        size_t coeff_shadow_cap;
     uint32_t *pred_modes_shadow; size_t pred_modes_shadow_cap;
     void *mvs_shadow;         size_t mvs_shadow_cap; /* actually gpu_mv_t*, typedef'd later in this file */
+    /* The nonzero-mask readback needs a shadow for the same reason the others
+     * do, and more so: block_any_nonzero() hits it once per block per query,
+     * which is precisely the scattered small-read pattern the GPU staging
+     * memory is worst at. It is 1/16th the size of quant_levels_shadow. */
+    uint32_t *nz_masks_shadow; size_t nz_masks_shadow_cap;
 };
 
 static void manage_dpb(h264_encoder_t *encoder, int new_frame_num, int new_poc)
@@ -354,6 +368,23 @@ static size_t maybe_append_filler(h264_encoder_t *encoder, size_t total_written)
  * macroblocks' motion vectors) was a fresh scattered read of that same
  * uncached memory, over and over, for the whole frame.
  *
+ * DO NOT DELETE THIS AS REDUNDANT. gpu_compute.c later started requesting
+ * HOST_CACHED for those same staging buffers, which looks like it addresses
+ * the identical root cause and makes this memcpy pure overhead. It does not -
+ * the two fixes are complementary, measured as a 2x2 on real hardware at
+ * 1440p (BC250_STAGING_CACHED x BC250_SHADOW_COPY, mean P-frame ms):
+ *
+ *            cached        uncached
+ *   shadow    13.76         329.92     <- memcpy itself: 3.0ms vs 319.3ms
+ *   no shadow 14.57         862.26     <- CAVLC: 5.6ms vs 857.1ms
+ *
+ * HOST_CACHED is what makes the bulk read affordable (319ms -> 3.0ms); this
+ * function is what keeps the per-MB scattered reads off that memory at all
+ * (a HOST_CACHED mapping still costs CAVLC 5.6 -> 13.1ms when read directly,
+ * so the flag alone does not make the staging buffer behave like ordinary
+ * cacheable RAM). Removing either one regresses; removing both is the
+ * original ~860ms/frame pathology.
+ *
  * This function turns that into ONE per-frame sequential streaming read
  * (the access pattern uncached/write-combined memory penalizes least) of
  * each GPU staging buffer into ordinary, cacheable malloc'd memory, done
@@ -388,7 +419,31 @@ static inline const int *coeff_block_ptr(const int *coeff, uint32_t mb_idx, int 
     return coeff + ((size_t)mb_idx * 24 + raster_block) * 16;
 }
 
-static int block_any_nonzero(const int *quant_levels, uint32_t mb_idx, int raster_block, int start_pos, int end_pos) {
+/*
+ * "Does this 4x4 block have a nonzero level anywhere in [start_pos, end_pos)?"
+ *
+ * PERF: `nz` is quantize.comp/intra_wavefront.comp's per-block nonzero bitmask
+ * (see nc_ctx_t::nz_mask). When present this answers from one 4-byte mask read
+ * instead of walking up to 16 ints out of the quant_levels readback, which at
+ * 1440p is a 22MB buffer that a BC250_NZ_AUDIT run measured to be 89.8-95.8%
+ * entirely-zero blocks - i.e. the overwhelmingly common answer to this
+ * question was being paid for at full memory cost. The bit test is EQUIVALENT
+ * to the scan, not an approximation: the shaders set bit p from the same
+ * `level != 0` test on the same value this loop would read, and that
+ * equivalence is checked block-for-block against a CPU recompute under
+ * BC250_NZ_AUDIT=1.
+ *
+ * `nz == NULL` falls back to the scan, so nothing here depends on the mask
+ * being available.
+ */
+static inline int block_any_nonzero(const int *quant_levels, const uint32_t *nz,
+                                     uint32_t mb_idx, int raster_block, int start_pos, int end_pos) {
+    if (nz) {
+        uint32_t mask = nz[(size_t)mb_idx * 24 + (uint32_t)raster_block] & 0xFFFFu;
+        /* bits [start_pos, end_pos) */
+        uint32_t range = ((end_pos >= 16) ? 0xFFFFu : ((1u << end_pos) - 1u)) & ~((1u << start_pos) - 1u);
+        return (mask & range) != 0;
+    }
     const int *blk = quant_block_ptr(quant_levels, mb_idx, raster_block);
     for (int p = start_pos; p < end_pos; p++) if (blk[p] != 0) return 1;
     return 0;
@@ -905,9 +960,9 @@ static void skip_mv_predictor(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
  * decision. Previously this read the lossy packed entropy summary
  * (mb_blocks[b]&0xFF); it now reads the real quant_levels data directly -
  * strictly more accurate, same semantic heuristic. */
-static int mb_has_any_luma_nonzero(const int *quant_levels, uint32_t mb_idx) {
+static int mb_has_any_luma_nonzero(const int *quant_levels, const uint32_t *nz, uint32_t mb_idx) {
     for (int b = 0; b < 16; b++) {
-        if (block_any_nonzero(quant_levels, mb_idx, b, 0, 16)) return 1;
+        if (block_any_nonzero(quant_levels, nz, mb_idx, b, 0, 16)) return 1;
     }
     return 0;
 }
@@ -942,7 +997,8 @@ static int mb_has_any_luma_nonzero(const int *quant_levels, uint32_t mb_idx) {
  * cbp_chroma (see encode_mb_p16x16/encode_mb_i16x16 and their CABAC
  * counterparts) - this is not a new heuristic, just applying the same
  * existing test to the skip decision. */
-static int mb_has_any_chroma_nonzero(const int *quant_levels, const int *coeff, uint32_t mb_idx) {
+static int mb_has_any_chroma_nonzero(const int *quant_levels, const int *coeff,
+                                      const uint32_t *nz, uint32_t mb_idx) {
     int cb_dc_raw[4], cr_dc_raw[4];
     for (int i = 0; i < 4; i++) cb_dc_raw[i] = coeff_block_ptr(coeff, mb_idx, 16 + i)[0];
     for (int i = 0; i < 4; i++) cr_dc_raw[i] = coeff_block_ptr(coeff, mb_idx, 20 + i)[0];
@@ -952,7 +1008,7 @@ static int mb_has_any_chroma_nonzero(const int *quant_levels, const int *coeff, 
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) return 1;
 
     for (int b = 16; b < 24; b++) {
-        if (block_any_nonzero(quant_levels, mb_idx, b, 1, 16)) return 1;
+        if (block_any_nonzero(quant_levels, nz, mb_idx, b, 1, 16)) return 1;
     }
     return 0;
 }
@@ -990,7 +1046,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
     /* cbp_luma: any nonzero AC (raster positions 1..15) across all 16 luma blocks. */
     int cbp_luma_flag = 0;
     for (int blk = 0; blk < 16 && !cbp_luma_flag; blk++) {
-        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) cbp_luma_flag = 1;
+        if (block_any_nonzero(quant_levels, nc->nz_mask, mb, blk, 1, 16)) cbp_luma_flag = 1;
     }
 
     /* Chroma DC (Hadamard) + cbp_chroma. */
@@ -1021,7 +1077,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
     int chroma_ac_nonzero = 0;
     for (int blk = 16; blk < 24 && !chroma_ac_nonzero; blk++) {
-        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
+        if (block_any_nonzero(quant_levels, nc->nz_mask, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
     }
     int cbp_chroma = chroma_ac_nonzero ? 2 : (chroma_dc_nonzero ? 1 : 0);
 
@@ -1113,7 +1169,7 @@ static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int
         for (int sub = 0; sub < 4 && !any; sub++) {
             int blk_idx = q * 4 + sub;
             int raster = gpu_raster_block_idx(blk_idx);
-            if (block_any_nonzero(quant_levels, mb, raster, 0, 16)) any = 1;
+            if (block_any_nonzero(quant_levels, nc->nz_mask, mb, raster, 0, 16)) any = 1;
         }
         if (any) luma_cbp |= (1 << q);
     }
@@ -1132,7 +1188,7 @@ static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
     int chroma_ac_nonzero = 0;
     for (int blk = 16; blk < 24 && !chroma_ac_nonzero; blk++) {
-        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
+        if (block_any_nonzero(quant_levels, nc->nz_mask, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
     }
     int cbp_chroma = chroma_ac_nonzero ? 2 : (chroma_dc_nonzero ? 1 : 0);
 
@@ -1313,7 +1369,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
 
     int cbp_luma_flag = 0;
     for (int blk = 0; blk < 16 && !cbp_luma_flag; blk++) {
-        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) cbp_luma_flag = 1;
+        if (block_any_nonzero(quant_levels, nc->nz_mask, mb, blk, 1, 16)) cbp_luma_flag = 1;
     }
 
     int cb_dc_raw[4], cr_dc_raw[4];
@@ -1328,7 +1384,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
     int chroma_ac_nonzero = 0;
     for (int blk = 16; blk < 24 && !chroma_ac_nonzero; blk++) {
-        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
+        if (block_any_nonzero(quant_levels, nc->nz_mask, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
     }
     int cbp_chroma = chroma_ac_nonzero ? 2 : (chroma_dc_nonzero ? 1 : 0);
 
@@ -1426,7 +1482,7 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
         for (int sub = 0; sub < 4 && !any; sub++) {
             int blk_idx = q * 4 + sub;
             int raster = gpu_raster_block_idx(blk_idx);
-            if (block_any_nonzero(quant_levels, mb, raster, 0, 16)) any = 1;
+            if (block_any_nonzero(quant_levels, nc->nz_mask, mb, raster, 0, 16)) any = 1;
         }
         if (any) luma_cbp |= (1 << q);
     }
@@ -1443,7 +1499,7 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
     int chroma_ac_nonzero = 0;
     for (int blk = 16; blk < 24 && !chroma_ac_nonzero; blk++) {
-        if (block_any_nonzero(quant_levels, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
+        if (block_any_nonzero(quant_levels, nc->nz_mask, mb, blk, 1, 16)) chroma_ac_nonzero = 1;
     }
     int cbp_chroma = chroma_ac_nonzero ? 2 : (chroma_dc_nonzero ? 1 : 0);
 
@@ -1807,6 +1863,21 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     struct timespec frame_t0;
     if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &frame_t0);
 
+    /* PERF toggle (BC250_SHADOW_COPY=0 disables), read once per process.
+     * See the shadow_copy() call site below and shadow_copy()'s doc comment. */
+    static int shadow_copy_enabled = -1;
+    if (shadow_copy_enabled < 0) {
+        const char *sc_env = getenv("BC250_SHADOW_COPY");
+        shadow_copy_enabled = (sc_env && strcmp(sc_env, "0") == 0) ? 0 : 1;
+    }
+    /* PERF/verification toggle (BC250_NZ_MASK=0 disables) - see the
+     * gpu_compute_get_nz_staging_data() call below. */
+    static int nz_mask_disabled = -1;
+    if (nz_mask_disabled < 0) {
+        const char *nz_env = getenv("BC250_NZ_MASK");
+        nz_mask_disabled = (nz_env && strcmp(nz_env, "0") == 0) ? 1 : 0;
+    }
+
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr;
     encoder->force_idr = false;
 
@@ -1866,6 +1937,10 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     const int *coeff = NULL;
     const uint32_t *pred_modes = NULL;
     const gpu_mv_t *mvs = NULL;
+    /* Per-4x4-block nonzero bitmask (see nc_ctx_t::nz_mask). Left NULL on
+     * every path that produces no new GPU output this frame, exactly like the
+     * four above; block_any_nonzero() then falls back to scanning. */
+    const uint32_t *nz_masks = NULL;
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE
         && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
         /* begin_picture()'s own vkWaitForFences is now checked (see its doc
@@ -1916,6 +1991,16 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0) {
             mvs = (const gpu_mv_t *)mv_data;
         }
+        void *nz_data = NULL;
+        size_t nz_size = 0;
+        /* BC250_NZ_MASK=0 forces the pre-mask behaviour (block_any_nonzero()
+         * scans quant_levels). The mask is an accelerator that must be exactly
+         * equivalent to the scan, so this toggle is the A/B that proves it:
+         * one binary, same content, output must be byte-identical. */
+        if (!nz_mask_disabled &&
+            gpu_compute_get_nz_staging_data(gpu_ctx, &nz_data, &nz_size) == 0) {
+            nz_masks = (const uint32_t *)nz_data;
+        }
 
         /* PERF: copy each GPU staging buffer once into cacheable host memory
          * before any of this function's repeated per-MB/per-block reads
@@ -1933,6 +2018,12 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         struct timespec shadow_t0, shadow_t1;
         if (perf_stats) clock_gettime(CLOCK_MONOTONIC, &shadow_t0);
 
+        /* BC250_SHADOW_COPY=0 skips the four bulk memcpys and reads the mapped
+         * staging buffers directly. This is a measurement toggle, not a
+         * correctness one: shadow_copy() only changes WHERE a byte is read
+         * from, so output is byte-identical either way (verified). See
+         * shadow_copy()'s doc comment for why it may now be redundant. */
+        if (shadow_copy_enabled) {
         quant_levels = (const int *)shadow_copy((void **)&encoder->quant_levels_shadow,
                                                  &encoder->quant_levels_shadow_cap,
                                                  quant_levels, quant_size);
@@ -1945,15 +2036,66 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         mvs = (const gpu_mv_t *)shadow_copy((void **)&encoder->mvs_shadow,
                                              &encoder->mvs_shadow_cap,
                                              mvs, mv_size);
+        nz_masks = (const uint32_t *)shadow_copy((void **)&encoder->nz_masks_shadow,
+                                                  &encoder->nz_masks_shadow_cap,
+                                                  nz_masks, nz_size);
+        }
 
         if (perf_stats) {
             clock_gettime(CLOCK_MONOTONIC, &shadow_t1);
             double shadow_ms = (double)(shadow_t1.tv_sec - shadow_t0.tv_sec) * 1000.0 +
                                 (double)(shadow_t1.tv_nsec - shadow_t0.tv_nsec) / 1e6;
             fprintf(stderr, "[BC250_PERF_SHADOW] frame=%u type=%s shadow_copy_ms=%.3f "
-                            "quant_bytes=%zu coeff_bytes=%zu pred_mode_bytes=%zu mv_bytes=%zu\n",
+                            "quant_bytes=%zu coeff_bytes=%zu pred_mode_bytes=%zu mv_bytes=%zu "
+                            "nz_bytes=%zu\n",
                     encoder->frame_count, is_idr ? "I" : "P", shadow_ms,
-                    quant_size, coeff_size, pred_mode_size, mv_size);
+                    quant_size, coeff_size, pred_mode_size, mv_size, nz_size);
+        }
+
+        /* DIAGNOSTIC ONLY (BC250_NZ_AUDIT=1): before anything is allowed to
+         * DEPEND on quantize.comp's per-block nonzero bitmask, prove two
+         * things about it on real board data:
+         *
+         *   1. CORRECTNESS - recompute the mask on the CPU straight from
+         *      quant_levels and require an exact match on every block. The
+         *      mask is meant to be an exact restatement of `level != 0`, so
+         *      any mismatch at all means the GPU buffer, the std430 layout
+         *      assumption, or the double-buffer/fence contract is wrong, and
+         *      a bit test against it would silently corrupt cbp / the P_Skip
+         *      decision rather than just running slow.
+         *   2. HEADROOM - report how many blocks are entirely zero, and how
+         *      many have zero AC (positions 1..15). Those are exactly the
+         *      blocks a mask-guided CAVLC would never have to read, so this
+         *      is the measured ceiling on the optimization BEFORE writing it.
+         *      If the density says there is little to skip, the refactor is
+         *      not worth doing.
+         *
+         * Deliberately runs OUTSIDE the perf_stats timing brackets and is off
+         * by default: it reads all of quant_levels a second time. */
+        if (nz_masks && quant_levels && getenv("BC250_NZ_AUDIT") &&
+            nz_size >= (size_t)encoder->total_mbs * 24 * sizeof(uint32_t) &&
+            quant_size >= (size_t)encoder->total_mbs * 24 * 16 * sizeof(int)) {
+            uint32_t total_blocks = encoder->total_mbs * 24;
+            uint32_t mismatches = 0, all_zero = 0, ac_zero = 0;
+            uint32_t first_bad_block = 0;
+            for (uint32_t b = 0; b < total_blocks; b++) {
+                const int *blk = quant_levels + (size_t)b * 16;
+                uint32_t cpu_mask = 0;
+                for (int p = 0; p < 16; p++) if (blk[p] != 0) cpu_mask |= (1u << p);
+                uint32_t gpu_mask = nz_masks[b] & 0xFFFFu;
+                if (cpu_mask != gpu_mask) {
+                    if (mismatches == 0) first_bad_block = b;
+                    mismatches++;
+                }
+                if (cpu_mask == 0) all_zero++;
+                if ((cpu_mask & 0xFFFEu) == 0) ac_zero++;
+            }
+            fprintf(stderr, "[BC250_NZ_AUDIT] frame=%u type=%s blocks=%u mismatches=%u "
+                            "first_bad=%u all_zero=%u (%.1f%%) ac_zero=%u (%.1f%%)\n",
+                    encoder->frame_count, is_idr ? "I" : "P", total_blocks, mismatches,
+                    mismatches ? first_bad_block : 0,
+                    all_zero, total_blocks ? 100.0 * all_zero / total_blocks : 0.0,
+                    ac_zero, total_blocks ? 100.0 * ac_zero / total_blocks : 0.0);
         }
 
         /* Opt-in debug instrumentation (BC250_DUMP_QUANT_LEVELS=1), kept as
@@ -2252,6 +2394,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
             .nz_cr = encoder->nz_cr,
             .width_in_mbs = encoder->width_in_mbs,
             .start_mb = start_mb,
+            .nz_mask = nz_masks,
         };
 
         size_t rbsp_len;
@@ -2336,10 +2479,10 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                  * (0,0)) a few dozen frames upstream of, and one macroblock
                  * away from, the originally-reported gradient-boundary pixel
                  * defect at mbx=21/mby=59. See docs/DEVLOG.md. */
-                bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
+                bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, nz_masks, mb) == 0) : true;
                 /* See mb_has_any_chroma_nonzero()'s doc comment: a P_Skip MB
                  * must have zero residual for chroma too, not just luma. */
-                bool zero_chroma_residual = (quant_levels && coeff) ? (mb_has_any_chroma_nonzero(quant_levels, coeff, mb) == 0) : true;
+                bool zero_chroma_residual = (quant_levels && coeff) ? (mb_has_any_chroma_nonzero(quant_levels, coeff, nz_masks, mb) == 0) : true;
                 bool mv_matches_predictor = true;
                 if (mvs) {
                     int pred_x, pred_y;
@@ -2441,11 +2584,11 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                      * CABAC just codes the decision differently (an explicit
                      * mb_skip_flag per MB, ITU-T 9.3.3.1.1.1, instead of an
                      * accumulated mb_skip_run). */
-                    bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, mb) == 0) : true;
+                    bool zero_luma_residual = quant_levels ? (mb_has_any_luma_nonzero(quant_levels, nz_masks, mb) == 0) : true;
                     /* See mb_has_any_chroma_nonzero()'s doc comment: a P_Skip
                      * MB must have zero residual for chroma too, not just
                      * luma. */
-                    bool zero_chroma_residual = (quant_levels && coeff) ? (mb_has_any_chroma_nonzero(quant_levels, coeff, mb) == 0) : true;
+                    bool zero_chroma_residual = (quant_levels && coeff) ? (mb_has_any_chroma_nonzero(quant_levels, coeff, nz_masks, mb) == 0) : true;
                     bool mv_matches_predictor = true;
                     if (mvs) {
                         int pred_x, pred_y;
@@ -2893,5 +3036,6 @@ void h264_encoder_destroy(h264_encoder_t *encoder)
     if (encoder->coeff_shadow) free(encoder->coeff_shadow);
     if (encoder->pred_modes_shadow) free(encoder->pred_modes_shadow);
     if (encoder->mvs_shadow) free(encoder->mvs_shadow);
+    if (encoder->nz_masks_shadow) free(encoder->nz_masks_shadow);
     free(encoder);
 }

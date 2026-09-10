@@ -30,6 +30,8 @@ Validated on physical hardware.
 
 **Performance**: 267 fps @ 640x480, 179 @ 720p, 100-134 @ 1080p, 67-80 @ 1440p — real-time or above throughout. GPU shaders are <1.5% of frame time; the remaining bottlenecks are CPU/memory-side. GPU contention against a concurrent game: ~8.4%.
 
+On moving 1440p content the encode ceiling is **52 fps**, up 12.6% from 46 fps: the GPU now hands the CPU a per-4x4-block nonzero bitmask, so the ~90-96% of blocks that quantize to all-zero are never read out of the 22 MB coefficient buffer. That cut CAVLC time ~20% at every resolution tested. `docs/DEVLOG.md` §19.
+
 - `tools/setup_bazzite.sh` — verified end-to-end on real Bazzite (installs, persists, `vainfo` sees it).
 - Test suite: all 4 binaries run and assert (not always true historically — see [Known Limitations](#known-limitations)).
 - **CABAC** (`feature/h264-cabac`, ITU-T 9.3, adapted from x264, GPL-2.0-or-later): auto-selected for Main/High profile or via `BC250_USE_CABAC=1`. 10-13% smaller output than CAVLC at matched QP, ~28% more CPU, still well above real-time. Scope: I_16x16 intra / P_L0_16x16 inter only.
@@ -42,6 +44,7 @@ Validated on physical hardware.
 - **`qp_min=12` is deliberate, and lowering it is a measured net loss** — don't "fix" it. At 1440p the encoder settles at QP 12 spending ~15-19 of 31 Mbps, which looks like wasted bandwidth; taking the floor to 8 spent 14% more bits for **−22% encode throughput and no visible quality change**. QP 12 is past the point of visible return on desktop content. `docs/DEVLOG.md` §18.
 - **Do not install `tools/bc250_sunshine_shim.c`.** It is kept only as a documented technique for `LD_PRELOAD`ing into an `AT_SECURE` binary. It was written to work around what turned out to be a rate-control bug (§16), was never load-bearing, and costs roughly 40% of your frame rate by forcing Sunshine off its zero-copy capture path. `docs/DEVLOG.md` §17.
 - **Rate control caveat**: `rc_estimate_base_qp()` saturates at `qp_min` for any target above roughly 31 Mbps at 1440p30, so it cannot differentiate high bitrate targets from each other.
+- **Output is not bit-reproducible on moving content.** Three runs of an identical configuration produce three different (all valid) bitstreams, differing ~0.02% in size — most likely GPU-side tie-breaking in motion estimation. It is only bit-reproducible on content that pins at `qp_min`. This matters if you are verifying a change: byte-exactness is a valid gate only on static/`qp_min` content, and anywhere else you need the PSNR gate plus repeated runs to separate your change from the encoder's own variance. `docs/DEVLOG.md` §19.6.
 - **Two known spec-conformance gaps** (together ~3.7 dB of per-GOP drift, not visually significant): in-loop deblocking is **luma-only** while the bitstream signals `disable_deblocking_filter_idc=0`; and I-slice intra prediction reads *source* rather than reconstructed neighbours. `docs/DEVLOG.md` §14.3.
 - **`build_and_install.sh`** doesn't work on immutable distros (wrote to read-only `/usr`, reported success anyway) — use `setup_bazzite.sh`/`setup_steamos.sh`.
 - **Releases before `v0.2.1`** predate real-client validation and hit 3 now-fixed defects (bad QP field, dropped chroma residual, undersized bitstream buffer). Use `v0.2.1`+.

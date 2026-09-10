@@ -94,16 +94,24 @@ static uint32_t find_memory_type(VkPhysicalDevice physical_device, uint32_t type
  * existing fence wait with no added vkInvalidateMappedMemoryRanges/
  * vkFlushMappedMemoryRanges calls needed), and not a single byte of what
  * either side reads or writes - purely a CPU-read-speed optimization. */
+/* Records the memory type index the most recent preferred-search settled on,
+ * so init can report what the staging buffers ACTUALLY got rather than what
+ * was asked for - a silently-ignored preference and a silently-ignored env
+ * toggle look identical in a timing run otherwise. */
+static uint32_t g_last_preferred_memtype = UINT32_MAX;
+
 static uint32_t find_memory_type_preferred(VkPhysicalDevice physical_device, uint32_t type_filter,
                                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags required) {
     VkPhysicalDeviceMemoryProperties mem_props;
     vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_props);
     for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
         if ((type_filter & (1 << i)) && (mem_props.memoryTypes[i].propertyFlags & preferred) == preferred) {
+            g_last_preferred_memtype = i;
             return i;
         }
     }
-    return find_memory_type(physical_device, type_filter, required);
+    g_last_preferred_memtype = find_memory_type(physical_device, type_filter, required);
+    return g_last_preferred_memtype;
 }
 
 static int create_buffer_with_memory(gpu_context_t *ctx, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer *buffer, VkDeviceMemory *memory) {
@@ -285,6 +293,16 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
             ctx->mv_staging_buffers[i] = VK_NULL_HANDLE;
             ctx->mv_staging_memories[i] = VK_NULL_HANDLE;
         }
+        if (ctx->nz_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->nz_staging_memories[i]);
+            ctx->nz_staging_mapped[i] = NULL;
+        }
+        if (ctx->nz_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->nz_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->nz_staging_memories[i], NULL);
+            ctx->nz_staging_buffers[i] = VK_NULL_HANDLE;
+            ctx->nz_staging_memories[i] = VK_NULL_HANDLE;
+        }
     }
 
     ctx->frame_width = width;
@@ -307,13 +325,16 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     ctx->coeff_staging_size = coeff_size;
     ctx->pred_mode_staging_size = pred_mode_size;
     ctx->mv_staging_size = mv_size;
+    ctx->nz_staging_size = nz_count_size;
 
     create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
     create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->residual_buffer, &ctx->residual_memory);
     create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_buffer, &ctx->pred_memory);
     create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->coeff_buffer, &ctx->coeff_memory);
     create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->quant_levels_buffer, &ctx->quant_levels_memory);
-    create_buffer_with_memory(ctx, nz_count_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->nz_count_buffer, &ctx->nz_count_memory);
+    /* TRANSFER_SRC added so the per-block nonzero mask can be read back - see
+     * gpu_compute.h's nz_staging_buffers and quantize.comp's NonZeroMask. */
+    create_buffer_with_memory(ctx, nz_count_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->nz_count_buffer, &ctx->nz_count_memory);
     create_buffer_with_memory(ctx, pred_mode_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_mode_buffer, &ctx->pred_mode_memory);
     create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->entropy_buffer, &ctx->entropy_memory);
     create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[0], &ctx->staging_memories[0]);
@@ -328,6 +349,19 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
      * and are deliberately left on plain create_buffer_with_memory(). */
     VkMemoryPropertyFlags cached_pref = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
     VkMemoryPropertyFlags visible_req = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    /* PERF measurement toggle (BC250_STAGING_CACHED=0): drop the HOST_CACHED
+     * preference, restoring the pre-fix uncached/write-combined behaviour.
+     * Exists so the HOST_CACHED memory type and encoder_h264.c's shadow_copy()
+     * - two independently-added fixes for the SAME uncached-read problem - can
+     * be A/B'd against each other in one binary instead of being assumed to
+     * both still be needed. Memory-type choice cannot change encoded output. */
+    {
+        const char *sc = getenv("BC250_STAGING_CACHED");
+        if (sc && strcmp(sc, "0") == 0) {
+            cached_pref = visible_req;
+            fprintf(stderr, "[bc250-gpu] BC250_STAGING_CACHED=0: staging buffers forced uncached\n");
+        }
+    }
     create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[0], &ctx->quant_staging_memories[0]);
     create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[1], &ctx->quant_staging_memories[1]);
     create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[0], &ctx->coeff_staging_memories[0]);
@@ -336,6 +370,17 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
     create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
     create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
+    create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[0], &ctx->nz_staging_memories[0]);
+    create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[1], &ctx->nz_staging_memories[1]);
+    {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &mp);
+        VkMemoryPropertyFlags f = (g_last_preferred_memtype < mp.memoryTypeCount)
+                                  ? mp.memoryTypes[g_last_preferred_memtype].propertyFlags : 0;
+        fprintf(stderr, "[bc250-gpu] readback staging memtype[%u] flags=0x%x %s\n",
+                g_last_preferred_memtype, f,
+                (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "HOST_CACHED" : "UNCACHED");
+    }
 
     /* Persistently map all staging buffers to eliminate per-frame map/unmap syscall overhead */
     vkMapMemory(ctx->device, ctx->staging_memories[0], 0, entropy_size, 0, &ctx->staging_mapped[0]);
@@ -348,6 +393,8 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     vkMapMemory(ctx->device, ctx->pred_mode_staging_memories[1], 0, pred_mode_size, 0, &ctx->pred_mode_staging_mapped[1]);
     vkMapMemory(ctx->device, ctx->mv_staging_memories[0], 0, mv_size, 0, &ctx->mv_staging_mapped[0]);
     vkMapMemory(ctx->device, ctx->mv_staging_memories[1], 0, mv_size, 0, &ctx->mv_staging_mapped[1]);
+    vkMapMemory(ctx->device, ctx->nz_staging_memories[0], 0, nz_count_size, 0, &ctx->nz_staging_mapped[0]);
+    vkMapMemory(ctx->device, ctx->nz_staging_memories[1], 0, nz_count_size, 0, &ctx->nz_staging_mapped[1]);
 
     /* Update buffer descriptors */
     update_storage_buffer_descriptor(ctx->device, ctx->me_desc_set, 2, ctx->mv_buffer, mv_size);
@@ -400,6 +447,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 4, ctx->quant_levels_buffer, quant_levels_size);
     update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 5, ctx->coeff_buffer, coeff_size);
     update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 6, ctx->pred_mode_buffer, pred_mode_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 7, ctx->nz_count_buffer, nz_count_size);
 
     return 0;
 }
@@ -865,9 +913,16 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 7 = nz_count_buffer (the per-block nonzero mask). This
+         * shader writes quant levels for I-slices on its own path, entirely
+         * bypassing quantize.comp, so without writing the mask here too the
+         * mask would be a stale P-frame's on every I-frame. Measured: a
+         * BC250_NZ_AUDIT run caught exactly that - 13443 of 345600 blocks
+         * mismatched on frame 0 and zero mismatches on every P frame. */
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = intra_wavefront_bindings };
+    VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 8, .pBindings = intra_wavefront_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &intra_wavefront_layout_info, NULL, &ctx->intra_wavefront_desc_layout);
 
     /* Descriptor Pool */
@@ -2024,6 +2079,13 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     VkBufferCopy mv_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->mv_staging_size };
     vkCmdCopyBuffer(cmd_buf, ctx->mv_buffer, ctx->mv_staging_buffers[ctx->current_buf], 1, &mv_copy_region);
 
+    /* And quantize.comp's per-block nonzero bitmask - 1/16th the size of the
+     * quant_levels copy above, and it lets the CPU answer every
+     * "is this block/MB all zero" question without reading quant_levels at
+     * all. See gpu_compute_get_nz_staging_data(). */
+    VkBufferCopy nz_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->nz_staging_size };
+    vkCmdCopyBuffer(cmd_buf, ctx->nz_count_buffer, ctx->nz_staging_buffers[ctx->current_buf], 1, &nz_copy_region);
+
     /* ctx->recon_image is now populated directly by Stage 4.5 (Reconstruct)
      * above via real dequant+IDCT+add-back+clip - see that stage's comment.
      * This replaces the old raw vkCmdCopyImage-from-render_target (source
@@ -2233,6 +2295,14 @@ int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *siz
     int prev_buf = (ctx->current_buf + 1) % 2;
     *size = ctx->mv_staging_size;
     *data = ctx->mv_staging_mapped[prev_buf];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_nz_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
+    if (!ctx || !data || !size) return -1;
+    int prev_buf = (ctx->current_buf + 1) % 2;
+    *size = ctx->nz_staging_size;
+    *data = ctx->nz_staging_mapped[prev_buf];
     return (*data != NULL) ? 0 : -1;
 }
 

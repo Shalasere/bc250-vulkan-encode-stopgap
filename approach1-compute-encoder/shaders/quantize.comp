@@ -10,7 +10,16 @@ layout(std430, set = 0, binding = 1) writeonly buffer OutputLevels {
     int levels[];
 };
 
-layout(std430, set = 0, binding = 2) writeonly buffer NonZeroCount {
+/* Per-4x4-block nonzero BITMASK (bit p set iff levels[p] != 0), one uint per
+ * block. This used to hold a plain nonzero COUNT that nothing ever read - the
+ * buffer was device-local with no host staging and no CPU consumer. A mask is
+ * strictly more informative than the count (the count is its popcount) and is
+ * what encoder_h264.c actually needs: every "does this block have a nonzero
+ * coefficient in positions [start,end)" question it asks - the P_Skip
+ * decision, cbp_luma, cbp_chroma, the CAVLC per-block early-out - becomes a
+ * bit test against this instead of a fresh 64-byte read out of the (22MB at
+ * 1440p) quant_levels readback. See gpu_compute.h's nz_staging_buffers. */
+layout(std430, set = 0, binding = 2) writeonly buffer NonZeroMask {
     uint nzc[];
 };
 
@@ -86,7 +95,7 @@ void main() {
 
     // Rounding offset: 1/3 for intra, 1/6 for inter
     int f = (1 << (15 + qp_per)) / (pcs.is_intra == 1 ? 3 : 6);
-    uint count = 0;
+    uint nz_mask = 0;
 
     for (int i = 0; i < 16; i++) {
         int coeff = coeffs[global_block_idx * 16 + i];
@@ -98,8 +107,8 @@ void main() {
         level *= sign;
 
         levels[global_block_idx * 16 + i] = level;
-        if (level != 0) count++;
+        if (level != 0) nz_mask |= (1u << uint(i));
     }
 
-    nzc[global_block_idx] = count;
+    nzc[global_block_idx] = nz_mask;
 }

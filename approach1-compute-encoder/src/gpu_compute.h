@@ -188,6 +188,21 @@ typedef struct bc250_gpu_context {
     void *mv_staging_mapped[2];
     VkDeviceSize mv_staging_size;
 
+    /* Host-visible readback of quantize.comp's per-4x4-block nonzero BITMASK
+     * (nz_count_buffer, one uint32 per block, bit i set iff levels[i] != 0).
+     *
+     * PERF: this is 1/16th the size of quant_staging_buffers and answers every
+     * "does this block/MB have a nonzero coefficient" question the CPU asks -
+     * questions that previously each rescanned the full 64-byte block out of
+     * the 22MB (at 1440p) quant_levels readback. The shader already computed
+     * this information per block and threw it away; nothing read
+     * nz_count_buffer at all before. Same double-buffer contract as the other
+     * staging buffers. */
+    VkBuffer nz_staging_buffers[2];
+    VkDeviceMemory nz_staging_memories[2];
+    void *nz_staging_mapped[2];
+    VkDeviceSize nz_staging_size;
+
     /* Reconstructed frame for DPB */
     gpu_image_t recon_image;
     gpu_memory_t recon_memory;
@@ -385,6 +400,14 @@ int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size
  * (16 bytes/entry, matching the GPU's std430 MotionVector struct). Only
  * meaningful for P-slices. Same fence-safe double-buffer contract as above. */
 int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+
+/* Per-4x4-block nonzero bitmask from quantize.comp, one uint32 per block laid
+ * out as num_mbs*24 entries, index = mb_idx*24 + block_idx, with bit p set iff
+ * that block's raster position p quantized to a nonzero level. Exactly derived
+ * from the same `level != 0` test that produces quant_levels, so a bit test on
+ * this is equivalent to - not an approximation of - scanning the block itself.
+ * Same fence-safe double-buffer contract as above. */
+int gpu_compute_get_nz_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 
 /* TEMPORARY debug instrumentation for Part A (reconstruction) verification -
  * see gpu_compute.c for details. No-op unless BC250_DUMP_RECON_FRAMES=1. */

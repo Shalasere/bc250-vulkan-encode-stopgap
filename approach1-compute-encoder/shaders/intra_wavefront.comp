@@ -145,6 +145,18 @@ layout(std430, set = 0, binding = 5) writeonly buffer CoeffBuf {
 layout(std430, set = 0, binding = 6) writeonly buffer PredModeOut {
     uint pred_modes[];
 };
+/* Per-4x4-block nonzero bitmask, same buffer and same meaning as
+ * quantize.comp's NonZeroMask (bit p set iff levels[p] != 0). This shader
+ * produces I-slice levels on its own path without ever running
+ * quantize.comp, so it MUST maintain this too - otherwise every I-frame's
+ * mask is a leftover from the last P-frame, and anything on the CPU that
+ * trusts the mask (cbp_luma/cbp_chroma, the P_Skip decision, the CAVLC
+ * per-block early-out) reads the wrong answer. Caught in exactly that state
+ * by a BC250_NZ_AUDIT run: 0 mismatches on every P frame, 13443 of 345600
+ * blocks wrong on the I frame. */
+layout(std430, set = 0, binding = 7) writeonly buffer NonZeroMask {
+    uint nzc[];
+};
 
 layout(push_constant) uniform PushConstants {
     uint frame_width;
@@ -509,11 +521,14 @@ void main() {
         s_dc_in[block_id] = coeff_block[0];
 
         levels[global_block_idx * 16u + 0u] = 0; /* DC handled separately below; AC quantizer's own position-0 output is unused */
+        uint nz_mask = 0u; /* bit 0 stays clear: position 0 is written as 0 above */
         for (int p = 1; p < 16; p++) {
             int level = quantize_ac(coeff_block[p], p, qp_per, qp_rem, f_ac);
             s_ac_level[block_id][p] = level;
             levels[global_block_idx * 16u + uint(p)] = level;
+            if (level != 0) nz_mask |= (1u << uint(p));
         }
+        nzc[global_block_idx] = nz_mask;
     }
     barrier();
 
@@ -649,6 +664,7 @@ void main() {
 
         levels[cb_global * 16u + 0u] = 0;
         levels[cr_global * 16u + 0u] = 0;
+        uint cb_mask = 0u, cr_mask = 0u; /* bit 0 stays clear, as for luma above */
         for (int p = 1; p < 16; p++) {
             int cb_level = quantize_ac(cb_coeff[p], p, qp_per_c, qp_rem_c, f_ac_c);
             int cr_level = quantize_ac(cr_coeff[p], p, qp_per_c, qp_rem_c, f_ac_c);
@@ -656,7 +672,11 @@ void main() {
             s_cr_ac_level[sub][p] = cr_level;
             levels[cb_global * 16u + uint(p)] = cb_level;
             levels[cr_global * 16u + uint(p)] = cr_level;
+            if (cb_level != 0) cb_mask |= (1u << uint(p));
+            if (cr_level != 0) cr_mask |= (1u << uint(p));
         }
+        nzc[cb_global] = cb_mask;
+        nzc[cr_global] = cr_mask;
     }
     barrier();
 

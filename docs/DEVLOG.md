@@ -2259,3 +2259,162 @@ gets reverted). It failed its own test and was reverted in minutes
 rather than defended. Both keepers (§18.2, §18.3) came from asking "what
 breaks if this works?" rather than from the change itself, which is a
 better return than the change would have been.
+
+---
+
+## 19. Optimization: the CPU was moving ~66 MB/frame to emit 14 KB. A GPU-side nonzero mask removes most of it.
+
+Post-`v0.3.0`, the remaining lever was named as "the CPU-side CAVLC path".
+That turned out to be right about the location and wrong about the reason:
+CAVLC is not compute-bound on entropy coding, it is bandwidth-bound on
+scanning a buffer that is almost entirely zeroes.
+
+### 19.1 Where the 1440p frame time actually goes
+
+Measured with the shipped driver (all `BC250_PERF_STATS` instrumentation is
+runtime `getenv`-gated, so no special build is needed), 300 frames, mean
+over P-frames:
+
+| stage | `testsrc` (QP 12) | `testsrc2` (QP 25) | scales with content? |
+|---|---|---|---|
+| CAVLC (CPU) | 5.44 ms (40%) | 11.19 ms (58%) | **yes, 2.1×** |
+| `shadow_copy` (CPU) | 3.03 ms (22%) | 2.92 ms (15%) | no |
+| GPU total | 4.08 ms (30%) | 4.93 ms (25%) | mildly (ME 1.5→2.3) |
+| unaccounted | ~1.1 ms | ~0.4 ms | |
+| **wall** | **13.69 ms → 71.9 fps** | **19.26 ms → 51.3 fps** | |
+
+This bracketed the real-session figure (~15.6 ms, 64 fps), so the synthetic
+harness is usable for *this* purpose. CAVLC is the only large term that
+doubles under motion, which is exactly the reported symptom.
+
+The volume explains it. At 1440p there are 14,400 macroblocks × 24 blocks ×
+16 `int`s = **22.1 MB** of `quant_levels` and another 22.1 MB of `coeff`.
+`shadow_copy()` copies all ~44 MB every frame and CAVLC then scans the 22 MB
+of levels — to produce a 14 KB frame.
+
+### 19.2 Disproven first: `shadow_copy()` is not a redundant leftover
+
+The obvious-looking win was to delete `shadow_copy()`. `gpu_compute.c` had
+since started requesting `HOST_CACHED` for the same staging buffers, which
+looks like the same fix applied twice — and the device does grant it
+(`memtype[5] flags=0xe`). Prediction: removing the memcpy returns ~3 ms.
+
+Measured as a 2×2 in one binary (`BC250_STAGING_CACHED` ×
+`BC250_SHADOW_COPY`), 1440p, mean P-frame ms:
+
+|  | cached | uncached |
+|---|---|---|
+| shadow | **13.76** | 329.92 |
+| no shadow | 14.57 | 862.26 |
+
+Removing the memcpy makes CAVLC go 5.57 → **13.07 ms** — a net loss. The two
+fixes are complementary, not duplicated: `HOST_CACHED` is what makes the bulk
+sequential read affordable (the memcpy is 319 ms without it), and
+`shadow_copy()` is what keeps the per-MB scattered reads off that mapping at
+all. A `HOST_CACHED` Vulkan mapping still does not behave like ordinary
+cacheable RAM for scattered CPU reads on this hardware. Both stay; the
+`shadow_copy()` doc comment now carries this table and a "do not delete this
+as redundant" warning, since the next person to read it will have the same
+idea.
+
+### 19.3 The actual finding: the GPU already computed the skip signal and threw it away
+
+`quantize.comp` maintained `nzc[]`, a per-4×4-block count of nonzero levels,
+in a buffer that was **device-local with no host staging and no CPU
+consumer** — computed every frame since the beginning and never read.
+
+Meanwhile every "is this block/MB all zero" question on the CPU
+(`block_any_nonzero()`, and through it `cbp_luma`, `cbp_chroma`, the P_Skip
+decision, and the CAVLC per-block path) answered by walking up to 16 `int`s
+out of that 22 MB buffer.
+
+Changes:
+
+- `quantize.comp` writes a **bitmask** instead of a count (bit *p* set iff
+  `levels[p] != 0`). Strictly more informative — the count is its popcount —
+  and it is what the CPU actually needs.
+- `nz_count_buffer` gained `TRANSFER_SRC`, a host-visible `HOST_CACHED`
+  staging pair, a `vkCmdCopyBuffer`, a getter, and a shadow copy. It is
+  1.38 MB at 1440p, 1/16th of `quant_levels`, and the extra readback measured
+  free (`copy_ms` 0.240 → 0.247, `P_wall` within noise).
+- `block_any_nonzero()` answers from one 4-byte mask read, with the scan kept
+  as the `nz == NULL` fallback so nothing depends on the mask existing.
+
+Headroom, measured before writing any of the consuming code: **89.8–95.8% of
+all blocks are entirely zero** (95.6–99.4% have zero AC). The overwhelmingly
+common answer was being paid for at full memory cost.
+
+### 19.4 The audit caught a real corruption before anything depended on it
+
+Rather than wire the mask in and test the output, the first step was
+`BC250_NZ_AUDIT=1`: recompute the mask on the CPU straight from
+`quant_levels` and require an exact match on every block, plus report the
+zero density. It immediately reported **13,443 of 345,600 blocks mismatched
+on frame 0 and zero mismatches on every P-frame**.
+
+Cause: `intra_wavefront.comp` produces I-slice levels on its own path,
+entirely bypassing `quantize.comp`, and had no mask binding — so on every
+I-frame the mask was a leftover from the previous P-frame. Wiring the mask
+into `cbp`/P_Skip without this would have corrupted every I-frame, which is
+the same shape of defect that cost §12–§16 a day. Fixed by giving that
+shader binding 7 and having it maintain the mask too (`bindingCount` 7 → 8).
+Re-audited with `-g 10` to force multiple I-frames: **0 mismatches on 200/200
+frames, both frame types, both content types.**
+
+### 19.5 Result
+
+Production rate control, 300 frames, mean over P-frames:
+
+| content | res | mask off | mask on | wall | CAVLC |
+|---|---|---|---|---|---|
+| `testsrc` | 1440p | 14.54 ms / 6.04 | 13.56 / 4.79 | −6.7% | **−20.7%** |
+| `testsrc2` | 1440p | 21.57 ms / 13.35 | 19.16 / 10.89 | **−11.2%** | −18.4% |
+| `testsrc` | 1080p | 8.82 ms / 3.72 | 8.15 / 3.00 | −7.6% | −19.4% |
+| `testsrc2` | 1080p | 12.84 ms / 7.94 | 11.53 / 6.55 | −10.2% | −17.5% |
+
+1440p encode ceiling on moving content: **46.4 → 52.2 fps (+12.6%)**. The
+gain is largest on busy content, which is where the frame-rate drop was
+actually reported.
+
+Quality, via the project's own gate run alternately on and off (not against a
+README figure from some other run, since §19.6 makes run-to-run comparison
+the only fair one):
+
+| | PSNR | SSIM |
+|---|---|---|
+| mask on | 58.554, 58.189 dB | 0.999271, 0.999219 |
+| mask off | 57.971, 58.356 dB | 0.999189, 0.999243 |
+
+Fully overlapping ranges, all four PASS — the ±0.3 dB spread is the encoder's
+own variance, not an effect of the change. All four unit-test binaries pass.
+
+### 19.6 The verification oracle was wrong before the code was
+
+Byte-exactness is the right gate for a change that only moves where a byte is
+read from, and it initially reported a failure: `testsrc2` output differed
+between mask-on and mask-off, from frame 4 onward, and it *stayed* different
+after pinning the wall-clock rate-control drain to a fixed quota
+(`BC250_RC_NOMINAL_DRAIN=1`) to remove the obvious timing feedback. The
+tempting read was a real mask bug, contradicting the audit.
+
+The audit was right. **This encoder is not deterministic on moving content**
+— three runs of the *identical* configuration produced three different
+bitstreams (13,349,517 / 13,348,932 / 13,352,212 bytes), with the same spread
+whether the mask was on or off. Byte-exactness is only a valid oracle on
+content that pins at `qp_min` (`testsrc`, where mask-on and mask-off *are*
+byte-identical).
+
+Two things worth carrying forward:
+
+- **Run-to-run variance is a property of this encoder**, not of the change
+  under test. Most likely GPU-side tie-breaking in motion estimation across
+  workgroups. It is not known to be harmful — each frame is still internally
+  consistent — but it is now a documented constraint on how any future
+  optimization can be validated. Anything claiming byte-exactness must say
+  which content it was measured on.
+- This is the same lesson as §14's contaminated instrument and §18.4's
+  falsifiability note, one level down: **validate the oracle, not just the
+  hypothesis.** Here the sequence "audit the data source → discover an I-frame
+  corruption → only then depend on it → distrust the oracle when it
+  contradicts the audit" is what kept a good change from being reverted for a
+  test artifact, having already kept a real corruption from shipping.

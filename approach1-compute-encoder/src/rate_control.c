@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include <math.h>
 #include <time.h>
 
@@ -224,9 +225,28 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
      * from injecting a huge one-shot drain that would slam QP to qp_min;
      * outside those cases it is a no-op. Falls back to the old fixed quota
      * when no timestamp is available yet. See docs/DEVLOG.md §16. */
+    /* TEST-ONLY (BC250_RC_NOMINAL_DRAIN=1): pin the drain to the fixed
+     * per-frame quota by pretending no clock is available, taking the
+     * already-existing fallback path below.
+     *
+     * Why this exists: the wall-clock drain makes the encoder's output a
+     * function of how fast it ran, which is correct for live streaming but
+     * destroys byte-exactness as a verification oracle - any optimization
+     * that changes speed also legitimately changes the bitstream, so a
+     * differing md5 no longer distinguishes "faster" from "broken". Setting
+     * this makes output timing-independent so an A/B of a supposedly
+     * output-neutral change can be checked byte-for-byte. Never set in
+     * production: it reintroduces the §16 failure mode where a slow encoder
+     * drains as if it were hitting its target frame rate. */
+    static int nominal_drain = -1;
+    if (nominal_drain < 0) {
+        const char *e = getenv("BC250_RC_NOMINAL_DRAIN");
+        nominal_drain = (e && strcmp(e, "1") == 0) ? 1 : 0;
+    }
+
     struct timespec now;
     uint64_t now_ns = 0;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+    if (!nominal_drain && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
         now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
     }
 
