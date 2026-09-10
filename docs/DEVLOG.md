@@ -2418,3 +2418,63 @@ Two things worth carrying forward:
   corruption → only then depend on it → distrust the oracle when it
   contradicts the audit" is what kept a good change from being reverted for a
   test artifact, having already kept a real corruption from shipping.
+
+### 19.7 Deploying it broke Sunshine, and that found a bug already shipped in `v0.3.0`
+
+The mask build passed everything above and then **SEGV'd Sunshine on
+deploy**, in `bc250_gpu_init`, after 18 `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+failures from buffer allocation. Standalone 1440p ffmpeg encodes through the
+same driver were fine, and had been all afternoon.
+
+A build-both-and-A/B bisect against the previous commit gave the decisive
+detail: the previous driver was **also** failing allocations — 9 of them per
+Sunshine start — and surviving only because the allocations that happened to
+fail were ones nothing subsequently dereferenced. Two extra small staging
+buffers took it to 18 and one of the newly-failing ones was load-bearing.
+So this was a latent defect in the shipped `v0.3.0`, not a new one; the mask
+commit only moved which allocation lost the race.
+
+Three facts made it clear:
+
+- **The BC-250 exposes a 512 MB VRAM heap** (`mem_info_vram_total`), ~261 MB
+  of which the desktop already holds. RADV reports that same heap for the
+  `HOST_VISIBLE` memory types the readback staging buffers use, so staging
+  competes with the display for a very small pool. This is not a discrete GPU
+  with a big BAR.
+- **`bc250_gpu_init()` eagerly allocated every encoding buffer for
+  3840x2160** — "allocate for the 4K worst case once" — which is ~440 MB per
+  context (49.8 MB each for quant/coeff/residual/pred device-local, plus
+  ~200 MB for the host-visible quant/coeff staging *pairs*). All of it is
+  freed and reallocated by the first `gpu_compute_dispatch_encode()` at the
+  real resolution, which already handles both first-use and resolution
+  changes. It was pure waste.
+- **Sunshine's encoder probe calls `bc250_gpu_init` 20 times** (at
+  1920x1088). 20 × 440 MB against a ~251 MB budget.
+
+Fixes, both of which stand on their own:
+
+1. **Removed the eager 4K pre-allocation.** Buffers are allocated lazily at
+   the real resolution. `Vulkan error -2` occurrences per Sunshine start:
+   **18 → 0** on the mask build, and **9 → 0** on the previous code.
+2. **Allocation failure is now checked.** `create_buffer_with_memory()` has
+   always returned -1, and all 20 call sites in
+   `allocate_encoding_buffers()` ignored it; the function then mapped
+   `VK_NULL_HANDLE` memories and the failure surfaced as a SEGV. It now
+   accumulates the result, logs the resolution and the megabytes it needed,
+   resets `frame_width/frame_height` so a later dispatch retries (memory
+   pressure here is transient — other contexts get destroyed), and returns
+   -1, which `gpu_compute_dispatch_encode()` propagates. An out-of-memory is
+   now "this encoder is unavailable", which Sunshine handles by falling back,
+   instead of taking the process down.
+
+This is the third instance in two days of the same shape — §18.2's silent
+slice overflow, §19.4's stale I-frame mask, and now an ignored allocation
+result — where an unchecked failure path was worse than the thing it was
+hiding. The pattern to keep looking for is a function that returns a status
+nobody reads.
+
+Also worth stating plainly: **a change that passes unit tests, a byte-exact
+A/B, an exactness audit and the PSNR gate can still be undeployable**, because
+none of those exercise 20 concurrent contexts against a 512 MB heap. The
+deploy step is part of the test, and "it works under ffmpeg" was not evidence
+that it works under Sunshine.

@@ -327,18 +327,28 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     ctx->mv_staging_size = mv_size;
     ctx->nz_staging_size = nz_count_size;
 
-    create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
-    create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->residual_buffer, &ctx->residual_memory);
-    create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_buffer, &ctx->pred_memory);
-    create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->coeff_buffer, &ctx->coeff_memory);
-    create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->quant_levels_buffer, &ctx->quant_levels_memory);
+    /* Every allocation below is checked. create_buffer_with_memory() has
+     * always returned -1 on failure, but all ~20 call sites here ignored it,
+     * so an out-of-memory left VK_NULL_HANDLE buffers behind and the failure
+     * surfaced later as a SEGV in the vkMapMemory()/dispatch path instead of a
+     * clean "this encoder is unavailable". That is the same failure shape as
+     * the silent slice overflow in DEVLOG §18.2: an ignored return turning a
+     * diagnosable error into a crash. On a 512 MB VRAM heap that Sunshine
+     * probes 20 times over, OOM here is a genuinely reachable state, not a
+     * theoretical one - it was already happening on v0.3.0. */
+    int rc = 0;
+    rc |= create_buffer_with_memory(ctx, mv_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->mv_buffer, &ctx->mv_memory);
+    rc |= create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->residual_buffer, &ctx->residual_memory);
+    rc |= create_buffer_with_memory(ctx, residual_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_buffer, &ctx->pred_memory);
+    rc |= create_buffer_with_memory(ctx, coeff_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->coeff_buffer, &ctx->coeff_memory);
+    rc |= create_buffer_with_memory(ctx, quant_levels_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->quant_levels_buffer, &ctx->quant_levels_memory);
     /* TRANSFER_SRC added so the per-block nonzero mask can be read back - see
      * gpu_compute.h's nz_staging_buffers and quantize.comp's NonZeroMask. */
-    create_buffer_with_memory(ctx, nz_count_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->nz_count_buffer, &ctx->nz_count_memory);
-    create_buffer_with_memory(ctx, pred_mode_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_mode_buffer, &ctx->pred_mode_memory);
-    create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->entropy_buffer, &ctx->entropy_memory);
-    create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[0], &ctx->staging_memories[0]);
-    create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[1], &ctx->staging_memories[1]);
+    rc |= create_buffer_with_memory(ctx, nz_count_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->nz_count_buffer, &ctx->nz_count_memory);
+    rc |= create_buffer_with_memory(ctx, pred_mode_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->pred_mode_buffer, &ctx->pred_mode_memory);
+    rc |= create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->entropy_buffer, &ctx->entropy_memory);
+    rc |= create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[0], &ctx->staging_memories[0]);
+    rc |= create_buffer_with_memory(ctx, entropy_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &ctx->staging_buffers[1], &ctx->staging_memories[1]);
 
     /* These four staging-buffer pairs are the ones encoder_h264.c's
      * shadow_copy() bulk-reads from the CPU every single frame (quant_levels/
@@ -362,16 +372,16 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
             fprintf(stderr, "[bc250-gpu] BC250_STAGING_CACHED=0: staging buffers forced uncached\n");
         }
     }
-    create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[0], &ctx->quant_staging_memories[0]);
-    create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[1], &ctx->quant_staging_memories[1]);
-    create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[0], &ctx->coeff_staging_memories[0]);
-    create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[1], &ctx->coeff_staging_memories[1]);
-    create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[0], &ctx->pred_mode_staging_memories[0]);
-    create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
-    create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
-    create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
-    create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[0], &ctx->nz_staging_memories[0]);
-    create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[1], &ctx->nz_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[0], &ctx->quant_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, quant_levels_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->quant_staging_buffers[1], &ctx->quant_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[0], &ctx->coeff_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->coeff_staging_buffers[1], &ctx->coeff_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[0], &ctx->pred_mode_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, pred_mode_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->pred_mode_staging_buffers[1], &ctx->pred_mode_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[0], &ctx->mv_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, mv_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->mv_staging_buffers[1], &ctx->mv_staging_memories[1]);
+    rc |= create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[0], &ctx->nz_staging_memories[0]);
+    rc |= create_buffer_with_memory_preferred(ctx, nz_count_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->nz_staging_buffers[1], &ctx->nz_staging_memories[1]);
     {
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &mp);
@@ -380,6 +390,24 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
         fprintf(stderr, "[bc250-gpu] readback staging memtype[%u] flags=0x%x %s\n",
                 g_last_preferred_memtype, f,
                 (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "HOST_CACHED" : "UNCACHED");
+    }
+
+    /* Bail BEFORE mapping: vkMapMemory() on a VK_NULL_HANDLE memory from a
+     * failed allocation above is undefined behaviour, and in practice this is
+     * where the SEGV landed. Returning -1 with frame_width/frame_height left
+     * at 0 means the next dispatch retries the allocation (memory pressure is
+     * transient - other contexts get destroyed), and until then the staging
+     * getters report "no data" and the encoder falls back. */
+    if (rc != 0) {
+        fprintf(stderr, "[bc250-gpu] allocate_encoding_buffers(%ux%u) FAILED - out of device memory. "
+                        "Encoding buffers need ~%.0f MB (%ux%u = %u MBs); this device's HOST_VISIBLE "
+                        "heap is shared with the display. Encoder unavailable at this resolution.\n",
+                width, height,
+                (double)(residual_size * 4 + quant_levels_size * 2 + coeff_size * 2 + entropy_size * 3) / (1024.0 * 1024.0),
+                width, height, num_mbs);
+        ctx->frame_width = 0;
+        ctx->frame_height = 0;
+        return -1;
     }
 
     /* Persistently map all staging buffers to eliminate per-frame map/unmap syscall overhead */
@@ -1080,8 +1108,33 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         fprintf(stderr, "[bc250-gpu] FAILED to load intra_wavefront.comp.spv shader module\n");
     }
 
-    /* Allocate device buffers for 4K maximum resolution */
-    allocate_encoding_buffers(ctx, 3840, 2160);
+    /* Encoding buffers are allocated LAZILY, on the first
+     * gpu_compute_dispatch_encode() at the real resolution (and again on any
+     * resolution change) - see that function's staging_buffers[0] ==
+     * VK_NULL_HANDLE check.
+     *
+     * This used to eagerly allocate for 3840x2160 here, on the reasoning that
+     * 4K is the worst case so allocating once avoids a reallocation later.
+     * That cost roughly 440 MB of VkDeviceMemory per context - at 4K,
+     * quant_levels/coeff/residual/pred are 49.8 MB each device-local, and the
+     * host-visible quant/coeff staging PAIRS are another ~200 MB - all of it
+     * thrown away and reallocated by the first dispatch at the actual
+     * resolution.
+     *
+     * On this hardware that is not affordable: the BC-250 exposes a 512 MB
+     * VRAM heap (mem_info_vram_total), which is also the heap RADV reports for
+     * the HOST_VISIBLE memory types the staging buffers use, and the desktop
+     * already holds ~261 MB of it. Sunshine's encoder probe calls
+     * bc250_gpu_init 20 times; the shipped v0.3.0 driver was already logging 9
+     * VK_ERROR_OUT_OF_DEVICE_MEMORY failures per probe and surviving only
+     * because the allocations that happened to fail were ones nothing
+     * dereferenced. Adding two more small staging buffers took it to 18
+     * failures and a SEGV in this function - which is how this was found.
+     *
+     * Removing it is safe because nothing reads the encoding buffers before
+     * the first dispatch: gpu_compute_get_*_staging_data() all return -1 while
+     * their mapped pointer is NULL, and encoder_h264.c already treats that as
+     * "no GPU output this frame" and falls back. */
 
     return 0;
 }
@@ -1171,6 +1224,14 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
         if (ctx->mv_staging_buffers[i]) {
             vkDestroyBuffer(ctx->device, ctx->mv_staging_buffers[i], NULL);
             vkFreeMemory(ctx->device, ctx->mv_staging_memories[i], NULL);
+        }
+        if (ctx->nz_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->nz_staging_memories[i]);
+            ctx->nz_staging_mapped[i] = NULL;
+        }
+        if (ctx->nz_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->nz_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->nz_staging_memories[i], NULL);
         }
     }
 
@@ -1708,9 +1769,15 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     if (!ctx) return -1;
     if (num_slices < 1) num_slices = 1;
 
-    /* Ensure pipeline buffers are allocated for current dimensions */
+    /* Ensure pipeline buffers are allocated for current dimensions. This is
+     * now the ONLY place they get allocated (bc250_gpu_init() no longer
+     * pre-allocates for 4K - see the comment there), and its failure is
+     * checked: proceeding with VK_NULL_HANDLE buffers is what turned an
+     * out-of-memory into a SEGV. */
     if (ctx->staging_buffers[0] == VK_NULL_HANDLE || ctx->frame_width != (uint32_t)width || ctx->frame_height != (uint32_t)height) {
-        allocate_encoding_buffers(ctx, (uint32_t)width, (uint32_t)height);
+        if (allocate_encoding_buffers(ctx, (uint32_t)width, (uint32_t)height) != 0) {
+            return -1;
+        }
     }
 
     /* Ensure reconstructed frame buffer is allocated for DPB / reference */
