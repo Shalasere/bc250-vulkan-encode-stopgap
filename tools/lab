@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# lab - drive tools/bc250_lab.sh on the board from a dev machine.
+#
+# Ships the harness (and, for `build work`, the working tree) to the board and
+# runs one lab command over ssh. Exists because every measurement this session
+# was a hand-rolled scp+ssh, and two bugs came from quoting: PowerShell mangles
+# inline pipes/quotes/$vars before wsl ever sees them, so commands must travel
+# as a FILE, never as an inline string.
+#
+# USAGE
+#   tools/lab setup
+#   tools/lab build work
+#   tools/lab bench <key> --load=gpu --repeat=3
+#   tools/lab compare <keyA> <keyB> --repeat=3
+#   tools/lab gate <key> <baselineKey>
+#   tools/lab deploy <key>
+#
+# ENVIRONMENT
+#   BC250_HOST   default user@10.0.0.104
+#   BC250_PASS   password for sshpass (or set up a key and unset this)
+#   BC250_SSH    override the whole ssh command
+#
+set -uo pipefail
+
+HOST="${BC250_HOST:-user@10.0.0.104}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LAB_REMOTE="/var/home/user/bc250-lab"
+
+if [ -n "${BC250_SSH:-}" ]; then
+    SSH=(${BC250_SSH})
+    SCP=(scp)
+elif [ -n "${BC250_PASS:-}" ]; then
+    SSH=(sshpass -p "$BC250_PASS" ssh -n -o StrictHostKeyChecking=no)
+    SCP=(sshpass -p "$BC250_PASS" scp -o StrictHostKeyChecking=no)
+else
+    SSH=(ssh -n -o StrictHostKeyChecking=no)
+    SCP=(scp -o StrictHostKeyChecking=no)
+fi
+
+# `ssh -n` is mandatory here: ssh inside a pipeline otherwise consumes stdin
+# and swallows the rest of the caller's script. It also nulls stdin, which is
+# why nothing below uses a heredoc over the wire.
+sh_remote() { "${SSH[@]}" "$HOST" "bash $LAB_REMOTE/bc250_lab.sh $*"; }
+
+cmd="${1:-}"
+
+# Always refresh the harness itself, so the board can never run a stale copy.
+"${SSH[@]}" "$HOST" "mkdir -p $LAB_REMOTE" >/dev/null 2>&1
+"${SCP[@]}" -q "$REPO_ROOT/tools/bc250_lab.sh" "$REPO_ROOT/tools/bc250_lab_parse.py" \
+    "$HOST:$LAB_REMOTE/" || { echo "lab: failed to ship harness" >&2; exit 1; }
+
+# Source that the board's own clone cannot see has to be shipped:
+#
+#   build work         the uncommitted working tree
+#   build local:<ref>  any LOCAL commit/tag, including unpushed ones
+#
+# The second form matters more than it looks. Without it, measuring a commit
+# requires pushing it first, which couples "I want a number" to "the world
+# sees this" - and the whole point of the harness is to get the number before
+# deciding whether to publish. The board keys the build by the tarball's md5,
+# so a given ref content-addresses to a stable key and stays cached.
+if [ "$cmd" = build ] && [ -n "${2:-}" ]; then
+    target="$2"
+    tmp=$(mktemp -d)
+    case "$target" in
+        work)
+            tar czf "$tmp/work-src.tar.gz" -C "$REPO_ROOT" \
+                --exclude=build --exclude='*.o' approach1-compute-encoder || exit 1
+            ;;
+        local:*)
+            ref="${target#local:}"
+            git -C "$REPO_ROOT" rev-parse --verify --quiet "$ref^{commit}" >/dev/null \
+                || { echo "lab: no such local ref '$ref'" >&2; exit 1; }
+            git -C "$REPO_ROOT" archive --format=tar.gz -o "$tmp/work-src.tar.gz" \
+                "$ref" approach1-compute-encoder || exit 1
+            echo "# shipping local ref $ref ($(git -C "$REPO_ROOT" rev-parse --short "$ref"))" >&2
+            set -- build work
+            ;;
+    esac
+    if [ -f "$tmp/work-src.tar.gz" ]; then
+        "${SCP[@]}" -q "$tmp/work-src.tar.gz" "$HOST:$LAB_REMOTE/work-src.tar.gz" || exit 1
+    fi
+    rm -rf "$tmp"
+fi
+
+sh_remote "$@"
