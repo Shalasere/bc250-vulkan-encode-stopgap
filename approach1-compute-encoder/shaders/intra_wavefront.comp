@@ -318,6 +318,18 @@ int dequant_dc_chroma(int f, int qp_per, int qp_rem) {
     return (f * LS) >> (5 - qp_per);
 }
 
+/* ITU-T H.264 Table 8-15 QPc mapping - see reconstruct.comp's copy of this
+ * function for the full derivation. Kept in sync with that copy and with
+ * quantize.comp's identical table (this file duplicates both files' quant/
+ * dequant logic for the I-slice diagonal-wavefront path - see this file's
+ * top-of-file comment). */
+int chroma_qp(int qpy) {
+    if (qpy < 30) return qpy;
+    const int table[22] = {29,30,31,32,32,33,34,34,35,35,36,36,37,37,37,38,38,38,39,39,39,39};
+    int idx = qpy - 30;
+    return table[idx < 22 ? idx : 21];
+}
+
 /* ---- shared state ---- */
 shared uint s_mbx, s_mby;
 
@@ -478,6 +490,10 @@ void main() {
     int qp_per = qp / 6;
     int qp_rem = qp % 6;
     int f_ac = (1 << (15 + qp_per)) / 3; /* intra AC rounding offset (1/3), matching quantize.comp */
+    int qpc = chroma_qp(qp);
+    int qp_per_c = qpc / 6;
+    int qp_rem_c = qpc % 6;
+    int f_ac_c = (1 << (15 + qp_per_c)) / 3; /* chroma counterpart of f_ac, at QPc not QPy */
 
     /* --- per-block forward transform + AC quantize (one thread per luma
      * block: local_id 0..15) --- */
@@ -634,8 +650,8 @@ void main() {
         levels[cb_global * 16u + 0u] = 0;
         levels[cr_global * 16u + 0u] = 0;
         for (int p = 1; p < 16; p++) {
-            int cb_level = quantize_ac(cb_coeff[p], p, qp_per, qp_rem, f_ac);
-            int cr_level = quantize_ac(cr_coeff[p], p, qp_per, qp_rem, f_ac);
+            int cb_level = quantize_ac(cb_coeff[p], p, qp_per_c, qp_rem_c, f_ac_c);
+            int cr_level = quantize_ac(cr_coeff[p], p, qp_per_c, qp_rem_c, f_ac_c);
             s_cb_ac_level[sub][p] = cb_level;
             s_cr_ac_level[sub][p] = cr_level;
             levels[cb_global * 16u + uint(p)] = cb_level;
@@ -652,15 +668,15 @@ void main() {
         chroma_dc_hadamard(s_cr_dc_in, cr_dc_raw);
         int cb_level4[4], cr_level4[4];
         for (int i = 0; i < 4; i++) {
-            cb_level4[i] = quantize_dc_chroma_scalar(cb_dc_raw[i], qp_per, qp_rem);
-            cr_level4[i] = quantize_dc_chroma_scalar(cr_dc_raw[i], qp_per, qp_rem);
+            cb_level4[i] = quantize_dc_chroma_scalar(cb_dc_raw[i], qp_per_c, qp_rem_c);
+            cr_level4[i] = quantize_dc_chroma_scalar(cr_dc_raw[i], qp_per_c, qp_rem_c);
         }
         int cb_f[4], cr_f[4];
         chroma_dc_hadamard(cb_level4, cb_f);
         chroma_dc_hadamard(cr_level4, cr_f);
         for (int i = 0; i < 4; i++) {
-            s_cb_dc_val[i] = dequant_dc_chroma(cb_f[i], qp_per, qp_rem);
-            s_cr_dc_val[i] = dequant_dc_chroma(cr_f[i], qp_per, qp_rem);
+            s_cb_dc_val[i] = dequant_dc_chroma(cb_f[i], qp_per_c, qp_rem_c);
+            s_cr_dc_val[i] = dequant_dc_chroma(cr_f[i], qp_per_c, qp_rem_c);
         }
     }
     barrier();
@@ -674,8 +690,8 @@ void main() {
         cb_dqt[0] = s_cb_dc_val[sub];
         cr_dqt[0] = s_cr_dc_val[sub];
         for (int p = 1; p < 16; p++) {
-            cb_dqt[p] = dequant_ac(s_cb_ac_level[sub][p], p, qp_per, qp_rem);
-            cr_dqt[p] = dequant_ac(s_cr_ac_level[sub][p], p, qp_per, qp_rem);
+            cb_dqt[p] = dequant_ac(s_cb_ac_level[sub][p], p, qp_per_c, qp_rem_c);
+            cr_dqt[p] = dequant_ac(s_cr_ac_level[sub][p], p, qp_per_c, qp_rem_c);
         }
         int cb_res16[16], cr_res16[16];
         inverse_4x4(cb_dqt, cb_res16);

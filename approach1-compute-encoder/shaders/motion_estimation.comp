@@ -184,7 +184,6 @@ int interp_luma_qpel(ivec2 ref_qpel) {
     int G = sampleY(ivec2(ix, iy));
     int H = sampleY(ivec2(ix + 1, iy));
     int M = sampleY(ivec2(ix, iy + 1));
-    int N = sampleY(ivec2(ix + 1, iy + 1));
     int b = clip_round5(hpel_h_raw(ix, iy));
     int h = clip_round5(hpel_v_raw(ix, iy));
     int m = clip_round5(hpel_v_raw(ix + 1, iy));
@@ -198,17 +197,17 @@ int interp_luma_qpel(ivec2 ref_qpel) {
         case 2:  return b;            /* b (0.5,  0)    */
         case 3:  return qavg(b, H);   /* c (0.75, 0)    */
         case 4:  return qavg(G, h);   /* d (0,    0.25) */
-        case 5:  return qavg(G, j);   /* e (0.25, 0.25) */
+        case 5:  return qavg(b, h);   /* e (0.25, 0.25) - diagonal halves */
         case 6:  return qavg(b, j);   /* f (0.5,  0.25) */
-        case 7:  return qavg(H, j);   /* g (0.75, 0.25) */
+        case 7:  return qavg(b, m);   /* g (0.75, 0.25) - diagonal halves */
         case 8:  return h;            /* h (0,    0.5)  */
         case 9:  return qavg(h, j);   /* i (0.25, 0.5)  */
         case 10: return j;            /* j (0.5,  0.5)  */
         case 11: return qavg(j, m);   /* k (0.75, 0.5)  */
         case 12: return qavg(h, M);   /* n (0,    0.75) */
-        case 13: return qavg(M, j);   /* p (0.25, 0.75) */
+        case 13: return qavg(h, s);   /* p (0.25, 0.75) - diagonal halves */
         case 14: return qavg(j, s);   /* q (0.5,  0.75) */
-        case 15: return qavg(j, N);   /* r (0.75, 0.75) */
+        case 15: return qavg(m, s);   /* r (0.75, 0.75) - diagonal halves */
     }
     return G; /* unreachable */
 }

@@ -1510,11 +1510,29 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
     (void)render_target;
     struct timespec w0, w1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &w0);
-    vkWaitForFences(ctx->device, 1, &ctx->fences[ctx->current_buf], VK_TRUE, UINT64_MAX);
+    /* Unchecked until now - same "assume success" gap already fixed for
+     * vkQueueSubmit() in gpu_compute_end_picture() (see that function's doc
+     * comment), just on the wait side instead of the submit side. A
+     * UINT64_MAX timeout can't return VK_TIMEOUT, but real GPU contention
+     * (a concurrently active compositor/cursor-plane update sharing this
+     * same hardware queue) can make the underlying driver return
+     * VK_ERROR_DEVICE_LOST here without the fence's GPU work having
+     * actually finished. Falling through in that case would vkResetFences()
+     * and immediately start recording new commands into cmd_bufs[current_buf]
+     * while the GPU might still be executing the previous submission into
+     * it - undefined behavior that reads exactly like the corruption this
+     * was chasing (garbage/partial data landing in scattered blocks of the
+     * frame). Bail out instead and let the caller treat this the same as
+     * an end_picture() submit failure: no new GPU work this frame. */
+    VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[ctx->current_buf], VK_TRUE, UINT64_MAX);
     if (ctx->perf_stats_enabled) {
         clock_gettime(CLOCK_MONOTONIC, &w1);
         fprintf(stderr, "[BC250_PERF_WAIT] site=begin_picture buf=%d wait_ms=%.3f\n",
                 ctx->current_buf, bc250_diag_delta_ms(&w0, &w1));
+    }
+    if (wait_result != VK_SUCCESS) {
+        fprintf(stderr, "[bc250-gpu] vkWaitForFences failed in begin_picture: %d\n", wait_result);
+        return -1;
     }
     vkResetFences(ctx->device, 1, &ctx->fences[ctx->current_buf]);
 
@@ -1996,11 +2014,25 @@ int gpu_compute_sync(gpu_context_t *ctx) {
     int prev_buf = (ctx->current_buf + 1) % 2;
     struct timespec w0, w1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &w0);
-    vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, UINT64_MAX);
+    /* Unchecked until now - this is precisely the call the doc comment in
+     * gpu_compute_end_picture() already identified as the vector for stale
+     * staging-buffer reads ("the previous code's unconditional
+     * vkWaitForFences() right after ... returned immediately without the
+     * GPU having done any new work"). That fix only covers the case where
+     * the *submit* failed; if this wait itself returns an error (e.g.
+     * VK_ERROR_DEVICE_LOST under real GPU contention) even though the
+     * submit reported success, the exact same stale-buffer read follows.
+     * Report failure so the caller skips the staging-buffer fetch instead
+     * of reading quant/coeff/mv data the GPU may still be mid-write on. */
+    VkResult wait_result = vkWaitForFences(ctx->device, 1, &ctx->fences[prev_buf], VK_TRUE, UINT64_MAX);
     if (ctx->perf_stats_enabled) {
         clock_gettime(CLOCK_MONOTONIC, &w1);
         fprintf(stderr, "[BC250_PERF_WAIT] site=sync buf=%d wait_ms=%.3f\n",
                 prev_buf, bc250_diag_delta_ms(&w0, &w1));
+    }
+    if (wait_result != VK_SUCCESS) {
+        fprintf(stderr, "[bc250-gpu] vkWaitForFences failed in sync: %d\n", wait_result);
+        return -1;
     }
 
     /* Opt-in GPU per-stage timing readback (BC250_PERF_STATS=1). Safe to

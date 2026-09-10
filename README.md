@@ -37,12 +37,13 @@ Validated on physical hardware.
 ## Known Limitations
 
 - **H.265/HEVC**: intra-only; correct on flat content (~56 dB PSNR), not on real high-frequency content; no inter-prediction/SAO/WPP. Leave `hevc_mode` off. See `docs/hevc_scope_note.md`.
-- **Rate control** doesn't recover quickly from a bitrate spike — `RC_CBR`'s 1-second buffer, not the already-implemented `RC_LOW_LATENCY`, is what's actually selected (`rc_init()` hardcodes `RC_CBR`). Root-caused, not fixed. `docs/DEVLOG.md` §10.8.
+- **Sunshine specifically** needs more than `LIBVA_DRIVER_NAME=bc250` — its binary's `cap_sys_admin` capability (needed for KMS capture) puts it in the kernel's secure-exec mode, where libva's `secure_getenv()`-based driver-name lookup can't see any environment variable at all, regardless of what's set. Run `sudo ./tools/install_vaapi_boot_redirect.sh` once (redirects the system `radeonsi` VA-API driver slot to this driver, persists across reboots). `docs/DEVLOG.md` §10.5/§10.6/§12.6.
+- **Real, live corruption during on-screen motion, not yet root-caused**: reported during real Sunshine/Moonlight use, confirmed to originate *upstream* of this driver — this driver's own pre-encode input and post-encode reconstruction are pixel-identical during the corrupted moment, so whatever's producing it is in Sunshine's KMS capture or the compositor, not this repo. `docs/DEVLOG.md` §12.5.
 - **`build_and_install.sh`** doesn't work on immutable distros (wrote to read-only `/usr`, reported success anyway) — use `setup_bazzite.sh`/`setup_steamos.sh`.
 - **Releases before `v0.2.1`** predate real-client validation and hit 3 now-fixed defects (bad QP field, dropped chroma residual, undersized bitstream buffer). Use `v0.2.1`+.
 - **CI** previously gave false confidence: `-DNDEBUG` silently disabled all `assert()`-based tests, and a CMake issue meant 3 of 4 test binaries never ran. Both fixed.
 
-Remaining work is concentrated in the CPU-side bitstream writer and rate control; the GPU compute path itself is correctness-verified.
+Remaining work is concentrated in the live capture-path corruption above; the GPU compute path and CPU-side bitstream writer are correctness-verified against real client sessions.
 
 ---
 
@@ -78,7 +79,7 @@ LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 profiles + VAEntrypointEncSlice
 
 ## Application Setup
 
-**Sunshine/Moonlight**: `export LIBVA_DRIVER_NAME=bc250`, set Video Encoder to VA-API in the web UI (`https://localhost:47990`). A tuned preset is at `tools/sunshine_preset/sunshine.conf` — `apply_sunshine_preset.sh` overwrites your existing config, so back it up first.
+**Sunshine/Moonlight**: run `sudo ./tools/install_vaapi_boot_redirect.sh` once first — Sunshine's binary needs a real capability (`cap_sys_admin`, for KMS capture) that makes plain `LIBVA_DRIVER_NAME=bc250` unable to reach it at all (see [Known Limitations](#known-limitations)); this script fixes that persistently, across reboots. Then set Video Encoder to VA-API in the web UI (`https://localhost:47990`). No desktop-session change is needed — `capture=kms` works against the board's default session (Gamescope/Big-Picture included) via direct DRM enumeration; only leave `WAYLAND_DISPLAY` unset (don't force it to a specific compositor socket) so Sunshine can fall through to that path. A tuned preset is at `tools/sunshine_preset/sunshine.conf` — `apply_sunshine_preset.sh` overwrites your existing config, so back it up first.
 
 **OBS**: `LIBVA_DRIVER_NAME=bc250 obs` → Output → Advanced → Video Encoder: FFmpeg VAAPI, Device: `/dev/dri/renderD128`.
 

@@ -536,6 +536,21 @@ static int quantize_dc_luma(int v, int qp) {
     return (int)(sign * level);
 }
 
+/* ITU-T H.264 Table 8-15: QPc = f(qPI), qPI = Clip3(-QpBdOffsetC, 51, QPy +
+ * chroma_qp_index_offset). This project always signals
+ * chroma_qp_index_offset = 0 (bitstream.c) and is 8-bit-only
+ * (QpBdOffsetC = 0), so qPI reduces to QPy clamped to [0,51] (already true
+ * by construction). Kept in sync with the identical copies in
+ * quantize.comp/reconstruct.comp/intra_wavefront.comp - see those for the
+ * full derivation and the real-hardware measurement (~13dB of chroma PSNR
+ * against a real decode at QP=42, luma unaffected) that this fixes. */
+static int chroma_qp(int qpy) {
+    if (qpy < 30) return qpy;
+    static const int table[22] = {29,30,31,32,32,33,34,34,35,35,36,36,37,37,37,38,38,38,39,39,39,39};
+    int idx = qpy - 30;
+    return table[idx < 22 ? idx : 21];
+}
+
 static int quantize_dc_chroma(int v, int qp) {
     int qp_per = qp / 6;
     int qp_rem = qp % 6;
@@ -985,7 +1000,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
     int cb_dc[4], cr_dc[4];
     chroma_dc_hadamard(cb_dc_raw, cb_dc);
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
-    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], chroma_qp(qp)); cr_dc[i] = quantize_dc_chroma(cr_dc[i], chroma_qp(qp)); }
 
     {
         const char *dbg = getenv("BC250_DEBUG_I16_MB");
@@ -1111,7 +1126,7 @@ static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int
     int cb_dc[4], cr_dc[4];
     chroma_dc_hadamard(cb_dc_raw, cb_dc);
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
-    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], chroma_qp(qp)); cr_dc[i] = quantize_dc_chroma(cr_dc[i], chroma_qp(qp)); }
 
     int chroma_dc_nonzero = 0;
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
@@ -1307,7 +1322,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     int cb_dc[4], cr_dc[4];
     chroma_dc_hadamard(cb_dc_raw, cb_dc);
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
-    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], chroma_qp(qp)); cr_dc[i] = quantize_dc_chroma(cr_dc[i], chroma_qp(qp)); }
 
     int chroma_dc_nonzero = 0;
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
@@ -1422,7 +1437,7 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     int cb_dc[4], cr_dc[4];
     chroma_dc_hadamard(cb_dc_raw, cb_dc);
     chroma_dc_hadamard(cr_dc_raw, cr_dc);
-    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
+    for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], chroma_qp(qp)); cr_dc[i] = quantize_dc_chroma(cr_dc[i], chroma_qp(qp)); }
 
     int chroma_dc_nonzero = 0;
     for (int i = 0; i < 4; i++) if (cb_dc[i] != 0 || cr_dc[i] != 0) { chroma_dc_nonzero = 1; break; }
@@ -1840,8 +1855,13 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     const int *coeff = NULL;
     const uint32_t *pred_modes = NULL;
     const gpu_mv_t *mvs = NULL;
-    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
-        gpu_compute_begin_picture(gpu_ctx, input_surface);
+    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE
+        && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
+        /* begin_picture()'s own vkWaitForFences is now checked (see its doc
+         * comment): a nonzero return means it refused to touch the command
+         * buffer at all, so there is nothing to dispatch or submit this
+         * frame - fall through with quant_levels/etc. left NULL, same as
+         * every other "no new GPU work this frame" path below. */
         gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
                                      qp, is_idr ? 1 : 0, num_slices);
         /* gpu_compute_end_picture() now retries vkQueueSubmit internally
@@ -1860,9 +1880,15 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * certifies the whole frame P_Skip, matching what a real decoder
          * does when it receives no new information - the frame repeats the
          * last reference picture, rather than fabricated stale content
-         * being sent as if it were genuinely this frame's. */
-        if (gpu_compute_end_picture(gpu_ctx) == 0) {
-        gpu_compute_sync(gpu_ctx);
+         * being sent as if it were genuinely this frame's.
+         *
+         * gpu_compute_sync()'s own vkWaitForFences is now checked too (see
+         * its doc comment) - it's the exact call this comment already
+         * identified as the vector for a stale read, just also guarding the
+         * case where the wait itself fails even though the submit
+         * succeeded. Folded into the same condition so either failure takes
+         * the same safe fallback. */
+        if (gpu_compute_end_picture(gpu_ctx) == 0 && gpu_compute_sync(gpu_ctx) == 0) {
         gpu_compute_debug_dump_recon(gpu_ctx, (int)encoder->width, (int)encoder->height);
 
         void *quant_data = NULL, *coeff_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
@@ -2064,7 +2090,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                 int cb_dc[4], cr_dc[4];
                 chroma_dc_hadamard(cb_dc_raw, cb_dc);
                 chroma_dc_hadamard(cr_dc_raw, cr_dc);
-                for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], qp); cr_dc[i] = quantize_dc_chroma(cr_dc[i], qp); }
+                for (int i = 0; i < 4; i++) { cb_dc[i] = quantize_dc_chroma(cb_dc[i], chroma_qp(qp)); cr_dc[i] = quantize_dc_chroma(cr_dc[i], chroma_qp(qp)); }
                 fprintf(stderr, "[BC250_DEBUG_MB] frame=%u mb=%u qp=%d cb_dc_raw=(%d,%d,%d,%d) cr_dc_raw=(%d,%d,%d,%d) "
                                 "cb_dc_tx=(%d,%d,%d,%d) cr_dc_tx=(%d,%d,%d,%d)\n",
                         dbg_frame, mb, qp,
@@ -2100,7 +2126,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                 }
             }
         }
-        } /* gpu_compute_end_picture() == 0 */
+        } /* gpu_compute_end_picture() == 0 && gpu_compute_sync() == 0 */
     }
 
     /* 4. Encode Slices */

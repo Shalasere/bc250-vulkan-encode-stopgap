@@ -293,6 +293,23 @@ int dequant_dc_chroma(int f, int qp_per, int qp_rem) {
     return (f * LS) >> (5 - qp_per);
 }
 
+/* ITU-T H.264 Table 8-15: QPc = f(qPI), qPI = Clip3(-QpBdOffsetC, 51, QPy +
+ * chroma_qp_index_offset). This project always signals
+ * chroma_qp_index_offset = 0 and is 8-bit-only (QpBdOffsetC = 0), so qPI
+ * reduces to QPy clamped to [0,51] (already true by construction). Identity
+ * below qPI=30. Previously MISSING entirely - chroma was quantized and
+ * dequantized at QPy directly, silently diverging from what a real decoder
+ * reconstructs (which always applies this table) as QP rises past 30, since
+ * QPc grows much slower than QPy above that point. Measured on real
+ * hardware: ~13dB of chroma PSNR lost against a real decode at QP=42, luma
+ * unaffected - see docs/DEVLOG.md. */
+int chroma_qp(int qpy) {
+    if (qpy < 30) return qpy;
+    const int table[22] = {29,30,31,32,32,33,34,34,35,35,36,36,37,37,37,38,38,38,39,39,39,39};
+    int idx = qpy - 30;
+    return table[idx < 22 ? idx : 21];
+}
+
 void main() {
     uint mb_x = gl_WorkGroupID.x;
     uint mb_y = gl_WorkGroupID.y;
@@ -311,6 +328,9 @@ void main() {
     int qp = int(pcs.qp);
     int qp_per = qp / 6;
     int qp_rem = qp % 6;
+    int qpc = chroma_qp(qp);
+    int qp_per_c = qpc / 6;
+    int qp_rem_c = qpc % 6;
 
     if (block_idx < 16u) {
         uint raster = block_idx;
@@ -379,20 +399,20 @@ void main() {
 
         int cb_level[4], cr_level[4];
         for (int i = 0; i < 4; i++) {
-            cb_level[i] = quantize_dc_chroma_scalar(cb_dc_raw[i], qp_per, qp_rem);
-            cr_level[i] = quantize_dc_chroma_scalar(cr_dc_raw[i], qp_per, qp_rem);
+            cb_level[i] = quantize_dc_chroma_scalar(cb_dc_raw[i], qp_per_c, qp_rem_c);
+            cr_level[i] = quantize_dc_chroma_scalar(cr_dc_raw[i], qp_per_c, qp_rem_c);
         }
         int cb_f[4], cr_f[4];
         chroma_dc_hadamard(cb_level, cb_f);
         chroma_dc_hadamard(cr_level, cr_f);
-        int cb_dc = dequant_dc_chroma(cb_f[int(sub)], qp_per, qp_rem);
-        int cr_dc = dequant_dc_chroma(cr_f[int(sub)], qp_per, qp_rem);
+        int cb_dc = dequant_dc_chroma(cb_f[int(sub)], qp_per_c, qp_rem_c);
+        int cr_dc = dequant_dc_chroma(cr_f[int(sub)], qp_per_c, qp_rem_c);
 
         int cb_dqt[16], cr_dqt[16];
         cb_dqt[0] = cb_dc; cr_dqt[0] = cr_dc;
         for (int p = 1; p < 16; p++) {
-            cb_dqt[p] = dequant_ac(cb_blk[p], p, qp_per, qp_rem);
-            cr_dqt[p] = dequant_ac(cr_blk[p], p, qp_per, qp_rem);
+            cb_dqt[p] = dequant_ac(cb_blk[p], p, qp_per_c, qp_rem_c);
+            cr_dqt[p] = dequant_ac(cr_blk[p], p, qp_per_c, qp_rem_c);
         }
 
         int cb_res[16], cr_res[16];

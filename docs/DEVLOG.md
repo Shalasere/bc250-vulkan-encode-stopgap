@@ -1117,3 +1117,226 @@ as of this writing.
   even when a task description implies it's the eventual goal — this was
   violated once, early on (an unrequested PR + issue comment), and
   hasn't been repeated.
+
+---
+
+## 12. Fixed: missing chroma QP (QPc) mapping — the real cause of the reported color/motion corruption, mostly
+
+Follow-on to the user's real-usage report: visible, colorful (blue/purple/
+pink) speckled corruption that begins as soon as anything moves on screen
+and gets worse the longer motion continues. Two smaller real bugs were
+found and fixed alongside the main one; the investigation also found the
+main fix does **not** fully explain what the user sees live, and honestly
+tracks that as still-open (§12.5).
+
+### 12.1 A methodology trap: the internal PSNR metric was blind to this bug by construction
+
+The obvious first metric — this driver's own GPU reconstruction
+(`BC250_DUMP_RECON_FRAMES`) vs. the real captured source
+(`BC250_DUMP_REAL_INPUT`) — stayed healthy even while real QP climbed past
+the point this bug should have shown up. Root cause of the blind spot:
+`reconstruct.comp` (the shader that builds the GPU's own reference image
+for future motion search) had the *identical* missing-QPc bug as the real
+quantize path, so the encoder's internal notion of "correct" and its
+actual output were wrong in the same way, at the same time — self-
+consistent, and invisible to any comparison that only looks at this
+driver's own two internal buffers. The metric that actually caught it had
+to be an independent one: this driver's real bitstream output vs. a real
+`libx264` encode of the *identical* captured source frames, at matched QP,
+scored against the same ground truth. A separate, earlier confound in the
+same investigation (recorded here so it isn't rediscovered): the
+`ydotool`-driven synthetic mouse wiggle used to force real motion in the
+test harness was, in one capture, found to bake its own rendering artifact
+directly into the *source* frames the driver never even touches yet —
+proof that a captured "ground truth" clip isn't automatically ground
+truth; the decisive comparison below only used the clean, pre-wiggle
+portion of each clip.
+
+### 12.2 Root cause: chroma was quantized at QPy instead of the spec's QPc
+
+ITU-T H.264 Table 8-15 requires chroma to be quantized/dequantized at a
+QP *derived from* the signaled luma QP (`QPy`), not `QPy` itself, once
+`QPy` exceeds 30 — `QPc` grows markedly slower than `QPy` above that
+point (e.g. `QPy=42 → QPc=38`). This project's whole pipeline — CPU-side
+`encoder_h264.c` and all three GPU shaders that touch chroma quantization
+(`quantize.comp`, `reconstruct.comp`, `intra_wavefront.comp`, the last of
+these being a verbatim duplicate of the P-path logic for the I-slice
+diagonal-wavefront dispatch) — always used `QPy` directly for chroma. The
+table is identity below `QPy=30`, so this was invisible at low QP/light
+load; above 30 the divergence grows fast, which is exactly why the
+reported corruption only ever showed up once something started moving —
+motion is what pushes this project's rate control past QP 30.
+
+Fixed by adding the real Table 8-15 mapping (`chroma_qp()`, a 22-entry
+table indexed by `QPy-30`, clamped) and using it for every chroma
+quantize/dequantize call site — luma is untouched. Four independent
+implementations of the identical table were needed and kept in sync
+(CPU `encoder_h264.c`, and the three GPU shaders above), since none of
+them share code with each other by this project's existing structure.
+
+**Verified against a real `libx264` encode of identical real captured
+content, matched QP** (`ffmpeg -c:v h264_vaapi` vs. `-c:v libx264`,
+scored against the same real ground truth via `-lavfi psnr,ssim`):
+
+| QP | Metric | Before (chroma-U / chroma-V gap vs. x264) | After |
+|---|---|---|---|
+| 22 | avg PSNR gap | ~1 dB (baseline, QPc≈QPy here) | 1.30 dB (U 0.94 / V 0.98) |
+| 32 | chroma-U / chroma-V gap | 8.2 dB / 6.4 dB | U 1.44 dB / V 1.27 dB |
+| 42 | chroma-U / chroma-V gap | 12.6 dB / 13.6 dB | U 0.20 dB / V 0.37 dB |
+| 42 | overall avg PSNR | this driver notably worse than x264 | **39.55 dB vs. x264's 38.96 dB — this driver now slightly ahead** |
+
+The QP42 chroma gap collapsing from ~13 dB to ~0.2-0.4 dB, with no
+corresponding change at QP22 (where the table is identity), is the
+signature that confirms the diagnosis rather than just plausibly
+explaining it. `ctest` 5/5 unaffected.
+
+### 12.3 Two smaller real fixes found and fixed alongside, kept for their own sake
+
+- **Quarter-pel diagonal luma interpolation** (`motion_estimation.comp`,
+  `residual_predict.comp`): the four true-diagonal quarter-pel positions
+  (ITU-T §8.4.2.2.1 positions e/g/p/r) were incorrectly averaging a 2D
+  diagonal half-pel sample (`j`) with an integer-pel neighbor, instead of
+  averaging the two nearest *half-pel* neighbors as the spec requires
+  (`qavg(b,h)`, `qavg(b,m)`, `qavg(h,s)`, `qavg(m,s)`). Confirmed wrong
+  against both the ITU-T text and libavcodec's `h264qpel_template.c`.
+  **Not** the cause of the reported corruption (tested in isolation via
+  §12.1's independent x264-comparison metric before the real QPc bug was
+  found — no measurable PSNR change) but a genuine spec violation, kept.
+- **`vkWaitForFences()` return value was never checked**, in both
+  `gpu_compute_begin_picture()` and `gpu_compute_sync()` — the same class
+  of gap already fixed for `vkQueueSubmit()` in §10.10, just on the wait
+  side. A `UINT64_MAX`-timeout wait can't return `VK_TIMEOUT`, but real
+  GPU contention (a concurrently active compositor/cursor-plane update
+  sharing this hardware queue) can return `VK_ERROR_DEVICE_LOST` without
+  the fence's GPU work having actually finished; falling through in that
+  case would reset the fence and start recording/reading buffers the GPU
+  might still be mid-write on — the same class of stale/torn-data
+  corruption §10.10 already root-caused for the submit side. Both call
+  sites now report failure to their caller instead of silently
+  proceeding.
+- **`VAConfigAttribEncMaxSlices` was unhandled**, falling to
+  `VA_ATTRIB_NOT_SUPPORTED` — which made ffmpeg's `vaapi_encode.c` reject
+  any encoder open where the caller (Sunshine's own multi-slice heuristic,
+  independent of this driver's `BC250_SLICES_PER_FRAME` tuning knob)
+  requested more than one slice, observed as "Driver does not support
+  encoding pictures as multiple slices" / "Could not open codec: Invalid
+  argument." Fixed by reporting the truth: this driver's own encode path
+  defaults to 1 slice unless `BC250_SLICES_PER_FRAME` says otherwise, so
+  advertising `1` here is accurate, not a value chosen just to satisfy the
+  caller.
+
+### 12.4 A self-inflicted FPS regression, real but not a code bug
+
+A live re-test dropped from the previously-measured ~70 fps at 1440p to
+~11 fps. Cause: the same session's earlier controlled tests had left
+`BC250_DUMP_REAL_INPUT=1`/`BC250_DUMP_RECON_FRAMES=1` set in Sunshine's
+systemd environment (`bc250-driver.conf`) — synchronous full-frame NV12
+dumps to disk on every single frame, at 1440p, are real, heavy I/O.
+Removing the debug env vars restored normal throughput immediately; no
+driver change involved. Recorded because it's a real trap for anyone
+reusing this project's own debug env vars for a controlled test and
+forgetting to clear them before real use.
+
+### 12.5 Still open, and squarely outside this repo: real, live corruption during motion persists after the QPc fix
+
+A full live re-test (real Sunshine session, real Moonlight client,
+synthetic sustained motion matching the user's own reported timeline)
+confirmed the QPc fix did **not** eliminate what the user sees live — the
+same blue/purple/pink speckle reappeared once motion started. Decisive
+test: pulling this driver's own `real_*.nv12` (the raw frame captured
+*before* this driver's encoder ever touches it) and `recon_*.nv12` (this
+driver's post-encode/decode reconstruction) from the exact same corrupted
+moment showed **the two are visually identical** — the corruption is
+already present in the frame Sunshine hands this driver. Whatever is
+producing it lives upstream, in Sunshine's own KMS screen-capture path or
+the Wayland compositor's rendering under load, not in any code this repo
+owns. This reframes what §12.2's fix actually was: a real, independently-
+verified encoder defect that happened to exist and is now closed, not the
+cause of the live symptom that motivated looking for it in the first
+place. Not investigated further here — a live capture-side defect on this
+specific compositor/driver stack is a different project.
+
+### 12.6 Sunshine + this driver, made to survive a reboot
+
+A hard reboot of the board (via its ESP32 PSU relay — the board had
+become fully unresponsive on every TCP port while still answering ICMP,
+consistent with severe resource starvation, not a network or power
+failure) surfaced that **none** of the working Sunshine integration state
+from §10.5/§10.6 survives a reboot on this system, for three independently-
+diagnosed reasons:
+
+1. **A red herring, caught before it shipped as a wrong "fix"**: mid-
+   investigation, Sunshine's `capture=kms` failed with "Missing Wayland
+   wire XDG_OUTPUT" under the board's default Gamescope/Big-Picture
+   session, which does not implement that Wayland protocol - and switching
+   to a real desktop (Plasma/KWin) session via `steamos-session-select
+   plasma` made it work. This was believed, and initially written up here,
+   as a real requirement ("Sunshine needs a real desktop session, not
+   Gamescope"). **A later, real full-reboot test disproved that**: booting
+   all the way to the board's actual default (Gamescope, untouched) with
+   no `steamos-session-select` and no manual `WAYLAND_DISPLAY` override at
+   all, Sunshine's `capture=kms` logged the same "[wayland] Environment
+   variable WAYLAND_DISPLAY has not been defined" as a non-fatal `Error`
+   and fell through cleanly to its own **direct KMS/DRM** monitor
+   enumeration ("Found monitor for DRM screencasting") - which needs no
+   compositor, Wayland or otherwise, at all. The XDG_OUTPUT failure only
+   ever happened because this same investigation had manually
+   `set-environment WAYLAND_DISPLAY=gamescope-0`'d Sunshine's own systemd
+   user manager while chasing the (real, separate) driver-redirect bug
+   below - forcing Sunshine down its Wayland-specific capture path against
+   a compositor that can't serve it, a self-inflicted precondition, not
+   anything about Gamescope itself. **Net effect**: no session-mode change
+   is actually needed; the board's default boot configuration (Gamescope/
+   Big-Picture, completely untouched) works with this driver and Sunshine
+   as-is. Recorded in this much detail specifically as a caution against
+   the earlier version of this entry, which stated the opposite as fact.
+2. **The `radeonsi_drv_video.so` → `bc250_drv_video.so` symlink redirect
+   from §10.6 is, by that section's own explicit warning, session-only**
+   — it lives inside an `rpm-ostree usroverlay`, and `/usr` on this system
+   is confirmed (via `mount`) to be a fresh, read-only-by-default overlay
+   every single boot; nothing written into it (via `usroverlay` or
+   otherwise) survives to the next one. This was already known and
+   documented in §10.6 as unfixed ("a real package-layering or install
+   question, not investigated here") — this entry closes that out. Fix:
+   `tools/bc250-vaapi-boot-redirect.service` + `install_vaapi_boot_redirect.sh`,
+   a `DefaultDependencies=no`, `Before=sysinit.target sddm.service` oneshot
+   that reapplies `rpm-ostree usroverlay` (`-`-prefixed so an
+   already-unlocked `/usr` isn't treated as failure) and the symlink swap
+   on every boot, before Sunshine's own (later, graphical-session-ordered)
+   unit ever starts. Installed and enabled
+   (`systemctl enable bc250-vaapi-boot-redirect.service`); confirmed via a
+   real, full `systemctl reboot` - all the way back to the board's
+   untouched default Gamescope session, no manual steps of any kind - that
+   the redirect and Sunshine's own `h264_vaapi` encoder selection both
+   come back clean (`NRestarts=0`, `[bc250-h264] Encoder initialized`
+   within seconds of the service starting).
+3. **Independently reconfirmed the §10.5 root cause of why a plain
+   `LIBVA_DRIVER_NAME=bc250` environment variable can never work for
+   Sunshine specifically**, via a cleaner, more portable reproduction than
+   §10.5's original: copying the system's own `ffmpeg` binary and granting
+   it the identical `cap_sys_admin` file capability Sunshine's binary
+   carries (needed for KMS capture) reproduces the exact same
+   `radeonsi_drv_video.so init failed` failure, with the *identical*
+   environment that a non-capability copy of the same binary handles
+   correctly. Mechanism: executing a binary with file capabilities beyond
+   what the calling (unprivileged) process already had puts the kernel
+   into secure-execution mode (`AT_SECURE=1`); glibc's `secure_getenv()` —
+   which libva uses for `LIBVA_DRIVER_NAME`/`LIBVA_DRIVERS_PATH`
+   specifically because those variables control which shared library gets
+   `dlopen()`'d into a privileged process — returns nothing in that mode,
+   regardless of what's actually in the environment (confirmed present via
+   `/proc/PID/environ`, race-caught mid-execution, both before and after
+   this reconfirmation). This is deliberate, correct libva security
+   design, not a bug anywhere in this repo or in Sunshine. **Process note**:
+   this exact mechanism, and the same symlink-redirect fix, were already
+   found and written up in §10.5/§10.6 in an earlier session — this
+   session re-derived it independently before re-reading this file
+   closely enough to notice. Lesson repeated from §11: check this log for
+   a mystery that might already be solved before spending hours
+   re-solving it.
+
+Net state: `docs/DEVLOG.md` §10.6's two open items ("making the driver
+redirect survive a reboot" and `pic_init_qp_minus26`) are now both
+closed — the latter by §10.7. What's left for full production use is
+§12.5's open capture-path corruption investigation, which lives outside
+this repo's own code.

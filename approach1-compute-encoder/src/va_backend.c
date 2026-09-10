@@ -107,6 +107,23 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
             case VAConfigAttribMaxPictureHeight:
                 attrib_list[i].value = BC250_MAX_HEIGHT;
                 break;
+            case VAConfigAttribEncMaxSlices:
+                /* Previously unhandled (fell to the NOT_SUPPORTED default
+                 * below), which made ffmpeg's vaapi_encode.c treat max
+                 * slices as unset and reject any encoder open where the
+                 * caller requested more than that - observed on real
+                 * hardware as "Driver does not support encoding pictures as
+                 * multiple slices" / "Could not open codec: Invalid
+                 * argument" whenever a client's default slice-count request
+                 * (Sunshine's own heuristic, independent of this driver's
+                 * BC250_SLICES_PER_FRAME env var - see encoder_h264.c) was
+                 * greater than 1. Report the truth: this driver's own
+                 * num_slices defaults to 1 (only BC250_SLICES_PER_FRAME, an
+                 * internal tuning knob never read from VA-API callers,
+                 * raises it), so advertising 1 here is accurate, not just a
+                 * value chosen to make the caller happy. */
+                attrib_list[i].value = 1;
+                break;
             default:
                 attrib_list[i].value = VA_ATTRIB_NOT_SUPPORTED;
                 break;

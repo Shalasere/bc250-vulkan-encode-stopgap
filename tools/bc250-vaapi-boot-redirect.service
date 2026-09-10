@@ -1,0 +1,24 @@
+[Unit]
+Description=Redirect the system radeonsi VA-API driver slot to bc250_drv_video.so
+Documentation=file:///opt/bc250-driver
+DefaultDependencies=no
+Before=sysinit.target sddm.service
+After=local-fs.target
+
+[Service]
+# /usr on this ostree system is a fresh, read-only overlay every boot, so
+# both the usroverlay (to get a writable /usr at all) and the symlink swap
+# itself have to be redone here on every single boot - neither survives
+# from the previous one. See docs/DEVLOG.md ("boot persistence") for why
+# this can't just be a one-time fix.
+Type=oneshot
+RemainAfterExit=yes
+# usroverlay fails loudly (nonzero exit) if /usr is already unlocked -
+# expected and harmless if this unit ever runs twice in one boot, or if
+# something else already unlocked it. The "-" tells systemd not to treat
+# that as a failure of this unit.
+ExecStart=-/usr/bin/rpm-ostree usroverlay
+ExecStart=/usr/bin/ln -sfn /opt/bc250-driver/bc250_drv_video.so /usr/lib64/dri/radeonsi_drv_video.so
+
+[Install]
+WantedBy=sysinit.target
