@@ -7,7 +7,7 @@
 Software H.264 encoder (Vulkan compute, not the VCN block) and a DisplayPort/HDMI audio clock fix for the AMD BC-250 on Linux.
 
 > [!IMPORTANT]
-> **H.264**: correct, real-time, one open rate-control issue. **H.265/HEVC**: non-functional stub — do not enable it in any app pointed at this driver. See [Known Limitations](#known-limitations).
+> **H.264**: correct, real-time, validated in real Sunshine/Moonlight use at 1440p. **H.265/HEVC**: non-functional stub — do not enable it in any app pointed at this driver. See [Known Limitations](#known-limitations).
 
 ---
 
@@ -38,12 +38,15 @@ Validated on physical hardware.
 
 - **H.265/HEVC**: intra-only; correct on flat content (~56 dB PSNR), not on real high-frequency content; no inter-prediction/SAO/WPP. Leave `hevc_mode` off. See `docs/hevc_scope_note.md`.
 - **Sunshine specifically** needs more than `LIBVA_DRIVER_NAME=bc250` — its binary's `cap_sys_admin` capability (needed for KMS capture) puts it in the kernel's secure-exec mode, where libva's `secure_getenv()`-based driver-name lookup can't see any environment variable at all, regardless of what's set. Run `sudo ./tools/install_vaapi_boot_redirect.sh` once (redirects the system `radeonsi` VA-API driver slot to this driver, persists across reboots). `docs/DEVLOG.md` §10.5/§10.6/§12.6.
-- **Real, live corruption during on-screen motion, not yet root-caused**: reported during real Sunshine/Moonlight use, confirmed to originate *upstream* of this driver — this driver's own pre-encode input and post-encode reconstruction are pixel-identical during the corrupted moment, so whatever's producing it is in Sunshine's KMS capture or the compositor, not this repo. `docs/DEVLOG.md` §12.5.
+- **Display must not be asleep** when Sunshine initializes capture, or it reads the output as `0x0` and fails with *"Failed to initialize video capture/encoding"* (Moonlight Error 503) — including on a client launching an app hours after Sunshine started, since each launch re-initializes capture. Disable screen blanking on the host (on KDE: PowerDevil "Screen Energy Saving" off). This is the single most likely reason a working install appears broken. `docs/DEVLOG.md` §14.4.
+- **Quality is currently limited by the `qp_min=12` floor**, not by bandwidth: at 1440p/31 Mbps requested the encoder settles at QP 12 and spends only ~19 Mbps. Lowering the floor is the next quality lever. `docs/DEVLOG.md` §16.5.
+- **Rate control caveat**: `rc_estimate_base_qp()` saturates at `qp_min` for any target above roughly 31 Mbps at 1440p30, so it cannot differentiate high bitrate targets from each other.
+- **Two known spec-conformance gaps** (together ~3.7 dB of per-GOP drift, not visually significant): in-loop deblocking is **luma-only** while the bitstream signals `disable_deblocking_filter_idc=0`; and I-slice intra prediction reads *source* rather than reconstructed neighbours. `docs/DEVLOG.md` §14.3.
 - **`build_and_install.sh`** doesn't work on immutable distros (wrote to read-only `/usr`, reported success anyway) — use `setup_bazzite.sh`/`setup_steamos.sh`.
 - **Releases before `v0.2.1`** predate real-client validation and hit 3 now-fixed defects (bad QP field, dropped chroma residual, undersized bitstream buffer). Use `v0.2.1`+.
 - **CI** previously gave false confidence: `-DNDEBUG` silently disabled all `assert()`-based tests, and a CMake issue meant 3 of 4 test binaries never ran. Both fixed.
 
-Remaining work is concentrated in the live capture-path corruption above; the GPU compute path and CPU-side bitstream writer are correctness-verified against real client sessions.
+The long-standing "corruption during on-screen motion" report is **fixed** as of `v0.3.0` — it was rate control, not the capture path: CBR filler bytes were being fed back into the bitrate feedback loop, which pinned QP at its 51 maximum for entire sessions while padding every frame to look like it was using the requested bitrate. Earlier releases attributed this upstream to Sunshine's KMS capture or the compositor; that was wrong, and the reasoning that produced the wrong answer is recorded in `docs/DEVLOG.md` §14–§16 alongside the fix. Remaining work is quality *tuning* (the QP floor above), not correctness.
 
 ---
 
@@ -80,6 +83,9 @@ LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 profiles + VAEntrypointEncSlice
 ## Application Setup
 
 **Sunshine/Moonlight**: run `sudo ./tools/install_vaapi_boot_redirect.sh` once first — Sunshine's binary needs a real capability (`cap_sys_admin`, for KMS capture) that makes plain `LIBVA_DRIVER_NAME=bc250` unable to reach it at all (see [Known Limitations](#known-limitations)); this script fixes that persistently, across reboots. Then set Video Encoder to VA-API in the web UI (`https://localhost:47990`). No desktop-session change is needed — `capture=kms` works against the board's default session (Gamescope/Big-Picture included) via direct DRM enumeration; only leave `WAYLAND_DISPLAY` unset (don't force it to a specific compositor socket) so Sunshine can fall through to that path. A tuned preset is at `tools/sunshine_preset/sunshine.conf` — `apply_sunshine_preset.sh` overwrites your existing config, so back it up first.
+
+> [!WARNING]
+> **Turn off screen blanking on the host.** Sunshine re-initializes KMS capture on every app launch, and if the display has slept it reads the output as `0x0` and returns *"Failed to initialize video capture/encoding. Is a display connected and turned on?"* (Error 503) to the client — even though Sunshine itself started fine hours earlier. On KDE: System Settings → Power Management → turn off "Screen Energy Saving". Verify with `cat /sys/class/drm/card*-DP-1/enabled` (must read `enabled`, not `disabled`); `kscreen-doctor -o` is *not* a reliable check here. `docs/DEVLOG.md` §14.4.
 
 **OBS**: `LIBVA_DRIVER_NAME=bc250 obs` → Output → Advanced → Video Encoder: FFmpeg VAAPI, Device: `/dev/dri/renderD128`.
 
