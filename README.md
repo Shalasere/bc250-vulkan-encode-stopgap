@@ -28,7 +28,10 @@ Validated on physical hardware.
 | PSNR (avg) | 59.6 dB @ 640x480, 61.7 dB @ 2560x1440 | 52.1 dB @ 2560x1440 |
 | Source | `tools/quality_test.sh` | Real Sunshine/Moonlight session — `docs/DEVLOG.md` §10.7-10.8 |
 
-**Performance**: 267 fps @ 640x480, 179 @ 720p, 100-134 @ 1080p, 67-80 @ 1440p — real-time or above throughout. GPU shaders are <1.5% of frame time; the remaining bottlenecks are CPU/memory-side. GPU contention against a concurrent game: ~8.4%.
+**Performance**: 267 fps @ 640x480, 179 @ 720p, 100-134 @ 1080p, 67-80 @ 1440p — real-time or above throughout. GPU shaders are <1.5% of frame time; the remaining bottlenecks are CPU/memory-side.
+
+> [!IMPORTANT]
+> **Every throughput figure here is measured with an otherwise idle GPU, and does not survive a GPU-bound game.** Reported from real use: 1440p desktop streaming holds 60 fps, but with a game saturating the GPU at 30 fps the stream fell to **11 fps**. Encode runs on the same compute units and the same memory system the game is using, so a large penalty under heavy 3D load is inherent to a compute-shader encoder rather than a tuning oversight — a working VCN block would not contend this way (no CU usage, no CPU entropy coding, no per-frame readback). The previously-published "~8.4% GPU contention" number measured the **encoder's cost to the game**, not the **game's cost to the encoder**, and must not be read as the latter. Good for desktop, remote-work and light-GPU streaming; expect much less under a demanding title.
 
 On moving 1440p content the encode ceiling is **67 fps, up 46% from 46 fps** (static content: 92 fps, up 42%), from two changes to what crosses the GPU→CPU boundary. The GPU now hands the CPU a per-4x4-block nonzero bitmask, so the ~90-96% of blocks that quantize to all-zero are never read out of the 22 MB coefficient buffer; and the pre-quantization coefficient buffer is no longer staged to the host at all, since all 13 CPU reads of it wanted only each block's DC term — the GPU writes those to a compact buffer 1/16th the size. Together that cut CAVLC time ~40% and dropped host-visible staging from 44.2 MB to 2.8 MB per encoder context. `docs/DEVLOG.md` §19–§20.
 
