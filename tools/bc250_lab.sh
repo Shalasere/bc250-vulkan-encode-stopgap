@@ -180,11 +180,23 @@ art_dir() {
     echo "$ART/$key"
 }
 
-# scoreboard <key> - the comparison this project exists to win: this driver
-# versus Sunshine's software encoder, across every load condition, in
-# end-to-end fps. Idle-only numbers flattered the compute encoder badly
-# (DEVLOG §21.4), so "better than software" has to be asserted per-condition
-# or not at all.
+# scoreboard <key> - this driver versus Sunshine's software encoder, across
+# every load condition.
+#
+# REPORTS CPU-SECONDS PER FRAME ALONGSIDE FPS, and that is not decoration.
+# The first version of this compared throughput alone and said we lose in all
+# four conditions including idle (64 vs 137 fps). That reading was wrong about
+# what matters: libx264 buys its throughput with 16 threads and 56 ms of CPU
+# per frame, against 16 ms and one thread here. Its 137 fps is headroom nobody
+# can spend, while the CPU it consumes is exactly what a game needs. A
+# compute-shader encoder's whole reason to exist is offloading the CPU, so a
+# scoreboard that cannot see CPU cost cannot tell whether the project is
+# succeeding.
+#
+# Still missing, and a known risk: quality at matched bitrate. This encoder
+# has no subpel ME, no B-frames and no RD optimisation, so part of any
+# efficiency win may simply be being a worse encoder. Do not quote the CPU
+# advantage without it.
 scoreboard() {
     local key="${1:?scoreboard <key> [opts]}"; shift
     local content=testsrc2 res=2560x1440 frames=150 reps=2
@@ -197,21 +209,34 @@ scoreboard() {
         esac
     done
     echo "# scoreboard: $key vs libx264 (${BC250_SW_PRESET:-veryfast}) @ $content $res, $frames frames, $reps runs"
-    printf "%-8s %-10s %10s %10s %10s\n" load encoder e2e_fps e2e_ms verdict
+    printf "%-6s %-8s %9s %9s %9s %9s\n" load encoder fps cpu_ms/f rss_mb hits60
     local out="$LAB/.scoreboard.$$"; : > "$out"
     for load in none gpu cpu both; do
-        local afps bfps
-        afps=$(bench_e2e "$key"     "$content" "$res" "$frames" "$reps" "$load")
-        bfps=$(bench_e2e libx264    "$content" "$res" "$frames" "$reps" "$load")
-        printf "%-8s %-10s %10.2f %10.2f\n" "$load" "$key"    "$afps" "$(awk -v f="$afps" 'BEGIN{printf "%.2f", (f>0?1000/f:0)}')"
-        printf "%-8s %-10s %10.2f %10.2f %10s\n" "$load" libx264 "$bfps" \
-            "$(awk -v f="$bfps" 'BEGIN{printf "%.2f", (f>0?1000/f:0)}')" \
-            "$(awk -v a="$afps" -v b="$bfps" 'BEGIN{print (a>b)?"WE WIN":"we lose"}')"
-        echo "$load $afps $bfps" >> "$out"
+        local ar br afps acpu arss bfps bcpu brss
+        ar=$(bench_e2e "$key"  "$content" "$res" "$frames" "$reps" "$load")
+        br=$(bench_e2e libx264 "$content" "$res" "$frames" "$reps" "$load")
+        read -r afps acpu arss <<<"$ar"
+        read -r bfps bcpu brss <<<"$br"
+        for e in "$key:$afps:$acpu:$arss" "libx264:$bfps:$bcpu:$brss"; do
+            IFS=: read -r nm f c r <<<"$e"
+            printf "%-6s %-8s %9.2f %9.2f %9.0f %9s\n" "$load" "${nm:0:8}" \
+                "$f" "$c" "$(awk -v x="$r" 'BEGIN{printf "%.0f", x/1024}')" \
+                "$(awk -v x="$f" 'BEGIN{print (x>=60)?"yes":"NO"}')"
+        done
+        echo "$load $afps $bfps $acpu $bcpu" >> "$out"
     done
     echo
-    echo "# ratio (this driver / libx264): >1 means the compute encoder is ahead"
-    awk '{printf "  load=%-6s %.2fx\n", $1, ($3>0? $2/$3 : 0)}' "$out"
+    echo "# The decision-relevant comparisons are 'hits60' and CPU per frame,"
+    echo "# NOT the fps ratio. libx264 buys throughput with every core; this"
+    echo "# encoder's purpose is to leave those cores to the game. Excess fps"
+    echo "# above the stream's target is headroom nobody can spend."
+    awk '{printf "  load=%-5s fps %.2fx   cpu/frame %.2fx %s\n", $1, \
+          ($3>0? $2/$3:0), ($4>0? $5/$4:0), \
+          (($2>=60 && $5>$4)?" <- we hit 60 AND use less CPU":"")}' "$out"
+    echo
+    echo "# NOT MEASURED HERE: quality at matched bitrate. This encoder has no"
+    echo "# subpel ME, no B-frames and no RD, so some efficiency may just be"
+    echo "# being a simpler encoder. Do not quote the CPU win without it."
     rm -f "$out"
 }
 
@@ -221,15 +246,20 @@ bench_e2e() {
     local stamp; stamp=$(date +%s%N)
     local d="$RUNS/e2e-$stamp"; mkdir -p "$d"
     start_load "$load" "$d"
-    local best=0
+    local best=0 best_cpu=0 best_rss=0
     for i in $(seq 1 "$reps"); do
         run_encode "$key" "$content" "$res" "$frames" 120 31M "" 0 "$d/r$i" >/dev/null
-        local f; f=$(awk '{print $3}' "$d/r$i.wall" 2>/dev/null || echo 0)
-        best=$(awk -v a="$best" -v b="$f" 'BEGIN{print (b>a)?b:a}')
+        local f c r
+        read -r _ _ f c _ r < "$d/r$i.wall" 2>/dev/null || { f=0; c=0; r=0; }
+        # keep the CPU/RSS figures from the FASTEST run so all three columns
+        # describe the same run rather than being independent extrema
+        if awk -v a="$best" -v b="${f:-0}" 'BEGIN{exit !(b>a)}'; then
+            best="${f:-0}"; best_cpu="${c:-0}"; best_rss="${r:-0}"
+        fi
         rm -f "$d/r$i.h264"
     done
     stop_load
-    echo "$best"
+    echo "$best $best_cpu $best_rss"
 }
 
 # ---------------------------------------------------------------------------
@@ -264,7 +294,12 @@ start_load() {
     esac
     case "$kind" in
         cpu|both)
-            local n; n=$(( $(nproc) / 2 )); [ "$n" -lt 1 ] && n=1
+            # Default is half the cores, which is NOT representative: a real
+            # game takes most of the machine, and leaving libx264 half the
+            # threads flatters it badly in the scoreboard. Override with
+            # BC250_CPU_LOAD_N to model a hungry title.
+            local n; n="${BC250_CPU_LOAD_N:-$(( $(nproc) / 2 ))}"
+            [ "$n" -lt 1 ] && n=1
             for _ in $(seq 1 "$n"); do
                 ( while :; do :; done ) & LOAD_PIDS+=($!)
             done
@@ -300,9 +335,14 @@ run_encode() {
           envs="$7" audit="$8" out="$9"
     local t0 t1
     t0=$(date +%s.%N)
+    # /usr/bin/time rather than the `times` builtin: the builtin accumulates
+    # across every child of this shell, so repeated runs would drift upward.
+    # %U+%S counts all threads, which is the point - libx264 spends 16
+    # threads to get its throughput.
+    local -a TIMER=(/usr/bin/time -o "${out}.time" -f "%e %U %S %M")
     if [ "$key" = libx264 ]; then
         # -preset veryfast matches this board's sunshine.conf (sw_preset).
-        ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
+        "${TIMER[@]}" ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
             -frames:v "$frames" -g "$gop" -vf 'format=nv12' \
             -c:v libx264 -preset "${BC250_SW_PRESET:-veryfast}" -b:v "$bitrate" \
             -f h264 "${out}.h264" > "${out}.log" 2>&1
@@ -313,8 +353,8 @@ run_encode() {
         if [ -n "$envs" ]; then
             local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
         fi
-        env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" BC250_SHADER_DIR="$bd" \
-            "${envv[@]}" \
+        "${TIMER[@]}" env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
+            BC250_SHADER_DIR="$bd" "${envv[@]}" \
             ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
             -frames:v "$frames" -g "$gop" -vaapi_device "$RENDER" \
             -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v "$bitrate" \
@@ -322,8 +362,16 @@ run_encode() {
     fi
     local rc=$?
     t1=$(date +%s.%N)
-    awk -v a="$t0" -v b="$t1" -v n="$frames" \
-        'BEGIN{e=b-a; printf "%.4f %.4f %.2f\n", e, (n>0? e*1000.0/n:0), (e>0? n/e:0)}' \
+    # wall_s  wall_ms/frame  fps  cpu_s  cpu_ms/frame  maxrss_kb
+    local cpu_s=0 rss=0
+    if [ -f "${out}.time" ]; then
+        read -r _e _u _s _m < "${out}.time"
+        cpu_s=$(awk -v u="${_u:-0}" -v s="${_s:-0}" 'BEGIN{printf "%.4f", u+s}')
+        rss="${_m:-0}"
+    fi
+    awk -v a="$t0" -v b="$t1" -v n="$frames" -v c="$cpu_s" -v r="$rss" \
+        'BEGIN{e=b-a; printf "%.4f %.4f %.2f %.4f %.4f %s\n", e, (n>0? e*1000.0/n:0), \
+               (e>0? n/e:0), c, (n>0? c*1000.0/n:0), r}' \
         > "${out}.wall"
     echo $rc
 }
@@ -366,12 +414,13 @@ bench() {
         local tag="$key/$content/$res/load=$load/r$i"
         # End-to-end throughput first: it is the only column that exists for
         # every encoder, and the one a user feels.
-        read -r e2e_s e2e_ms e2e_fps < "$base.wall"
+        read -r e2e_s e2e_ms e2e_fps cpu_s cpu_ms rss_kb < "$base.wall"
         if [ "$first" = 1 ] && [ "$quiet" = 0 ]; then
-            printf "e2e_fps\te2e_ms\t%s\n" "$(echo "$BENCH_FIELDS" | tr ',' '\t')"
+            printf "e2e_fps\te2e_ms\tcpu_ms\trss_mb\t%s\n" "$(echo "$BENCH_FIELDS" | tr ',' '\t')"
             first=0
         fi
-        printf "%s\t%s\t" "$e2e_fps" "$e2e_ms"
+        printf "%s\t%s\t%s\t%s\t" "$e2e_fps" "$e2e_ms" "$cpu_ms" \
+            "$(awk -v r="${rss_kb:-0}" 'BEGIN{printf "%.0f", r/1024}')"
         python3 "$PARSE" "$base.log" --tsv --tag "$tag" --fields "$BENCH_FIELDS"
         python3 "$PARSE" "$base.log" --tag "$tag" > "$base.json"
     done

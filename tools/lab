@@ -41,7 +41,18 @@ fi
 # `ssh -n` is mandatory here: ssh inside a pipeline otherwise consumes stdin
 # and swallows the rest of the caller's script. It also nulls stdin, which is
 # why nothing below uses a heredoc over the wire.
-sh_remote() { "${SSH[@]}" "$HOST" "bash $LAB_REMOTE/bc250_lab.sh $*"; }
+# Forward the harness's own tunables to the board. Without this, setting
+# something like BC250_CPU_LOAD_N locally silently has no effect, because the
+# remote bash gets a fresh environment - a quiet way to believe you measured
+# a condition you never actually applied.
+FORWARD=""
+for v in BC250_CPU_LOAD_N BC250_SW_PRESET BC250_LAB_DIR BC250_DRV_DIR \
+         BC250_DISTROBOX BC250_RENDER BC250_LAB_REPO; do
+    eval "val=\${$v:-}"
+    [ -n "$val" ] && FORWARD="$FORWARD $v=$(printf '%q' "$val")"
+done
+
+sh_remote() { "${SSH[@]}" "$HOST" "env$FORWARD bash $LAB_REMOTE/bc250_lab.sh $*"; }
 
 cmd="${1:-}"
 
