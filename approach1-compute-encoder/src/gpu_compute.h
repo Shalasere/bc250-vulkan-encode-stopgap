@@ -236,6 +236,34 @@ typedef struct bc250_gpu_context {
      * creation via vkGetDeviceProcAddr() - see gpu_compute_export_nv12_dmabuf().
      * NULL if the device extension wasn't available (callers must check). */
     PFN_vkGetMemoryFdKHR get_memory_fd_khr;
+
+    /* VK_KHR_external_semaphore_fd's vkImportSemaphoreFdKHR, resolved once at
+     * device creation the same way as get_memory_fd_khr above. Lets this
+     * driver explicitly wait, before it reads a VA-API render-target surface
+     * as encoder input, on whatever GPU work last wrote into that same
+     * memory through a *different* API context - e.g. Sunshine's own OpenGL
+     * rendering into this surface via its own EGL/GL import of the dma-buf
+     * this driver exported for it (see bc250_ExportSurfaceHandle()). Without
+     * this, this driver's Vulkan compute dispatch has no explicit ordering
+     * relative to that GL write and can start reading the surface before
+     * Mesa's radeonsi has actually finished rendering into it - see
+     * gpu_compute_wait_for_image_ready()'s doc comment for the full story.
+     * NULL if the device extension wasn't available (callers must check). */
+    PFN_vkImportSemaphoreFdKHR import_semaphore_fd_khr;
+    bool have_external_semaphore_fd;
+
+    /* Persistent semaphore object re-used every frame as the import target
+     * for gpu_compute_wait_for_image_ready(). vkImportSemaphoreFdKHR with
+     * VK_SEMAPHORE_IMPORT_TEMPORARY_BIT replaces just this semaphore's
+     * *payload* each call, so one long-lived handle is all that's needed -
+     * no per-frame semaphore creation/destruction. */
+    VkSemaphore image_ready_semaphore;
+
+    /* Set by gpu_compute_wait_for_image_ready() when it successfully
+     * imported a wait fence; consumed (and cleared) by the next
+     * gpu_compute_end_picture() call, which adds image_ready_semaphore to
+     * its vkQueueSubmit()'s pWaitSemaphores. */
+    bool has_pending_wait_semaphore;
 } bc250_gpu_context_t;
 
 typedef bc250_gpu_context_t gpu_context_t;
@@ -278,6 +306,43 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
  * own contract for vaExportSurfaceHandle() says the same: "backend driver
  * will not close the file descriptor"). Returns 0 on success. */
 int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd);
+
+/* Explicit GPU-side wait for whatever wrote into `memory` last, through
+ * *any* API/context - not just this driver's own Vulkan submissions.
+ *
+ * This driver's VA-API render-target surfaces are shared, zero-copy, with
+ * Sunshine's own OpenGL context: bc250_ExportSurfaceHandle() hands out a
+ * real DMA-BUF fd for this same `memory`, and Sunshine's EGL/GL code
+ * imports it as the render target its color-conversion shader renders NV12
+ * output into (see egl::sws_t::convert_nv12() and how va_t::set_frame()
+ * wires the export up - both the RAM and VRAM capture paths share this
+ * exact mechanism on the *output* side regardless of which one is used for
+ * capture, which is why corruption from a race here appears identically
+ * under either capture path).
+ *
+ * Two independent GPU command-submission contexts (Mesa's radeonsi/RADV
+ * for GL, and this driver's own Vulkan compute queue) touching the same
+ * dma-buf need an explicit hand-off unless implicit kernel-level dma-buf
+ * fencing is both engaged and correctly ordered for both sides - which
+ * this driver has no way to verify from here, and evidently cannot rely
+ * on given the observed corruption. This function makes the dependency
+ * explicit instead of assuming implicit sync covers it: it snapshots the
+ * dma-buf's current fences via DMA_BUF_IOCTL_EXPORT_SYNC_FILE (kernel,
+ * cross-API-agnostic - see <linux/dma-buf.h>) and imports that snapshot as
+ * a one-shot Vulkan wait semaphore for the *next* gpu_compute_end_picture()
+ * call, so this driver's compute shaders cannot start reading the surface
+ * until whatever last wrote to it - our own prior Vulkan work, or a
+ * completely separate GL context's render pass - has actually finished on
+ * the GPU.
+ *
+ * Call once per real frame, after the render target's contents are known
+ * to be final (i.e. right before this driver would otherwise read it -
+ * see bc250_EndPicture()) and before the matching gpu_compute_end_picture()
+ * call. A no-op returning -1 if VK_KHR_external_semaphore_fd wasn't
+ * available at device creation (have_external_semaphore_fd is false) -
+ * callers must tolerate that and proceed without the extra wait, exactly
+ * like every other opportunistic capability check in this file. */
+int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory);
 
 /* Test-harness instrumentation (tools/quality_test.sh): dumps raw NV12
  * frame bytes to BC250_DUMP_DIR (default /tmp/bc250_dump_frames) when

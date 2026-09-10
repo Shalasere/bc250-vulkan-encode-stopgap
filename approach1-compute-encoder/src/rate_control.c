@@ -82,6 +82,17 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
     rc->current_qp = base_qp;
     rc->prev_frame_sad = 0;
     rc->error_integral = 0;
+
+    /* Diagnostic (BC250_DEBUG_RC=1): every rc_init with the target it was
+     * actually handed and the base QP that fell out of it. Added while
+     * root-causing "requested bitrate has no effect on output" - see
+     * docs/DEVLOG.md §15. */
+    if (getenv("BC250_DEBUG_RC")) {
+        fprintf(stderr, "[bc250-rc] rc_init: mode=%d target=%u bps fps=%.1f %ux%u "
+                        "-> base_qp=%d target_bits_per_frame=%u\n",
+                (int)mode, rc->target_bitrate, rc->framerate, width, height,
+                base_qp, rc->target_bits_per_frame);
+    }
 }
 
 /*

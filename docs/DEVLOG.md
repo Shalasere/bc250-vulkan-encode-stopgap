@@ -1340,3 +1340,611 @@ redirect survive a reboot" and `pic_init_qp_minus26`) are now both
 closed — the latter by §10.7. What's left for full production use is
 §12.5's open capture-path corruption investigation, which lives outside
 this repo's own code.
+
+---
+
+## 13. §12.5 revisited: not capture-path-dependent, not continuous — a one-time early onset that propagates via P-frame prediction
+
+Follow-on session to §12.5. §12.5 left the live corruption as "squarely
+outside this repo... a live capture-side defect." Two concrete fix
+attempts based on that framing were built, deployed, and tested live —
+both had **zero effect** on the corruption. A third diagnostic, much
+cheaper than either fix attempt, then overturned the framing itself:
+the corruption is not present from the start of a session, appears
+within roughly the first second, and — critically — never recovers for
+the rest of the session. That pattern is the signature of H.264
+reference-frame error propagation, not a continuously-wrong capture or
+color pipeline. This reopens the question of whether the real cause is
+inside this repo's own encoder after all.
+
+### 13.1 Fix attempt #1 (disproven): the VRAM zero-copy capture path's shared color-conversion shader
+
+Working theory going in: Sunshine's zero-copy VAAPI capture
+(`kms::display_vram_t`) samples the captured KMS plane through a GLSL
+shader (`egl::sws_t::convert_nv12()`) that assumes an 8-bit-per-channel
+source; the board's compositor (KWin) scans out at 10-bit
+(`DRM_FORMAT_XRGB2101010`/"XR30", confirmed via `ffmpeg -f kmsgrab`
+rejecting the format and via an `LD_PRELOAD` shim's own
+`drmModeGetFB2()` hook logging the real fourcc live) even with HDR
+disabled, because KWin's `colorPowerPreference()` picks 10-bit
+automatically whenever HDR is merely *advertised*. Sunshine's own RAM
+capture path (`kms::display_ram_t`) is provably immune (its
+`glGetTextureSubImage()` CPU readback correctly normalizes any source
+depth) and — not obviously known before this session — already
+supports real hardware VAAPI encoding too (`display_ram_t::
+make_avcodec_encode_device()` has a `mem_type_e::vaapi` branch calling
+`va::make_avcodec_encode_device(..., vram=false)`), used as Sunshine's
+own built-in fallback whenever `display_vram_t::init()` fails. So the
+fix tested: make `display_vram_t::init()` deliberately fail on a
+non-8bpc source, forcing Sunshine onto its own already-correct RAM+vaapi
+path — real hardware encoding retained, zero-copy traded for one extra
+GPU→CPU→GPU round trip.
+
+**Two ways to test this without a Sunshine rebuild, both real, both worth
+keeping as techniques:**
+
+1. **The source patch** (for the record — not what got tested live,
+   see below): `kmsgrab.cpp`'s `display_t::init()` already reads
+   `fb->pixel_format` (line ~951, discarded); store it, and in
+   `display_vram_t::init()` add a third check alongside the two that
+   already exist there (`va::validate()` failure, CUDA-without-support):
+   fail if `mem_type == vaapi` and the format isn't
+   `DRM_FORMAT_XRGB8888`/`ARGB8888`, logging the same "Reverting back to
+   GPU -> RAM -> GPU" message the existing checks use.
+
+2. **What actually got tested — an `LD_PRELOAD` shim, no Sunshine
+   rebuild at all, and a genuinely reusable technique for this exact
+   binary**: Sunshine's binary carries `cap_sys_admin`/`cap_sys_nice`
+   file capabilities (§12.6 item 3), which puts it in kernel
+   `AT_SECURE` mode — and glibc's dynamic linker unconditionally
+   **strips `LD_PRELOAD` from the environment** for any `AT_SECURE`
+   process, confirmed here via `getauxval(AT_SECURE)` reading `1` for
+   the live PID (also confirmed indirectly: the same process can't even
+   read its own `/proc/<pid>/environ` — the kernel clears the
+   "dumpable" flag for the same reason). A per-service
+   `Environment=LD_PRELOAD=...` in the systemd drop-in is therefore
+   silently ignored no matter how it's set. The fix: `/etc/ld.so.preload`
+   — a root-owned, system-wide preload list the dynamic linker honors
+   *regardless* of `AT_SECURE`, since it's trusted/root-controlled
+   rather than the untrusted process's own environment. Cost: it's
+   genuinely global (every dynamically-linked process on the machine
+   loads the shim), not just scoped to Sunshine — acceptable here
+   because the shim's two hooks are narrow and inert for anything that
+   doesn't match.
+   The shim itself (`tools/bc250_sunshine_shim.c`): hooks
+   `drmModeGetFB2()` (libdrm)
+   to record whether the queried plane's `pixel_format` is 8bpc-safe,
+   and hooks `vaInitialize()` (libva) to force failure on exactly the
+   *first* call — always `va::validate()`'s own probe, always before
+   any real encode session starts — when the recorded format was
+   unsafe; every later `vaInitialize()` call (the real encode session,
+   once Sunshine has fallen back) passes through untouched. No libdrm-
+   devel/libva-devel headers needed — both structs/signatures are
+   hand-declared to their stable, documented kernel/library ABI.
+
+**Live result**: journal confirmed the shim fired exactly as designed —
+`drmModeGetFB2: ... fourcc=0x30335258 unsafe=1` → `vaInitialize:
+failing the display_vram_t validate() probe` → Sunshine's own `Warning:
+Monitor doesn't support hardware encoding. Reverting back to GPU -> RAM
+-> GPU` → `Found H.264 encoder: h264_vaapi [vaapi]` (real hardware
+encoding retained, not a fallback to software). A full live loopback
+session (real Sunshine, real Moonlight client, ~48s, 2081 frames
+captured via `BC250_DUMP_REAL_INPUT`/`BC250_DUMP_RECON_FRAMES`) on the
+forced RAM path showed **the identical corruption** as the original
+zero-copy VRAM path. Capture-path selection has no effect on the bug.
+Theory disproven; the 10-bit scanout format is a real, confirmed fact
+about this display, just not the cause of *this* corruption.
+
+### 13.2 Fix attempt #2 (disproven): explicit GPU-side wait for the shared encode-target surface
+
+Second working theory: this driver's VA-API render-target surfaces are
+zero-copy shared with Sunshine's *own* OpenGL context — `va_t::
+set_frame()` (the base class both `va_ram_t` and `va_vram_t` inherit,
+in Sunshine's `vaapi.cpp`) calls `vaExportSurfaceHandle()` on this
+driver's freshly-allocated encode surface and imports the resulting
+dma-buf into its EGL/GL context as the literal render target
+`egl::sws_t::convert_nv12()` writes NV12 output into — a zero-copy
+write on the *output* side, identical for both capture paths (which is
+exactly why §13.1's capture-path switch had no effect either way: this
+shared step is downstream of capture entirely). This driver's own
+`gpu_compute_end_picture()` submits its compute-shader read of that
+same memory via a bare `VkSubmitInfo` — `waitSemaphoreCount`/
+`pWaitSemaphores` both zero, no execution-order dependency on whatever
+GPU work (Sunshine's separate GL context) last wrote into it. Whether
+that gap is real depends entirely on whether amdgpu's kernel-level
+implicit dma-buf fencing is actually engaged and correctly ordered for
+this cross-API (GL-writer/Vulkan-reader) case — not verifiable by
+reading code alone.
+
+Fix implemented (kept in this repo, still present in `main` as of this
+writing — see 13.4 for why it wasn't reverted): `gpu_compute_
+wait_for_image_ready()` (`gpu_compute.c`/`.h`) snapshots the shared
+surface's *current* dma-buf fences via `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`
+(kernel, API-agnostic — see `<linux/dma-buf.h>`) and imports that
+snapshot as a one-shot `VkSemaphore` (`VK_KHR_external_semaphore_fd`,
+enabled opportunistically the same way `VK_KHR_external_memory_fd`
+already was) for the next `gpu_compute_end_picture()`'s
+`vkQueueSubmit()` to wait on. Called from `bc250_EndPicture()` right
+before the encode dispatch, for both the real (h264/hevc) and the
+test-only fallback path.
+
+**Live result**: built cleanly (no warnings), deployed, ran a full ~48s
+live session with no hang (ruling out the obvious risk of this fix —
+an imported semaphore that never signals would deadlock
+`vkQueueSubmit` forever) and **the identical corruption** as before,
+pixel-for-pixel similar in both `real_*` and `recon_*` dumps. Theory
+disproven, or at least not the (sole) cause — plausibly because Mesa's
+implicit dma-buf fencing already covers this correctly and the wait was
+always a no-op in practice, or because the actual race (if any) is
+elsewhere in the pipeline. Not reverted: it's a correct, low-risk,
+purely-additive belt-and-suspenders fix regardless of whether it's
+load-bearing for *this* bug, and removing it gains nothing.
+
+### 13.3 The finding that reframes the whole investigation: onset timing
+
+Cheap diagnostic, no new live test needed — just sampling more frames
+already sitting in the 2081-frame dump from 13.2's test:
+
+| frame index | ~elapsed | `real_*.nv12` (pre-encode capture) |
+|---|---|---|
+| 10  | ~0.2s | Clean. Crisp Steam sign-in dialog, taskbar, desktop icons — no artifact of any kind. |
+| 30  | ~0.7s | Mostly clean; early motion-blur-like softness starting (text edges smearing). |
+| 60  | ~1.4s | Fully corrupted — the same blue/purple/pink speckle pattern as every later frame. |
+| 90, 300, 800, 1500, 2000 | 2s–45s | All corrupted, visually the same pattern/severity as frame 60. |
+
+This rules out every theory tested so far in this log (§12's QPc fix,
+§13.1's capture path, §13.2's GPU sync) by construction — all of those
+are either always-wrong-from-frame-1 (a static color/format bug would
+show in frame 10) or continuously-re-random (a live per-frame race
+would look different frame to frame, not settle into one stable
+pattern and hold it for 40+ seconds). What actually fits: **something
+goes wrong once, early — within roughly the first 60 frames of a fresh
+session — corrupting a reference frame, which every subsequent P-frame
+then predicts from**, via ordinary H.264 motion-compensated prediction.
+With no periodic keyframe/IDR refresh inserted mid-stream (not
+confirmed either way yet — see 13.4), a single early corrupted
+reference has no mechanism to ever self-correct: exactly the "starts
+fine, gets unusable, and stays that way" pattern the user originally
+reported, and exactly what §12.1's "self-consistent, invisible to
+internal-only comparisons" trap would predict if the true root cause
+were ever tested only via aggregate/steady-state metrics instead of a
+frame-by-frame timeline.
+
+This also means §12.5's "not investigated further here — a different
+project" framing was premature: reference-frame error propagation is
+this repo's own encoder behavior (P-frame prediction, DPB/`recon_image`
+management, whatever early event seeds the corrupted reference), not
+necessarily Sunshine's capture path or the compositor at all. The 10-bit
+scanout format and the GL/Vulkan shared-surface sync gap are both real,
+confirmed facts about this system — just apparently not *this* bug.
+
+### 13.4 Open, next session: find the one-time trigger
+
+Not yet done, in priority order:
+
+1. **Pin the exact onset frame** (currently only bracketed to
+   "somewhere in 30–60") and check whether it's the *same* frame index
+   across independent fresh sessions (deterministic — e.g. always the
+   first P-frame after the initial IDR, or tied to the double-buffer
+   `current_buf` wraparound at frame 2) or varies run to run (a rare
+   race that happens to land somewhere in an early window).
+2. **Check whether any periodic IDR/keyframe is ever inserted** for the
+   rest of a session (`encoder_h264.c`'s GOP/keyframe logic) — if the
+   corrupted reference is never flushed by a fresh IDR, that alone
+   would fully explain "never recovers," independent of whatever seeds
+   the original corruption.
+3. If the onset frame is deterministic, that's a far more tractable
+   target than "the whole live pipeline is sometimes wrong" — likely
+   something specific to early-session state: the first real
+   `vaBeginPicture`/`vaRenderPicture`/`vaEndPicture` cycle, the DPB
+   having no real previous reconstruction yet (`has_recon_frame`
+   false → true transition), or the double-buffered `cmd_bufs`/
+   `fences[2]` seeing their first wraparound.
+
+### 13.5 Concrete, load-bearing lead found while investigating 13.4: periodic IDR refresh never actually fires
+
+Confirmed via `BC250_PERF_SHADOW` log lines (`fprintf(stderr, "[BC250_PERF_SHADOW]
+frame=%u type=%s ..."` in `h264_encoder_encode_frame()`, `encoder_h264.c`
+~line 1942 — emitted unconditionally under `BC250_PERF_STATS=1`, which
+this session's test harness already sets) from the same live session
+as §13.3's table: across the real streaming window (`CLIENT CONNECTED`
+10:15:04.662 → `CLIENT DISCONNECTED` 10:15:52.294, 2020 total encoded
+frames, `frame_count` running 0→2018) there is exactly **one** real
+`type=I` (IDR) frame in the whole ~48-second session, right at the
+start. Every one of the other ~2019 frames is a P-frame chained,
+unbroken, all the way back to that single IDR.
+
+This is a real, independent bug regardless of whatever seeds §13.3's
+onset: `h264_encoder_create()` sets `encoder->gop_size =
+encoder->fps` (a normal 1-second keyframe interval — `encoder_h264.c`
+~line 1538, `fps` defaulting to 60 if the caller passes `<= 0`), and
+`h264_encoder_encode_frame()`'s `is_idr = (encoder->frame_count %
+encoder->gop_size == 0) || encoder->force_idr` (~line 1801) is the
+*only* code path VA-API real encoding actually calls (confirmed —
+`bc250_EndPicture()` calls this function specifically, not the
+parallel `h264_encoder_encode_raw()` a few hundred lines later, which
+is a separate raw-buffer entry point only `tests/test_encode.c` uses).
+With `frame_count` incrementing by exactly 1 every real call (confirmed
+— the only `encoder->frame_count++` on this call path is at the end of
+this same function) and running well past 2000, the modulo should have
+landed on an exact multiple of a normal (tens-to-low-hundreds) `gop_size`
+dozens of times. It did not, even once, after frame 2. Not yet
+determined: whether `gop_size` itself is some unexpectedly huge value
+(the `fps` this driver actually receives from Sunshine/ffmpeg's VA-API
+config could be a very different number than assumed — never directly
+logged/confirmed this session) or whether `force_idr`/`gop_size`'s
+check has some other bug entirely.
+
+Practical significance, independent of §13.3's root cause: with no
+periodic refresh, a real H.264 decoder has zero mechanism to ever
+resync mid-session no matter what upstream/downstream capture or sync
+bug seeds the original corruption — "starts fine, degrades, and stays
+broken for the rest of the session" is *exactly* what "one bad P-frame
+reference, then no refresh for 48 seconds" predicts. Fixing periodic
+IDR insertion (confirm the real `fps`/`gop_size` value in a live
+session via added logging, or hunt directly for why the modulo check
+never re-triggers) is likely the single highest-leverage next fix
+regardless of whatever turns out to seed §13.3's initial drift — it
+would turn "unusable after ~1s, forever" into, at worst, "briefly
+glitches every GOP," which is a fundamentally different and far more
+tractable failure mode to chase further, and a real improvement to
+ship even before the root seed is fully found.
+
+> 🚨 **§13.1–13.5 are SUPERSEDED by §14.** The encoder is exonerated
+> (60.5 dB against a real decoder), and every live A/B measurement in
+> §13 was scored with a contaminated instrument. Read §14 before
+> acting on anything above.
+
+---
+
+## 14. Correction: the encoder measures 60.5 dB against a real decoder, and every live A/B in §13 was scored with a contaminated instrument
+
+§13 built an increasingly specific theory of encoder-side reference
+drift on top of the `real_*`/`recon_*` frame dumps. §14 tests the
+encoder directly, against an independent oracle, and the theory does
+not survive.
+
+### 14.1 The measurement §12 and §13 never made: decoder-in-the-loop, offline
+
+`tools/quality_test.sh` already does exactly the right thing —
+encode → decode with **ffmpeg's own software H.264 decoder** as
+oracle → per-frame PSNR/SSIM against the driver's own captured input
+(`BC250_DUMP_INPUT_FRAMES`, i.e. ground truth is byte-exactly what the
+driver received). It had only ever been run at its 50-frame default,
+too short for a drift argument. Run at 300 frames, 1280×720, on the
+same driver binary and shaders as every live test in §13, with
+Sunshine, KWin, KMS capture and dma-buf sharing **entirely out of the
+loop**:
+
+```
+PSNR average: 60.47 dB   (y 60.50 / u 60.21 / v 60.61)
+SSIM All:     0.9994
+```
+
+Per-frame curve (`psnr_per_frame.log`, GOP = 120): **63.5 dB at each
+IDR (n:1, n:121, n:241), decaying smoothly to ~59.8 dB by GOP end,
+snapping back at the next IDR.**
+
+Two conclusions, both firm:
+
+1. **Reference drift is real, and is exactly the mechanism §13.3/§13.5
+   reasoned toward** — a per-GOP sawtooth is the unmistakable signature
+   of encoder-reference divergence that only an IDR resets. The
+   mechanism was correctly identified.
+2. **Its magnitude is ~3.7 dB at ~60 dB, i.e. visually irrelevant.** It
+   cannot produce the live symptom. At 60.5 dB / 0.9994 SSIM this
+   encoder is, against a real decoder, essentially numerically exact.
+   **The encoder is not the cause of the live corruption.**
+
+### 14.2 Why the live A/Bs in §13 proved nothing: the loopback harness is a video feedback loop
+
+`final_working_repro.sh` runs the Moonlight client **on the board**,
+streaming from `127.0.0.1`, rendering onto the only display Sunshine
+captures. So: Sunshine captures the desktop → encodes → Moonlight
+decodes and paints it onto that same desktop → Sunshine captures
+*that* → encodes again. Every frame adds another 4:2:0 lossy round
+trip, and they compound.
+
+That one fact accounts for the entire body of evidence §12.5 and §13
+were built on:
+
+| Observation | Explained by the feedback loop |
+|---|---|
+| Frame 10 clean → ~60 saturated → constant to frame 2000 (§13.3) | Count of accumulated codec round trips, saturating |
+| Chroma-dominant blue/purple/pink speckle | 4:2:0 chroma loss compounds hardest under repeated re-encode |
+| Corruption present in `real_*`, i.e. the **input** (§12.5's decisive evidence) | The captured desktop genuinely *is* the recursively degraded image |
+| `real_* ≈ recon_*` | The encoder faithfully encoding a degraded input — at 60.5 dB, as §14.1 now shows |
+| Identical under forced RAM vs VRAM capture (§13.1) | Loop untouched |
+| Identical with an explicit GPU wait semaphore (§13.2) | Loop untouched |
+| Identical with deblocking disabled on both sides (§14.3) | Loop untouched |
+| Offline, no client on screen: 60.5 dB | No loop |
+
+A fullscreen client makes the nesting invisible: the re-captured image
+is 1:1 aligned with the original, so recursion looks like "the same
+picture, progressively mangled" rather than a visible infinite mirror.
+Corroborating detail: the `sink-sunshine-stereo` audio OSD is absent
+from frame 10 and present in every corrupted frame — direct evidence
+the captured desktop changed when the client came up **on it**.
+
+**Consequence: every live A/B in §13 was scored with an instrument
+whose own artifact is far larger than any effect being measured.** All
+three hypotheses §13 reports as disproven — the 10-bit capture path,
+the GPU sync gap, and §14.3's deblocking gap — were tested with a
+harness that could not resolve them. In particular the 10-bit finding
+(§13.1) is real, was correctly identified, and was **discarded on
+invalid evidence**; it is once again the leading hypothesis.
+
+This is the same class of error §12.1 already recorded and warned
+about ("the `ydotool` wiggle... baked its own rendering artifact
+directly into the *source* frames the driver never even touches yet —
+proof that a captured 'ground truth' clip isn't automatically ground
+truth"). The lesson was written down and not generalized: **any
+loopback test in which the client renders onto the captured display is
+invalid, for any measurement.**
+
+### 14.3 Found along the way and still real: in-loop deblocking is luma-only
+
+`deblock_filter.comp` declares exactly three bindings —
+`binding 0` is `frameImage` as **`r8`** (single channel, luma), plus
+QuantLevels and MVs. **There is no chroma image binding at all**, and
+`gpu_compute.c` binds only `recon_image.y_view`. Meanwhile the slice
+header signals `disable_deblocking_filter_idc = 0` by default, so every
+real decoder deblocks **luma and chroma** in-loop. The encoder's chroma
+reference is therefore never deblocked while the decoder's always is —
+the same defect class, and the same "diverges from the second frame of
+every GOP onward, invisible on flat content, compounding with residual
+energy" mechanism, that the luma-side binding fix in
+`gpu_compute.c`'s Stage-5 comment already describes. That fix rebound
+luma and did not notice chroma has no binding: it was half a fix.
+
+Tested directly, and **disproven as the live cause**: `BC250_FAST_MODE=1`
+makes the encoder skip deblocking *and* signal `idc=1` so the decoder
+skips it too, eliminating any deblock mismatch by construction. Live
+loopback with FAST_MODE confirmed present in the process environment
+(and the output visibly blockier, proving the flag actually engaged):
+**the same progressive chroma corruption, unchanged.** This is a
+trustworthy negative — unlike §13.1/§13.2, the fix was verified to have
+taken effect — but per §14.2 it was still scored on the contaminated
+harness, so it only rules deblocking out as the *dominant* live effect.
+It remains a real spec-conformance defect worth fixing on its own
+merits (~part of §14.1's measured 3.7 dB sawtooth): add an `rg8`
+binding on `recon_image.uv_view` and ITU-T 8.7.2.4 chroma edge
+filtering (bS inherited from the co-located luma edge, 4:2:0 filters
+only the 8×8-in-chroma edges, chroma-specific `tc0`, 2-tap).
+
+Also found and now explained: `color_convert_pipeline` is created and
+destroyed but **never dispatched** — dead code, and a red herring for
+anyone tracing where the input surface could be written.
+
+### 14.4 Root-caused: the "flaky capture-init race" is display blanking
+
+§12/§13 repeatedly hit `Unable to initialize capture method` /
+`Platform failed to initialize` (which then fails *every* encoder,
+including software, because capture init precedes encoder probing) and
+recorded it as intermittent with "root cause never fully pinned down."
+It is not random. The failing runs log:
+
+```
+Warning: Mismatch on expected Resolution compared to actual resolution: 0x0 vs 1920x1080
+```
+
+Sunshine reads the output as **0×0** — the display has blanked/DPMS'd
+off after idle. Both runs that succeeded by luck did so immediately
+after a test that had been driving `ydotool` mouse motion. Confirmed:
+after explicitly waking the display (a few `ydotool mousemove` calls
+plus `SimulateUserActivity`), Sunshine came up **healthy on the first
+attempt**, with no other change. Any harness or install script that
+starts Sunshine on this board should wake the display first, or
+blanking should be disabled outright for the session.
+
+### 14.5 Corrected state and the one test that matters next
+
+- **Encoder**: exonerated for the live symptom. 60.5 dB / 0.9994 SSIM
+  against a real decoder over 300 frames. Two genuine but minor
+  spec-conformance defects remain (luma-only deblocking §14.3;
+  intra prediction from source rather than reconstructed neighbors,
+  documented in `residual_predict.comp`'s own header) which together
+  account for the measured ~3.7 dB per-GOP sawtooth. Worth fixing;
+  not urgent.
+- **§12.5's conclusion stands** — the live corruption enters upstream of
+  this driver — though its supporting evidence (`real_* ≈ recon_*`) was
+  never valid reasoning for it, and its "not investigated further, a
+  different project" framing sent §13 chasing the wrong things.
+- **§13.1–13.5 are void as disproofs.** The GPU wait semaphore added in
+  §13.2 is retained (correct, additive, low-risk) but is not known to
+  be load-bearing and was never verified to engage.
+- **Leading hypothesis, restored**: Sunshine's VRAM shader path
+  mishandling the compositor's 10-bit scanout (confirmed live via the
+  shim's own `drmModeGetFB2` hook: `XR30`/XRGB2101010 in one session,
+  `AB30`/ABGR2101010 in another — always 10-bit, never 8-bit). The
+  `LD_PRELOAD` shim that forces Sunshine's own
+  `display_ram_t`+vaapi fallback is reinstated and verified firing
+  (`/etc/ld.so.preload`, forced fallback logged, `h264_vaapi` retained).
+- **The only valid next measurement**: a **remote** Moonlight client, on
+  a separate machine, with the shim enabled. That is the sole
+  instrument in this setup free of §14.2's feedback loop. Do not score
+  this on the on-board loopback harness.
+
+---
+
+## 15. Root cause of the real user-visible defect: the requested bitrate is ignored (~4 Mbps regardless)
+
+§14.5's "only valid next measurement" was taken: a **remote** client
+(separate machine, OBS screen recording, shim active — no §14.2
+feedback loop). Result, and it reframes the symptom entirely.
+
+### 15.1 What the remote client actually shows
+
+Not the catastrophic corruption the loopback dumps showed. Across the
+19s recording the picture is **structurally intact and legible** — Steam
+logo crisp, QR code readable, button clean — with **fine mottling and
+banding confined to flat gradient areas** (a smooth purple wall), and
+**no progressive degradation** (t=4s, t=8s and t=16s are comparable;
+t=16s is arguably cleanest). That is independent confirmation of
+§14.2: the runaway, chroma-scrambled corruption in every §12.5/§13
+dump was substantially the on-board feedback loop, not the stream.
+
+### 15.2 The session numbers
+
+Sunshine's own log for the recorded session (the earlier 1 Mbps /
+1920x1088 lines are the *startup encoder probe*, not the session):
+
+```
+Info: Streaming bitrate is 30988000                                ← client requested ~31 Mbps
+[bc250-h264] Encoder initialized: 2560x1440 @ 30 fps, 4000000 bps  ← driver's hardcoded default
+Info: Minimum FPS target set to ~30fps
+[bc250-h264] fps updated: 30 -> 60 (rate control re-initialized)
+```
+
+Note `h264_encoder_set_bitrate()` does **not** log (only
+`set_fps()` does), so the absence of a bitrate line proves nothing —
+it had to be measured, not inferred.
+
+### 15.3 Measured, offline and deterministic: the request is ignored
+
+2560×1440, 150 frames, `testsrc`, no Sunshine/compositor/capture in the
+loop, varying only `-b:v`:
+
+| requested | measured output |
+|---|---|
+| `-b:v 4M`  | 3.82 Mbps |
+| **`-b:v 31M`** | **3.90 Mbps** |
+
+**A 7.75× increase in requested bitrate produces a 2% change in
+output.** The encoder is effectively running at fixed QP, pinned near
+the `h264_encoder_create(..., 30, 4000000)` default hardcoded in
+`bc250_CreateContext()` (`va_backend.c` ~line 354/356). The
+client's target never reaches rate control.
+
+### 15.4 Why this is the defect that matters, and why it evaded five hypotheses
+
+Everything about the real-world report follows from "1440p at ~4 Mbps":
+
+- Mottling/banding on flat gradients, structure intact, no drift —
+  exactly what ~4 Mbps at 1440p looks like, and exactly what §15.1 shows.
+- **x264 honors the 31 Mbps request**, so software encoding looks
+  pristine at identical client settings. That is the entire content of
+  the user's "software works fine, our vaapi looks bad" report — with
+  no correctness bug anywhere.
+- The user's Moonlight bitrate slider has **no effect**, so no
+  client-side tuning could ever have helped.
+- It is a **quality** defect, not a **corruption** defect. That is why
+  every correctness hypothesis pursued in §12–§14 (chroma QP, 10-bit
+  capture path, GPU-sync gap, luma-only deblocking, reference drift)
+  either measured clean or failed to change the symptom: they were all
+  answers to the wrong question. §14.1's 60.5 dB says the encoder is
+  numerically fine; it was never *accuracy* that was wrong, it was
+  *bit allocation*.
+
+The machinery to fix this already exists and is already wired:
+`va_backend.c` handles both `VAEncSequenceParameterBufferH264`
+(`seq->bits_per_second`, ~line 581) and
+`VAEncMiscParameterTypeRateControl` (~line 607-624, including the
+`target_percentage` scaling documented in
+`docs/rate_control_audit.md` §2), and `h264_encoder_set_bitrate()`
+re-inits the feedback loop. The advertised caps are
+`VA_RC_CBR | VA_RC_VBR | VA_RC_CQP` (~line 82). So the target is
+either not arriving, arriving as a value the `target_percentage` math
+collapses, being rejected by `set_bitrate()`'s no-change guard, or
+being ignored downstream because `rc_get_frame_qp()` isn't actually
+driven by `target_bits_per_frame`. Next step is to instrument those
+four points and find which — a tight, offline, deterministic loop
+(§15.3's test is a ~60s reproduction), not a live-streaming hunt.
+
+Corroborating breadcrumb, previously written down and not pursued to
+conclusion: `h264_encoder_set_fps()`'s own comment
+(`encoder_h264.c` ~line 1730) names the fps/rate-control mismatch as
+"a real, independent contributor to the *'same issue, no change'*
+real-client report." Rate control was the right neighborhood all
+along.
+
+### 15.5 Fixed: the sequence-parameter path dropped `target_percentage` (2× rate-control overshoot)
+
+Instrumented all four candidate points with an opt-in
+`BC250_DEBUG_RC=1` diagnostic (kept — it is how this was found:
+`rc_init` now logs the target it was handed and the base QP that fell
+out, and both VA-API bitrate paths log what they received). That
+immediately showed the mechanism:
+
+```
+RateControl: bits_per_second=62000000 target_percentage=50   <- ffmpeg: "31 Mbps as 50% of 62M"
+SeqParam:    bits_per_second=62000000                        <- same value, raw
+rc_init: target=62000000 -> base_qp=12                       <- re-initialized at 2X
+```
+
+ffmpeg sends the intended target in **both** buffers using the "50% of
+2X" convention. The misc `VAEncMiscParameterTypeRateControl` handler
+applied the percentage correctly (the fix recorded in
+`docs/rate_control_audit.md` §2) — but
+`VAEncSequenceParameterBufferH264` passed its `bits_per_second`
+**raw**, and whichever buffer is processed last wins. So rate control
+was routinely re-initialized at **twice** the client's real target.
+
+First attempt at a fix (recording the percentage in the misc handler
+for the seq handler to reuse) **did not work**, and the reason is worth
+recording: the buffers arrive in one `vaRenderPicture()` batch and the
+sequence parameter is processed *first*, so the percentage wasn't known
+yet (`pct=100`). Compounding the confusion, the verification script
+piped the diagnostic through `sort -u`, destroying chronological order
+and making the sequence impossible to read — a self-inflicted
+instrument error, the same category as §14.2's, caught only by
+re-running without the sort.
+
+The actual fix is order-independent: a pre-pass over the buffer array
+in `bc250_RenderPicture()` captures `target_percentage` from any
+RateControl buffer in the batch *before* any buffer is processed, so
+the sequence-parameter path scales identically no matter the ordering.
+Verified chronologically:
+
+```
+SeqParam: bits_per_second=62000000 pct=50 -> target=31000000
+rc_init:  target=31000000 -> base_qp=12 target_bits_per_frame=1033333
+```
+
+**What this fixes, precisely**: the controller's per-frame budget was
+2,066,666 bits when it should have been 1,033,333. It believed it had
+double the bits available, so its feedback loop (`rc_update_stats()` /
+`rc_get_frame_qp()`) measured error against a target twice too large
+and had no reason to raise QP until real output was ~2× the negotiated
+network rate. On a real 31 Mbps session that is a ~2× overshoot →
+congestion, packet loss, and client-side artifacts. That is a
+plausible, mechanically-sound cause of the mottling in §15.1's remote
+recording.
+
+**What is NOT yet demonstrated, stated plainly**: an end-to-end
+quality improvement. The offline probe cannot show one, for a
+legitimate reason — at 1440p30, `rc_estimate_base_qp()` saturates at
+`qp_min=12` for any target ≳31 Mbps, and `testsrc` at QP 12 is already
+near-lossless (§14.1's 60.5 dB), so it cannot consume 31 Mbps and
+output is ~3.8 Mbps either way. The encoder is *not* bitrate-capped —
+a high-entropy noise probe emits 832 Mbps at QP 26 and 420 Mbps at
+QP 40, i.e. properly QP-responsive (an earlier "QP-insensitive"
+alarm from the `testsrc` numbers was wrong and is retracted). So this
+fix is confirmed correct in its *target*, and unvalidated in its
+*delivered result*. The remaining measurement is a remote-client
+session on real content, per §14.5.
+
+Two further real issues found and deliberately not fixed here:
+
+- `rc_estimate_base_qp()` saturating at `qp_min=12` means the
+  estimator cannot distinguish 31 Mbps from 62 Mbps at 1440p30 — which
+  is also why the pre-fix and post-fix offline numbers look identical.
+  Harmless in itself (QP 12 is near-lossless) but it leaves the
+  controller no headroom at high targets.
+- A forced `BC250_FORCE_QP=12` encode of high-entropy 1440p noise
+  produced a 1,535-byte (empty) file — an encode failure, almost
+  certainly the coded buffer being too small for that bit volume.
+  Pathological input, but a real robustness gap.
+
+### 15.6 Method note
+
+The three measurements that produced §14 and §15 — decoder-in-the-loop
+offline PSNR, a remote (loop-free) client recording, and an offline
+`-b:v` sweep — are all cheap, and all three were available from the
+start. Every expensive thing done before them (three board reboots, a
+wedged-board power-cycle recovery, four failed Sunshine/Docker builds,
+a WSL VM reconfiguration, two full fix-build-deploy-test cycles, an
+`LD_PRELOAD`/`AT_SECURE` shim) was spent scoring hypotheses on an
+instrument that could not resolve them. **Validate the instrument
+before spending anything on what it appears to show** — §12.1 said
+this, and it needed saying twice more.

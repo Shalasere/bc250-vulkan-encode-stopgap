@@ -11,6 +11,9 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
@@ -638,14 +641,15 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VkExtensionProperties *ext_props = malloc(ext_count * sizeof(VkExtensionProperties));
     vkEnumerateDeviceExtensionProperties(ctx->physical_device, NULL, &ext_count, ext_props);
 
-    bool have_memory_fd = false, have_dma_buf = false;
+    bool have_memory_fd = false, have_dma_buf = false, have_semaphore_fd = false;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) have_memory_fd = true;
         if (strcmp(ext_props[i].extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) have_dma_buf = true;
+        if (strcmp(ext_props[i].extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME) == 0) have_semaphore_fd = true;
     }
     free(ext_props);
 
-    const char *device_extensions[2];
+    const char *device_extensions[3];
     uint32_t device_ext_count = 0;
     if (have_memory_fd && have_dma_buf) {
         device_extensions[device_ext_count++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
@@ -653,6 +657,19 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     } else {
         fprintf(stderr, "[bc250-gpu] VK_KHR_external_memory_fd/VK_EXT_external_memory_dma_buf not available - "
                         "vaExportSurfaceHandle() will report unimplemented\n");
+    }
+    /* VK_KHR_external_semaphore_fd (provides vkImportSemaphoreFdKHR) - lets
+     * gpu_compute_wait_for_image_ready() explicitly wait on whatever GPU
+     * work (e.g. Sunshine's own GL rendering into a surface this driver
+     * exported) last wrote into a shared render-target surface before this
+     * driver's own compute shaders read it. See that function's doc comment
+     * in gpu_compute.h. Requested opportunistically, same pattern as
+     * have_memory_fd/have_dma_buf above. */
+    if (have_semaphore_fd) {
+        device_extensions[device_ext_count++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
+    } else {
+        fprintf(stderr, "[bc250-gpu] VK_KHR_external_semaphore_fd not available - "
+                        "cannot explicitly wait for cross-context surface writers\n");
     }
 
     VkDeviceCreateInfo dev_info = {
@@ -666,8 +683,22 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VK_CHECK(vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device));
     vkGetDeviceQueue(ctx->device, ctx->compute_queue_family, 0, &ctx->compute_queue);
 
-    if (device_ext_count > 0) {
+    if (have_memory_fd && have_dma_buf) {
         ctx->get_memory_fd_khr = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(ctx->device, "vkGetMemoryFdKHR");
+    }
+
+    ctx->have_external_semaphore_fd = have_semaphore_fd;
+    if (have_semaphore_fd) {
+        ctx->import_semaphore_fd_khr = (PFN_vkImportSemaphoreFdKHR)vkGetDeviceProcAddr(ctx->device, "vkImportSemaphoreFdKHR");
+        if (ctx->import_semaphore_fd_khr) {
+            VkSemaphoreCreateInfo sem_info = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            if (vkCreateSemaphore(ctx->device, &sem_info, NULL, &ctx->image_ready_semaphore) != VK_SUCCESS) {
+                fprintf(stderr, "[bc250-gpu] Failed to create image_ready_semaphore\n");
+                ctx->have_external_semaphore_fd = false;
+            }
+        } else {
+            ctx->have_external_semaphore_fd = false;
+        }
     }
 
     /* Command Pool */
@@ -1096,6 +1127,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->timestamp_pools[0]) vkDestroyQueryPool(ctx->device, ctx->timestamp_pools[0], NULL);
     if (ctx->timestamp_pools[1]) vkDestroyQueryPool(ctx->device, ctx->timestamp_pools[1], NULL);
     if (ctx->timeline_sem) vkDestroySemaphore(ctx->device, ctx->timeline_sem, NULL);
+    if (ctx->image_ready_semaphore) vkDestroySemaphore(ctx->device, ctx->image_ready_semaphore, NULL);
     if (ctx->fences[0]) vkDestroyFence(ctx->device, ctx->fences[0], NULL);
     if (ctx->fences[1]) vkDestroyFence(ctx->device, ctx->fences[1], NULL);
     if (ctx->cmd_pool) vkDestroyCommandPool(ctx->device, ctx->cmd_pool, NULL);
@@ -1294,6 +1326,56 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
         fprintf(stderr, "[bc250-gpu] Vulkan error %d at %s:%d (vkGetMemoryFdKHR)\n", result, __FILE__, __LINE__);
         return -1;
     }
+    return 0;
+}
+
+/* See gpu_compute.h for the full story on why this exists. Short version:
+ * this driver's VA-API render-target surfaces are zero-copy shared with
+ * Sunshine's own GL context via the dma-buf bc250_ExportSurfaceHandle()
+ * exports, and this driver's Vulkan compute dispatch otherwise has no
+ * explicit ordering relative to whatever last wrote into that surface
+ * through that *other* API/context. This snapshots the dma-buf's current
+ * fences as a sync_file (kernel, API-agnostic) and imports that as a
+ * one-shot wait semaphore for the next gpu_compute_end_picture() call. */
+int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
+    if (!ctx || !ctx->have_external_semaphore_fd || !ctx->import_semaphore_fd_khr) return -1;
+
+    int dmabuf_fd;
+    if (gpu_compute_export_nv12_dmabuf(ctx, memory, &dmabuf_fd) != 0) return -1;
+
+    struct dma_buf_export_sync_file sync_file_info = {
+        .flags = DMA_BUF_SYNC_READ,
+        .fd = -1
+    };
+    int ioctl_ret = ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &sync_file_info);
+    /* This fd is our own independent reference to the buffer object (a
+     * fresh vkGetMemoryFdKHR call above) - the sync_file ioctl only reads
+     * its attached fences, it doesn't consume or need to keep this fd
+     * around afterward. */
+    close(dmabuf_fd);
+    if (ioctl_ret != 0) {
+        fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_EXPORT_SYNC_FILE failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    VkImportSemaphoreFdInfoKHR import_info = {
+        .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+        .semaphore = ctx->image_ready_semaphore,
+        .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+        .fd = sync_file_info.fd
+    };
+    VkResult result = ctx->import_semaphore_fd_khr(ctx->device, &import_info);
+    if (result != VK_SUCCESS) {
+        fprintf(stderr, "[bc250-gpu] vkImportSemaphoreFdKHR failed: %d\n", result);
+        /* Import failed - the fd wasn't consumed, so it's still ours to close. */
+        close(sync_file_info.fd);
+        return -1;
+    }
+    /* vkImportSemaphoreFdKHR takes ownership of the fd on success (Vulkan
+     * spec, "Importing Semaphore Payloads") - must not close it ourselves. */
+
+    ctx->has_pending_wait_semaphore = true;
     return 0;
 }
 
@@ -1943,6 +2025,21 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
         .commandBufferCount = 1,
         .pCommandBuffers = &ctx->cmd_bufs[ctx->current_buf]
     };
+    /* See gpu_compute_wait_for_image_ready()'s doc comment. If it ran for
+     * this frame's render target, make this submission explicitly wait on
+     * whatever last wrote into that surface (potentially a different GPU
+     * API context entirely, e.g. Sunshine's own GL) before the compute
+     * shaders below start reading it. VK_SEMAPHORE_IMPORT_TEMPORARY_BIT
+     * means this semaphore reverts to its prior (unsignaled, no payload)
+     * state once this wait consumes it, so has_pending_wait_semaphore
+     * exactly tracks whether a payload is currently imported. */
+    VkPipelineStageFlags wait_stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    if (ctx->has_pending_wait_semaphore) {
+        submit_info.waitSemaphoreCount = 1;
+        submit_info.pWaitSemaphores = &ctx->image_ready_semaphore;
+        submit_info.pWaitDstStageMask = &wait_stage_mask;
+        ctx->has_pending_wait_semaphore = false;
+    }
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &s0);
     /* vkQueueSubmit()'s return value was previously discarded entirely.
      * Confirmed on real hardware (see the real-content investigation in

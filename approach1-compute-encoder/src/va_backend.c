@@ -563,6 +563,31 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
     }
     bc250_context *c = &data->contexts[context];
 
+    /* Pre-pass: capture target_percentage from any VAEncMiscParameterType-
+     * RateControl buffer in this batch BEFORE processing anything, so the
+     * sequence-parameter path below scales its raw bits_per_second by the
+     * same percentage regardless of which buffer happens to come first in
+     * the array. ffmpeg sends the intended target X as "50% of 2X" in both
+     * buffers, and whichever is handled last previously won - so with
+     * SeqParam last, rate control was re-initialized at 2X the real target.
+     * Making this order-independent is the actual fix; see docs/DEVLOG.md
+     * §15 and docs/rate_control_audit.md §2. */
+    for (int i = 0; i < num_buffers; i++) {
+        VABufferID pid = buffers[i];
+        if (!VALID_ID(pid, MAX_BUFFERS) || !data->buffers[pid].allocated) continue;
+        bc250_buffer *pb = &data->buffers[pid];
+        if (pb->type != VAEncMiscParameterBufferType ||
+            pb->size < sizeof(VAEncMiscParameterBuffer) || !pb->data) {
+            continue;
+        }
+        VAEncMiscParameterBuffer *pmisc = (VAEncMiscParameterBuffer *)pb->data;
+        if (pmisc->type != VAEncMiscParameterTypeRateControl) continue;
+        VAEncMiscParameterRateControl *prc = (VAEncMiscParameterRateControl *)pmisc->data;
+        unsigned int pct = prc->target_percentage;
+        if (pct == 0 || pct > 100) pct = 100;
+        c->h264_state.rc_target_percentage = pct;
+    }
+
     for (int i = 0; i < num_buffers; i++) {
         VABufferID buf_id = buffers[i];
         if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) continue;
@@ -579,7 +604,27 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                             h264_encoder_set_gop_size(c->h264_enc, seq->intra_period);
                         }
                         if (seq->bits_per_second > 0) {
-                            h264_encoder_set_bitrate(c->h264_enc, seq->bits_per_second);
+                            /* Scale by the same target_percentage the misc
+                             * RateControl buffer carries (see the field's
+                             * doc comment in va_backend.h). Without this,
+                             * ffmpeg's "50% of 2X" convention made this
+                             * path re-init rate control at 2X the real
+                             * target, clobbering the misc path's correct
+                             * value - whichever buffer arrives last wins,
+                             * and this one usually does. */
+                            unsigned int pct = c->h264_state.rc_target_percentage;
+                            if (pct == 0 || pct > 100) pct = 100;
+                            uint32_t seq_target = (uint32_t)(((uint64_t)seq->bits_per_second * pct) / 100);
+                            if (seq_target == 0) seq_target = seq->bits_per_second;
+                            if (getenv("BC250_DEBUG_RC")) {
+                                fprintf(stderr, "[bc250-rc] SeqParam: bits_per_second=%u pct=%u -> target=%u "
+                                                "intra_period=%u\n",
+                                        seq->bits_per_second, pct, seq_target, seq->intra_period);
+                            }
+                            h264_encoder_set_bitrate(c->h264_enc, seq_target);
+                        } else if (getenv("BC250_DEBUG_RC")) {
+                            fprintf(stderr, "[bc250-rc] SeqParam: bits_per_second=0 intra_period=%u\n",
+                                    seq->intra_period);
                         }
                     }
                 }
@@ -603,8 +648,17 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
             case VAEncMiscParameterBufferType:
                 if (b->size >= sizeof(VAEncMiscParameterBuffer)) {
                     VAEncMiscParameterBuffer *misc = (VAEncMiscParameterBuffer*)b->data;
+                    if (getenv("BC250_DEBUG_RC")) {
+                        fprintf(stderr, "[bc250-rc] MiscParam: type=%d\n", (int)misc->type);
+                    }
                     if (misc->type == VAEncMiscParameterTypeRateControl && c->h264_enc) {
                         VAEncMiscParameterRateControl *rc = (VAEncMiscParameterRateControl*)misc->data;
+                        if (getenv("BC250_DEBUG_RC")) {
+                            fprintf(stderr, "[bc250-rc] RateControl: bits_per_second=%u target_percentage=%u "
+                                            "window_size=%u initial_qp=%u min_qp=%u\n",
+                                    rc->bits_per_second, rc->target_percentage,
+                                    rc->window_size, rc->initial_qp, rc->min_qp);
+                        }
                         if (rc->bits_per_second > 0) {
                             /* docs/rate_control_audit.md section 2: ffmpeg's actual
                              * default h264_vaapi invocation (-b:v X, no -rc_mode) is
@@ -619,6 +673,9 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                              * convention for an absent/invalid percentage field. */
                             unsigned int pct = rc->target_percentage;
                             if (pct == 0 || pct > 100) pct = 100;
+                            /* Remember it so the sequence-parameter path can
+                             * scale its own raw bits_per_second identically. */
+                            c->h264_state.rc_target_percentage = pct;
                             uint32_t target_bps = (uint32_t)(((uint64_t)rc->bits_per_second * pct) / 100);
                             if (target_bps == 0) target_bps = rc->bits_per_second;
                             h264_encoder_set_bitrate(c->h264_enc, target_bps);
@@ -705,6 +762,17 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
         uint8_t *dest = ((uint8_t *)coded_buf->data) + sizeof(VACodedBufferSegment);
         size_t max_payload = (size_t)coded_buf->size * coded_buf->num_elements;
 
+        /* This render target's surface memory may have been written most
+         * recently by a completely different GPU API context - e.g.
+         * Sunshine's own OpenGL rendering into it via its EGL/GL import of
+         * the dma-buf bc250_ExportSurfaceHandle() exported for this same
+         * surface (see gpu_compute_wait_for_image_ready()'s doc comment in
+         * gpu_compute.h for the full story). Queue an explicit GPU-side wait
+         * for that write before the encode dispatch below reads the surface -
+         * a no-op (returns -1, has_pending_wait_semaphore stays false) if
+         * VK_KHR_external_semaphore_fd wasn't available at device creation. */
+        gpu_compute_wait_for_image_ready(&data->gpu, surf->memory);
+
         int written = -1;
         gpu_compute_debug_dump_real_input(&data->gpu, &surf->image, surf->memory, surf->width, surf->height);
         if (c->h264_enc) {
@@ -723,6 +791,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
             seg->next = NULL;
         }
     } else {
+        gpu_compute_wait_for_image_ready(&data->gpu, surf->memory);
         gpu_compute_begin_picture(&data->gpu, surf->image);
         gpu_compute_dispatch_encode(&data->gpu, surf->image, c->width, c->height, 26, 0, 1);
         gpu_compute_end_picture(&data->gpu);

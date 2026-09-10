@@ -92,6 +92,17 @@ struct bc250_context {
         int has_seq;
         int has_pic;
         int has_slice;
+        /* Last target_percentage seen on a VAEncMiscParameterTypeRateControl
+         * buffer, so VAEncSequenceParameterBufferH264's own raw
+         * bits_per_second can be scaled the same way. ffmpeg's default
+         * h264_vaapi invocation sends the intended target X as "50% of 2X"
+         * in BOTH buffers, and the sequence-parameter path used to apply the
+         * raw 2X - re-initializing rate control at double the real target
+         * and undoing the misc path's correct scaling, since whichever
+         * buffer arrives last wins. See docs/DEVLOG.md §15 and
+         * docs/rate_control_audit.md §2. 0 means "none seen yet"; treated
+         * as 100% (no scaling). */
+        unsigned int rc_target_percentage;
     } h264_state;
 
     struct {
