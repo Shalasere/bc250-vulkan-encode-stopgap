@@ -2436,11 +2436,14 @@ commit only moved which allocation lost the race.
 
 Three facts made it clear:
 
-- **The BC-250 exposes a 512 MB VRAM heap** (`mem_info_vram_total`), ~261 MB
-  of which the desktop already holds. RADV reports that same heap for the
-  `HOST_VISIBLE` memory types the readback staging buffers use, so staging
-  competes with the display for a very small pool. This is not a discrete GPU
-  with a big BAR.
+- 🚨 **The memory-pool claim first written here was WRONG — see §21 for the
+  correction.** It said the constraint was a 512 MB VRAM heap
+  (`mem_info_vram_total`) shared with the display. It is not: Vulkan reports
+  **5.30 GiB device-local + 2.65 GiB host-visible** for this device, and the
+  real ceiling is the ~8 GB GART/GTT aperture. The 512 MB figure was read off
+  amdgpu's sysfs and assumed to be the heap RADV allocates from, without
+  checking the heap sizes. The fix below is unaffected and the corrected
+  arithmetic actually fits the observed failure pattern better.
 - **`bc250_gpu_init()` eagerly allocated every encoding buffer for
   3840x2160** — "allocate for the 4K worst case once" — which is ~440 MB per
   context (49.8 MB each for quant/coeff/residual/pred device-local, plus
@@ -2475,7 +2478,7 @@ nobody reads.
 
 Also worth stating plainly: **a change that passes unit tests, a byte-exact
 A/B, an exactness audit and the PSNR gate can still be undeployable**, because
-none of those exercise 20 concurrent contexts against a 512 MB heap. The
+none of those exercise 20 concurrent contexts against ~8 GB of Vulkan heaps. The
 deploy step is part of the test, and "it works under ffmpeg" was not evidence
 that it works under Sunshine.
 
@@ -2525,7 +2528,7 @@ Per encoder context at 1440p:
 | `shadow_copy()` per frame | ~46 MB | 24 MB |
 
 That gives back roughly **17× more staging memory than §19.3's mask buffer
-consumed**, which matters directly against the 512 MB heap of §19.7.
+consumed**, which matters directly against the ~8 GB GART aperture (§21).
 
 The descriptor pool went from 32 to 64 descriptors of each type at the same
 time: the nine layouts bind 24 storage buffers, and the mask plus the DC
@@ -2620,3 +2623,142 @@ The general form, which §19.6 already stated for verification oracles and
 which applies just as well to health checks: **a signal that fires on both
 the good and the bad case carries no information.** The SEGV count was
 measuring Sunshine's exit behaviour, not this driver's viability.
+
+---
+
+## 21. Correction: there is no 512 MB memory ceiling. It is ~8 GB of GART/GTT, and it is not the reason a game starves the encoder.
+
+§19.7 attributed the out-of-memory crash to "a 512 MB VRAM heap shared with
+the display", and that framing propagated into the README, into
+`gpu_compute.c`'s comments and into the `v0.3.1` release notes. It is wrong.
+Prompted by the question "can we change the 512 MB limit?", the heap sizes
+were finally read rather than inferred.
+
+🚨 **And this was a repeat, not a first offence. §10.3 of this very file
+already recorded the same wrong claim, already had the correct heap sizes
+(2.65 GiB + 5.30 GiB), already established by live instrumentation that this
+driver's allocations land on the GTT-backed heap and never on the 512 MB VRAM
+heap, and closed with an explicit caution against exactly this reasoning.**
+That section is titled "a wrong claim, caught and corrected before it
+shipped." This time it shipped: into a public README, a release note, and a
+commit message. The driver even carries a `BC250_DEBUG_MEMTYPE=1` diagnostic
+added for this specific question, which went unused.
+
+### 21.1 What the memory topology actually is
+
+`vulkaninfo` for `AMD BC-250 (RADV GFX1013)` — the device with 11 memory
+types, matching this driver's own init dump; the 14.90 GiB single-type device
+in the same output is `llvmpipe` and irrelevant:
+
+| heap | size | flags | memory types |
+|---|---|---|---|
+| 0 | **2.65 GiB** | none | 2, 5, 6, 8, 10 — every `HOST_VISIBLE` type |
+| 1 | **5.30 GiB** | `DEVICE_LOCAL` | 0, 1, 3, 4, 7, 9 |
+
+Total ≈ 7.95 GiB, which is `gtt_total` (7631 MiB) plus the 512 MiB carve-out.
+amdgpu's `mem_info_vram_total` = 512 MiB is only the slice it labels VRAM;
+**nothing this encoder allocates is confined to it.** This is a unified-memory
+APU: all 16 GB is one pool of GDDR6, the GPU reaches it through GART/GTT, and
+`gtt_total` is amdgpu's auto default of half of system RAM.
+
+### 21.2 The corrected arithmetic, which fits better
+
+Per context at 3840x2160 (32,400 MBs), pre-§20:
+
+- device-local ≈ 209 MiB (residual/pred/coeff/quant_levels 47.5 MiB each,
+  plus entropy 15.8, nz 3.0, mv/pred_mode ~0.6)
+- host-visible ≈ 222 MiB (quant staging 2x47.5, coeff staging 2x47.5,
+  entropy staging 2x15.8, mv/pred_mode ~1.2)
+- **≈ 431 MiB per context**
+
+20 contexts ≈ 8.6 GiB against 7.95 GiB of heaps — exhausted. And host-visible
+alone is 20 x 222 MiB ≈ 4.4 GiB against heap 0's **2.65 GiB**, so heap 0 runs
+out first. That explains something the 512 MB story did not: the failures
+clustered on `gpu_compute.c:163`, the `create_buffer_with_memory_preferred()`
+path, which is used *only* for host-visible staging. §19.7's fix (allocate
+lazily at the real resolution, check every allocation) was correct and is
+unaffected; only the account of which pool ran dry was wrong.
+
+### 21.3 Can the carve-out be raised, and should it
+
+No, and it would not help.
+
+- **Not settable in software.** `amdgpu.vramlimit` and
+  `amdgpu.vis_vramlimit` only *restrict* VRAM (both are "for testing" per
+  `modinfo`). No parameter raises it. Resizable BAR (`amdgpu.rebar`, currently
+  auto) changes CPU visibility of VRAM, not its size.
+- **Not settable in firmware, on this board.** The carve-out is the BIOS UMA
+  frame-buffer setting (AMI P3.00, 12/2021), and the APCB path is a
+  known-dead end here — the VCN-enablement effort established that even a
+  single byte changed in CBSG hangs ABL.
+- **No benefit if it were.** There is no fast-VRAM tier to get into. On a
+  discrete GPU, VRAM versus system RAM is a real bandwidth cliff; on this APU
+  both are the same GDDR6 at the same bandwidth, so the carve-out is an
+  accounting boundary rather than a performance one.
+
+The genuine memory ceiling, if one is ever hit, is the GART/GTT aperture:
+`amdgpu.gttsize` (megabytes, `-1` = auto = half of RAM), optionally with
+`amdgpu.no_system_mem_limit`. Both exist on this kernel (6.17.7). Current
+usage is nowhere near it.
+
+### 21.4 What this does to the "game starves the encoder" diagnosis
+
+It removes the leading hypothesis. The observed behaviour is 1440p desktop
+streaming holding 60 fps while a game saturating the GPU at 30 fps drops the
+stream to **11 fps** — roughly 90 ms/frame against 15 ms measured idle, a ~6x
+penalty where naive time-slicing of a 4.8 ms GPU cost into a 33 ms budget
+predicts ~1.15x.
+
+"VRAM pressure evicting encoder buffers to slower memory" was the favourite
+explanation. It is now largely dead: device-local memory on this part *is*
+GDDR6 reached through GTT, so there is no slower tier to be evicted into.
+What remains:
+
+1. **Memory-bandwidth contention.** The strongest candidate, and the one with
+   independent support: §20.4 showed this encoder is bandwidth- and
+   cache-bound rather than arithmetic-bound — removing 22 MB/frame of memcpy
+   made *untouched* CAVLC 30-37% faster. A game saturating a single shared
+   GDDR6 bus starves exactly that. It also explains why the CPU side suffers,
+   which pure CU contention would not.
+2. **No overlap, no priority.** The encode path is synchronous per frame —
+   dispatch, fence wait, CPU entropy coding — submitted at default queue
+   priority, so the fence wait inflates with the game's queue depth and
+   nothing overlaps.
+
+Both are at least partly addressable, unlike the carve-out: further reducing
+bytes/frame (`quant_levels` is 22 MB of `int` holding values that fit in
+`int16_t`; `residual` and `pred` are another 44 MB device-side), and looking
+at whether the compute queue can be submitted at a different priority. Both
+are unmeasured. Neither is a substitute for VCN, which would spend no CU
+time, no CPU entropy time and no readback bandwidth at all.
+
+### 21.5 Method note
+
+Three things are worth extracting, in increasing order of how much they
+should change future behaviour.
+
+**1. A number read off one interface does not describe another.**
+`mem_info_vram_total` is amdgpu's kernel-side label; RADV's Vulkan heaps are
+a different partition of the same physical pool. Assuming one described the
+other is the same shape of error as §14 scoring an encoder with a
+contaminated instrument. `vulkaninfo` was on the board the whole time and
+took one command.
+
+**2. A hypothesis that leaves evidence unexplained is not finished.** §19.7
+had a loose end it did not chase: the failures appeared at *two* call sites,
+`:134` and `:163`, and the 512 MB story only accounted for one of them. That
+discrepancy was visible in the output at the time and was read past, because
+the fix derived from the hypothesis worked. **A working fix is not
+confirmation of the diagnosis that produced it.**
+
+**3. The single most useful correction: read the project's own record before
+asserting a mechanism.** §10.3 already contained the right answer and a
+warning against this exact mistake. Nothing about this needed new
+measurement — it needed one `grep` of `docs/DEVLOG.md` for "heap", which the
+README itself tells readers is the authoritative source. The whole
+investigation in §19.7 was conducted as though the repository had no memory,
+on a file that opens by saying it is the truth for this project.
+
+The cost was not the wrong belief; the fix was correct anyway. The cost was
+publishing a false mechanism under a version tag, and needing this section to
+walk it back.

@@ -172,9 +172,9 @@ typedef struct bc250_gpu_context {
      * position 0 only, 24 of the 384 ints per macroblock - so the staging
      * pair, the per-frame vkCmdCopyBuffer and the per-frame shadow_copy() were
      * all moving 16x more data than anything consumed. At 1440p that is 44.2 MB
-     * of staging (of a 512 MB VRAM heap that RADV also uses for HOST_VISIBLE
-     * allocations, shared with the display - see DEVLOG §19.7) and 22.1 MB of
-     * copy + 22.1 MB of memcpy per frame, for 1.4 MB of actually-used values.
+     * of staging (out of a 2.65 GiB host-visible heap, the smaller half of this
+     * APU's ~8 GB GART/GTT aperture - see DEVLOG §21) and 22.1 MB of copy +
+     * 22.1 MB of memcpy per frame, for 1.4 MB of actually-used values.
      *
      * dct_transform.comp (P/inter) and intra_wavefront.comp (I) now write this
      * alongside their full coeff output. coeff_buffer itself stays device-local

@@ -340,7 +340,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
      * surfaced later as a SEGV in the vkMapMemory()/dispatch path instead of a
      * clean "this encoder is unavailable". That is the same failure shape as
      * the silent slice overflow in DEVLOG §18.2: an ignored return turning a
-     * diagnosable error into a crash. On a 512 MB VRAM heap that Sunshine
+     * diagnosable error into a crash. On a ~8 GB GART aperture that Sunshine
      * probes 20 times over, OOM here is a genuinely reachable state, not a
      * theoretical one - it was already happening on v0.3.0. */
     int rc = 0;
@@ -412,8 +412,9 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
      * getters report "no data" and the encoder falls back. */
     if (rc != 0) {
         fprintf(stderr, "[bc250-gpu] allocate_encoding_buffers(%ux%u) FAILED - out of device memory. "
-                        "Encoding buffers need ~%.0f MB (%ux%u = %u MBs); this device's HOST_VISIBLE "
-                        "heap is shared with the display. Encoder unavailable at this resolution.\n",
+                        "Encoding buffers need ~%.0f MB (%ux%u = %u MBs); on this APU that comes out of "
+                        "the ~8 GB GART/GTT aperture (amdgpu.gttsize), whose host-visible heap is the "
+                        "smaller half. Encoder unavailable at this resolution.\n",
                 width, height,
                 (double)(residual_size * 4 + quant_levels_size * 2 + coeff_size * 2 + entropy_size * 3) / (1024.0 * 1024.0),
                 width, height, num_mbs);
@@ -1149,15 +1150,19 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
      * thrown away and reallocated by the first dispatch at the actual
      * resolution.
      *
-     * On this hardware that is not affordable: the BC-250 exposes a 512 MB
-     * VRAM heap (mem_info_vram_total), which is also the heap RADV reports for
-     * the HOST_VISIBLE memory types the staging buffers use, and the desktop
-     * already holds ~261 MB of it. Sunshine's encoder probe calls
-     * bc250_gpu_init 20 times; the shipped v0.3.0 driver was already logging 9
-     * VK_ERROR_OUT_OF_DEVICE_MEMORY failures per probe and surviving only
-     * because the allocations that happened to fail were ones nothing
-     * dereferenced. Adding two more small staging buffers took it to 18
-     * failures and a SEGV in this function - which is how this was found.
+     * On this hardware that is not affordable. Vulkan exposes ~7.95 GiB here,
+     * split as a 2.65 GiB host-visible heap (every HOST_VISIBLE memory type)
+     * and a 5.30 GiB DEVICE_LOCAL heap - it is a unified-memory APU, so this
+     * is the GART/GTT aperture, NOT the 512 MB mem_info_vram_total carve-out
+     * (an earlier version of this comment claimed the latter; see DEVLOG §21).
+     * Sunshine's encoder probe calls bc250_gpu_init 20 times, and 20 x ~431 MiB
+     * exceeds 7.95 GiB - the host-visible half worst, at 20 x ~222 MiB against
+     * 2.65 GiB, which is why the failures clustered on
+     * create_buffer_with_memory_preferred(). The shipped v0.3.0 driver was
+     * already logging 9 VK_ERROR_OUT_OF_DEVICE_MEMORY failures per probe and
+     * surviving only because the allocations that happened to fail were ones
+     * nothing dereferenced. Adding two more small staging buffers took it to
+     * 18 failures and a SEGV in this function - which is how this was found.
      *
      * Removing it is safe because nothing reads the encoding buffers before
      * the first dispatch: gpu_compute_get_*_staging_data() all return -1 while
