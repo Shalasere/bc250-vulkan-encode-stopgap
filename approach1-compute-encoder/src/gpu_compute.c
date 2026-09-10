@@ -1337,6 +1337,15 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
  * through that *other* API/context. This snapshots the dma-buf's current
  * fences as a sync_file (kernel, API-agnostic) and imports that as a
  * one-shot wait semaphore for the next gpu_compute_end_picture() call. */
+/* DMA_BUF_IOCTL_EXPORT_SYNC_FILE (and its struct) are Linux ~6.0 UAPI. This
+ * driver only ever runs on one machine, but it is built on others: CI builds
+ * on ubuntu-22.04, whose linux/dma-buf.h predates both, and this function
+ * broke that build after being verified only on the board's Fedora 43
+ * headers. Compile it out where the header can't support it, leaving the
+ * same "return -1 and let the caller proceed unsynchronized" behaviour every
+ * other opportunistic capability check in this file already uses. */
+#ifdef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+
 int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
     if (!ctx || !ctx->have_external_semaphore_fd || !ctx->import_semaphore_fd_khr) return -1;
 
@@ -1378,6 +1387,19 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
     ctx->has_pending_wait_semaphore = true;
     return 0;
 }
+
+#else  /* !DMA_BUF_IOCTL_EXPORT_SYNC_FILE - pre-6.0 kernel headers */
+
+int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
+    (void)ctx; (void)memory;
+    /* No sync_file export available at build time; callers treat -1 as "no
+     * explicit wait was queued" and proceed, relying on the kernel's
+     * implicit dma-buf fencing exactly as this driver did before the
+     * explicit wait was added. */
+    return -1;
+}
+
+#endif /* DMA_BUF_IOCTL_EXPORT_SYNC_FILE */
 
 /* Test-harness instrumentation (tools/quality_test.sh): dump raw NV12 frame
  * bytes to disk when BC250_DUMP_INPUT_FRAMES=1 is set, building a
