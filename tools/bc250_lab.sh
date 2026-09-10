@@ -175,8 +175,61 @@ build() {
 
 art_dir() {
     local key="${1:?}"
+    [ "$key" = libx264 ] && { echo "libx264"; return 0; }
     [ -d "$ART/$key" ] || die "unknown build key '$key' (run build first)"
     echo "$ART/$key"
+}
+
+# scoreboard <key> - the comparison this project exists to win: this driver
+# versus Sunshine's software encoder, across every load condition, in
+# end-to-end fps. Idle-only numbers flattered the compute encoder badly
+# (DEVLOG §21.4), so "better than software" has to be asserted per-condition
+# or not at all.
+scoreboard() {
+    local key="${1:?scoreboard <key> [opts]}"; shift
+    local content=testsrc2 res=2560x1440 frames=150 reps=2
+    for a in "$@"; do
+        case "$a" in
+            --content=*) content="${a#*=}";;
+            --res=*)     res="${a#*=}";;
+            --frames=*)  frames="${a#*=}";;
+            --repeat=*)  reps="${a#*=}";;
+        esac
+    done
+    echo "# scoreboard: $key vs libx264 (${BC250_SW_PRESET:-veryfast}) @ $content $res, $frames frames, $reps runs"
+    printf "%-8s %-10s %10s %10s %10s\n" load encoder e2e_fps e2e_ms verdict
+    local out="$LAB/.scoreboard.$$"; : > "$out"
+    for load in none gpu cpu both; do
+        local afps bfps
+        afps=$(bench_e2e "$key"     "$content" "$res" "$frames" "$reps" "$load")
+        bfps=$(bench_e2e libx264    "$content" "$res" "$frames" "$reps" "$load")
+        printf "%-8s %-10s %10.2f %10.2f\n" "$load" "$key"    "$afps" "$(awk -v f="$afps" 'BEGIN{printf "%.2f", (f>0?1000/f:0)}')"
+        printf "%-8s %-10s %10.2f %10.2f %10s\n" "$load" libx264 "$bfps" \
+            "$(awk -v f="$bfps" 'BEGIN{printf "%.2f", (f>0?1000/f:0)}')" \
+            "$(awk -v a="$afps" -v b="$bfps" 'BEGIN{print (a>b)?"WE WIN":"we lose"}')"
+        echo "$load $afps $bfps" >> "$out"
+    done
+    echo
+    echo "# ratio (this driver / libx264): >1 means the compute encoder is ahead"
+    awk '{printf "  load=%-6s %.2fx\n", $1, ($3>0? $2/$3 : 0)}' "$out"
+    rm -f "$out"
+}
+
+# median-ish end-to-end fps for one condition, printed bare
+bench_e2e() {
+    local key="$1" content="$2" res="$3" frames="$4" reps="$5" load="$6"
+    local stamp; stamp=$(date +%s%N)
+    local d="$RUNS/e2e-$stamp"; mkdir -p "$d"
+    start_load "$load" "$d"
+    local best=0
+    for i in $(seq 1 "$reps"); do
+        run_encode "$key" "$content" "$res" "$frames" 120 31M "" 0 "$d/r$i" >/dev/null
+        local f; f=$(awk '{print $3}' "$d/r$i.wall" 2>/dev/null || echo 0)
+        best=$(awk -v a="$best" -v b="$f" 'BEGIN{print (b>a)?b:a}')
+        rm -f "$d/r$i.h264"
+    done
+    stop_load
+    echo "$best"
 }
 
 # ---------------------------------------------------------------------------
@@ -233,23 +286,46 @@ stop_load() {
 trap stop_load EXIT INT TERM
 
 # ---------------------------------------------------------------------------
-# one encode run -> log file
+# one encode run -> log file. Writes "${out}.wall" with the end-to-end
+# seconds, because that is the only metric comparable across encoders: the
+# libx264 path produces none of this driver's instrumentation, and
+# end-to-end throughput is also what a user actually experiences.
+#
+# `key` may be the literal "libx264", which selects Sunshine's software
+# encoder path instead of this driver. That comparison is the real
+# scoreboard - this project's purpose is to beat software encoding on this
+# hardware, not to beat its own previous commit.
 run_encode() {
     local key="$1" content="$2" res="$3" frames="$4" gop="$5" bitrate="$6" \
           envs="$7" audit="$8" out="$9"
-    local bd; bd=$(art_dir "$key")
-    local -a envv=(BC250_PERF_STATS=1)
-    [ "$audit" = 1 ] && envv+=(BC250_NZ_AUDIT=1)
-    if [ -n "$envs" ]; then
-        local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
-    fi
-    env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" BC250_SHADER_DIR="$bd" \
-        "${envv[@]}" \
+    local t0 t1
+    t0=$(date +%s.%N)
+    if [ "$key" = libx264 ]; then
+        # -preset veryfast matches this board's sunshine.conf (sw_preset).
         ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
-        -frames:v "$frames" -g "$gop" -vaapi_device "$RENDER" \
-        -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v "$bitrate" \
-        -f h264 "${out}.h264" > "${out}.log" 2>&1
-    echo $?
+            -frames:v "$frames" -g "$gop" -vf 'format=nv12' \
+            -c:v libx264 -preset "${BC250_SW_PRESET:-veryfast}" -b:v "$bitrate" \
+            -f h264 "${out}.h264" > "${out}.log" 2>&1
+    else
+        local bd; bd=$(art_dir "$key")
+        local -a envv=(BC250_PERF_STATS=1)
+        [ "$audit" = 1 ] && envv+=(BC250_NZ_AUDIT=1)
+        if [ -n "$envs" ]; then
+            local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
+        fi
+        env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" BC250_SHADER_DIR="$bd" \
+            "${envv[@]}" \
+            ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
+            -frames:v "$frames" -g "$gop" -vaapi_device "$RENDER" \
+            -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v "$bitrate" \
+            -f h264 "${out}.h264" > "${out}.log" 2>&1
+    fi
+    local rc=$?
+    t1=$(date +%s.%N)
+    awk -v a="$t0" -v b="$t1" -v n="$frames" \
+        'BEGIN{e=b-a; printf "%.4f %.4f %.2f\n", e, (n>0? e*1000.0/n:0), (e>0? n/e:0)}' \
+        > "${out}.wall"
+    echo $rc
 }
 
 BENCH_FIELDS="tag,p_wall_ms,p_wall_ms_sd,p_fps_ceiling,cavlc_ms,shadow_ms,gpu_total_ms,gpu_me_ms,gpu_copy_ms,unaccounted_ms,unaccounted_pct,qp,bytes_p,frames_p,err_vk_oom,err_alloc_failed,err_slice_overflow"
@@ -288,12 +364,15 @@ bench() {
             continue
         fi
         local tag="$key/$content/$res/load=$load/r$i"
+        # End-to-end throughput first: it is the only column that exists for
+        # every encoder, and the one a user feels.
+        read -r e2e_s e2e_ms e2e_fps < "$base.wall"
         if [ "$first" = 1 ] && [ "$quiet" = 0 ]; then
-            python3 "$PARSE" "$base.log" --tsv --header --tag "$tag" --fields "$BENCH_FIELDS"
+            printf "e2e_fps\te2e_ms\t%s\n" "$(echo "$BENCH_FIELDS" | tr ',' '\t')"
             first=0
-        else
-            python3 "$PARSE" "$base.log" --tsv --tag "$tag" --fields "$BENCH_FIELDS"
         fi
+        printf "%s\t%s\t" "$e2e_fps" "$e2e_ms"
+        python3 "$PARSE" "$base.log" --tsv --tag "$tag" --fields "$BENCH_FIELDS"
         python3 "$PARSE" "$base.log" --tag "$tag" > "$base.json"
     done
     stop_load
@@ -569,6 +648,7 @@ case "$cmd" in
     units)    units "$@";;
     quality)  quality "$@";;
     gate)     gate "$@";;
+    scoreboard) scoreboard "$@";;
     health)   health "$@";;
     deploy)   deploy "$@";;
     rollback) rollback "$@";;

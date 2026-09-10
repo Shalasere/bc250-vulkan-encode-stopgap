@@ -59,6 +59,9 @@ def parse(text):
     shadow = []      # [BC250_PERF_SHADOW]
     gpu = []         # [BC250_PERF_GPU]
     audit = []       # [BC250_NZ_AUDIT]
+    waits = []       # [BC250_PERF_WAIT]   site=sync|begin_picture
+    submits = []     # [BC250_PERF_SUBMIT]
+    phases = []      # [BC250_PERF_PHASE]
 
     for raw in text.splitlines():
         m = LINE_RE.search(raw)
@@ -81,6 +84,12 @@ def parse(text):
             gpu.append(rec)
         elif tag == "BC250_NZ_AUDIT":
             audit.append(rec)
+        elif tag == "BC250_PERF_WAIT":
+            waits.append(rec)
+        elif tag == "BC250_PERF_SUBMIT":
+            submits.append(rec)
+        elif tag == "BC250_PERF_PHASE":
+            phases.append(rec)
 
     out = {}
 
@@ -146,15 +155,78 @@ def parse(text):
     for st in GPU_STAGES:
         emit_by_type("gpu_%s_ms" % st, gpu, st + "_ms")
 
+    # --- fence waits and submits -----------------------------------------
+    # `wait_sync_ms` is the host blocked in vkWaitForFences. It is the term
+    # that explodes under GPU contention (1.9 ms idle -> 321 ms with a GPU
+    # load), and it matters because this device exposes exactly ONE queue
+    # family with ONE queue (graphics+compute+transfer): there is no
+    # async-compute ring, so encode is ordered against everything else on the
+    # machine rather than running alongside it.
+    for site in ("sync", "begin_picture"):
+        emit("wait_%s_ms" % site,
+             [w["wait_ms"] for w in waits
+              if w.get("site") == site and "wait_ms" in w])
+    emit("submit_ms", [s["submit_ms"] for s in submits if "submit_ms" in s])
+
+    # Phase brackets from encoder_h264.c. `dispatch_ms` covers command-buffer
+    # recording, per-frame descriptor updates and image-layout transitions -
+    # all CPU work that was never timed, and the first place to look for the
+    # ~327 ms that no other bracket accounted for under GPU load.
+    emit_by_type("phase_begin_ms", phases, "begin_ms")
+    emit_by_type("phase_dispatch_ms", phases, "dispatch_ms")
+    emit_by_type("phase_end_sync_ms", phases, "end_sync_ms")
+
+    # DELIBERATELY NOT DERIVED: an earlier version computed
+    # queue_wait = wait_sync - gpu_total and reported it as "time spent
+    # queued behind other work". That is wrong, and measurably so - it came
+    # out NEGATIVE (-2.9 ms) on an idle board. The pipeline is
+    # double-buffered: gpu_compute_sync() waits on prev_buf, the PREVIOUS
+    # frame's fence, so GPU execution overlaps the next frame's CPU work and
+    # wait_sync can legitimately be far smaller than execution time.
+    #
+    # wait_sync_ms is therefore reported raw, and means "host blocked waiting
+    # for the previous frame's submission to complete". Under GPU contention
+    # that is dominated by queue backlog, but the two are not separable from
+    # these counters alone, so no such number is invented here.
+    if out.get("wait_sync_ms") is not None and out.get("p_wall_ms"):
+        out["wait_sync_pct"] = round(
+            100.0 * out["wait_sync_ms"] / out["p_wall_ms"], 2)
+
     # --- accounting check -------------------------------------------------
-    # gpu_total + cavlc + shadow should approximately equal p_wall, because
-    # the pipeline is synchronous per frame. A widening gap means time is
-    # going somewhere none of the brackets cover, which is worth noticing
-    # BEFORE attributing a win to one of the stages. DEVLOG §20.4 leaned on
-    # exactly this closing. All three terms are P-only, matching p_wall_ms -
-    # mixing a pooled term in here is what produced a negative residual on
-    # the first version of this parser.
-    parts = [out.get("gpu_total_ms"), out.get("cavlc_ms"), out.get("shadow_ms")]
+    # The frame is synchronous, so the host-side terms should sum to p_wall:
+    #
+    #   p_wall ~= wait(begin_picture) + submit + wait(sync) + shadow + cavlc
+    #
+    # NOTE gpu_total_ms is NOT a term here. It comes from GPU timestamp
+    # queries and measures execution, which happens *inside* wait(sync) - so
+    # adding it would double-count. An earlier version of this parser summed
+    # gpu_total + cavlc + shadow, which is only right when the GPU is idle
+    # (submit-then-immediately-wait makes wait(sync) ~= execution). Under a
+    # GPU load that approximation reported ~96% of the frame as
+    # "unaccounted", which read like missing instrumentation when in fact the
+    # model was wrong and the time was plainly in a bracket already being
+    # logged. Prefer the wait-based sum whenever the WAIT lines are present.
+    have_waits = out.get("wait_sync_ms") is not None
+    if have_waits:
+        # phase_end_sync_ms already contains submit + wait(sync), so those
+        # are not added again; phase_begin_ms contains wait(begin_picture).
+        if out.get("phase_dispatch_ms") is not None:
+            parts = [out.get("phase_begin_ms") or 0.0,
+                     out.get("phase_dispatch_ms") or 0.0,
+                     out.get("phase_end_sync_ms") or 0.0,
+                     out.get("shadow_ms") or 0.0,
+                     out.get("cavlc_ms") or 0.0]
+            out["accounted_model"] = "phase-based"
+        else:
+            parts = [out.get("wait_begin_picture_ms") or 0.0,
+                     out.get("submit_ms") or 0.0,
+                     out.get("wait_sync_ms") or 0.0,
+                     out.get("shadow_ms") or 0.0,
+                     out.get("cavlc_ms") or 0.0]
+            out["accounted_model"] = "wait-based"
+    else:
+        parts = [out.get("gpu_total_ms"), out.get("cavlc_ms"), out.get("shadow_ms")]
+        out["accounted_model"] = "gpu-timestamp-based (approximate; valid only when idle)"
     if out.get("p_wall_ms") and all(p is not None for p in parts):
         accounted = sum(parts)
         out["accounted_ms"] = round(accounted, 4)

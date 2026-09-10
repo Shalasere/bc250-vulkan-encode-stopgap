@@ -1,0 +1,98 @@
+# Working on this repo
+
+A Vulkan-compute H.264 encoder exposed as a VA-API driver, for a board whose
+hardware video engine is dead. Correctness and performance here are both
+*measured*, never argued — this file exists because the expensive mistakes on
+this project have all been measurement and process mistakes, not coding ones.
+
+## Before you assert a mechanism, grep the DEVLOG
+
+`docs/DEVLOG.md` is ~2600 lines and is the authoritative record. **Search it
+for the subsystem before explaining any behaviour.**
+
+This is rule one because breaking it was the single worst error made here: a
+crash was diagnosed as "a 512 MB VRAM heap shared with the display", and that
+went into the README and a release note — while §10.3 already contained the
+correct Vulkan heap sizes, live instrumentation proving the driver never
+allocates from the VRAM heap, and an explicit warning against that exact
+claim. Its title is "a wrong claim, caught and corrected before it shipped."
+It shipped the second time. See §21.
+
+`grep -n -i '<subsystem>' docs/DEVLOG.md` costs seconds.
+
+## Measure with tools/lab, not with a fresh script
+
+```bash
+tools/lab setup                       # once
+tools/lab build work                  # or: build local:<unpushed-ref>
+tools/lab noise <key> --repeat=5      # establish the floor FIRST
+tools/lab compare <keyA> <keyB>       # significance-tested A/B
+tools/lab scoreboard <key>            # vs libx264, per load condition
+tools/lab gate <key> [<baseKey>]      # units + mask audit + PSNR + byte-exactness
+tools/lab deploy <key>                # health-checked, auto-rollback
+```
+
+The harness encodes validity rules that were learned the hard way. Writing a
+one-off script bypasses them, and about a dozen such scripts are what produced
+the errors below.
+
+## Hard-won rules
+
+- **Byte-exactness is only a valid oracle on `testsrc`.** This encoder is not
+  bit-reproducible on moving content — three runs of one config give three
+  different valid bitstreams. Using md5 on `testsrc2` made a *correct* change
+  look broken and nearly got it reverted. §19.6
+- **Never gate health on a SEGV count.** Sunshine SEGVs in its own teardown
+  path (`libevdev_uinput_destroy`, `_dl_fini`) on nearly every stop on this
+  box. That signal fires for healthy and broken builds alike and rolled back a
+  working driver. Use `tools/lab health`, which keys on the live pid. §20.5
+- **No delta under ~2.5% of wall time is a result** from a single run. Noise
+  floor at 1440p: `p_wall` sd 1.2%, `cavlc` 1.6%, `shadow` 3.1%,
+  `gpu_total` 0.09%.
+- **Idle numbers do not transfer.** Every published throughput figure was
+  taken on an idle GPU; a real game took 1440p streaming from 60 fps to
+  11 fps. Always state the load condition. §21.4
+- **The goal is beating libx264, not beating the previous commit.** Software
+  encoding doesn't touch the GPU, so it barely notices a game while contention
+  costs this encoder up to 46×. `tools/lab scoreboard` is the real
+  scoreboard.
+- **A working fix is not confirmation of the diagnosis that produced it.** If
+  part of the evidence is still unexplained, the hypothesis is unfinished —
+  two failing call sites were visible and read past because the fix worked. §21.5
+- **Design an audit before depending on a new GPU→CPU data path.** The
+  per-block nonzero mask was silently wrong on every I-frame because
+  `intra_wavefront.comp` bypasses `quantize.comp`. `BC250_NZ_AUDIT=1`
+  recomputes it on the CPU and caught it before anything relied on it. §19.4
+- **Ship shaders with the `.so`.** New C against old SPIR-V is silent wrong
+  output, not a load error. Use `make -j12` (the `all` target);
+  `make bc250_drv_video` does **not** rebuild `compile_shaders`.
+- **Memory: ~7.95 GiB of GART/GTT** (Vulkan heaps 2.65 + 5.30 GiB), *not* the
+  512 MB `mem_info_vram_total`. Unified-memory APU, no fast-VRAM tier, and the
+  carve-out is neither raisable nor worth raising. Read `vulkaninfo` heaps, not
+  sysfs. Sunshine's probe creates **20 GPU contexts**, so size per-context
+  allocations accordingly. §21
+- **Don't "fix" `qp_min = 12`** — lowering it was measured as +14% bits for
+  −22% throughput and no visible change. §18
+- **Don't install `tools/bc250_sunshine_shim.c`** — kept as a documented
+  `LD_PRELOAD`-into-`AT_SECURE` technique only; it costs ~40% of frame rate.
+  §17
+
+## Board and repo operations
+
+- Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
+- **Never push to `origin`** (upstream `simpmix/bc250-vcn-driver`). Only
+  `fork` (`Shalasere/bc250-vulkan-encode-stopgap`), and only when asked.
+- **Repeatedly ssh'ing into the board during a long job crashes it**
+  (systemd-logind exhaustion). Launch once, wait, read once.
+- `ssh -n` is mandatory (ssh in a pipeline eats stdin), and `-n` nulls stdin
+  so heredocs vanish — ship remote scripts as files.
+- Driving this from Windows: PowerShell mangles inline quotes, pipes and
+  `$vars` before WSL sees them. Always write a `.sh` and run that.
+- **Disable screen blanking on the host.** Sunshine re-inits KMS capture on
+  every app launch and reads a slept output as `0x0`, returning Error 503 —
+  hours after starting fine. This is the most common "it broke" report. §14.4
+
+## Scope
+
+H.264 is real and validated. **H.265/HEVC is a non-functional stub** — do not
+enable it or extend it without reading `docs/hevc_scope_note.md`.

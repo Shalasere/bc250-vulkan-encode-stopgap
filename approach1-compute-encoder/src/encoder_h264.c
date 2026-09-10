@@ -1953,6 +1953,18 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
      * every path that produces no new GPU output this frame, exactly like the
      * four above; block_any_nonzero() then falls back to scanning. */
     const uint32_t *nz_masks = NULL;
+    /* Opt-in phase brackets (BC250_PERF_STATS=1). Added because the existing
+     * per-stage brackets accounted for only ~52% of frame time once the GPU
+     * was contended: wait(sync) + cavlc + shadow came to 348 ms of a 675 ms
+     * frame, with begin_picture and submit both ~0. Rather than guess where
+     * the other 327 ms went, bracket the phases. dispatch is the interesting
+     * one - it records the command buffer, updates descriptors and does
+     * per-frame image-layout transitions, none of which was ever timed. */
+    struct timespec ph_a, ph_b, ph_c, ph_d;
+    bool ph = perf_stats;
+    double ph_begin_ms = 0.0, ph_dispatch_ms = 0.0, ph_end_ms = 0.0;
+
+    if (ph) clock_gettime(CLOCK_MONOTONIC, &ph_a);
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE
         && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
         /* begin_picture()'s own vkWaitForFences is now checked (see its doc
@@ -1960,8 +1972,10 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * buffer at all, so there is nothing to dispatch or submit this
          * frame - fall through with quant_levels/etc. left NULL, same as
          * every other "no new GPU work this frame" path below. */
+        if (ph) clock_gettime(CLOCK_MONOTONIC, &ph_b);
         gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
                                      qp, is_idr ? 1 : 0, num_slices);
+        if (ph) clock_gettime(CLOCK_MONOTONIC, &ph_c);
         /* gpu_compute_end_picture() now retries vkQueueSubmit internally
          * (real GPU contention can transiently fail a submit the same way
          * it can transiently fail an allocation - see that function's doc
@@ -1987,6 +2001,19 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * succeeded. Folded into the same condition so either failure takes
          * the same safe fallback. */
         if (gpu_compute_end_picture(gpu_ctx) == 0 && gpu_compute_sync(gpu_ctx) == 0) {
+        if (ph) {
+            clock_gettime(CLOCK_MONOTONIC, &ph_d);
+            ph_begin_ms    = (double)(ph_b.tv_sec - ph_a.tv_sec) * 1000.0 +
+                             (double)(ph_b.tv_nsec - ph_a.tv_nsec) / 1e6;
+            ph_dispatch_ms = (double)(ph_c.tv_sec - ph_b.tv_sec) * 1000.0 +
+                             (double)(ph_c.tv_nsec - ph_b.tv_nsec) / 1e6;
+            ph_end_ms      = (double)(ph_d.tv_sec - ph_c.tv_sec) * 1000.0 +
+                             (double)(ph_d.tv_nsec - ph_c.tv_nsec) / 1e6;
+            fprintf(stderr, "[BC250_PERF_PHASE] frame=%u type=%s begin_ms=%.3f "
+                            "dispatch_ms=%.3f end_sync_ms=%.3f\n",
+                    encoder->frame_count, is_idr ? "I" : "P",
+                    ph_begin_ms, ph_dispatch_ms, ph_end_ms);
+        }
         gpu_compute_debug_dump_recon(gpu_ctx, (int)encoder->width, (int)encoder->height);
 
         void *quant_data = NULL, *dc_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
