@@ -684,6 +684,81 @@ VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID ima
     return VA_STATUS_SUCCESS;
 }
 
+VAStatus bc250_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette) {
+    (void)ctx; (void)image; (void)palette;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+/* Subpictures are not supported by this driver. Query returns zero available
+ * formats (the standard way to report "unsupported"); the rest are stubs to
+ * satisfy libva's vtable completeness check. */
+VAStatus bc250_QuerySubpictureFormats(VADriverContextP ctx, VAImageFormat *format_list, unsigned int *flags, unsigned int *num_formats) {
+    (void)ctx; (void)format_list; (void)flags;
+    if (!num_formats) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    *num_formats = 0;
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus bc250_CreateSubpicture(VADriverContextP ctx, VAImageID image, VASubpictureID *subpicture) {
+    (void)ctx; (void)image; (void)subpicture;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+VAStatus bc250_DestroySubpicture(VADriverContextP ctx, VASubpictureID subpicture) {
+    (void)ctx; (void)subpicture;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+VAStatus bc250_SetSubpictureImage(VADriverContextP ctx, VASubpictureID subpicture, VAImageID image) {
+    (void)ctx; (void)subpicture; (void)image;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+VAStatus bc250_SetSubpictureChromakey(VADriverContextP ctx, VASubpictureID subpicture, unsigned int chromakey_min, unsigned int chromakey_max, unsigned int chromakey_mask) {
+    (void)ctx; (void)subpicture; (void)chromakey_min; (void)chromakey_max; (void)chromakey_mask;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+VAStatus bc250_SetSubpictureGlobalAlpha(VADriverContextP ctx, VASubpictureID subpicture, float global_alpha) {
+    (void)ctx; (void)subpicture; (void)global_alpha;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+VAStatus bc250_AssociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture, VASurfaceID *target_surfaces, int num_surfaces,
+                                   short src_x, short src_y, unsigned short src_width, unsigned short src_height,
+                                   short dest_x, short dest_y, unsigned short dest_width, unsigned short dest_height,
+                                   unsigned int flags) {
+    (void)ctx; (void)subpicture; (void)target_surfaces; (void)num_surfaces;
+    (void)src_x; (void)src_y; (void)src_width; (void)src_height;
+    (void)dest_x; (void)dest_y; (void)dest_width; (void)dest_height; (void)flags;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+VAStatus bc250_DeassociateSubpicture(VADriverContextP ctx, VASubpictureID subpicture, VASurfaceID *target_surfaces, int num_surfaces) {
+    (void)ctx; (void)subpicture; (void)target_surfaces; (void)num_surfaces;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
+/* Display attributes are not supported. Query/Get report zero/no-op success
+ * (the standard way to report "unsupported"); Set is unimplemented since
+ * nothing was ever exposed to set. */
+VAStatus bc250_QueryDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int *num_attributes) {
+    (void)ctx; (void)attr_list;
+    if (!num_attributes) return VA_STATUS_ERROR_INVALID_PARAMETER;
+    *num_attributes = 0;
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus bc250_GetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes) {
+    (void)ctx; (void)attr_list; (void)num_attributes;
+    return VA_STATUS_SUCCESS;
+}
+
+VAStatus bc250_SetDisplayAttributes(VADriverContextP ctx, VADisplayAttribute *attr_list, int num_attributes) {
+    (void)ctx; (void)attr_list; (void)num_attributes;
+    return VA_STATUS_ERROR_UNIMPLEMENTED;
+}
+
 VAStatus bc250_QueryVideoProcFilters(VADriverContextP ctx, VAContextID context, VAProcFilterType *filters, unsigned int *num_filters) {
     (void)ctx; (void)context;
     if (!num_filters) return VA_STATUS_ERROR_INVALID_PARAMETER;
@@ -736,6 +811,19 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     ctx->pDriverData = data;
     ctx->str_vendor = "AMD BC-250 RDNA2 Compute VA-API Driver";
 
+    /* libva's core vaInitialize() validates these counts and the vtable
+     * completeness before returning control to the driver's caller - both
+     * are mandatory, not just documentation. */
+    ctx->max_profiles = MAX_PROFILES;
+    ctx->max_entrypoints = MAX_ENTRYPOINTS;
+    ctx->max_attributes = MAX_CONFIG_ATTRIBUTES;
+    ctx->max_image_formats = MAX_IMAGE_FORMATS;
+    /* libva requires these positive even though we report zero actual
+     * subpicture formats / display attributes at query time - they only
+     * size libva's internal arrays, they aren't a "supported" flag. */
+    ctx->max_subpic_formats = 1;
+    ctx->max_display_attributes = 1;
+
     /* Wire complete vtable */
     ctx->vtable->vaTerminate = bc250_Terminate;
     ctx->vtable->vaQueryConfigProfiles = bc250_QueryConfigProfiles;
@@ -766,6 +854,18 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     ctx->vtable->vaDeriveImage = bc250_DeriveImage;
     ctx->vtable->vaGetImage = bc250_GetImage;
     ctx->vtable->vaPutImage = bc250_PutImage;
+    ctx->vtable->vaSetImagePalette = bc250_SetImagePalette;
+    ctx->vtable->vaQuerySubpictureFormats = bc250_QuerySubpictureFormats;
+    ctx->vtable->vaCreateSubpicture = bc250_CreateSubpicture;
+    ctx->vtable->vaDestroySubpicture = bc250_DestroySubpicture;
+    ctx->vtable->vaSetSubpictureImage = bc250_SetSubpictureImage;
+    ctx->vtable->vaSetSubpictureChromakey = bc250_SetSubpictureChromakey;
+    ctx->vtable->vaSetSubpictureGlobalAlpha = bc250_SetSubpictureGlobalAlpha;
+    ctx->vtable->vaAssociateSubpicture = bc250_AssociateSubpicture;
+    ctx->vtable->vaDeassociateSubpicture = bc250_DeassociateSubpicture;
+    ctx->vtable->vaQueryDisplayAttributes = bc250_QueryDisplayAttributes;
+    ctx->vtable->vaGetDisplayAttributes = bc250_GetDisplayAttributes;
+    ctx->vtable->vaSetDisplayAttributes = bc250_SetDisplayAttributes;
 
     if (major_version) *major_version = VA_MAJOR_VERSION;
     if (minor_version) *minor_version = VA_MINOR_VERSION;
