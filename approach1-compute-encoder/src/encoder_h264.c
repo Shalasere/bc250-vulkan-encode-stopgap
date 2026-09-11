@@ -2474,8 +2474,30 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
          * bounded well under 32 bytes even at high magnitude) while still
          * being a trivial, transient per-slice allocation (~11MB for a full
          * 2560x1440 frame in one slice, freed immediately after this loop
-         * body). See docs/DEVLOG.md for the full investigation. */
-        size_t rbsp_buf_size = (end_mb - start_mb) * 768 + 4096;
+         * body). See docs/DEVLOG.md for the full investigation.
+         *
+         * That 768 figure is CABAC-only reasoning and does not hold for
+         * CAVLC (docs/DEVLOG.md §26.1.1, "ruled out as the SIGSEGV cause but
+         * worth fixing on its own merits" - undersizing truncates the
+         * bitstream rather than corrupting the heap, since bs_write_u() above
+         * bounds-checks byte_offset before every store, but truncation still
+         * desyncs the decoder exactly like the CABAC case above). CAVLC's
+         * `level_prefix >= 15` escape path, combined with this driver's
+         * int16_t-clamped `quant_levels`, lets a single coefficient level
+         * reach `level_code = 65534`, `total = level_code + 4066`,
+         * `suffix_size = 16` (since 2^16 <= total < 2^17), `prefix =
+         * suffix_size + 3 = 19` - about 36 bits (~4.5 bytes) for that one
+         * level, and a 4x4 block can carry up to 16 of them plus
+         * coeff_token/total_zeros/run_before overhead, putting a single
+         * worst-case CAVLC 4x4 block near 90-100 bytes rather than CABAC's
+         * <32. Scaled to 24 blocks/MB that is ~2.0-2.5 KB/MB; 2560 bytes/MB
+         * is used below to round up generously (correctness matters far more
+         * than a few transient KB of malloc). This buffer is allocated fresh
+         * per slice per frame, so keying it off encoder->use_cabac keeps the
+         * common CABAC path at its original, already-validated size instead
+         * of paying the CAVLC allowance unconditionally. */
+        size_t bytes_per_mb = encoder->use_cabac ? 768 : 2560;
+        size_t rbsp_buf_size = (end_mb - start_mb) * bytes_per_mb + 4096;
         uint8_t *slice_rbsp = malloc(rbsp_buf_size);
         if (!slice_rbsp) return -1;
 
