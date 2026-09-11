@@ -3365,6 +3365,46 @@ a Baseline profile or this override, and essentially nothing exercises it.
 **This is an open bug, not a regression.** Do not chase it inside the
 threading work - it reproduces without any of it.
 
+#### 26.1.1 What has already been ruled out (so the next attempt starts further along)
+
+**Two code-level hypotheses tested and refuted by reading:**
+
+- *The slice RBSP buffer is undersized for CAVLC.* Its `768 bytes/MB` is
+  justified in-comment by **CABAC** reasoning ("each block's CABAC
+  bypass-coded coefficients bounded well under 32 bytes"; 24 x 32 = 768), and
+  CAVLC's true worst case is far higher - the `level_prefix >= 15` escape with
+  an int16-clamped level gives `total = 65532 + 4066`, `suffix_size = 16`,
+  `prefix = 19`, so ~36 bits per level, ~96 bytes per 4x4 block, ~2.3 KB/MB.
+  So the buffer genuinely *is* sized for the wrong coder. **But that cannot
+  corrupt the heap**: `bs_write_u()` (bitstream.h, the inline all writers
+  funnel through, including `cavlc.c`'s `bs_write_zeros`/`bs_write_bit`/
+  `bs_write_bits` wrappers) bounds-checks `byte_offset >= size` inside its
+  per-byte store loop and sets `overflow`. Undersizing truncates; it does not
+  overrun. Worth fixing on its own merits, but it is not this bug.
+- *The driver overruns the caller's coded buffer.* Guarded:
+  `if (output_size < total_written) { ...; return -1; }` immediately precedes
+  the `memcpy` into the caller's buffer.
+
+**ASan did not reproduce it.** Hand-compiled the driver with
+`-fsanitize=address -O1 -g` (CMake's `ENABLE_DEBUG` path is unusable here:
+`FindThreads`' try-compile fails once `-fsanitize` is in the flags), preloaded
+`libasan.so.8`, ran the 1-slice/forced-QP config 4x - **all clean, rc=0, no
+report.** Note the shape of that: it is either a classic allocation-layout
+Heisenbug, or it is **optimisation-dependent** - the crashing builds are CMake
+Release (`-O3 -DNDEBUG`, plus `-march=znver2` auto-enabled on this hardware),
+while the ASan build was `-O1`, generic. An optimiser-visible UB (uninitialised
+read, strict aliasing, signed overflow) fits that asymmetry.
+
+**Next probes, in order:** rebuild the sanitized driver at `-O3
+-march=znver2 -DNDEBUG` to match Release; add `-fsanitize=undefined`
+separately (this attempt used address only); and raise the frame count above
+the 12 used here, since the unsanitized repro needed ~40. Useful mechanics for
+whoever resumes: ffmpeg lives on the **host**, not in the `driver-build`
+distrobox, so the sanitized `.so` must be built in the container and *run*
+on the host with the runtime preloaded; `libasan`/`libubsan` are not installed
+in the container by default; and `gcc -print-file-name=libasan.so` returns a
+linker script, not the runtime (use `/usr/lib64/libasan.so.8`).
+
 ### 26.2 The threading works, and parallelises the wrong coder
 
 Mechanically it does what it should. `testsrc`, forced QP, all-intra, 4
