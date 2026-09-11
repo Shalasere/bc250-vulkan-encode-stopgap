@@ -2902,3 +2902,89 @@ number looks like. Nothing here was checked against known-good ground truth
 until §22.2's elimination test. Cross-checking two measurements against each
 other, when both come from the same untrusted pipeline, only tells you they
 agree — not that either is right.
+
+## 23. `quant_levels` halved to int16_t, and a compute shader that had been dispatching against nothing for several sessions
+
+### 23.1 The observation
+
+`quant_levels` (`num_mbs*24*16` entries) holds quantized transform
+coefficient levels — dequantized 16-bit residuals scaled by a 4-bit
+`qp_scale` factor, so the real range never approaches what an `int` provides
+and every write site already clamps into it. It was still declared `int`,
+4 bytes/entry, 22 MB at 1440p per context — the same order of overcopy §20
+found in `coeff_buffer`, just never audited because nothing was reading it
+back 16× over; this one was just the wrong width throughout.
+
+While tracing every dispatch that touches this buffer to plan the width
+change, the "Stage 6: Entropy" `vkCmdDispatch` in `gpu_compute.c` turned out
+to be live: it runs unconditionally every frame, gated only on
+`if (ctx->entropy_pipeline)` — "did the shader load," not "does anything
+still need it." Nothing has read `entropy_buffer` since CAVLC/CABAC moved to
+real host-side entropy coding; the dispatch and its dependent
+`vkCmdCopyBuffer` were pure waste, and would have read out-of-bounds against
+the resized `quant_levels_buffer` if left in place while everything else
+changed width around it.
+
+### 23.2 The change
+
+`quantize.comp`, `intra_wavefront.comp`, `reconstruct.comp` and
+`deblock_filter.comp` now declare the SSBO as `int16_t`
+(`GL_EXT_shader_16bit_storage` + `GL_EXT_shader_explicit_arithmetic_types_int16`;
+`storageBuffer16BitAccess`/`shaderInt16` device support already confirmed
+present). `gpu_compute.c`'s size computation, `encoder_h264.c`'s
+`quant_levels_shadow` and every accessor (`quant_block_ptr`,
+`block_any_nonzero`, both CAVLC and CABAC write paths), and `cavlc.c`/`.h`'s
+block-encode signatures were threaded through to match.
+`coeff_buffer`/`residual_buffer`/`dc_coeff_buffer` were deliberately left
+alone — different data, wider real range.
+
+The type change earned its keep as a safety net exactly the way §19.4's
+audit did for the mask: the compiler rejected two call sites a text search
+would have passed straight over — the CAVLC-path luma DC block (`dc_out`, a
+plain `int[16]` produced by the Hadamard stage, no `int16_t` anywhere near
+it) and an all-zero fallback block (`zero16`). Both are local arrays that
+never touch the GPU buffer at all; narrowing them was never the point of
+this change, and the compiler is what caught that they still had to change
+at the call boundary. Fixed with a narrow-and-copy into a local `int16_t[16]`
+for `dc_out` rather than touching the shared Hadamard-side type, and a direct
+retype for `zero16`.
+
+Also found in the same pass: `BC250_NZ_AUDIT`'s buffer-size guard checked
+`quant_size >= ... * sizeof(int)`. Against a buffer that now reports half
+that size, the stale guard would have silently disabled the audit — not
+corrupted anything, just gone quiet exactly when a width bug would most need
+it watching. Changed to `sizeof(int16_t)`.
+
+The dead entropy dispatch and its copy were removed outright rather than
+merely made conditional; the pipeline/buffer/descriptor objects stay
+allocated (removing them is a separate change) but the encode loop no longer
+invokes them.
+
+### 23.3 Verification
+
+`tools/lab gate` against the pre-change commit:
+
+| check | result |
+|---|---|
+| unit tests | test_bitstream, test_cavlc, test_encode, test_va_api — all PASS |
+| `BC250_NZ_AUDIT`, testsrc | 200/200 frames, 0 mismatches, mask exact |
+| `BC250_NZ_AUDIT`, testsrc2 | 200/200 frames, 0 mismatches, mask exact |
+| quality, testsrc2 | PSNR 58.23 / 58.39 dB, SSIM 0.9992 — PASS |
+| byte-exact vs baseline, testsrc, GOP 120 | byte-identical |
+| byte-exact vs baseline, testsrc, **GOP 1 (all-intra)** | byte-identical |
+| byte-exact vs baseline, testsrc, GOP 10 | byte-identical |
+
+`testsrc2` was not byte-compared, per §19.6: this encoder isn't
+bit-reproducible on moving content, so a diff there would mean nothing. The
+all-intra case is the one that matters most for this specific change, same
+reasoning as §20.3 — it's the case that would show a bug in
+`intra_wavefront.comp`'s write path with nothing else in the way. This is a
+pure memory-layout change with an expected result of *no* bitstream
+difference at all, and that's what came back.
+
+### 23.4 Result
+
+Per encoder context at 1440p, `quant_levels` staging: 22 MB → 11 MB. Plus one
+fewer GPU dispatch and one fewer `vkCmdCopyBuffer` per frame (the dead
+entropy stage), previously ~0.34 ms/frame of GPU time spent on a shader
+nothing downstream reads.
