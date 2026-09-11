@@ -2762,3 +2762,143 @@ on a file that opens by saying it is the truth for this project.
 The cost was not the wrong belief; the fix was correct anyway. The cost was
 publishing a false mechanism under a version tag, and needing this section to
 walk it back.
+
+---
+
+## 22. A "catastrophic 21dB quality gap" was a measurement artifact. The real gap is ~4dB.
+
+§21.4 named quality-at-matched-bitrate as unmeasured and a known risk. Once
+measured, it produced a result reported as decisive: 26.5dB PSNR here against
+libx264's 47.9dB at matched 31Mbps/1440p/testsrc2, with per-frame PSNR
+swinging 26–61dB while libx264 held a tight 47–49dB band. That was reported
+as proof the fps/CPU advantage in `tools/lab scoreboard` was bought by
+producing dramatically worse video, and it reversed that session's whole
+verdict. It was wrong, and the way it was wrong is worth recording in full,
+because catching it took several extra measurements — the finding did not
+announce itself as broken.
+
+### 22.1 The finding looked like a real bug, not a bad measurement
+
+The methodology (`ffmpeg -f lavfi -i <source> -i <our>.h264 -lavfi psnr`)
+looked ordinary — it is the standard way to score an encode, used everywhere
+else in this project including `tools/quality_test.sh`. A per-frame trace
+made it look diagnosable rather than suspicious: PSNR started at 60.7dB on
+the IDR, cratered to 27.8dB on the very next frame, then decayed smoothly
+frame over frame toward a ~25.5dB floor — a shape that pattern-matched
+cleanly onto real, already-documented phenomena (P-frame drift; the
+`rc_estimate_base_qp()` saturation note from §21). Re-running on `testsrc`
+(gentle content, historically 58dB+) made it look worse, not better: the same
+decay, down into the *teens*, and critically **it did not reset at a second,
+fresh IDR at frame 120** — the IDR itself measured barely above its drifted
+P-frame neighbours.
+
+That last detail is what turned this from "plausible bug" to "check the
+measurement first": a real per-frame quality defect tied to encoder or
+reference state should reset at a fresh intra frame, which by definition has
+no dependency on anything before it. A defect that saw the IDR and shrugged
+is not a property of the encoded frames — it is a property of the
+*comparison*.
+
+### 22.2 The actual mechanism
+
+Our encoder emits a raw, container-less Annex-B `.h264` elementary stream
+(`-f h264`). Fed straight into `ffmpeg -i` for comparison against a `-f
+lavfi` reference, ffmpeg has to infer timing for the raw stream from
+whatever's in-band (SPS VUI, if present) rather than from a container's
+explicit timestamps, and `-lavfi psnr`'s frame matching leans on that
+inferred timing. `ffprobe` showed a live discrepancy: our stream reported
+`r_frame_rate=60/1`, while a raw libx264 `.h264` file from the same session
+reported `r_frame_rate=120/1` — different streams, different inferred
+timing, read back by the same tool. Whatever the precise mechanism inside the
+`psnr` filter, the observable effect was a small, compounding misalignment
+between "frame N of the reference" and "frame N of the decoded stream" that
+grew every single frame — exactly a smooth, ever-worsening trend indifferent
+to IDR boundaries, and exactly what was measured.
+
+**Confirmed by elimination**, not just inferred: decoding both the reference
+and our stream to raw `yuv420p` first, then comparing as `-f rawvideo` with
+*identical, explicitly forced* resolution/framerate on both inputs — so
+there is no container or SPS timing inference anywhere left in the
+comparison path — the `testsrc` case that had shown teens-dB and a
+non-resetting IDR measured a flat, stable **59.9dB across all 150 frames**,
+matching this project's long-established figures for this content. The
+artifact was 100% in the comparison, 0% in the encoder.
+
+### 22.3 It was asymmetric, and that's why it wasn't caught by comparison alone
+
+Redone the same way on the actual disputed case (31Mbps/1440p/testsrc2, both
+encoders, decode-to-raw-YUV method):
+
+| | PSNR avg | PSNR range |
+|---|---|---|
+| libx264 (real Sunshine construction) | 47.9dB | 47.1–52.7dB |
+| this encoder | **43.7dB** | 40.4–60.7dB |
+
+libx264's number is **unchanged** from the broken measurement (47.9dB both
+times) — its raw stream apparently carries timing information the naive
+method could read correctly, or its structure otherwise avoided the drift.
+Only our stream's ad hoc measurement was corrupted. That asymmetry is exactly
+why comparing the two encoders' numbers to each other didn't surface the
+bug: libx264 served as an accidentally-uncorrupted control that nothing ever
+checked against a *known-good* reference of its own.
+
+The real gap is **~4dB**, not ~21dB. That's a genuine, moderate quality cost
+— consistent with a simpler encoder lacking subpel motion estimation,
+B-frames and RD optimisation — not the disqualifying result first reported.
+`tools/lab qsweep`'s bitrate-sweep table was built on the same broken method
+and is equally void; §21.4's bitrate-saturation pattern-match built on top of
+it (QP responding normally to bitrate while PSNR stayed flat "proving" an RC
+bug) was reasoning correctly from corrupted data and is retracted along with
+it. Both `tools/lab qsweep` and `scoreboard --quality` now decode to raw YUV
+before comparing; see their source comments for the same account.
+
+Re-run with the fixed method across the full bitrate range, the picture is
+unremarkable in the best sense — sensible and expected, nothing to explain:
+
+| bitrate | our QP avg | our PSNR | libx264 PSNR | gap |
+|---|---|---|---|---|
+| 4M | 48.8 | 34.1dB | 36.3dB | −2.3dB |
+| 8M | 42.4 | 35.7dB | 38.9dB | −3.2dB |
+| 15M | 36.0 | 38.2dB | 41.6dB | −3.4dB |
+| 20M | 33.1 | 39.9dB | 43.7dB | −3.8dB |
+| 25M | 30.6 | 41.5dB | 45.7dB | −4.2dB |
+| 31M | 27.5 | 43.7dB | 47.9dB | −4.2dB |
+
+QP falls monotonically as bitrate rises (48.8→27.5), and PSNR rises smoothly
+for both encoders at every step — no floor, no saturation, no bitrate-
+independent defect. The gap widens slightly at higher bitrates (−2.3dB →
+−4.2dB), which is itself a sensible, explicable shape: at low bitrates both
+encoders are similarly bit-starved, so a "simple" and a "sophisticated"
+encoder land close together; at higher bitrates libx264's extra tools
+(subpel ME, B-frames, RD) let it convert additional bits into quality more
+efficiently than this encoder can, so the gap grows. That is an ordinary
+capability difference, not a bug.
+
+### 22.4 Method notes
+
+**A trace that "explains itself" is not yet a validated trace.** The
+per-frame decay had an internally coherent story at every step — pattern-
+matched to a documented rate-control note, then pattern-matched again to a
+documented drift bug — and each story was plausible enough to keep going.
+The one observation that didn't fit either story (no reset at a fresh IDR)
+is what forced a check of the instrument instead of a third theory. §21.5
+already named this pattern ("a hypothesis that leaves evidence unexplained is
+not finished"); this is the same lesson applied to a measurement pipeline
+instead of a code hypothesis.
+
+**Validate a new metric against elimination, not against plausibility.**
+"Decode to raw YUV, compare with forced identical framing" wasn't chosen
+because it seemed more careful — it was chosen because it removes an entire
+*category* of possible error (container/timing inference) rather than
+patching the specific symptom seen. When a measurement is suspect, prefer a
+method that structurally cannot have the suspected class of bug over one
+that's merely been checked for it.
+
+**A number that never got compared against a trusted reference is not
+validated by being compared against another number.** libx264's PSNR was
+taken at face value because it "looked reasonable" (tight, stable, in a
+plausible range) — which is true, and is also exactly what a plausible wrong
+number looks like. Nothing here was checked against known-good ground truth
+until §22.2's elimination test. Cross-checking two measurements against each
+other, when both come from the same untrusted pipeline, only tells you they
+agree — not that either is right.

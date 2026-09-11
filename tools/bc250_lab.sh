@@ -41,6 +41,8 @@
 #   ./bc250_lab.sh exact <keyA> <keyB>       byte-exactness, deterministic only
 #   ./bc250_lab.sh audit <key>               nonzero-mask exactness audit
 #   ./bc250_lab.sh quality <key> [-r N]      PSNR/SSIM via quality_test.sh
+#   ./bc250_lab.sh qsweep <key> [opts]       PSNR/SSIM vs libx264 across bitrates,
+#                                            with per-frame QP correlation
 #   ./bc250_lab.sh units <key>               unit-test binaries
 #   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + exact
 #   ./bc250_lab.sh health                    is the live Sunshine healthy?
@@ -218,9 +220,10 @@ art_dir() {
 # two extra decode passes, but do not trust an fps/CPU number from a run that
 # skipped it. This encoder has no subpel ME, no B-frames and no RD
 # optimisation, so part of any efficiency or fps win may simply be being a
-# simpler/worse encoder - measured once already at 1440p/testsrc2/31Mbps:
-# 26.5dB PSNR here vs 47.9dB for libx264's real construction, which reversed
-# that run's fps verdict entirely. See the quality-check block below.
+# simpler/worse encoder - measured (correctly; see the quality-check block
+# below for why "correctly" needed its own investigation) at
+# 1440p/testsrc2/31Mbps: 43.7dB PSNR here vs libx264's 47.9dB - a real ~4dB
+# gap, worth weighing against any fps/CPU advantage, but not disqualifying.
 scoreboard() {
     local key="${1:?scoreboard <key> [opts]}"; shift
     local content=testsrc2 res=2560x1440 frames=150 reps=2 quality_check=0
@@ -260,40 +263,57 @@ scoreboard() {
           ($3>0? $2/$3:0), ($4>0? $5/$4:0), \
           (($2>=60 && $5>$4)?" <- we hit 60 AND use less CPU":"")}' "$out"
     echo
-    # Quality at matched bitrate. This used to be a footer warning that it
-    # was "not measured here" - it was measured, once, by hand, off this
-    # tool, and it reversed the whole verdict: on 1440p/testsrc2/31Mbps,
-    # PSNR was 47.9dB (libx264, real 2-thread/zerolatency construction) vs
-    # 26.5dB here, with this encoder swinging 26-61dB frame to frame while
-    # libx264 held a tight 47-49dB band - a rate-control failure signature,
-    # not uniform codec weakness, and it lines up with this project's own
-    # documented rc_estimate_base_qp() saturation above ~31 Mbps at 1440p30.
-    # A speed/CPU "win" bought by producing dramatically worse video is not
-    # a win. This is why it is a real measurement now, not a footnote: a
-    # warning nobody re-checks is worse than not having one, since it reads
-    # as due diligence already done.
+    # Quality at matched bitrate.
+    #
+    # THE COMPARISON METHOD HERE WAS ITSELF WRONG ONCE, and it produced a
+    # false "catastrophic" result that got reported as fact before it was
+    # caught. The first version fed our raw, container-less .h264 straight
+    # into `-lavfi psnr` against a freshly-generated `-f lavfi` reference,
+    # and that comparison drifted worse frame after frame, never resetting
+    # even at a fresh IDR - the signature of a FRAME-SYNC artifact, not a
+    # real defect (a real per-frame quality problem tied to encoder state
+    # would reset at an IDR; a comparison-alignment problem doesn't care
+    # where IDRs are). Confirmed by decoding to raw YUV and comparing as
+    # forced `-f rawvideo` on both sides (zero container/SPS timing
+    # inference anywhere in the path): the SAME clip that measured 26.5dB
+    # PSNR the broken way measured 43.7dB the correct way - libx264's own
+    # number was unchanged either way (47.9dB), so the artifact was
+    # asymmetric, specific to reading OUR raw stream back in directly.
+    # The real gap is ~4dB, not ~21dB - present, and consistent with a
+    # simpler encoder (no subpel ME, no B-frames, no RD) genuinely costing
+    # some efficiency, but not the disqualifying result first reported.
+    #
+    # So: decode BOTH streams to raw YUV first, and compare those with
+    # identical forced framing. No shortcuts back to the broken method.
     if [ "$quality_check" = 1 ] && [ -f "$LAB/.sb_none_key.h264" ] && [ -f "$LAB/.sb_none_libx264.h264" ]; then
         echo "# quality at matched bitrate (load=none condition, same clip/bitrate as above):"
+        local qref="$LAB/.sb_none_ref.yuv"
+        ffmpeg -y -v error -f lavfi -i "${content}=size=${res}:rate=60" \
+            -frames:v "$frames" -pix_fmt yuv420p -f rawvideo "$qref"
         for f in key libx264; do
             local label="$key"; [ "$f" = libx264 ] && label="libx264"
-            local p s
-            p=$(ffmpeg -hide_banner -f lavfi -i "${content}=size=${res}:rate=60" \
-                -i "$LAB/.sb_none_$f.h264" -frames:v "$frames" -lavfi psnr -f null - 2>&1 \
-                | grep -a -m1 'average:' | grep -oP 'average:\K[0-9.]+')
-            s=$(ffmpeg -hide_banner -f lavfi -i "${content}=size=${res}:rate=60" \
-                -i "$LAB/.sb_none_$f.h264" -frames:v "$frames" -lavfi ssim -f null - 2>&1 \
-                | grep -a -m1 'All:' | grep -oP 'All:\K[0-9.]+')
+            local dec="$LAB/.sb_none_${f}_dec.yuv" p s
+            ffmpeg -y -v error -i "$LAB/.sb_none_$f.h264" -frames:v "$frames" \
+                -pix_fmt yuv420p -f rawvideo "$dec"
+            p=$(ffmpeg -hide_banner -f rawvideo -pix_fmt yuv420p -s "$res" -r 60 -i "$qref" \
+                -f rawvideo -pix_fmt yuv420p -s "$res" -r 60 -i "$dec" \
+                -lavfi psnr -f null - 2>&1 | grep -a -m1 'average:' | grep -oP 'average:\K[0-9.]+')
+            s=$(ffmpeg -hide_banner -f rawvideo -pix_fmt yuv420p -s "$res" -r 60 -i "$qref" \
+                -f rawvideo -pix_fmt yuv420p -s "$res" -r 60 -i "$dec" \
+                -lavfi ssim -f null - 2>&1 | grep -a -m1 'All:' | grep -oP 'All:\K[0-9.]+')
             printf "  %-10s PSNR_avg=%-8s SSIM=%s\n" "$label" "${p:-FAILED}" "${s:-FAILED}"
+            rm -f "$dec"
         done
-        echo "  a >3-4dB PSNR gap at matched bitrate outweighs any fps/CPU number above."
-        rm -f "$LAB/.sb_none_key.h264" "$LAB/.sb_none_libx264.h264"
+        echo "  a >3dB PSNR gap at matched bitrate is a real cost against any fps/CPU number above."
+        rm -f "$LAB/.sb_none_key.h264" "$LAB/.sb_none_libx264.h264" "$qref"
     else
         echo "# Quality at matched bitrate NOT checked this run - pass --quality."
         echo "# Without it, any fps/CPU advantage above is unverified: this encoder"
         echo "# has no subpel ME, no B-frames and no RD, so speed can come from doing"
         echo "# less compression work rather than being a better encoder. Measured"
-        echo "# once already (not by this flag) at 1440p/testsrc2/31Mbps: 26.5dB vs"
-        echo "# 47.9dB PSNR, a result that reversed that run's whole verdict."
+        echo "# correctly (decode-to-raw-YUV method - see this block's own history"
+        echo "# above) at 1440p/testsrc2/31Mbps: 43.7dB vs libx264's 47.9dB PSNR -"
+        echo "# a real ~4dB gap, present but not disqualifying on its own."
     fi
     rm -f "$out"
 }
@@ -690,6 +710,95 @@ quality() {
     return $ok
 }
 
+# qsweep <key> [opts] - the check that decides whether the fps/CPU advantage
+# in `scoreboard` is real or an artifact of testing at a bad bitrate.
+#
+# PSNR IS MEASURED BY DECODING BOTH STREAMS TO RAW YUV FIRST, then comparing
+# with identical forced `-f rawvideo` framing on both sides. Do not
+# "simplify" this back to feeding the raw .h264 straight into `-lavfi psnr`
+# against a fresh `-f lavfi` source - that was the ORIGINAL version of this
+# function, and it produced a false 26.5dB-flat-regardless-of-bitrate result
+# with QP responding normally to bitrate while PSNR did not. That pattern
+# was pattern-matched (wrongly) against this project's documented RC
+# saturation note, when the real cause was a frame-sync artifact in the
+# comparison: a raw, container-less .h264 has no reliable timing for `-lavfi
+# psnr`'s PTS-based alignment to lock onto against a `-f lavfi` source, and
+# the misalignment compounds every frame - which is also why it never reset
+# at a fresh IDR, the tell that gave it away. Decoding first removes every
+# container/SPS timing question from the comparison path entirely.
+qsweep() {
+    local key="${1:?qsweep <key> [opts]}"; shift
+    local content=testsrc2 res=2560x1440 frames=150
+    local bitrates="8M,15M,20M,25M,31M"
+    for a in "$@"; do
+        case "$a" in
+            --content=*)  content="${a#*=}";;
+            --res=*)      res="${a#*=}";;
+            --frames=*)   frames="${a#*=}";;
+            --bitrates=*) bitrates="${a#*=}";;
+        esac
+    done
+    local bd; bd=$(art_dir "$key")
+    local stamp; stamp=$(date +%s)
+    local d="$RUNS/qsweep-$stamp"; mkdir -p "$d"
+
+    printf "%-9s %-9s %8s %9s %9s %9s %9s %9s %9s\n" \
+        bitrate encoder fps psnr_avg psnr_min psnr_max qp_avg qp_min qp_max
+    local IFS=,
+    for br in $bitrates; do
+        local IFS=$'\n\t '
+        for enc in "$key" libx264; do
+            local base="$d/${br}_${enc//\//_}"
+            local rc; rc=$(run_encode "$enc" "$content" "$res" "$frames" 120 "$br" "" 0 "$base")
+            if [ "$rc" != 0 ]; then
+                printf "%-9s %-9s ENCODE FAILED (rc=%s) - see %s.log\n" "$br" "$enc" "$rc" "$base"
+                continue
+            fi
+            local fps; fps=$(awk '{print $3}' "$base.wall" 2>/dev/null)
+
+            # Per-frame PSNR: decode to raw YUV, compare against a raw-YUV
+            # reference with identical forced framing on both sides. See
+            # this function's header comment for why the direct
+            # raw-h264-vs-lavfi route is not a shortcut worth taking.
+            local qref="$d/ref.yuv"
+            [ -f "$qref" ] || ffmpeg -y -v error -f lavfi -i "${content}=size=${res}:rate=60" \
+                -frames:v "$frames" -pix_fmt yuv420p -f rawvideo "$qref"
+            local dec="$base.dec.yuv" pstats="$base.psnr.txt"
+            ffmpeg -y -v error -i "$base.h264" -frames:v "$frames" \
+                -pix_fmt yuv420p -f rawvideo "$dec" 2>/dev/null
+            local pavg pmin pmax
+            if [ -s "$dec" ]; then
+                ffmpeg -hide_banner -v error -f rawvideo -pix_fmt yuv420p -s "$res" -r 60 -i "$qref" \
+                    -f rawvideo -pix_fmt yuv420p -s "$res" -r 60 -i "$dec" \
+                    -lavfi "psnr=stats_file=$pstats" -f null - >/dev/null 2>&1
+                read -r pavg pmin pmax < <(grep -oP 'psnr_avg:\K[0-9.]+|inf' "$pstats" | \
+                    awk '{if($1=="inf")$1=99; s+=$1; n++; if(n==1||$1<mn)mn=$1; if(n==1||$1>mx)mx=$1}
+                         END{if(n)printf "%.2f %.2f %.2f", s/n, mn, mx; else print "na na na"}')
+            else
+                pavg=FAIL; pmin=FAIL; pmax=FAIL
+            fi
+            rm -f "$dec"
+
+            # Per-frame QP: only meaningful for our own encoder (BC250_PERF_FRAME).
+            # Rerun with BC250_PERF_STATS=1 - the run above didn't request it since
+            # run_encode() only adds it for non-libx264 keys AND `audit=0` doesn't
+            # disable BC250_PERF_STATS, so it's already in $base.log for our encoder.
+            local qavg=- qmin=- qmax=-
+            if [ "$enc" != libx264 ]; then
+                read -r qavg qmin qmax < <(grep -oP '\[BC250_PERF_FRAME\].*qp=\K[0-9]+' "$base.log" 2>/dev/null | \
+                    awk '{s+=$1; n++; if(n==1||$1<mn)mn=$1; if(n==1||$1>mx)mx=$1}
+                         END{if(n)printf "%.1f %d %d", s/n, mn, mx; else print "na na na"}')
+            fi
+
+            printf "%-9s %-9s %8s %9s %9s %9s %9s %9s %9s\n" \
+                "$br" "${enc:0:9}" "${fps:-na}" "$pavg" "$pmin" "$pmax" "$qavg" "$qmin" "$qmax"
+            rm -f "$base.h264" "$pstats"
+        done
+    done
+    rm -f "$d/ref.yuv"
+    note "logs kept at: $d (*.log per run, for anything the summary doesn't show)"
+}
+
 gate() {
     local key="${1:?gate <key> [<baselineKey>]}" base="${2:-}"
     local rc=0
@@ -773,7 +882,7 @@ rollback() {
     health
 }
 
-usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+usage() { sed -n '2,61p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in
@@ -786,6 +895,7 @@ case "$cmd" in
     audit)    audit "$@";;
     units)    units "$@";;
     quality)  quality "$@";;
+    qsweep)   qsweep "$@";;
     gate)     gate "$@";;
     scoreboard) scoreboard "$@";;
     health)   health "$@";;

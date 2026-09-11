@@ -63,6 +63,16 @@ the errors below.
   per-block nonzero mask was silently wrong on every I-frame because
   `intra_wavefront.comp` bypasses `quantize.comp`. `BC250_NZ_AUDIT=1`
   recomputes it on the CPU and caught it before anything relied on it. §19.4
+- **Never PSNR-compare a raw `.h264` against a fresh `-f lavfi` source
+  directly** (`ffmpeg -i ours.h264 -i lavfi... -lavfi psnr`). A raw,
+  container-less stream has no reliable timing for `-lavfi psnr`'s frame
+  alignment, and the resulting drift compounds every frame while being
+  totally indifferent to IDR boundaries — which produced a false
+  "catastrophic 21dB quality gap" that took several more measurements to
+  catch (the tell: a fresh IDR should reset a real quality problem; this one
+  didn't). Decode BOTH streams to raw YUV first, then compare with identical
+  forced `-f rawvideo -s WxH -r N` framing on both sides — `tools/lab
+  qsweep` and `scoreboard --quality` do this correctly now. §22
 - **Ship shaders with the `.so`.** New C against old SPIR-V is silent wrong
   output, not a load error. Use `make -j12` (the `all` target);
   `make bc250_drv_video` does **not** rebuild `compile_shaders`.
