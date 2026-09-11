@@ -46,8 +46,8 @@ fi
 # remote bash gets a fresh environment - a quiet way to believe you measured
 # a condition you never actually applied.
 FORWARD=""
-for v in BC250_CPU_LOAD_N BC250_SW_PRESET BC250_LAB_DIR BC250_DRV_DIR \
-         BC250_DISTROBOX BC250_RENDER BC250_LAB_REPO; do
+for v in BC250_CPU_LOAD_N BC250_SW_PRESET BC250_SW_TUNE BC250_SW_THREADS \
+         BC250_LAB_DIR BC250_DRV_DIR BC250_DISTROBOX BC250_RENDER BC250_LAB_REPO; do
     eval "val=\${$v:-}"
     [ -n "$val" ] && FORWARD="$FORWARD $v=$(printf '%q' "$val")"
 done

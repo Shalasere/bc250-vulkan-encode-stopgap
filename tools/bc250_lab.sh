@@ -183,29 +183,54 @@ art_dir() {
 # scoreboard <key> - this driver versus Sunshine's software encoder, across
 # every load condition.
 #
-# REPORTS CPU-SECONDS PER FRAME ALONGSIDE FPS, and that is not decoration.
-# The first version of this compared throughput alone and said we lose in all
-# four conditions including idle (64 vs 137 fps). That reading was wrong about
-# what matters: libx264 buys its throughput with 16 threads and 56 ms of CPU
-# per frame, against 16 ms and one thread here. Its 137 fps is headroom nobody
-# can spend, while the CPU it consumes is exactly what a game needs. A
-# compute-shader encoder's whole reason to exist is offloading the CPU, so a
-# scoreboard that cannot see CPU cost cannot tell whether the project is
-# succeeding.
+# THE LIBX264 SIDE MUST MATCH SUNSHINE'S REAL CONSTRUCTION, NOT A GENERIC
+# FFMPEG INVOCATION. Two prior versions of this got that wrong in ways that
+# each flipped the headline conclusion:
 #
-# Still missing, and a known risk: quality at matched bitrate. This encoder
-# has no subpel ME, no B-frames and no RD optimisation, so part of any
-# efficiency win may simply be being a worse encoder. Do not quote the CPU
-# advantage without it.
+#   v1: `-c:v libx264 -preset X` alone, no thread limit -> ffmpeg defaults to
+#       ~nproc threads (137 fps on this board). Read as "we lose everywhere."
+#   v2: added -tune from sw_tune but still no thread limit. Added CPU-seconds
+#       reporting, which was real and worth having, but the underlying fps
+#       comparison was still against a 16-thread libx264 no real session runs.
+#   v3 (current): verified against LizardByte/Sunshine's actual source
+#       (src/video.cpp, src/rtsp.cpp, src/config.cpp) that the software
+#       H.264 path runs `-preset sw_preset -tune sw_tune -threads N` where
+#       N = max(client-requested slicesPerFrame, min_threads). min_threads
+#       defaults to 2 and is unmodified on this board; Sunshine's own source
+#       comment states clients "request the fewest slices per frame", and
+#       moonlight-common-c confirms the client default is exactly 1 absent a
+#       decoder override - so N=2 is the realistic value, not an assumption.
+#       At N=2 this driver's idle-condition fps EXCEEDS libx264's (measured
+#       57 vs 52 on 1440p testsrc2), reversing v1/v2's idle verdict. See
+#       run_encode()'s libx264 branch for the exact derivation and citations.
+#
+# The lesson, not just the fix: benchmarking "the alternative" from a generic
+# invocation of the same codec is not the same as benchmarking the actual
+# competing system. Go read that system's source for what it actually
+# constructs before trusting a comparison against it.
+#
+# REPORTS CPU-SECONDS PER FRAME ALONGSIDE FPS. A compute-shader encoder's
+# whole reason to exist is offloading the CPU, so a scoreboard that cannot
+# see CPU cost cannot tell whether the project is succeeding even when fps
+# alone looks close.
+#
+# Quality at matched bitrate: pass --quality. Off by default because it costs
+# two extra decode passes, but do not trust an fps/CPU number from a run that
+# skipped it. This encoder has no subpel ME, no B-frames and no RD
+# optimisation, so part of any efficiency or fps win may simply be being a
+# simpler/worse encoder - measured once already at 1440p/testsrc2/31Mbps:
+# 26.5dB PSNR here vs 47.9dB for libx264's real construction, which reversed
+# that run's fps verdict entirely. See the quality-check block below.
 scoreboard() {
     local key="${1:?scoreboard <key> [opts]}"; shift
-    local content=testsrc2 res=2560x1440 frames=150 reps=2
+    local content=testsrc2 res=2560x1440 frames=150 reps=2 quality_check=0
     for a in "$@"; do
         case "$a" in
             --content=*) content="${a#*=}";;
             --res=*)     res="${a#*=}";;
             --frames=*)  frames="${a#*=}";;
             --repeat=*)  reps="${a#*=}";;
+            --quality)   quality_check=1;;
         esac
     done
     echo "# scoreboard: $key vs libx264 (${BC250_SW_PRESET:-veryfast}) @ $content $res, $frames frames, $reps runs"
@@ -213,8 +238,9 @@ scoreboard() {
     local out="$LAB/.scoreboard.$$"; : > "$out"
     for load in none gpu cpu both; do
         local ar br afps acpu arss bfps bcpu brss
-        ar=$(bench_e2e "$key"  "$content" "$res" "$frames" "$reps" "$load")
-        br=$(bench_e2e libx264 "$content" "$res" "$frames" "$reps" "$load")
+        local keep=""; [ "$quality_check" = 1 ] && [ "$load" = none ] && keep="$LAB/.sb_none"
+        ar=$(bench_e2e "$key"  "$content" "$res" "$frames" "$reps" "$load" "${keep:+${keep}_key.h264}")
+        br=$(bench_e2e libx264 "$content" "$res" "$frames" "$reps" "$load" "${keep:+${keep}_libx264.h264}")
         read -r afps acpu arss <<<"$ar"
         read -r bfps bcpu brss <<<"$br"
         for e in "$key:$afps:$acpu:$arss" "libx264:$bfps:$bcpu:$brss"; do
@@ -234,15 +260,51 @@ scoreboard() {
           ($3>0? $2/$3:0), ($4>0? $5/$4:0), \
           (($2>=60 && $5>$4)?" <- we hit 60 AND use less CPU":"")}' "$out"
     echo
-    echo "# NOT MEASURED HERE: quality at matched bitrate. This encoder has no"
-    echo "# subpel ME, no B-frames and no RD, so some efficiency may just be"
-    echo "# being a simpler encoder. Do not quote the CPU win without it."
+    # Quality at matched bitrate. This used to be a footer warning that it
+    # was "not measured here" - it was measured, once, by hand, off this
+    # tool, and it reversed the whole verdict: on 1440p/testsrc2/31Mbps,
+    # PSNR was 47.9dB (libx264, real 2-thread/zerolatency construction) vs
+    # 26.5dB here, with this encoder swinging 26-61dB frame to frame while
+    # libx264 held a tight 47-49dB band - a rate-control failure signature,
+    # not uniform codec weakness, and it lines up with this project's own
+    # documented rc_estimate_base_qp() saturation above ~31 Mbps at 1440p30.
+    # A speed/CPU "win" bought by producing dramatically worse video is not
+    # a win. This is why it is a real measurement now, not a footnote: a
+    # warning nobody re-checks is worse than not having one, since it reads
+    # as due diligence already done.
+    if [ "$quality_check" = 1 ] && [ -f "$LAB/.sb_none_key.h264" ] && [ -f "$LAB/.sb_none_libx264.h264" ]; then
+        echo "# quality at matched bitrate (load=none condition, same clip/bitrate as above):"
+        for f in key libx264; do
+            local label="$key"; [ "$f" = libx264 ] && label="libx264"
+            local p s
+            p=$(ffmpeg -hide_banner -f lavfi -i "${content}=size=${res}:rate=60" \
+                -i "$LAB/.sb_none_$f.h264" -frames:v "$frames" -lavfi psnr -f null - 2>&1 \
+                | grep -a -m1 'average:' | grep -oP 'average:\K[0-9.]+')
+            s=$(ffmpeg -hide_banner -f lavfi -i "${content}=size=${res}:rate=60" \
+                -i "$LAB/.sb_none_$f.h264" -frames:v "$frames" -lavfi ssim -f null - 2>&1 \
+                | grep -a -m1 'All:' | grep -oP 'All:\K[0-9.]+')
+            printf "  %-10s PSNR_avg=%-8s SSIM=%s\n" "$label" "${p:-FAILED}" "${s:-FAILED}"
+        done
+        echo "  a >3-4dB PSNR gap at matched bitrate outweighs any fps/CPU number above."
+        rm -f "$LAB/.sb_none_key.h264" "$LAB/.sb_none_libx264.h264"
+    else
+        echo "# Quality at matched bitrate NOT checked this run - pass --quality."
+        echo "# Without it, any fps/CPU advantage above is unverified: this encoder"
+        echo "# has no subpel ME, no B-frames and no RD, so speed can come from doing"
+        echo "# less compression work rather than being a better encoder. Measured"
+        echo "# once already (not by this flag) at 1440p/testsrc2/31Mbps: 26.5dB vs"
+        echo "# 47.9dB PSNR, a result that reversed that run's whole verdict."
+    fi
     rm -f "$out"
 }
 
-# median-ish end-to-end fps for one condition, printed bare
+# median-ish end-to-end fps for one condition, printed bare.
+# Optional 7th arg: absolute path to preserve the FASTEST rep's .h264 output
+# to, for a later quality check (scoreboard --quality uses this on load=none
+# only - contention doesn't change what bits get produced, only how long
+# they take, so checking once at idle is representative and 4x cheaper).
 bench_e2e() {
-    local key="$1" content="$2" res="$3" frames="$4" reps="$5" load="$6"
+    local key="$1" content="$2" res="$3" frames="$4" reps="$5" load="$6" keep="${7:-}"
     local stamp; stamp=$(date +%s%N)
     local d="$RUNS/e2e-$stamp"; mkdir -p "$d"
     start_load "$load" "$d"
@@ -255,6 +317,7 @@ bench_e2e() {
         # describe the same run rather than being independent extrema
         if awk -v a="$best" -v b="${f:-0}" 'BEGIN{exit !(b>a)}'; then
             best="${f:-0}"; best_cpu="${c:-0}"; best_rss="${r:-0}"
+            if [ -n "$keep" ]; then rm -f "$keep"; cp -f "$d/r$i.h264" "$keep" 2>/dev/null; fi
         fi
         rm -f "$d/r$i.h264"
     done
@@ -337,14 +400,41 @@ run_encode() {
     t0=$(date +%s.%N)
     # /usr/bin/time rather than the `times` builtin: the builtin accumulates
     # across every child of this shell, so repeated runs would drift upward.
-    # %U+%S counts all threads, which is the point - libx264 spends 16
-    # threads to get its throughput.
+    # %U+%S counts all threads.
     local -a TIMER=(/usr/bin/time -o "${out}.time" -f "%e %U %S %M")
     if [ "$key" = libx264 ]; then
-        # -preset veryfast matches this board's sunshine.conf (sw_preset).
+        # THIS MUST MATCH Sunshine's ACTUAL software-encoder construction, not
+        # a generic ffmpeg invocation - verified against LizardByte/Sunshine's
+        # own source (src/video.cpp), not assumed:
+        #
+        #   - preset/tune: the "software" encoder_t's only libx264-specific
+        #     options are {preset: sw_preset, tune: sw_tune} - confirmed
+        #     against sunshine.conf on this board (veryfast / zerolatency).
+        #     An earlier version of this ran WITHOUT -tune at all.
+        #   - threads: ctx->thread_count = ctx->slices, and for the software
+        #     path ctx->slices = max(client-requested slicesPerFrame,
+        #     config::video.min_threads). min_threads defaults to 2 (
+        #     src/config.cpp) and is NOT overridden on this board.
+        #     slicesPerFrame is client-negotiated (RTSP
+        #     x-nv-video[0].videoEncoderSlicesPerFrame per src/rtsp.cpp), and
+        #     Sunshine's own comment states plainly: "Clients will request
+        #     for the fewest slices per frame to get the most efficient
+        #     encode" - moonlight-common-c's SdpGenerator.c confirms the
+        #     client default is exactly 1 absent a decoder override. So the
+        #     realistic real-session thread count on THIS board is
+        #     max(1, 2) = 2, not ffmpeg's unconstrained ~nproc default.
+        #
+        # An earlier version of this benchmark used neither override, which
+        # measured plain multi-threaded ffmpeg throughput (137 fps on this
+        # clip) rather than what Sunshine's software path actually delivers
+        # in a real session (52 fps) - a materially different, much stronger
+        # number that was never run by this project's own encoder either.
+        # BC250_SW_THREADS overrides the derived default for experimentation.
         "${TIMER[@]}" ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
             -frames:v "$frames" -g "$gop" -vf 'format=nv12' \
-            -c:v libx264 -preset "${BC250_SW_PRESET:-veryfast}" -b:v "$bitrate" \
+            -c:v libx264 -preset "${BC250_SW_PRESET:-veryfast}" \
+            -tune "${BC250_SW_TUNE:-zerolatency}" \
+            -threads "${BC250_SW_THREADS:-2}" -b:v "$bitrate" \
             -f h264 "${out}.h264" > "${out}.log" 2>&1
     else
         local bd; bd=$(art_dir "$key")
