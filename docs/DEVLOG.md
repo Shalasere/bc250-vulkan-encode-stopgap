@@ -3320,10 +3320,115 @@ nothing to win and a fragmentation penalty to pay.
 
 `quant_levels` staging is **not** the remaining lever - it is 11 MB moving at
 near-bandwidth in ~1.2 ms, and its consumers need cbp-granular completeness.
-The measured frame is still dominated by **CAVLC itself** (7.0 ms of a 12.8 ms
-`testsrc2` frame; 3.5 ms of 8.9 ms on `testsrc`), which is CPU entropy coding
-that no data-transport change touches. Attacking that means attacking the
-coding work: multi-threading it across slices (slices are independent by
-construction, `BC250_SLICES_PER_FRAME` already exists) at the cost of some
-compression efficiency and a bitstream change, which byte-exactness therefore
-cannot validate.
+The measured frame is still dominated by **entropy coding** (7.0 ms of a
+12.8 ms `testsrc2` frame; 3.5 ms of 8.9 ms on `testsrc`), which no
+data-transport change touches.
+
+> 🚨 **CORRECTION (§26): this section originally called that term "CAVLC
+> itself", and so did the commit that introduced it.** It is whichever entropy
+> coder is active, and the shipped default is **CABAC**, not CAVLC:
+> `use_cabac = (prof_idc != PROFILE_BASELINE)` and ffmpeg negotiates profile
+> 100 (High), confirmed by the driver's own init line
+> (`entropy=CABAC`). The `BC250_PERF_CPU cavlc_ms=` counter is named after
+> CAVLC but brackets whichever coder ran. The magnitude was right; the
+> attribution was wrong.
+
+## 26. Threading the entropy stage across slices: reverted. Fast, but it parallelises the coder this driver does not use — and it uncovered a pre-existing crash.
+
+§25.3 pointed at entropy coding as the last term worth attacking. H.264 slices
+are independent by construction, `BC250_SLICES_PER_FRAME` already exists, so
+one slice per thread should be near-free parallelism. Built it, measured it,
+reverted it. Three findings, in descending order of how much they matter.
+
+### 26.1 🚨 A pre-existing, flaky SIGSEGV in the forced-CAVLC path
+
+Found while trying to validate the threading, and it is **not** caused by any
+of today's work. Same command, `BC250_USE_CABAC=0 BC250_FORCE_QP=26
+BC250_RC_NOMINAL_DRAIN=1`, 40 frames of 1440p `testsrc`:
+
+| build | slices | threads | crashes |
+|---|---|---|---|
+| **pre-change `work-3b0c1690aed6`** | 4 | 1 | **2 / 4** |
+| **pre-change `work-3b0c1690aed6`** | **1** | **1** | **2 / 2** |
+| today's restructure | 4 | 1 | 3 / 4 |
+| today's restructure | 4 | 4 | 0 / 4 |
+| today's restructure | 1 | 1 | 0 / 2 |
+
+The unmodified build crashes **2 out of 2 at a single slice with no
+threading**, which rules out slicing, threading and the restructure. Faults
+land in ffmpeg's own frame teardown (`av_frame_unref` → `free`), i.e. heap
+corruption surfacing well after the fact. It is flaky, and it is rarer with
+rate control left on (0/3 on the old build), which is why nothing hit it
+before: `use_cabac` defaults **true**, so the CAVLC path is only reachable via
+a Baseline profile or this override, and essentially nothing exercises it.
+
+**This is an open bug, not a regression.** Do not chase it inside the
+threading work - it reproduces without any of it.
+
+### 26.2 The threading works, and parallelises the wrong coder
+
+Mechanically it does what it should. `testsrc`, forced QP, all-intra, 4
+slices - and this is the **valid** byte-exactness oracle (§19.6: only
+`testsrc`):
+
+| threads | entropy_ms | wall_ms | fps | md5 |
+|---|---|---|---|---|
+| 1 | 5.718 | 17.481 | 57.2 | `393f6614…723a` |
+| 4 | **1.971** | **11.666** | **85.7 (+50%)** | `393f6614…723a` **identical** |
+
+2.9× on the entropy stage, byte-identical output, same size to the byte. On
+P-frames it was ~3.1 → 1.2 ms and 111 → 143 fps.
+
+But every one of those numbers is on the **CAVLC** path, reached only by
+forcing `BC250_USE_CABAC=0` - which is also the path that crashes (§26.1), so
+treat them as indicative, not validated. The shipped configuration is CABAC,
+and **CABAC cannot be threaded as it stands**: `start_mb` appears *only* in
+`luma_nc()`/`chroma_nc()`, so the CABAC per-MB context arrays (`dc_cbf_luma`,
+`dc_cbf_chroma`, `cbp_nb`, `mvd_x_abs`, `mvd_y_abs`, `skip_flag`) have no
+slice-boundary gating at all. That is both a data race waiting to happen and,
+independently, a probable multi-slice CABAC spec problem worth its own
+investigation - CABAC context must not cross a slice boundary.
+
+### 26.3 And switching to CAVLC to collect the win costs ~24% bitrate
+
+Measured honestly at **fixed QP 26**, 1 slice, nominal drain (the earlier
+cross-coder byte comparison was confounded by the wall-clock RC drain):
+
+| coder | entropy_ms | bytes |
+|---|---|---|
+| CABAC | 9.365 | 8,625,876 |
+| CAVLC | **6.008** | **10,685,092 (+23.9%)** |
+
+So CAVLC's entropy stage is genuinely ~36% cheaper in CPU *and* ~24% more
+expensive in bits. Trading 24% of the bitrate for ~30-50% more fps is a bad
+deal for a bandwidth-limited stream, and it is the whole deal on offer until
+CABAC can be threaded. Slicing itself is cheap by comparison (~1% more bytes
+from 1 → 4 slices, measured with rate control on).
+
+**Order of operations for anyone resuming this:** fix §26.1's crash, then add
+slice-boundary gating to the CABAC neighbour helpers (a correctness fix in its
+own right), and only then thread it. Threading CAVLC is not the win; CABAC is
+where the 9.4 ms actually is.
+
+### 26.4 Method notes — two false greens in one session
+
+**A guard can make an oracle vacuous.** The first threaded build reported
+byte-identical output at 4 threads. It was identical because the OpenMP region
+was disabled by the author's own `if(... && !encoder->use_cabac)` clause while
+the runs were all CABAC - nothing was ever threaded. The tell was the same as
+§24.3's: a number that did not move when the mechanism said it must
+(`cavlc_ms` 6.585 → 6.709 at 4 threads). **Twice in one session a performance
+counter, not a correctness check, was the thing that exposed a false green.**
+Before believing a pass, confirm the code under test actually executed -
+here, that OpenMP was enabled (`libgomp` linked, `-fopenmp` in `flags.make`,
+`_OPENMP=201511`) *and* that the runtime guard let it through.
+
+**The §19.6 trap is easy to walk into while being careful about oracles.**
+Threads 1/2/4/8 were first compared on `testsrc2` and the md5s all differed,
+which reads exactly like a race. The byte spread was 8,563,162-8,565,127:
+**0.02%**, precisely the GPU-side ME tie-breaking non-determinism §19.6
+documents, on content CLAUDE.md's first hard rule says byte-exactness is
+invalid for. The rule was known, cited earlier in the same session, and still
+tripped over - because the *shape* of the evidence (threads change output)
+matched the feared bug so well that the content it was measured on went
+unexamined.
