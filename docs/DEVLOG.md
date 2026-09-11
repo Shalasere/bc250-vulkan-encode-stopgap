@@ -3233,6 +3233,9 @@ and re-measured rather than deleted once fixed, which is the only reason
 "`qsweep` can see this" is a fact here instead of an assumption — the same
 discipline §22 arrived at the hard way.
 
+**A measured dead end is still a result — record the premise that failed, not
+just the outcome.** See §25.
+
 **A number without its load condition decays into whatever the reader
 assumes.** "Up to 46×" sat in CLAUDE.md as a hard rule for sessions, with no
 DEVLOG entry, no generator named, and no load condition; it reads as a
@@ -3244,3 +3247,83 @@ claim shipping twice because the correction lived somewhere the next reader
 did not look). When recording a performance number, record what produced it,
 and when correcting one, correct it **where it is cited**, not only where it
 was discovered.
+
+## 25. Tried and reverted: a sparse, mask-guided `shadow_copy` for `quant_levels`. Wrong on both counts.
+
+The premise looked excellent, and §20 is a direct precedent for this shape of
+win (remove bytes nobody reads, get +30%). `BC250_NZ_AUDIT` measures
+**90.6% (testsrc) to 96.1% (testsrc2) of all 4x4 blocks as entirely zero**,
+`block_any_nonzero()` already answers every "is this block zero" question from
+the 1.38 MB mask instead of the 11 MB levels buffer (§19.3), and yet
+`shadow_copy()` still memcpys all 11 MB every frame. So: copy only the blocks
+whose mask bit is set, coalescing adjacent nonzero blocks into single memcpys,
+leaving zero blocks' slots untouched (allocation zeroed so an ungated read
+would see the correct zeros rather than heap garbage).
+
+Reverted. It was wrong twice, independently.
+
+### 25.1 Wrong on correctness: the mask gates reads at *cbp* granularity, not per block
+
+Output changed — `tools/lab exact` failed all three deterministic cases, and
+sparse-vs-full within the *same binary* differed on `testsrc` and on `gop=1`
+all-intra. The bitstream got consistently **larger** (2 874 587 → 3 062 312
+bytes at GOP 120), which is the signature of extra coefficients being coded:
+stale values being read out of blocks that should have been zero.
+
+The premise "every read of a block's levels is mask-gated" is **false**, and
+it is false for a structural reason rather than an oversight:
+
+| read site | gate | granularity |
+|---|---|---|
+| `encode_mb_i16x16` luma AC | `if (cbp_luma_flag)` | **whole macroblock** — then reads all 16 blocks |
+| `encode_mb_p16x16` luma | `if (luma_cbp & (1 << q))` | **8x8 quadrant** — then reads all 4 of its blocks |
+| chroma AC (both paths) | `if (cbp_chroma == 2)` | **all 8 chroma blocks** |
+
+That is H.264, not this encoder: `coded_block_pattern` is per-8x8 for luma and
+per-component for chroma, and CAVLC must emit a `coeff_token` for **every** 4x4
+block inside a coded group — including the all-zero ones. There is no per-4x4
+skip signal to hang a sparse transfer off. A correct version would have to
+match the copy granularity to cbp (an 8x8 luma quadrant if any of its four
+blocks is nonzero; all chroma if any chroma block is), which copies
+strictly more than the per-block scheme and clusters far worse than the
+block-level 90% figure suggests.
+
+### 25.2 Wrong on performance anyway: the big sequential memcpy was already the right answer
+
+Even setting correctness aside, it was **slower**. Same binary,
+`BC250_SPARSE_SHADOW=0` vs default, 1440p, 150 frames, mean of last 100:
+
+| content | arm | shadow_ms | cavlc_ms | wall_ms | fps |
+|---|---|---|---|---|---|
+| testsrc | full copy | 1.286 | 3.459 | **8.929** | **112.0** |
+| testsrc | sparse | 1.175 | 3.861 | 9.246 | 108.2 |
+| testsrc2 | full copy | 1.263 | 7.036 | **12.776** | **78.3** |
+| testsrc2 | sparse | 1.212 | 7.184 | 12.925 | 77.4 |
+
+Skipping ~90% of the bytes bought only **8% of `shadow_copy`** (1.286 →
+1.175 ms) and cost more than that elsewhere. An 11 MB sequential memcpy at
+~9 GB/s is already close to what this memory system can do; replacing it with
+345 600 mask tests plus fragmented per-run copies trades that sequential
+streaming for per-block branch and call overhead, and `cavlc` got *slower*
+too (plausibly a colder, more fragmented shadow buffer — not chased, since
+the wall-clock verdict was already negative).
+
+**The transferable lesson: "fewer bytes" is not automatically faster when the
+bytes were already moving optimally.** §20's +30% came from deleting a 22 MB
+copy *entirely* (16x overcopy, nothing read it), not from making a copy
+conditional. Deleting traffic wins; making traffic branchy does not. Before
+reaching for a sparse/conditional variant of a bulk operation, check whether
+the bulk operation is bandwidth-bound-and-sequential, because then there is
+nothing to win and a fragmentation penalty to pay.
+
+### 25.3 What this leaves
+
+`quant_levels` staging is **not** the remaining lever - it is 11 MB moving at
+near-bandwidth in ~1.2 ms, and its consumers need cbp-granular completeness.
+The measured frame is still dominated by **CAVLC itself** (7.0 ms of a 12.8 ms
+`testsrc2` frame; 3.5 ms of 8.9 ms on `testsrc`), which is CPU entropy coding
+that no data-transport change touches. Attacking that means attacking the
+coding work: multi-threading it across slices (slices are independent by
+construction, `BC250_SLICES_PER_FRAME` already exists) at the cost of some
+compression efficiency and a bitstream change, which byte-exactness therefore
+cannot validate.
