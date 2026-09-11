@@ -39,7 +39,8 @@
 #   ./bc250_lab.sh noise <key> [opts]        establish the run-to-run floor
 #   ./bc250_lab.sh compare <keyA> <keyB>     A/B with significance testing
 #   ./bc250_lab.sh exact <keyA> <keyB>       byte-exactness, deterministic only
-#   ./bc250_lab.sh audit <key>               nonzero-mask exactness audit
+#   ./bc250_lab.sh audit <key> [opts]        nonzero-mask exactness audit
+#                                            (--env=K=V, --md5, --res, --frames)
 #   ./bc250_lab.sh quality <key> [-r N]      PSNR/SSIM via quality_test.sh
 #   ./bc250_lab.sh qsweep <key> [opts]       PSNR/SSIM vs libx264 across bitrates,
 #                                            with per-frame QP correlation
@@ -656,17 +657,38 @@ exact() {
 
 audit() {
     local key="${1:?audit <key>}"; shift
-    local res=2560x1440 frames=200
-    for x in "$@"; do case "$x" in --res=*) res="${x#*=}";; --frames=*) frames="${x#*=}";; esac; done
+    local res=2560x1440 frames=200 envs="" want_md5=0
+    # --env is here for the same reason bench has it: the audit is this
+    # project's only EXACT oracle for GPU-produced data (§19.4), which makes it
+    # the right instrument for checking a change *below* the driver - a patched
+    # Mesa/RADV, say - where the question is whether the GPU still computes the
+    # same values at all. Without it that check has to be hand-rolled, and
+    # hand-rolled encode invocations are what produced most of the wrong
+    # conclusions this harness exists to prevent.
+    for x in "$@"; do case "$x" in
+        --res=*)    res="${x#*=}";;
+        --frames=*) frames="${x#*=}";;
+        --env=*)    envs="${x#*=}";;
+        --md5)      want_md5=1;;
+    esac; done
     local ok=0
     for content in $DETERMINISTIC_CONTENT $NONDETERMINISTIC_CONTENT; do
         local base="$RUNS/audit-$(date +%s)-$content"
-        local rc; rc=$(run_encode "$key" "$content" "$res" "$frames" 10 31M "" 1 "$base")
+        local rc; rc=$(run_encode "$key" "$content" "$res" "$frames" 10 31M "$envs" 1 "$base")
         [ "$rc" != 0 ] && { echo "$content: ENCODE FAILED rc=$rc"; ok=1; continue; }
         python3 "$PARSE" "$base.log" \
           | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%-10s frames=%s mismatched_frames=%s total_mismatches=%s all_zero=%.1f%% ac_zero=%.1f%%" % (sys.argv[1], d.get("audit_frames"), d.get("audit_mismatch_frames"), d.get("audit_mismatches_total"), d.get("audit_all_zero_pct",0), d.get("audit_ac_zero_pct",0)))' "$content"
         local mm; mm=$(python3 "$PARSE" "$base.log" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("audit_mismatch_frames",1))')
         [ "$mm" = 0 ] || ok=1
+        # md5 is only a valid comparison on deterministic content (§19.6); it is
+        # printed for the others purely so the asymmetry stays visible rather
+        # than looking like an omission.
+        if [ "$want_md5" = 1 ]; then
+            local valid="INVALID-ORACLE (nondeterministic content, ignore)"
+            is_deterministic "$content" && valid="valid oracle"
+            printf "%-10s md5=%s  [%s]\n" "$content" \
+                "$(md5sum "$base.h264" 2>/dev/null | awk '{print $1}')" "$valid"
+        fi
         rm -f "$base.h264"
     done
     [ "$ok" -eq 0 ] && echo "=> mask EXACT on all audited frames" || echo "=> MASK MISMATCH - do not ship"
