@@ -2709,6 +2709,19 @@ stream to **11 fps** — roughly 90 ms/frame against 15 ms measured idle, a ~6x
 penalty where naive time-slicing of a 4.8 ms GPU cost into a 33 ms budget
 predicts ~1.15x.
 
+> 🚨 **CORRECTION (§24.6): the "11 fps with a real game" figure above is
+> UNSOURCED and must not be relied on.** It cites no run, and it is
+> numerically identical — same value, same resolution — to a figure §12.4
+> explicitly **retracted** as a self-inflicted measurement artifact
+> (`BC250_DUMP_REAL_INPUT=1`/`BC250_DUMP_RECON_FRAMES=1` left set in
+> Sunshine's systemd environment, doing synchronous full-frame NV12 disk
+> dumps every frame; "no driver change involved"). Whether this paragraph
+> describes an independent later observation or re-attributes that retracted
+> number to GPU contention cannot now be determined. **The reasoning in
+> 21.4 below survives regardless** — it rests on §20.4's bandwidth evidence
+> and on the encoder being synchronous per frame, not on this number. What
+> contention actually measures, with the generator named, is in §24.6.
+
 "VRAM pressure evicting encoder buffers to slower memory" was the favourite
 explanation. It is now largely dead: device-local memory on this part *is*
 GDDR6 reached through GTT, so there is no slower tier to be evicted into.
@@ -3104,7 +3117,102 @@ it is byte-exact when off and the slot-explicit API removes a real footgun.
 **The remaining CPU-side lever is CAVLC itself (7.1 ms, 57% of the frame), not
 scheduling around it.**
 
-### 24.5 Method notes
+### 24.6 What GPU contention actually costs, with the generator named — and a documentation audit
+
+§24.4's verdict was measured on an **idle** GPU, which §21.4's own rule says
+does not transfer. Re-measured under load. `--load=gpu` is ffmpeg's
+`nlmeans_vulkan`, a heavy Vulkan compute denoiser that loads the shader cores
+and memory system without touching this VA-API driver, so encoder contention
+is isolated from anything this driver does.
+
+1440p `testsrc2`, 150 frames, same build (`work-531fefaac101`):
+
+| | idle, OFF | idle, ON | load=gpu, OFF | load=gpu, ON |
+|---|---|---|---|---|
+| e2e fps | 66.2 | 67.7 | **1.48** | 1.53 |
+| frame wall | 12.8 ms | 12.8 ms | **674.9 ms** | 648–657 ms |
+| `cavlc` (CPU) | 7.1 ms | 7.1 ms | **24.0 ms** | 23.8 ms |
+| GPU *execution* | 4.33 ms | 4.28 ms | **2.34 ms** | 2.33 ms |
+| frame-time sd | ~1.0 ms | ~1.1 ms | 2.3 ms | **105–129 ms** |
+
+Three things worth extracting:
+
+1. **The contention cost is ~45×** (66.2 → 1.48 fps). Of a 675 ms frame, this
+   encoder's shaders *execute* for 2.34 ms and the CPU works for ~26 ms;
+   **~646 ms is the submission waiting its turn.** The GPU timestamps measure
+   only our command buffer actually running, which is why "GPU time" appears
+   to *drop* under load — it is being serviced less, not working less.
+
+2. **`cavlc` triples, 7.1 → 24.0 ms, with no code change.** A pure
+   CU-contention story cannot do that; a shared-memory-bus story can, and
+   §20.4 already showed this encoder is bandwidth/cache-bound (removing
+   22 MB/frame made *untouched* CAVLC 30-37% faster). This is the strongest
+   evidence yet for the bandwidth diagnosis in §21.4's item 1.
+
+3. **Pipelining works under load and is still worth ~3%,** for the reason
+   §24.4 could not see from idle numbers: there is only ~24 ms of CPU work
+   available to hide inside a ~646 ms wait. It also made frame-time sd
+   explode from ~2 ms to 105–129 ms (jitter, which matters more than mean
+   throughput for a live stream), and **one of three pipelined load runs died
+   with `rc=139` (SIGSEGV)** — an unresolved crash in the deferred path, on
+   top of §24.4's unexplained quality loss.
+
+**So the lever contention points at is service *order*, not overlap.**
+`VK_EXT_global_priority`, `VK_KHR_global_priority` and
+`VK_EXT_global_priority_query` are all present here, and the driver's priority
+query is privilege-aware:
+
+| | unprivileged | as root |
+|---|---|---|
+| supported levels (every family) | LOW, MEDIUM | LOW, MEDIUM, HIGH, REALTIME |
+| `vkCreateDevice` at HIGH/REALTIME | `VK_ERROR_NOT_PERMITTED_KHR` | succeeds |
+
+Identical with and without the GFX1013 ACE-queue patch, so exposing the async
+compute queues is irrelevant to priority. MEDIUM is already the default, so
+**an unprivileged process can only go down** — the knob does nothing for
+Sunshine as it currently runs (plain user service, no capabilities, no file
+caps on `/usr/bin/sunshine`) unless `CAP_SYS_NICE` is granted to it, which is
+a system/security decision, not a driver default. `BC250_QUEUE_PRIORITY=`
+`low|medium|high|realtime` exists to test it and degrades gracefully on
+refusal. Note also that raising it does not create GPU time, it reallocates
+it: the stream gets smoother by making the game wait.
+
+Independent corroboration that this is the right lever, from a completely
+different measurement in a different project era: **§4 measured this encoder's
+own appetite at ~8.4% of a concurrent game's GPU throughput** (down from
+~29% before that phase's fixes). Today's 2.34 ms of execution per frame is
+~14% of a 60 fps budget. Two unrelated instruments agree that the GPU demand
+here is small — which is exactly why being served ~1% of the frame looks like
+a queueing problem rather than resource exhaustion.
+
+#### 24.6.1 Documentation audit: the contention numbers were not what they looked like
+
+Chasing the provenance of the figures above turned up a real documentation
+defect, which is recorded here because it is the same failure mode §21's
+header warns about:
+
+- **§12.4 retracted an 11 fps @ 1440p figure** as a self-inflicted artifact
+  (leftover `BC250_DUMP_REAL_INPUT`/`BC250_DUMP_RECON_FRAMES` doing per-frame
+  NV12 disk dumps).
+- **§21.4 then asserted "a game saturating the GPU drops the stream to
+  11 fps"** — same value, same resolution, citing no run. It is not
+  determinable now whether that was an independent observation or the
+  retracted number re-attributed to contention. It is flagged in place and
+  must not be re-cited.
+- **CLAUDE.md carried "contention costs this encoder up to 46×" as a hard
+  rule with no DEVLOG entry behind it.** It matches 66.2 ÷ 1.48 = 44.7× from
+  the synthetic generator almost exactly, so it was very likely always this
+  measurement — recorded with neither its load condition nor its generator,
+  which is how it became readable as a real-game number. Both CLAUDE.md rules
+  are now corrected to name the generator and to say plainly that **no
+  trustworthy real-game contention figure exists.**
+
+There is still no recorded scoreboard or load-condition result anywhere in
+this log (`grep` for `load=`, `hits60`, `scoreboard` finds none) — this
+section is the first. A measured number with no written-down load condition
+degrades into a claim about whatever the reader assumes.
+
+### 24.7 Method notes
 
 **An exact oracle is only exact about what it compares.** The mask audit is a
 genuinely strong instrument — §19.4 built it precisely to catch a stale GPU→CPU
@@ -3124,3 +3232,15 @@ nobody was watching for correctness.
 and re-measured rather than deleted once fixed, which is the only reason
 "`qsweep` can see this" is a fact here instead of an assumption — the same
 discipline §22 arrived at the hard way.
+
+**A number without its load condition decays into whatever the reader
+assumes.** "Up to 46×" sat in CLAUDE.md as a hard rule for sessions, with no
+DEVLOG entry, no generator named, and no load condition; it reads as a
+statement about games and is a statement about `nlmeans_vulkan`. Separately,
+§21.4 asserted an 11 fps game figure identical to one §12.4 had already
+retracted. Neither was a measurement error — both were *bookkeeping* errors,
+and they are the same class of failure as §21's headline mistake (a corrected
+claim shipping twice because the correction lived somewhere the next reader
+did not look). When recording a performance number, record what produced it,
+and when correcting one, correct it **where it is cited**, not only where it
+was discovered.

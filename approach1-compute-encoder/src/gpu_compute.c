@@ -740,14 +740,16 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     vkEnumerateDeviceExtensionProperties(ctx->physical_device, NULL, &ext_count, ext_props);
 
     bool have_memory_fd = false, have_dma_buf = false, have_semaphore_fd = false;
+    bool have_global_priority = false;
     for (uint32_t i = 0; i < ext_count; i++) {
         if (strcmp(ext_props[i].extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME) == 0) have_memory_fd = true;
         if (strcmp(ext_props[i].extensionName, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME) == 0) have_dma_buf = true;
         if (strcmp(ext_props[i].extensionName, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME) == 0) have_semaphore_fd = true;
+        if (strcmp(ext_props[i].extensionName, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) == 0) have_global_priority = true;
     }
     free(ext_props);
 
-    const char *device_extensions[3];
+    const char *device_extensions[4];
     uint32_t device_ext_count = 0;
     if (have_memory_fd && have_dma_buf) {
         device_extensions[device_ext_count++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
@@ -770,6 +772,52 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
                         "cannot explicitly wait for cross-context surface writers\n");
     }
 
+    /* BC250_QUEUE_PRIORITY=low|medium|high|realtime asks for a global queue
+     * priority instead of the driver-default (MEDIUM).
+     *
+     * WHY THIS EXISTS: under real GPU contention this encoder's frame is ~675ms
+     * of which its shaders only EXECUTE ~2.3ms - the rest is the submission
+     * waiting behind the other process's work (DEVLOG 24.4). At 60fps that is
+     * only ~14% of the GPU being asked for, yet contention drops the encoder to
+     * 1.48fps. Queue *priority*, not more queues and not CPU/GPU overlap, is
+     * the mechanism aimed at that wait.
+     *
+     * PRIVILEGE: measured on this board, HIGH and REALTIME are unavailable to
+     * an unprivileged process - vkCreateDevice returns
+     * VK_ERROR_NOT_PERMITTED_KHR and the driver's own priority query lists only
+     * LOW/MEDIUM. As root all four appear. So this knob does nothing for
+     * Sunshine as it currently runs (plain user service, no capabilities)
+     * unless CAP_SYS_NICE is granted to it, which is a deliberate system
+     * decision, not something this driver should assume.
+     *
+     * POLICY: raising this above the game does not create GPU time, it
+     * reallocates it - the stream gets smoother by making the game wait. That
+     * is a reasonable trade on a box whose purpose is streaming, and a bad one
+     * elsewhere, which is why there is no default change here.
+     *
+     * Falls back to the default on NOT_PERMITTED rather than failing init, so
+     * an over-optimistic setting degrades instead of breaking the driver. */
+    VkDeviceQueueGlobalPriorityCreateInfoEXT gp_info = {
+        .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
+    };
+    bool want_priority = false;
+    const char *prio_env = getenv("BC250_QUEUE_PRIORITY");
+    if (prio_env && have_global_priority) {
+        if      (strcmp(prio_env, "low")      == 0) { gp_info.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_LOW_EXT;      want_priority = true; }
+        else if (strcmp(prio_env, "medium")   == 0) { gp_info.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT;   want_priority = true; }
+        else if (strcmp(prio_env, "high")     == 0) { gp_info.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT;     want_priority = true; }
+        else if (strcmp(prio_env, "realtime") == 0) { gp_info.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT; want_priority = true; }
+        else fprintf(stderr, "[bc250-gpu] BC250_QUEUE_PRIORITY='%s' not recognised "
+                             "(low|medium|high|realtime) - ignoring\n", prio_env);
+        if (want_priority) {
+            q_info.pNext = &gp_info;
+            device_extensions[device_ext_count++] = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+        }
+    } else if (prio_env && !have_global_priority) {
+        fprintf(stderr, "[bc250-gpu] BC250_QUEUE_PRIORITY set but "
+                        "VK_EXT_global_priority is unavailable - ignoring\n");
+    }
+
     VkDeviceCreateInfo dev_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .pNext = &features12,
@@ -778,7 +826,21 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         .enabledExtensionCount = device_ext_count,
         .ppEnabledExtensionNames = device_ext_count > 0 ? device_extensions : NULL
     };
-    VK_CHECK(vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device));
+    if (want_priority) {
+        VkResult pr = vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device);
+        if (pr == VK_SUCCESS) {
+            fprintf(stderr, "[bc250-gpu] queue global priority '%s' GRANTED\n", prio_env);
+        } else {
+            fprintf(stderr, "[bc250-gpu] queue global priority '%s' REFUSED (VkResult %d%s) - "
+                            "falling back to driver default\n", prio_env, (int)pr,
+                    pr == VK_ERROR_NOT_PERMITTED_KHR ? " = NOT_PERMITTED, needs CAP_SYS_NICE" : "");
+            q_info.pNext = NULL;
+            dev_info.enabledExtensionCount = --device_ext_count;
+            VK_CHECK(vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device));
+        }
+    } else {
+        VK_CHECK(vkCreateDevice(ctx->physical_device, &dev_info, NULL, &ctx->device));
+    }
     vkGetDeviceQueue(ctx->device, ctx->compute_queue_family, 0, &ctx->compute_queue);
 
     if (have_memory_fd && have_dma_buf) {

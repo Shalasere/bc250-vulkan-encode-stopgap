@@ -49,13 +49,22 @@ the errors below.
 - **No delta under ~2.5% of wall time is a result** from a single run. Noise
   floor at 1440p: `p_wall` sd 1.2%, `cavlc` 1.6%, `shadow` 3.1%,
   `gpu_total` 0.09%.
-- **Idle numbers do not transfer.** Every published throughput figure was
-  taken on an idle GPU; a real game took 1440p streaming from 60 fps to
-  11 fps. Always state the load condition. §21.4
+- **Idle numbers do not transfer, and name the load generator.** Every
+  published throughput figure was taken on an idle GPU. Under `--load=gpu`
+  (ffmpeg `nlmeans_vulkan`) 1440p goes **66.2 → 1.48 fps**, measured
+  2026-09-11 — but that generator is a pathologically heavy compute filter,
+  almost certainly harsher than a game, so it is a synthetic worst case and
+  not a "what a game does" number. ⚠️ **There is no trustworthy real-game
+  figure.** The often-repeated "a real game took 1440p from 60 to 11 fps" is
+  unsourced and collides with a number §12.4 retracted as a debug-I/O
+  artifact — see §21.4's correction box and §24.6. Always state the load
+  condition *and* what produced it. §24.6
 - **The goal is beating libx264, not beating the previous commit.** Software
-  encoding doesn't touch the GPU, so it barely notices a game while contention
-  costs this encoder up to 46×. `tools/lab scoreboard` is the real
-  scoreboard.
+  encoding doesn't touch the GPU, so it barely notices a game while GPU
+  contention costs this encoder up to ~45× (66.2 → 1.48 fps under
+  `--load=gpu`/`nlmeans_vulkan` — synthetic, see the load-condition rule
+  above; the older bare "46×" claim had no recorded provenance at all).
+  `tools/lab scoreboard` is the real scoreboard.
 - **A working fix is not confirmation of the diagnosis that produced it.** If
   part of the evidence is still unexplained, the hypothesis is unfinished —
   two failing call sites were visible and read past because the fix worked. §21.5
