@@ -1,13 +1,26 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 32) in; // Wave32 aligned
 
 layout(std430, set = 0, binding = 0) readonly buffer InputCoeffs {
     int coeffs[];
 };
 
+/* Quantized coefficient levels, stored as int16_t (was int32). Verified this
+ * device/driver supports it natively (vulkaninfo: shaderInt16=true,
+ * storageBuffer16BitAccess=true, VK_KHR_16bit_storage present) - this is a
+ * real narrow load/store, not manual bit-packing. Levels are quantized 4x4
+ * transform coefficients for 8-bit video (QpBdOffsetC=0 per this project's
+ * own chroma_qp() comment); ITU-T H.264's coefficient magnitudes at this bit
+ * depth are nowhere near +-32767, so the clamp on write below is defensive
+ * (turn a theoretical overflow into a visible saturation, never a silent
+ * wraparound) rather than an expected code path - see PERF note in
+ * gpu_compute.h's quant_levels_buffer comment for the byte-exact validation
+ * this shipped with. */
 layout(std430, set = 0, binding = 1) writeonly buffer OutputLevels {
-    int levels[];
+    int16_t levels[];
 };
 
 /* Per-4x4-block nonzero BITMASK (bit p set iff levels[p] != 0), one uint per
@@ -106,7 +119,7 @@ void main() {
         int level = (abs_coeff * MF[qp_rem][pos_type] + f) >> (15 + qp_per);
         level *= sign;
 
-        levels[global_block_idx * 16 + i] = level;
+        levels[global_block_idx * 16 + i] = int16_t(clamp(level, -32768, 32767));
         if (level != 0) nz_mask |= (1u << uint(i));
     }
 

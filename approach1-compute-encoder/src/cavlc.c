@@ -605,7 +605,7 @@ static void cavlc_write_run_befores(bitstream_t *bs, const int *runs, int total_
     }
 }
 
-int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
+int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     if (!bs || !coeffs) return 0;
 
     int scanned[16];
@@ -688,7 +688,7 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC) {
  * (see cavlc_write_total_zeros's comment) with the max_coeff=15 "omit when
  * full" threshold; coeff_token and run_before are unchanged/shared.
  */
-int cavlc_write_4x4_ac_block(bitstream_t *bs, const int *coeffs, int nC) {
+int cavlc_write_4x4_ac_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     if (!bs || !coeffs) return 0;
 
     int scanned[15];

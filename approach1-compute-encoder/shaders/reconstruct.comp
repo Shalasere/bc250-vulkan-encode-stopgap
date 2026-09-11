@@ -1,5 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 32) in;
 
 /*
@@ -48,8 +50,11 @@ layout(local_size_x = 32) in;
  * decoder would.
  */
 
+/* int16_t storage - see quantize.comp's OutputLevels comment. Read sites
+ * below widen to int explicitly (int(levels[...])) rather than relying on
+ * implicit promotion, to keep the type change unambiguous at every use. */
 layout(std430, set = 0, binding = 0) readonly buffer QuantLevels {
-    int levels[];
+    int16_t levels[];
 };
 /* Pre-quantization transform coefficients (dct_transform.comp's output) -
  * needed to independently re-derive the I16x16 luma DC Hadamard and the
@@ -337,7 +342,7 @@ void main() {
         uint global_block_idx = mb_idx * 24u + raster;
 
         int blk[16];
-        for (int p = 0; p < 16; p++) blk[p] = levels[global_block_idx * 16u + uint(p)];
+        for (int p = 0; p < 16; p++) blk[p] = int(levels[global_block_idx * 16u + uint(p)]);
 
         int dc_val;
         if (pcs.is_intra == 1u) {
@@ -381,8 +386,8 @@ void main() {
 
         int cb_blk[16], cr_blk[16];
         for (int p = 0; p < 16; p++) {
-            cb_blk[p] = levels[cb_global * 16u + uint(p)];
-            cr_blk[p] = levels[cr_global * 16u + uint(p)];
+            cb_blk[p] = int(levels[cb_global * 16u + uint(p)]);
+            cr_blk[p] = int(levels[cr_global * 16u + uint(p)]);
         }
 
         /* Joint chroma DC Hadamard across the 4 sub-blocks of each plane -

@@ -320,7 +320,14 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     VkDeviceSize mv_size = num_mbs * sizeof(uint32_t) * 4;
     VkDeviceSize residual_size = num_mbs * 24 * 16 * sizeof(int);
     VkDeviceSize coeff_size = residual_size;
-    VkDeviceSize quant_levels_size = residual_size;
+    /* Half the width of residual/coeff: quantized LEVELS (post-quantization)
+     * are stored int16_t, not int32 - verified device support
+     * (VK_KHR_16bit_storage / shaderInt16 / storageBuffer16BitAccess, all
+     * true on this GPU) and confirmed safe by ITU-T H.264's coefficient
+     * magnitude bounds at 8-bit depth, nowhere near +-32767. coeff_buffer and
+     * residual_buffer are NOT changed - they hold pre-quantization values,
+     * a different (larger-headroom) quantity, out of scope for this. */
+    VkDeviceSize quant_levels_size = num_mbs * 24 * 16 * sizeof(int16_t);
     VkDeviceSize nz_count_size = num_mbs * 24 * sizeof(uint32_t);
     VkDeviceSize pred_mode_size = num_mbs * sizeof(uint32_t);
     VkDeviceSize entropy_size = width * height * 2; /* Generous */
@@ -2144,23 +2151,38 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
         vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 7);
     }
 
-    /* Stage 6: Entropy */
-    if (ctx->entropy_pipeline) {
-        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->entropy_pipeline);
-        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->entropy_layout, 0, 1, &ctx->entropy_desc_set, 0, NULL);
-        vkCmdPushConstants(cmd_buf, ctx->entropy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
-        vkCmdDispatch(cmd_buf, width_mbs, height_mbs, 1);
-        insert_compute_barrier(cmd_buf);
-    }
+    /* Stage 6: Entropy - REMOVED (was: unconditional every-frame dispatch of
+     * entropy_encode.comp whenever ctx->entropy_pipeline was non-null, which
+     * is just "did the shader load", not "is this needed"). Its output
+     * (entropy_buffer / staging_buffers[]) has never been read by the CPU -
+     * nothing calls gpu_compute_get_staging_data() - real entropy coding runs
+     * on the CPU (cavlc.c/cabac.c). So this was pure waste: a genuine
+     * per-frame GPU dispatch (measured ~0.34ms via BC250_PERF_GPU's
+     * entropy_ms) that did real work nobody ever used, and every frame
+     * lengthens the single contended GPU queue this driver is stuck on
+     * under contention (DEVLOG s.21/§ the phase-bracket work) for zero
+     * benefit. Found while converting quant_levels_buffer to int16_t
+     * storage: this dispatch reads that exact buffer through
+     * entropy_desc_set binding 0, and entropy_encode.comp's own SPIR-V was
+     * never updated to match (its output is discarded, so there was no
+     * reason to) - left running, it would read out of bounds against the
+     * now-half-sized buffer. Removing the dispatch fixes that risk and
+     * removes a real GPU-time cost in the same stroke; the shader source,
+     * pipeline object and descriptor sets are left in place (harmless, never
+     * invoked) rather than torn out here, to keep this change to exactly
+     * what it needs to be. */
     if (ctx->perf_stats_enabled) {
         vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 8);
     }
 
-    /* Copy entropy output buffer to current staging buffer for overlapped CPU readback */
-    VkDeviceSize copy_size = width * height;
-    if (copy_size > ctx->staging_size) copy_size = ctx->staging_size;
-    VkBufferCopy copy_region = { .srcOffset = 0, .dstOffset = 0, .size = copy_size };
-    vkCmdCopyBuffer(cmd_buf, ctx->entropy_buffer, ctx->staging_buffers[ctx->current_buf], 1, &copy_region);
+    /* Copy of entropy_buffer -> staging_buffers[] REMOVED, same reason as the
+     * dispatch above: entropy_buffer is never written to now (nothing
+     * produces it), and staging_buffers[]'s own readback was already
+     * confirmed dead (nothing calls gpu_compute_get_staging_data()) before
+     * this change - so this was a GPU-time-costing copy of stale/undefined
+     * data to a destination nothing reads, on every frame. Both buffers and
+     * their staging/descriptor plumbing are left allocated (harmless) for
+     * the same "minimal change" reason as above. */
 
     /* Copy the REAL post-quantization coefficient levels and pre-quantization
      * transform coefficients to their host-visible staging buffers, full size

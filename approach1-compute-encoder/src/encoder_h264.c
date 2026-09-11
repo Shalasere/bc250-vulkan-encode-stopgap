@@ -179,7 +179,7 @@ struct h264_encoder {
      * Persistent/growable across frames (realloc'd only when a frame needs a
      * bigger buffer than before, e.g. the very first frame at a given
      * resolution) so a steady-state encode does zero allocation per frame. */
-    int *quant_levels_shadow; size_t quant_levels_shadow_cap;
+    int16_t *quant_levels_shadow; size_t quant_levels_shadow_cap;
     int *dc_coeff_shadow;     size_t dc_coeff_shadow_cap;
     uint32_t *pred_modes_shadow; size_t pred_modes_shadow_cap;
     void *mvs_shadow;         size_t mvs_shadow_cap; /* actually gpu_mv_t*, typedef'd later in this file */
@@ -412,7 +412,7 @@ static const void *shadow_copy(void **shadow_ptr, size_t *cap, const void *src, 
 /* quant_levels/coeff buffers are laid out as num_mbs*24*16 ints; block index
  * (0-23) is the GPU RASTER convention (see file-top comment), position (0-15)
  * is raster within the 4x4 block (index = row*4+col, NOT zigzag). */
-static inline const int *quant_block_ptr(const int *quant_levels, uint32_t mb_idx, int raster_block) {
+static inline const int16_t *quant_block_ptr(const int16_t *quant_levels, uint32_t mb_idx, int raster_block) {
     return quant_levels + ((size_t)mb_idx * 24 + raster_block) * 16;
 }
 /* One 4x4 block's PRE-quantization DC term (what used to be
@@ -448,7 +448,7 @@ static inline int dc_coeff_at(const int *dc_coeff, uint32_t mb_idx, int raster_b
  * `nz == NULL` falls back to the scan, so nothing here depends on the mask
  * being available.
  */
-static inline int block_any_nonzero(const int *quant_levels, const uint32_t *nz,
+static inline int block_any_nonzero(const int16_t *quant_levels, const uint32_t *nz,
                                      uint32_t mb_idx, int raster_block, int start_pos, int end_pos) {
     if (nz) {
         uint32_t mask = nz[(size_t)mb_idx * 24 + (uint32_t)raster_block] & 0xFFFFu;
@@ -456,7 +456,7 @@ static inline int block_any_nonzero(const int *quant_levels, const uint32_t *nz,
         uint32_t range = ((end_pos >= 16) ? 0xFFFFu : ((1u << end_pos) - 1u)) & ~((1u << start_pos) - 1u);
         return (mask & range) != 0;
     }
-    const int *blk = quant_block_ptr(quant_levels, mb_idx, raster_block);
+    const int16_t *blk = quant_block_ptr(quant_levels, mb_idx, raster_block);
     for (int p = start_pos; p < end_pos; p++) if (blk[p] != 0) return 1;
     return 0;
 }
@@ -972,7 +972,7 @@ static void skip_mv_predictor(const gpu_mv_t *mvs, uint32_t mbx, uint32_t mby,
  * decision. Previously this read the lossy packed entropy summary
  * (mb_blocks[b]&0xFF); it now reads the real quant_levels data directly -
  * strictly more accurate, same semantic heuristic. */
-static int mb_has_any_luma_nonzero(const int *quant_levels, const uint32_t *nz, uint32_t mb_idx) {
+static int mb_has_any_luma_nonzero(const int16_t *quant_levels, const uint32_t *nz, uint32_t mb_idx) {
     for (int b = 0; b < 16; b++) {
         if (block_any_nonzero(quant_levels, nz, mb_idx, b, 0, 16)) return 1;
     }
@@ -1009,7 +1009,7 @@ static int mb_has_any_luma_nonzero(const int *quant_levels, const uint32_t *nz, 
  * cbp_chroma (see encode_mb_p16x16/encode_mb_i16x16 and their CABAC
  * counterparts) - this is not a new heuristic, just applying the same
  * existing test to the skip decision. */
-static int mb_has_any_chroma_nonzero(const int *quant_levels, const int *dc_coeff,
+static int mb_has_any_chroma_nonzero(const int16_t *quant_levels, const int *dc_coeff,
                                       const uint32_t *nz, uint32_t mb_idx) {
     int cb_dc_raw[4], cr_dc_raw[4];
     for (int i = 0; i < 4; i++) cb_dc_raw[i] = dc_coeff_at(dc_coeff, mb_idx, 16 + i);
@@ -1030,7 +1030,7 @@ static int mb_has_any_chroma_nonzero(const int *quant_levels, const int *dc_coef
  * (Hadamard), luma AC (16 blocks, spec order), chroma DC (Hadamard x2) and
  * chroma AC (8 blocks), updating the nC neighbor-context arrays as it goes.
  */
-static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int *dc_coeff,
+static void encode_mb_i16x16(bitstream_t *bs, const int16_t *quant_levels, const int *dc_coeff,
                               const uint32_t *pred_modes,
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
     int pred_mode = gpu_pred_mode_i16(pred_modes, mb);
@@ -1078,7 +1078,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
                     cr_dc_raw[0],cr_dc_raw[1],cr_dc_raw[2],cr_dc_raw[3],
                     cb_dc[0],cb_dc[1],cb_dc[2],cb_dc[3], cr_dc[0],cr_dc[1],cr_dc[2],cr_dc[3]);
             for (int blk = 16; blk < 24; blk++) {
-                const int *b = quant_block_ptr(quant_levels, mb, blk);
+                const int16_t *b = quant_block_ptr(quant_levels, mb, blk);
                 fprintf(stderr, "[BC250_DEBUG_I16_MB]   quant_block=%d dc=%d vals=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
                         blk, b[0], b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
             }
@@ -1104,7 +1104,14 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
      * NEIGHBOR MB's block-0-adjacent values, not this MB's own (not-yet-
      * decoded) block 0. */
     int nC_dc = luma_nc(nc, mb, mbx, mby, 0);
-    cavlc_write_4x4_block(bs, dc_out, nC_dc);
+    /* dc_out is the Hadamard-transformed luma DC (plain int[16], computed
+     * above by h264_intra16_luma_dc_transform) - narrow to int16_t only for
+     * this call, rather than changing that function's output type, for the
+     * same reason cabac_write_quant_block() exists: keep this one CAVLC
+     * call site's needs from rippling into a shared computation. */
+    int16_t dc_out16[16];
+    for (int i = 0; i < 16; i++) dc_out16[i] = (int16_t)dc_out[i];
+    cavlc_write_4x4_block(bs, dc_out16, nC_dc);
 
     /* Luma AC blocks, spec blkIdx order (0..15). */
     if (cbp_luma_flag) {
@@ -1147,7 +1154,7 @@ static void encode_mb_i16x16(bitstream_t *bs, const int *quant_levels, const int
  * real 6-bit CBP), luma (16 FULL blocks, DC included, spec order), chroma DC
  * (Hadamard, same as I16x16) and chroma AC (8 blocks).
  */
-static void encode_mb_p16x16(bitstream_t *bs, const int *quant_levels, const int *dc_coeff,
+static void encode_mb_p16x16(bitstream_t *bs, const int16_t *quant_levels, const int *dc_coeff,
                               const gpu_mv_t *mvs,
                               uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp) {
     int pred_x, pred_y;
@@ -1357,6 +1364,23 @@ static bool cabac_write_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
     return nz;
 }
 
+/* cabac_write_block() takes `const int *raw` because its callers are a
+ * genuine mix: DC-Hadamard results (dc_out/cb_dc/cr_dc, plain local `int`
+ * arrays) alongside quant_block_ptr()'s int16_t-backed pointers into the
+ * quant_levels readback. Rather than change cabac_write_block()'s shared
+ * signature - which would ripple into the Hadamard-result call sites too,
+ * for no benefit there - this is a thin widen-and-forward wrapper used only
+ * at the quant_block_ptr() call sites. The 16-int scratch copy is noise
+ * next to everything else in this pipeline; the point is keeping the
+ * shared function's contract simple and not touching the DC-Hadamard
+ * variables' types at all. */
+static bool cabac_write_quant_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
+                                     int nA, int nB, const int16_t *raw16, bool skip_dc) {
+    int raw[16];
+    for (int i = 0; i < 16; i++) raw[i] = raw16[i];
+    return cabac_write_block(cb, cat, nA, nB, raw, skip_dc);
+}
+
 /*
  * encode_mb_i16x16_cabac - CABAC equivalent of encode_mb_i16x16(): mb_type
  * (with embedded cbp/pred-mode), intra_chroma_pred_mode, mb_qp_delta,
@@ -1366,7 +1390,7 @@ static bool cabac_write_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
  * see that function for the GPU-buffer-layout rationale shared by both.
  */
 static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
-                                    const int *quant_levels, const int *dc_coeff,
+                                    const int16_t *quant_levels, const int *dc_coeff,
                                     const uint32_t *pred_modes,
                                     uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp,
                                     bool *last_dqp_nonzero) {
@@ -1429,7 +1453,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
         for (int blk_idx = 0; blk_idx < 16; blk_idx++) {
             int raster = gpu_raster_block_idx(blk_idx);
             luma_cbf_neighbors(nc, mb, mbx, mby, blk_idx, true, &nA, &nB);
-            bool nz = cabac_write_block(cb, CABAC_CAT_LUMA_AC, nA, nB,
+            bool nz = cabac_write_quant_block(cb, CABAC_CAT_LUMA_AC, nA, nB,
                                          quant_block_ptr(quant_levels, mb, raster), true);
             nc->nz_luma[mb][blk_idx] = nz ? 1 : 0;
         }
@@ -1454,13 +1478,13 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     if (cbp_chroma == 2) {
         for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
             chroma_cbf_neighbors(nc->nz_cb, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx, true, &nA, &nB);
-            bool nz = cabac_write_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
+            bool nz = cabac_write_quant_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
                                          quant_block_ptr(quant_levels, mb, 16 + blk_idx), true);
             nc->nz_cb[mb][blk_idx] = nz ? 1 : 0;
         }
         for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
             chroma_cbf_neighbors(nc->nz_cr, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx, true, &nA, &nB);
-            bool nz = cabac_write_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
+            bool nz = cabac_write_quant_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
                                          quant_block_ptr(quant_levels, mb, 20 + blk_idx), true);
             nc->nz_cr[mb][blk_idx] = nz ? 1 : 0;
         }
@@ -1479,7 +1503,7 @@ static void encode_mb_i16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
  * split in the CAVLC path).
  */
 static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
-                                    const int *quant_levels, const int *dc_coeff,
+                                    const int16_t *quant_levels, const int *dc_coeff,
                                     const gpu_mv_t *mvs,
                                     uint32_t mb, uint32_t mbx, uint32_t mby, nc_ctx_t *nc, int qp,
                                     bool *last_dqp_nonzero) {
@@ -1549,7 +1573,7 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
         if (luma_cbp & (1 << q)) {
             int raster = gpu_raster_block_idx(blk_idx);
             luma_cbf_neighbors(nc, mb, mbx, mby, blk_idx, false, &nA, &nB);
-            bool nz = cabac_write_block(cb, CABAC_CAT_LUMA_4x4, nA, nB,
+            bool nz = cabac_write_quant_block(cb, CABAC_CAT_LUMA_4x4, nA, nB,
                                          quant_block_ptr(quant_levels, mb, raster), false);
             nc->nz_luma[mb][blk_idx] = nz ? 1 : 0;
         } else {
@@ -1571,13 +1595,13 @@ static void encode_mb_p16x16_cabac(cabac_engine_t *cb, h264_encoder_t *encoder,
     if (cbp_chroma == 2) {
         for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
             chroma_cbf_neighbors(nc->nz_cb, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx, false, &nA, &nB);
-            bool nz = cabac_write_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
+            bool nz = cabac_write_quant_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
                                          quant_block_ptr(quant_levels, mb, 16 + blk_idx), true);
             nc->nz_cb[mb][blk_idx] = nz ? 1 : 0;
         }
         for (int blk_idx = 0; blk_idx < 4; blk_idx++) {
             chroma_cbf_neighbors(nc->nz_cr, mb, mbx, mby, nc->width_in_mbs, nc->start_mb, blk_idx, false, &nA, &nB);
-            bool nz = cabac_write_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
+            bool nz = cabac_write_quant_block(cb, CABAC_CAT_CHROMA_AC, nA, nB,
                                          quant_block_ptr(quant_levels, mb, 20 + blk_idx), true);
             nc->nz_cr[mb][blk_idx] = nz ? 1 : 0;
         }
@@ -1945,7 +1969,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
      * REAL per-coefficient residual data (post-quant levels + pre-quant
      * transform coefficients) - not just the lossy packed entropy summary
      * the old heuristic-only path used. */
-    const int *quant_levels = NULL;
+    const int16_t *quant_levels = NULL;
     const int *dc_coeff = NULL;
     const uint32_t *pred_modes = NULL;
     const gpu_mv_t *mvs = NULL;
@@ -2019,7 +2043,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         void *quant_data = NULL, *dc_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
         size_t quant_size = 0, dc_size = 0, pred_mode_size = 0, mv_size = 0;
         if (gpu_compute_get_quant_staging_data(gpu_ctx, &quant_data, &quant_size) == 0) {
-            quant_levels = (const int *)quant_data;
+            quant_levels = (const int16_t *)quant_data;
         }
         if (gpu_compute_get_dc_staging_data(gpu_ctx, &dc_data, &dc_size) == 0) {
             dc_coeff = (const int *)dc_data;
@@ -2063,7 +2087,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * from, so output is byte-identical either way (verified). See
          * shadow_copy()'s doc comment for why it may now be redundant. */
         if (shadow_copy_enabled) {
-        quant_levels = (const int *)shadow_copy((void **)&encoder->quant_levels_shadow,
+        quant_levels = (const int16_t *)shadow_copy((void **)&encoder->quant_levels_shadow,
                                                  &encoder->quant_levels_shadow_cap,
                                                  quant_levels, quant_size);
         dc_coeff = (const int *)shadow_copy((void **)&encoder->dc_coeff_shadow,
@@ -2114,12 +2138,12 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * by default: it reads all of quant_levels a second time. */
         if (nz_masks && quant_levels && getenv("BC250_NZ_AUDIT") &&
             nz_size >= (size_t)encoder->total_mbs * 24 * sizeof(uint32_t) &&
-            quant_size >= (size_t)encoder->total_mbs * 24 * 16 * sizeof(int)) {
+            quant_size >= (size_t)encoder->total_mbs * 24 * 16 * sizeof(int16_t)) {
             uint32_t total_blocks = encoder->total_mbs * 24;
             uint32_t mismatches = 0, all_zero = 0, ac_zero = 0;
             uint32_t first_bad_block = 0;
             for (uint32_t b = 0; b < total_blocks; b++) {
-                const int *blk = quant_levels + (size_t)b * 16;
+                const int16_t *blk = quant_levels + (size_t)b * 16;
                 uint32_t cpu_mask = 0;
                 for (int p = 0; p < 16; p++) if (blk[p] != 0) cpu_mask |= (1u << p);
                 uint32_t gpu_mask = nz_masks[b] & 0xFFFFu;
@@ -2292,7 +2316,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                         cb_dc[0], cb_dc[1], cb_dc[2], cb_dc[3],
                         cr_dc[0], cr_dc[1], cr_dc[2], cr_dc[3]);
                 for (int blk = 16; blk < 24; blk++) {
-                    const int *b = quant_block_ptr(quant_levels, mb, blk);
+                    const int16_t *b = quant_block_ptr(quant_levels, mb, blk);
                     int any_ac = 0;
                     for (int p = 1; p < 16; p++) if (b[p] != 0) any_ac = 1;
                     fprintf(stderr, "[BC250_DEBUG_MB]   quant_block=%d dc=%d any_ac=%d vals=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
@@ -2309,7 +2333,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                             mvs[mb].mvx, mvs[mb].mvy, mvs[mb].sad);
                 }
                 for (int blk = 0; blk < 16; blk++) {
-                    const int *b = quant_block_ptr(quant_levels, mb, blk);
+                    const int16_t *b = quant_block_ptr(quant_levels, mb, blk);
                     int nz = 0, maxabs = 0;
                     for (int p = 0; p < 16; p++) { if (b[p] != 0) nz++; if (abs(b[p]) > maxabs) maxabs = abs(b[p]); }
                     fprintf(stderr, "[BC250_DEBUG_MB]   luma_block=%d nz=%d maxabs=%d vals=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
@@ -2451,7 +2475,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                      * fall back to an all-zero-residual I16x16 MB so the
                      * bitstream stays structurally valid. */
                     cavlc_write_mb_i16x16_header(&bs, H264_I16x16_DC, H264_CHROMA_DC, 0, 0, 0);
-                    int zero16[16] = {0};
+                    int16_t zero16[16] = {0};
                     cavlc_write_4x4_block(&bs, zero16, luma_nc(&nc, mb, mbx, mby, 0));
                     memset(nc.nz_luma[mb], 0, sizeof(nc.nz_luma[mb]));
                     memset(nc.nz_cb[mb], 0, sizeof(nc.nz_cb[mb]));

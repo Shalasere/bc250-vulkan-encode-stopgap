@@ -1,5 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB), same as residual_predict.comp
 
 /*
@@ -130,8 +132,12 @@ layout(set = 0, binding = 1, rg8) uniform readonly image2D currentUV;   // Cb/Cr
 layout(set = 0, binding = 2, r8) uniform image2D reconY;
 layout(set = 0, binding = 3, rg8) uniform image2D reconUV;
 
+/* int16_t storage - see quantize.comp's OutputLevels comment for the
+ * device-support verification and clamp rationale; this shader's own
+ * dequant/reconstruct step never reads this buffer back (writeonly, kept
+ * entirely in local variables), so there is no read-side to update here. */
 layout(std430, set = 0, binding = 4) writeonly buffer QuantLevels {
-    int levels[];
+    int16_t levels[];
 };
 /* Pre-quantization transform coefficients - only position 0 of each block
  * (the block's own pre-Hadamard DC term) is actually consumed downstream
@@ -529,12 +535,12 @@ void main() {
         dc[global_block_idx] = coeff_block[0];
         s_dc_in[block_id] = coeff_block[0];
 
-        levels[global_block_idx * 16u + 0u] = 0; /* DC handled separately below; AC quantizer's own position-0 output is unused */
+        levels[global_block_idx * 16u + 0u] = int16_t(0); /* DC handled separately below; AC quantizer's own position-0 output is unused */
         uint nz_mask = 0u; /* bit 0 stays clear: position 0 is written as 0 above */
         for (int p = 1; p < 16; p++) {
             int level = quantize_ac(coeff_block[p], p, qp_per, qp_rem, f_ac);
             s_ac_level[block_id][p] = level;
-            levels[global_block_idx * 16u + uint(p)] = level;
+            levels[global_block_idx * 16u + uint(p)] = int16_t(clamp(level, -32768, 32767));
             if (level != 0) nz_mask |= (1u << uint(p));
         }
         nzc[global_block_idx] = nz_mask;
@@ -673,16 +679,16 @@ void main() {
         s_cb_dc_in[sub] = cb_coeff[0];
         s_cr_dc_in[sub] = cr_coeff[0];
 
-        levels[cb_global * 16u + 0u] = 0;
-        levels[cr_global * 16u + 0u] = 0;
+        levels[cb_global * 16u + 0u] = int16_t(0);
+        levels[cr_global * 16u + 0u] = int16_t(0);
         uint cb_mask = 0u, cr_mask = 0u; /* bit 0 stays clear, as for luma above */
         for (int p = 1; p < 16; p++) {
             int cb_level = quantize_ac(cb_coeff[p], p, qp_per_c, qp_rem_c, f_ac_c);
             int cr_level = quantize_ac(cr_coeff[p], p, qp_per_c, qp_rem_c, f_ac_c);
             s_cb_ac_level[sub][p] = cb_level;
             s_cr_ac_level[sub][p] = cr_level;
-            levels[cb_global * 16u + uint(p)] = cb_level;
-            levels[cr_global * 16u + uint(p)] = cr_level;
+            levels[cb_global * 16u + uint(p)] = int16_t(clamp(cb_level, -32768, 32767));
+            levels[cr_global * 16u + uint(p)] = int16_t(clamp(cr_level, -32768, 32767));
             if (cb_level != 0) cb_mask |= (1u << uint(p));
             if (cr_level != 0) cr_mask |= (1u << uint(p));
         }

@@ -17,7 +17,7 @@
 
 static void test_zero_blocks(void) {
     printf("  [1] Testing 4x4 Zero Block encoding across all nC contexts...\n");
-    int zero_coeffs[16] = {0};
+    int16_t zero_coeffs[16] = {0};
     uint8_t buf[64];
 
     /* nC < 2 (VLC 1: code '1', 1 bit) */
@@ -67,7 +67,7 @@ static void test_trailing_ones(void) {
     uint8_t buf[64];
 
     /* Block with 3 trailing ones: +1, -1, +1 */
-    int coeffs[16] = {1, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t coeffs[16] = {1, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     bitstream_t bs;
     bs_init(&bs, buf, sizeof(buf));
     int tc = cavlc_write_4x4_block(&bs, coeffs, 0);
@@ -77,7 +77,7 @@ static void test_trailing_ones(void) {
     assert(bs_bytes_written(&bs) > 0);
 
     /* Block with single trailing one: -1 */
-    int single_t1[16] = {-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t single_t1[16] = {-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     bs_init(&bs, buf, sizeof(buf));
     tc = cavlc_write_4x4_block(&bs, single_t1, 0);
     assert(tc == 1);
@@ -93,7 +93,7 @@ static void test_levels_and_runs(void) {
     uint8_t buf[64];
 
     /* Mixed block: high level, scattered zeros */
-    int coeffs[16] = {5, 0, -2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t coeffs[16] = {5, 0, -2, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     bitstream_t bs;
     bs_init(&bs, buf, sizeof(buf));
     int tc = cavlc_write_4x4_block(&bs, coeffs, 1);
@@ -154,7 +154,7 @@ static void test_ac_block(void) {
     bitstream_t bs;
 
     /* All-zero AC block (DC value at raster position 0 is irrelevant/ignored) */
-    int zero_block[16] = {99, 0};
+    int16_t zero_block[16] = {99, 0};
     bs_init(&bs, buf, sizeof(buf));
     int tc = cavlc_write_4x4_ac_block(&bs, zero_block, 0);
     assert(tc == 0);
@@ -169,7 +169,7 @@ static void test_ac_block(void) {
      * AC positions). Only checks structural properties (tc==1, some bytes
      * written) since exact bit-packing is covered by cavlc_write_4x4_block's
      * own tests via the now-shared cavlc_scan_coeffs/level-writer helpers. */
-    int one_ac[16] = {0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t one_ac[16] = {0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     bs_init(&bs, buf, sizeof(buf));
     tc = cavlc_write_4x4_ac_block(&bs, one_ac, 0);
     assert(tc == 1);
@@ -180,7 +180,7 @@ static void test_ac_block(void) {
      * must be entirely omitted from the bitstream (this is the case the old
      * "reuse the 16-coefficient table & threshold" approach would have
      * gotten wrong, since it would only skip total_zeros at TotalCoeff==16). */
-    int full_ac[16];
+    int16_t full_ac[16];
     for (int i = 0; i < 16; i++) full_ac[i] = 2; /* raster pos 0 (DC) ignored by this function */
     bs_init(&bs, buf, sizeof(buf));
     tc = cavlc_write_4x4_ac_block(&bs, full_ac, 4);
@@ -189,8 +189,8 @@ static void test_ac_block(void) {
     assert(bs_bytes_written(&bs) > 0);
 
     /* DC value at raster position 0 must never influence the result. */
-    int with_dc[16] = {123, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
-    int without_dc[16] = {0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t with_dc[16] = {123, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t without_dc[16] = {0, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     uint8_t buf_a[64], buf_b[64];
     bitstream_t bs_a, bs_b;
     bs_init(&bs_a, buf_a, sizeof(buf_a));
@@ -220,7 +220,7 @@ static void test_large_level_escalation(void) {
 
     /* total_coeff=4, no trailing ones (all magnitudes > 1): forces the
      * escalating level-suffix path for the 2nd..4th coefficients. */
-    int coeffs[16] = {40, 0, -25, 0, 12, 0, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int16_t coeffs[16] = {40, 0, -25, 0, 12, 0, -6, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     bs_init(&bs, buf, sizeof(buf));
     int tc = cavlc_write_4x4_block(&bs, coeffs, 3);
     assert(tc == 4);
@@ -351,7 +351,7 @@ static void test_run_before_order(void) {
          9, 12, 13, 10,
          7, 11, 14, 15
     };
-    int coeffs[16] = {0};
+    int16_t coeffs[16] = {0};
     coeffs[zigzag_4x4[12]] = 5;   /* rank 0: highest freq of the 3 */
     coeffs[zigzag_4x4[6]]  = -3;  /* rank 1 */
     coeffs[zigzag_4x4[2]]  = 2;   /* rank 2: lowest freq of the 3 */

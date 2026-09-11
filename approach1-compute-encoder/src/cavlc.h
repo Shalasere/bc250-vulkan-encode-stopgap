@@ -82,7 +82,7 @@ void cavlc_write_mb_p16x16_header(bitstream_t *bs, int mvd_x, int mvd_y, int cbp
  * @param nC          Context prediction value (average of left and top block non-zero counts)
  * @return            Total number of non-zero coefficients (for updating neighbor context)
  */
-int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC);
+int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC);
 
 /**
  * Encode the 15 AC coefficients of a 4x4 block (maxNumCoeff=15) using CAVLC.
@@ -98,7 +98,7 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int *coeffs, int nC);
  * @param nC          Context prediction value (average of left and top block non-zero counts)
  * @return            Total number of non-zero AC coefficients (for updating neighbor context)
  */
-int cavlc_write_4x4_ac_block(bitstream_t *bs, const int *coeffs, int nC);
+int cavlc_write_4x4_ac_block(bitstream_t *bs, const int16_t *coeffs, int nC);
 
 /**
  * Encode a 2x2 chroma DC block using CAVLC.

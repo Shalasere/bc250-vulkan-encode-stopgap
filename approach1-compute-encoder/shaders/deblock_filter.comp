@@ -1,5 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 16, local_size_y = 16) in;
 
 /*
@@ -140,8 +142,9 @@ layout(set = 0, binding = 0, r8) uniform image2D frameImage;
  * raster = block_row*4+block_col for the 16 luma blocks). Renamed here to
  * reflect what it actually is; used below for the real ITU-T 8.7.2.1
  * "nonzero coefficient" boundary-strength test. */
+/* int16_t storage - see quantize.comp's OutputLevels comment. */
 layout(std430, set = 0, binding = 1) readonly buffer QuantLevels {
-    int levels[];
+    int16_t levels[];
 };
 
 /* Same MotionVector struct/binding convention as motion_estimation.comp's
@@ -222,7 +225,7 @@ void write_px(ivec2 p, int v) {
 bool block_nonzero(uint mb_idx, uint raster) {
     uint base = (mb_idx * 24u + raster) * 16u;
     for (int i = 0; i < 16; i++) {
-        if (levels[base + uint(i)] != 0) return true;
+        if (levels[base + uint(i)] != int16_t(0)) return true;
     }
     return false;
 }
