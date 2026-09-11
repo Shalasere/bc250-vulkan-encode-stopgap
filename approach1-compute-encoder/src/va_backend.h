@@ -84,6 +84,23 @@ struct bc250_context {
     hevc_encoder_t *hevc_enc;
     h264_decoder_t *h264_dec;
 
+    /* BC250_PIPELINE=1 only: one frame whose GPU work is in flight and whose
+     * CPU entropy coding has not been done yet. At most one - the pipeline is
+     * deliberately bounded to a depth of 1, because the point is to overlap the
+     * CPU and GPU halves of adjacent frames, not to buffer a queue of frames
+     * (which would add latency to a live stream for no extra overlap).
+     *
+     * pending_coded_buf_id is the coded buffer the deferred finish must write
+     * into: by the time it runs, c->coded_buf_id has already moved on to the
+     * next frame's buffer. Getting this wrong would write frame N's bitstream
+     * into frame N+1's buffer, which decodes as plausible-looking garbage
+     * rather than failing loudly - the same shape of bug as the stale nonzero
+     * mask in DEVLOG 19.4, so it is the thing to check first if pipelined
+     * output ever looks subtly wrong. */
+    bool has_pending_frame;
+    h264_pending_frame_t pending_frame;
+    VABufferID pending_coded_buf_id;
+
     /* Codec parameters accumulated during vaRenderPicture */
     struct {
         VAEncSequenceParameterBufferH264 seq_param;

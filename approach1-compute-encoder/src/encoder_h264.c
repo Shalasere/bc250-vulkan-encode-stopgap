@@ -1876,12 +1876,96 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
     }
 }
 
+/* Choose frame type and QP and put this frame's GPU work in flight without
+ * waiting for it. See h264_encoder_submit_frame()'s header doc for why the
+ * split exists and what it costs (rate control runs one frame ahead). */
+int h264_encoder_submit_frame(h264_encoder_t *encoder,
+                              bc250_gpu_context_t *gpu_ctx,
+                              gpu_image_t input_surface,
+                              h264_pending_frame_t *pending)
+{
+    if (!encoder || !pending) return -1;
+
+    memset(pending, 0, sizeof(*pending));
+
+    bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr;
+    encoder->force_idr = false;
+
+    if (is_idr) {
+        encoder->frame_num = 0;
+        encoder->idr_pic_id++;
+        encoder->poc = 0;
+        encoder->dpb_count = 0;
+    }
+
+    int qp = rc_get_frame_qp(&encoder->rc, 0);
+    /* Must track rate_control.c's rc->qp_min - see the comment there for
+     * why 12 is deliberate and what lowering it measured. */
+    if (qp < 12) qp = 12;
+    if (qp > 51) qp = 51;
+    qp = apply_qp_override(qp);
+
+    /* Kept identical to the synchronous path's own slice-count logic so that
+     * submit+finish back to back is byte-for-byte the old behaviour. */
+    int num_slices = 1;
+    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
+    if (slice_env) {
+        int s = atoi(slice_env);
+        if (s >= 1 && s <= 16) num_slices = s;
+    }
+
+    pending->valid      = true;
+    pending->is_idr     = is_idr;
+    pending->qp         = qp;
+    pending->num_slices = num_slices;
+
+    /* The dispatch/submit half of what used to be one synchronous block. A
+     * failed begin_picture() or a permanently failed submit leaves
+     * gpu_submitted false, and the finish then takes the same safe
+     * "no new GPU output this frame" fallback the synchronous path took -
+     * critically WITHOUT waiting on a fence that will never signal, and
+     * without reading staging buffers still holding the previous successful
+     * dispatch's data as if it were this frame's. */
+    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE
+        && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
+        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
+                                     qp, is_idr ? 1 : 0, num_slices);
+        if (gpu_compute_end_picture(gpu_ctx) == 0) {
+            pending->gpu_submitted = true;
+            /* Captured HERE, not read back at finish time: this is the frame
+             * whose data the matching finish must wait on and read. */
+            pending->gpu_slot = gpu_compute_submitted_slot(gpu_ctx);
+        }
+    }
+
+    return 0;
+}
+
 int h264_encoder_encode_frame(h264_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               gpu_image_t input_surface,
                               uint8_t *output_buf, size_t output_size)
 {
     if (!encoder || !output_buf) return -1;
+
+    /* The original synchronous contract, preserved exactly: submit and finish
+     * back to back with no other frame interleaved, so frame type, QP, rate
+     * control order and every emitted byte are identical to before the split.
+     * Only a caller that interleaves another submit between these two (see
+     * va_backend.c's BC250_PIPELINE path) gets pipelined behaviour. */
+    h264_pending_frame_t pending;
+    if (h264_encoder_submit_frame(encoder, gpu_ctx, input_surface, &pending) != 0)
+        return -1;
+    return h264_encoder_finish_frame(encoder, gpu_ctx,
+                                     output_buf, output_size, &pending);
+}
+
+int h264_encoder_finish_frame(h264_encoder_t *encoder,
+                              bc250_gpu_context_t *gpu_ctx,
+                              uint8_t *output_buf, size_t output_size,
+                              const h264_pending_frame_t *pending)
+{
+    if (!encoder || !output_buf || !pending || !pending->valid) return -1;
 
     /* Opt-in CPU-side timing (BC250_PERF_STATS=1), added for real-time
      * throughput diagnosis. Two brackets: `frame_t0` covers this entire
@@ -1914,22 +1998,13 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
         nz_mask_disabled = (nz_env && strcmp(nz_env, "0") == 0) ? 1 : 0;
     }
 
-    bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr;
-    encoder->force_idr = false;
-
-    if (is_idr) {
-        encoder->frame_num = 0;
-        encoder->idr_pic_id++;
-        encoder->poc = 0;
-        encoder->dpb_count = 0;
-    }
-
-    int qp = rc_get_frame_qp(&encoder->rc, 0);
-    /* Must track rate_control.c's rc->qp_min - see the comment there for
-     * why 12 is deliberate and what lowering it measured. */
-    if (qp < 12) qp = 12;
-    if (qp > 51) qp = 51;
-    qp = apply_qp_override(qp);
+    /* Frame type and QP were decided, and the IDR state reset applied, by the
+     * matching h264_encoder_submit_frame() - they had to be, because the
+     * quantize dispatch already consumed them. Recomputing them here would
+     * re-read a frame_count that has not advanced yet and double-apply the
+     * IDR side effects. */
+    const bool is_idr = pending->is_idr;
+    const int qp = pending->qp;
 
     size_t total_written = 0;
 
@@ -1958,12 +2033,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
      * needs num_slices too (see gpu_compute_dispatch_encode's doc comment
      * and that shader's SLICE BOUNDARIES note) to correctly treat a
      * different-slice neighbor MB as unavailable for intra prediction. */
-    int num_slices = 1;
-    const char *slice_env = getenv("BC250_SLICES_PER_FRAME");
-    if (slice_env) {
-        int s = atoi(slice_env);
-        if (s >= 1 && s <= 16) num_slices = s;
-    }
+    const int num_slices = pending->num_slices;
 
     /* 3b. Dispatch GPU compute encoding pipeline if available, and fetch the
      * REAL per-coefficient residual data (post-quant levels + pre-quant
@@ -1989,16 +2059,19 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
     double ph_begin_ms = 0.0, ph_dispatch_ms = 0.0, ph_end_ms = 0.0;
 
     if (ph) clock_gettime(CLOCK_MONOTONIC, &ph_a);
-    if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE
-        && gpu_compute_begin_picture(gpu_ctx, input_surface) == 0) {
-        /* begin_picture()'s own vkWaitForFences is now checked (see its doc
-         * comment): a nonzero return means it refused to touch the command
-         * buffer at all, so there is nothing to dispatch or submit this
-         * frame - fall through with quant_levels/etc. left NULL, same as
-         * every other "no new GPU work this frame" path below. */
+    /* begin_picture/dispatch/submit all happened in h264_encoder_submit_frame().
+     * gpu_submitted false means it refused to touch the command buffer or every
+     * submit retry failed, so there is nothing to wait on and nothing fresh in
+     * the staging slot - fall through with quant_levels/etc. left NULL, same as
+     * every other "no new GPU work this frame" path below.
+     *
+     * begin_ms/dispatch_ms are now both zero by construction; the phases they
+     * measured moved into the submit half, which in pipelined use is deliberately
+     * no longer inside this frame's critical path. end_sync_ms remains the
+     * interesting one - in pipelined use it should collapse toward zero, because
+     * the GPU ran this frame while the CPU was entropy-coding the previous one. */
+    if (pending->gpu_submitted) {
         if (ph) clock_gettime(CLOCK_MONOTONIC, &ph_b);
-        gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,
-                                     qp, is_idr ? 1 : 0, num_slices);
         if (ph) clock_gettime(CLOCK_MONOTONIC, &ph_c);
         /* gpu_compute_end_picture() now retries vkQueueSubmit internally
          * (real GPU contention can transiently fail a submit the same way
@@ -2024,7 +2097,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * case where the wait itself fails even though the submit
          * succeeded. Folded into the same condition so either failure takes
          * the same safe fallback. */
-        if (gpu_compute_end_picture(gpu_ctx) == 0 && gpu_compute_sync(gpu_ctx) == 0) {
+        if (gpu_compute_sync_slot(gpu_ctx, pending->gpu_slot) == 0) {
         if (ph) {
             clock_gettime(CLOCK_MONOTONIC, &ph_d);
             ph_begin_ms    = (double)(ph_b.tv_sec - ph_a.tv_sec) * 1000.0 +
@@ -2042,16 +2115,21 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
 
         void *quant_data = NULL, *dc_data = NULL, *pred_mode_data = NULL, *mv_data = NULL;
         size_t quant_size = 0, dc_size = 0, pred_mode_size = 0, mv_size = 0;
-        if (gpu_compute_get_quant_staging_data(gpu_ctx, &quant_data, &quant_size) == 0) {
+        /* All five readbacks MUST name this frame's own slot. Using the
+         * implicit "most recently submitted" variants here is correct only in
+         * the synchronous path and silently reads the next frame's data in the
+         * pipelined one. */
+        const int slot = pending->gpu_slot;
+        if (gpu_compute_get_quant_staging_data_slot(gpu_ctx, slot, &quant_data, &quant_size) == 0) {
             quant_levels = (const int16_t *)quant_data;
         }
-        if (gpu_compute_get_dc_staging_data(gpu_ctx, &dc_data, &dc_size) == 0) {
+        if (gpu_compute_get_dc_staging_data_slot(gpu_ctx, slot, &dc_data, &dc_size) == 0) {
             dc_coeff = (const int *)dc_data;
         }
-        if (gpu_compute_get_pred_mode_staging_data(gpu_ctx, &pred_mode_data, &pred_mode_size) == 0) {
+        if (gpu_compute_get_pred_mode_staging_data_slot(gpu_ctx, slot, &pred_mode_data, &pred_mode_size) == 0) {
             pred_modes = (const uint32_t *)pred_mode_data;
         }
-        if (gpu_compute_get_mv_staging_data(gpu_ctx, &mv_data, &mv_size) == 0) {
+        if (gpu_compute_get_mv_staging_data_slot(gpu_ctx, slot, &mv_data, &mv_size) == 0) {
             mvs = (const gpu_mv_t *)mv_data;
         }
         void *nz_data = NULL;
@@ -2061,7 +2139,7 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
          * equivalent to the scan, so this toggle is the A/B that proves it:
          * one binary, same content, output must be byte-identical. */
         if (!nz_mask_disabled &&
-            gpu_compute_get_nz_staging_data(gpu_ctx, &nz_data, &nz_size) == 0) {
+            gpu_compute_get_nz_staging_data_slot(gpu_ctx, slot, &nz_data, &nz_size) == 0) {
             nz_masks = (const uint32_t *)nz_data;
         }
 
@@ -2343,8 +2421,8 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                 }
             }
         }
-        } /* gpu_compute_end_picture() == 0 && gpu_compute_sync() == 0 */
-    }
+        } /* gpu_compute_sync() == 0 */
+    } /* pending->gpu_submitted */
 
     /* 4. Encode Slices */
 

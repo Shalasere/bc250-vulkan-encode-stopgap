@@ -372,6 +372,12 @@ VAStatus bc250_DestroyContext(VADriverContextP ctx, VAContextID context) {
         return VA_STATUS_ERROR_INVALID_CONTEXT;
     }
     bc250_context *c = &data->contexts[context];
+    /* Deliberately dropped rather than finished: the client is tearing the
+     * context down, so it is never going to read this frame's coded buffer,
+     * and finishing would mean entropy-coding a frame nobody wants. Cleared
+     * before the encoder is freed so nothing can later try to finish a frame
+     * through a dangling h264_enc. */
+    c->has_pending_frame = false;
     if (c->h264_enc) {
         h264_encoder_destroy(c->h264_enc);
         c->h264_enc = NULL;
@@ -449,10 +455,26 @@ VAStatus bc250_BufferSetNumElements(VADriverContextP ctx, VABufferID buf_id, uns
     return VA_STATUS_SUCCESS;
 }
 
+/* Defined further down, next to bc250_EndPicture() where the pipeline lives. */
+static bool bc250_pipeline_enabled(void);
+static void bc250_finish_pending_frame(bc250_driver_data *data, bc250_context *c);
+
 VAStatus bc250_MapBuffer(VADriverContextP ctx, VABufferID buf_id, void **pbuf) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated || !pbuf) {
         return VA_STATUS_ERROR_INVALID_BUFFER;
+    }
+    /* If this is the coded buffer of a frame still in flight, its bitstream
+     * has not been written yet - produce it now, before handing the caller a
+     * pointer to what would otherwise be an empty (or previous frame's)
+     * buffer. This is the path a client takes when it reads frame N's output
+     * without having submitted frame N+1; correct, just with no overlap. */
+    if (bc250_pipeline_enabled()) {
+        for (int i = 0; i < MAX_CONTEXTS; i++) {
+            bc250_context *c = &data->contexts[i];
+            if (c->allocated && c->has_pending_frame && c->pending_coded_buf_id == buf_id)
+                bc250_finish_pending_frame(data, c);
+        }
     }
     data->buffers[buf_id].mapped = 1;
     *pbuf = data->buffers[buf_id].data;
@@ -746,6 +768,71 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
     return VA_STATUS_SUCCESS;
 }
 
+/* BC250_PIPELINE=1 defers a frame's CPU entropy coding so that the next
+ * frame's GPU work can overlap it.
+ *
+ * 🛑 MEASURED A NET LOSS - see docs/DEVLOG.md 24. Kept only because the
+ * submit/finish split it needs is independently useful and is byte-exact when
+ * this is off. Do not enable it on the strength of the theory; the theory was
+ * measured and it did not hold:
+ *
+ *   - fps 64.27 -> 65.56 (+2%), BELOW this project's ~2.5% noise floor
+ *   - PSNR 42.96 -> 37.01 dB avg, 39.69 -> 28.86 dB on the worst frame
+ *   - mean end_sync_ms 4.450 -> 4.463, i.e. UNCHANGED: the overlap this
+ *     exists to create provably never happened, so the +2% is not even from
+ *     pipelining
+ *
+ * The overlap requires the VA-API client to have two frames in flight (submit
+ * N+1 before reading N's coded buffer). Whether ffmpeg/Sunshine here ever does
+ * is unresolved. The quality loss appears even WITHOUT overlap, which points at
+ * an unexplained encoder/decoder reference mismatch in the deferred path -
+ * root-cause that before trusting this knob for anything. */
+static bool bc250_pipeline_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("BC250_PIPELINE");
+        enabled = (e && (strcmp(e, "1") == 0 || strcmp(e, "true") == 0)) ? 1 : 0;
+        if (enabled)
+            fprintf(stderr, "[bc250] WARNING: BC250_PIPELINE=1 is EXPERIMENTAL and was "
+                            "measured as a net loss (~6dB PSNR for +2%% fps, which is "
+                            "inside the noise floor). See docs/DEVLOG.md 24.\n");
+    }
+    return enabled == 1;
+}
+
+/* Complete the one in-flight frame, if any: wait for its GPU work, read it
+ * back, entropy-code it, and fill in ITS coded buffer's segment header (not
+ * whatever buffer the context has moved on to). Safe to call when nothing is
+ * pending. */
+static void bc250_finish_pending_frame(bc250_driver_data *data, bc250_context *c) {
+    if (!c->has_pending_frame) return;
+
+    /* Clear the flag first: every exit path below must leave nothing pending,
+     * or a later call would wait a second time on an already-consumed fence
+     * and re-encode stale staging data as a fresh frame. */
+    h264_pending_frame_t pending = c->pending_frame;
+    VABufferID buf_id = c->pending_coded_buf_id;
+    c->has_pending_frame = false;
+
+    if (!VALID_ID(buf_id, MAX_BUFFERS) || !data->buffers[buf_id].allocated) return;
+
+    bc250_buffer *coded_buf = &data->buffers[buf_id];
+    uint8_t *dest = ((uint8_t *)coded_buf->data) + sizeof(VACodedBufferSegment);
+    size_t max_payload = (size_t)coded_buf->size * coded_buf->num_elements;
+
+    int written = h264_encoder_finish_frame(c->h264_enc, &data->gpu,
+                                            dest, max_payload, &pending);
+    if (written > 0) {
+        VACodedBufferSegment *seg = (VACodedBufferSegment *)coded_buf->data;
+        seg->size = (unsigned int)written;
+        seg->bit_offset = 0;
+        seg->status = 0;
+        seg->reserved = 0;
+        seg->buf = dest;
+        seg->next = NULL;
+    }
+}
+
 VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data || !VALID_ID(context, MAX_CONTEXTS) || !data->contexts[context].allocated) return VA_STATUS_ERROR_INVALID_CONTEXT;
@@ -775,7 +862,32 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
 
         int written = -1;
         gpu_compute_debug_dump_real_input(&data->gpu, &surf->image, surf->memory, surf->width, surf->height);
-        if (c->h264_enc) {
+        if (c->h264_enc && bc250_pipeline_enabled()) {
+            /* Pipelined: submit THIS frame's GPU work first, then finish the
+             * PREVIOUS frame on the CPU. That order is the entire point - the
+             * GPU chews on frame N+1 while the CPU entropy-codes frame N,
+             * instead of the CPU idling ~4.2ms on a fence and the GPU then
+             * idling ~8ms through shadow_copy+CAVLC (DEVLOG 21.4's "no overlap"
+             * note, and the per-stage profile that confirmed it).
+             *
+             * The current frame's bitstream is NOT produced here; it is
+             * produced by whichever call next needs it - the following
+             * EndPicture, or bc250_SyncSurface()/bc250_MapBuffer() if the
+             * client reads before submitting another frame. */
+            h264_pending_frame_t just_submitted;
+            bool submitted = (h264_encoder_submit_frame(c->h264_enc, &data->gpu,
+                                                        surf->image, &just_submitted) == 0);
+
+            bc250_finish_pending_frame(data, c);
+
+            if (submitted) {
+                c->has_pending_frame = true;
+                c->pending_frame = just_submitted;
+                c->pending_coded_buf_id = c->coded_buf_id;
+            }
+            /* written stays -1: nothing to report for this frame yet. The
+             * segment header is filled in by the deferred finish. */
+        } else if (c->h264_enc) {
             written = h264_encoder_encode_frame(c->h264_enc, &data->gpu, surf->image, dest, max_payload);
         } else if (c->hevc_enc) {
             written = hevc_encoder_encode_frame(c->hevc_enc, &data->gpu, surf->image, surf->memory, dest, max_payload);
@@ -816,6 +928,16 @@ VAStatus bc250_SyncSurface(VADriverContextP ctx, VASurfaceID render_target) {
     if (!data || !VALID_ID(render_target, MAX_SURFACES) || !data->surfaces[render_target].allocated ||
         data->surfaces[render_target].pending_destroy) {
         return VA_STATUS_ERROR_INVALID_SURFACE;
+    }
+    /* A sync is a promise that this surface is done being read and its coded
+     * output is available, so any deferred frame has to be completed here
+     * rather than left in flight. Finishing unconditionally (there is at most
+     * one pending frame) only ever costs the overlap, never correctness. */
+    if (bc250_pipeline_enabled()) {
+        for (int i = 0; i < MAX_CONTEXTS; i++) {
+            if (data->contexts[i].allocated && data->contexts[i].has_pending_frame)
+                bc250_finish_pending_frame(data, &data->contexts[i]);
+        }
     }
     gpu_compute_sync(&data->gpu);
     return VA_STATUS_SUCCESS;

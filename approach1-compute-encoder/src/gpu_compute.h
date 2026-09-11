@@ -397,6 +397,26 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
+
+/* Which double-buffer slot (0/1) holds the frame most recently submitted by
+ * gpu_compute_end_picture(). The unsuffixed gpu_compute_sync() and
+ * gpu_compute_get_*_staging_data() all implicitly mean this slot, which is
+ * correct only while exactly one frame is ever in flight.
+ *
+ * A PIPELINED caller (one that submits frame N+1 before entropy-coding frame
+ * N) must capture this at submit time and pass it to the _slot variants below,
+ * because by finish time "most recently submitted" is the WRONG frame. That
+ * mistake is a silent one-frame data swap: it produces a decodable stream and
+ * it is invisible to the BC250_NZ_AUDIT mask audit, since quant_levels and
+ * nz_masks would both be read from the same wrong slot and therefore still
+ * match exactly. PSNR on moving content is what catches it. */
+int gpu_compute_submitted_slot(gpu_context_t *ctx);
+int gpu_compute_sync_slot(gpu_context_t *ctx, int slot);
+int gpu_compute_get_quant_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_dc_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_pred_mode_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_mv_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_nz_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 int gpu_compute_release_staging_data(gpu_context_t *ctx);
 

@@ -44,6 +44,7 @@
 #   ./bc250_lab.sh quality <key> [-r N]      PSNR/SSIM via quality_test.sh
 #   ./bc250_lab.sh qsweep <key> [opts]       PSNR/SSIM vs libx264 across bitrates,
 #                                            with per-frame QP correlation
+#                                            (--env=K=V, --no-ref, --bitrates)
 #   ./bc250_lab.sh units <key>               unit-test binaries
 #   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + exact
 #   ./bc250_lab.sh health                    is the live Sunshine healthy?
@@ -752,12 +753,15 @@ qsweep() {
     local key="${1:?qsweep <key> [opts]}"; shift
     local content=testsrc2 res=2560x1440 frames=150
     local bitrates="8M,15M,20M,25M,31M"
+    local envs="" skip_ref=0
     for a in "$@"; do
         case "$a" in
             --content=*)  content="${a#*=}";;
             --res=*)      res="${a#*=}";;
             --frames=*)   frames="${a#*=}";;
             --bitrates=*) bitrates="${a#*=}";;
+            --env=*)      envs="${a#*=}";;
+            --no-ref)     skip_ref=1;;
         esac
     done
     local bd; bd=$(art_dir "$key")
@@ -769,9 +773,20 @@ qsweep() {
     local IFS=,
     for br in $bitrates; do
         local IFS=$'\n\t '
-        for enc in "$key" libx264; do
+        local encoders="$key libx264"
+        # --no-ref drops the libx264 reference column. The point of qsweep is
+        # normally "how do we compare to libx264", but it is also the only
+        # instrument here that measures per-frame PSNR on MOVING content, which
+        # makes it the right tool for an encoder-vs-itself A/B (e.g. pipelined
+        # vs synchronous) - and in that use the reference costs an encode per
+        # bitrate while answering nothing.
+        [ "$skip_ref" = 1 ] && encoders="$key"
+        for enc in $encoders; do
             local base="$d/${br}_${enc//\//_}"
-            local rc; rc=$(run_encode "$enc" "$content" "$res" "$frames" 120 "$br" "" 0 "$base")
+            # libx264 ignores driver env; passing it only to our own encoder
+            # keeps the reference column an honest constant.
+            local this_env=""; [ "$enc" != libx264 ] && this_env="$envs"
+            local rc; rc=$(run_encode "$enc" "$content" "$res" "$frames" 120 "$br" "$this_env" 0 "$base")
             if [ "$rc" != 0 ]; then
                 printf "%-9s %-9s ENCODE FAILED (rc=%s) - see %s.log\n" "$br" "$enc" "$rc" "$base"
                 continue

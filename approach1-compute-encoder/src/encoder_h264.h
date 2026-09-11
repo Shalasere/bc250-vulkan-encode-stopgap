@@ -50,6 +50,66 @@ int h264_encoder_encode_frame(h264_encoder_t *encoder,
                               uint8_t *output_buf, size_t output_size);
 
 /**
+ * Everything h264_encoder_finish_frame() needs to know about a frame whose GPU
+ * work h264_encoder_submit_frame() already put in flight. Small on purpose: the
+ * bulk per-frame GPU output does NOT live here, it stays in the gpu context's
+ * double-buffered staging slot until the matching finish reads it.
+ */
+typedef struct {
+    bool     valid;          /* a submit filled this in and no finish consumed it yet */
+    bool     gpu_submitted;  /* dispatch+submit actually succeeded; if false there is
+                              * no fence to wait on and no fresh staging data - the
+                              * finish must take the same safe all-P_Skip fallback the
+                              * synchronous path takes (see encoder_h264.c) */
+    bool     is_idr;
+    int      qp;
+    int      num_slices;
+    /* Which GPU double-buffer slot THIS frame was submitted into. Captured at
+     * submit time because by finish time another frame may already have been
+     * submitted, making "the most recently submitted slot" the wrong one - see
+     * gpu_compute_submitted_slot()'s comment for why that mistake is invisible
+     * to the mask audit. */
+    int      gpu_slot;
+} h264_pending_frame_t;
+
+/**
+ * h264_encoder_submit_frame - first half of an encode: choose frame type/QP and
+ * put this frame's GPU compute work in flight, WITHOUT waiting for it.
+ *
+ * Writes no bitstream at all; every byte of output is produced by the matching
+ * h264_encoder_finish_frame(). Pair each submit with exactly one finish, in
+ * order. Splitting the two is what lets frame N+1's GPU work overlap frame N's
+ * CPU entropy coding (the CPU is ~8ms of a ~12.5ms frame and the GPU ~4.2ms of
+ * it, and they were strictly serial before).
+ *
+ * NOTE ON RATE CONTROL: QP is chosen here because the quantize shader needs it
+ * at dispatch time, so in pipelined use frame N's QP is picked before frame
+ * N-1's bits have been accounted. That is ordinary for a pipelined encoder but
+ * it IS a behaviour change - pipelined output is therefore not bit-identical to
+ * the synchronous path, by construction, and must not be validated with a
+ * byte-exactness oracle against it.
+ *
+ * Returns 0 on success (pending filled in), -1 on bad arguments.
+ */
+int h264_encoder_submit_frame(h264_encoder_t *encoder,
+                              bc250_gpu_context_t *gpu_ctx,
+                              gpu_image_t input_surface,
+                              h264_pending_frame_t *pending);
+
+/**
+ * h264_encoder_finish_frame - second half: wait for the submitted GPU work,
+ * read it back, and produce the whole Annex B frame.
+ *
+ * @pending: the state filled in by the matching h264_encoder_submit_frame().
+ *
+ * Returns number of bytes written, or -1 on error.
+ */
+int h264_encoder_finish_frame(h264_encoder_t *encoder,
+                              bc250_gpu_context_t *gpu_ctx,
+                              uint8_t *output_buf, size_t output_size,
+                              const h264_pending_frame_t *pending);
+
+/**
  * h264_encoder_force_idr - Request next frame to be an instantaneous decoder refresh (IDR)
  */
 void h264_encoder_force_idr(h264_encoder_t *encoder);

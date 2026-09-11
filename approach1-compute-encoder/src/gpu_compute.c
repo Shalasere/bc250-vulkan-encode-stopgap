@@ -2316,8 +2316,28 @@ int gpu_compute_end_picture(gpu_context_t *ctx) {
     return (submit_result == VK_SUCCESS) ? 0 : -1;
 }
 
-int gpu_compute_sync(gpu_context_t *ctx) {
-    int prev_buf = (ctx->current_buf + 1) % 2;
+int gpu_compute_submitted_slot(gpu_context_t *ctx) {
+    if (!ctx) return -1;
+    /* end_picture() toggles current_buf AFTER submitting, so the slot holding
+     * the frame just submitted is the one current_buf now points away from. */
+    return (ctx->current_buf + 1) % 2;
+}
+
+/* Slot-explicit readback. A pipelined caller MUST use these and pass the slot
+ * its own frame was submitted into: once it has submitted frame N+1, "the most
+ * recently submitted slot" is no longer the frame it is about to entropy-code.
+ *
+ * Reading the wrong slot here is a silent one-frame data swap, and note which
+ * checks CANNOT see it: the BC250_NZ_AUDIT mask audit compares quant_levels
+ * against nz_masks, and in a slot mix-up BOTH come from the same wrong slot, so
+ * they still agree exactly and the audit reports 0 mismatches. Byte-exactness
+ * is also unavailable (pipelined output legitimately differs). The oracle that
+ * does see it is PSNR on MOVING content, plus the tell that gave it away the
+ * first time: end_sync_ms failing to collapse, which can only mean the finish
+ * is waiting on a frame that was submitted after it. */
+int gpu_compute_sync_slot(gpu_context_t *ctx, int slot) {
+    if (!ctx || slot < 0 || slot > 1) return -1;
+    const int prev_buf = slot;
     struct timespec w0, w1;
     if (ctx->perf_stats_enabled) clock_gettime(CLOCK_MONOTONIC, &w0);
     /* Unchecked until now - this is precisely the call the doc comment in
@@ -2377,6 +2397,11 @@ int gpu_compute_sync(gpu_context_t *ctx) {
     return 0;
 }
 
+int gpu_compute_sync(gpu_context_t *ctx) {
+    if (!ctx) return -1;
+    return gpu_compute_sync_slot(ctx, gpu_compute_submitted_slot(ctx));
+}
+
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
     if (!ctx || !data || !size) return -1;
     int prev_buf = (ctx->current_buf + 1) % 2;
@@ -2391,44 +2416,66 @@ int gpu_compute_release_staging_data(gpu_context_t *ctx) {
     return 0;
 }
 
-int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx || !data || !size) return -1;
-    int prev_buf = (ctx->current_buf + 1) % 2;
+/* See gpu_compute_sync_slot()'s comment for why a pipelined caller must pass
+ * its own frame's slot rather than relying on "most recently submitted". */
+int gpu_compute_get_quant_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
     *size = ctx->quant_staging_size;
-    *data = ctx->quant_staging_mapped[prev_buf];
+    *data = ctx->quant_staging_mapped[slot];
     return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_dc_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->dc_staging_size;
+    *data = ctx->dc_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_pred_mode_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->pred_mode_staging_size;
+    *data = ctx->pred_mode_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_mv_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->mv_staging_size;
+    *data = ctx->mv_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
+    if (!ctx) return -1;
+    return gpu_compute_get_quant_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
 }
 
 int gpu_compute_get_dc_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx || !data || !size) return -1;
-    int prev_buf = (ctx->current_buf + 1) % 2;
-    *size = ctx->dc_staging_size;
-    *data = ctx->dc_staging_mapped[prev_buf];
-    return (*data != NULL) ? 0 : -1;
+    if (!ctx) return -1;
+    return gpu_compute_get_dc_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
 }
 
 int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx || !data || !size) return -1;
-    int prev_buf = (ctx->current_buf + 1) % 2;
-    *size = ctx->pred_mode_staging_size;
-    *data = ctx->pred_mode_staging_mapped[prev_buf];
-    return (*data != NULL) ? 0 : -1;
+    if (!ctx) return -1;
+    return gpu_compute_get_pred_mode_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
 }
 
 int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx || !data || !size) return -1;
-    int prev_buf = (ctx->current_buf + 1) % 2;
-    *size = ctx->mv_staging_size;
-    *data = ctx->mv_staging_mapped[prev_buf];
+    if (!ctx) return -1;
+    return gpu_compute_get_mv_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
+}
+
+int gpu_compute_get_nz_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->nz_staging_size;
+    *data = ctx->nz_staging_mapped[slot];
     return (*data != NULL) ? 0 : -1;
 }
 
 int gpu_compute_get_nz_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx || !data || !size) return -1;
-    int prev_buf = (ctx->current_buf + 1) % 2;
-    *size = ctx->nz_staging_size;
-    *data = ctx->nz_staging_mapped[prev_buf];
-    return (*data != NULL) ? 0 : -1;
+    if (!ctx) return -1;
+    return gpu_compute_get_nz_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
 }
 
 /* Opt-in debug instrumentation, originally added for Part A verification

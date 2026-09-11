@@ -2988,3 +2988,139 @@ Per encoder context at 1440p, `quant_levels` staging: 22 MB → 11 MB. Plus one
 fewer GPU dispatch and one fewer `vkCmdCopyBuffer` per frame (the dead
 entropy stage), previously ~0.34 ms/frame of GPU time spent on a shader
 nothing downstream reads.
+
+## 24. CPU/GPU pipelining: tried, measured, NOT adopted — and the mask audit turned out to be blind to the bug it should have caught
+
+§21.4 named "no overlap, no priority" as addressable, and the per-stage profile
+made it look like the biggest remaining lever. It isn't, and the way that was
+established is the part worth keeping.
+
+### 24.1 The lever, and why it looked good
+
+Measured per P-frame, 1440p `testsrc2`, idle:
+
+| term | ms |
+|---|---|
+| **wall** | **12.46** (77.4 fps) |
+| GPU total | 4.20 (me 2.24, deblock 0.66, predict 0.51, recon 0.44, quant 0.16, dct 0.14) |
+| `end_sync` — CPU blocked on the GPU fence | 4.32 |
+| `shadow_copy` (14.1 MB) | 1.00 |
+| **`cavlc` (CPU)** | **7.07 — 57% of the frame** |
+
+Strictly serial: dispatch, wait, entropy-code. The GPU stages are a hard
+dependency chain (me→predict→dct→quant→recon→deblock), so there is nothing to
+overlap *within* a frame — which is also why the newly-enabled GFX1013 async
+compute queues are irrelevant here (§24.5). But frame N+1's GPU work does not
+depend on frame N's entropy coding, so overlapping *those* predicts
+max(4.3, 8.1) ≈ 8.1 ms, ~123 fps, +54%.
+
+### 24.2 What was built
+
+`h264_encoder_encode_frame()` split into `h264_encoder_submit_frame()` (pick
+frame type/QP, dispatch, submit, return without waiting) and
+`h264_encoder_finish_frame()` (wait, read back, entropy-code, emit). The
+entry point is now `submit(); finish();` back to back, which is why the
+default path stayed **byte-identical** — verified on `testsrc` at GOP 120, 10
+and 1 (all-intra) against the pre-split build.
+
+Under `BC250_PIPELINE=1`, `bc250_EndPicture()` submits the current frame and
+*then* finishes the previous one, with `bc250_MapBuffer()`/`bc250_SyncSurface()`
+finishing on demand for a client that reads before submitting again. Depth is
+bounded to 1 deliberately: the goal is CPU/GPU overlap, not a frame queue,
+and queueing costs latency on a live stream for no extra overlap. The
+double-buffered `cmd_bufs`/`fences`/staging slots this needs already existed
+(their header comment has said "Double-buffering for pipeline overlap" the
+whole time) and had never been used for it, because the wait immediately
+followed the submit.
+
+### 24.3 🚨 The bug, and the oracle that could not see it
+
+First pipelined build: `gpu_compute_sync()` and all five
+`gpu_compute_get_*_staging_data()` resolve their slot as
+`prev_buf = (current_buf + 1) % 2` — "the frame most recently submitted".
+That is correct only while exactly one frame is in flight. Once
+`EndPicture(N+1)` submits before `finish(N)` runs, "most recently submitted"
+is **N+1**, so `finish(N)` waited on N+1's fence and read N+1's staging
+buffers, encoding one frame's coefficients into another frame's bitstream.
+
+**`BC250_NZ_AUDIT` reported `mismatches=0`, "mask EXACT on all audited
+frames", on 401 frames of both contents.** It cannot see this class of bug by
+construction: it compares `quant_levels` against `nz_masks`, and in a slot
+mix-up *both* come from the same wrong slot, so they still agree perfectly.
+The static-content PSNR gate also passed (58.2/58.5 dB, SSIM 0.999) and the
+stream decoded with zero errors. Three green checks on corrupt output.
+
+What actually caught it was a **performance** number, not a correctness one:
+`end_sync_ms` did not collapse. It had no innocent explanation — if the
+overlap were working, the fence would already be signaled — and the only way
+to still wait a full GPU frame is to be waiting on a frame submitted *after*
+the one being finished. Fixed by capturing the slot at submit time into the
+pending state and adding slot-explicit `gpu_compute_sync_slot()` /
+`gpu_compute_get_*_staging_data_slot()`; the implicit variants remain for
+single-frame-in-flight callers.
+
+Then the oracle question was settled properly, by checking that the instrument
+can produce the symptom (per-frame PSNR on **moving** content, 1440p
+`testsrc2`, decode-to-YUV per §22):
+
+| build | psnr_avg | psnr_min |
+|---|---|---|
+| buggy slot parity, pipeline ON | 29.49 | 25.98 |
+| slot-fixed, pipeline ON | 37.01 | 28.86 |
+| slot-fixed, pipeline OFF | 42.96 | 39.69 |
+
+7.5 dB between the first two rows: `qsweep` sees the bug the mask audit called
+exact. `tools/lab audit` and `qsweep` both gained `--env` so a change
+*underneath* the driver can be A/B'd at all.
+
+### 24.4 Verdict: not adopted
+
+Slot-fixed, `BC250_PIPELINE=1` versus off:
+
+| | off | on |
+|---|---|---|
+| fps | 64.27 | 65.56 (+2%, **inside the ~2.5% noise floor**) |
+| PSNR avg | 42.96 dB | 37.01 dB |
+| PSNR worst frame | 39.69 dB | 28.86 dB |
+| mean `end_sync_ms` | 4.450 | **4.463 — unchanged** |
+| bytes | 8 400 693 | 7 911 008 |
+
+The overlap never happened. `end_sync_ms` is flat, so the +2% is not
+pipelining, and the whole predicted win is absent. The overlap needs the
+VA-API client to hold two frames in flight (submit N+1 before reading N's
+coded buffer); whether ffmpeg/Sunshine here ever does is unresolved and is the
+first thing to check if this is revisited.
+
+Worse, ~6 dB is lost *without* any overlap to pay for it — fewer bytes at
+lower quality, at the same average QP, which looks like an
+encoder/decoder reference mismatch in the deferred path rather than the
+rate-control reordering the split knowingly introduces (QP for a frame must be
+chosen before the previous frame's bits are accounted, because the quantize
+dispatch needs QP up front). That is unexplained, and per §21.5 an unexplained
+piece of evidence means the hypothesis is unfinished.
+
+So: default off, warns loudly when enabled, and the split is kept only because
+it is byte-exact when off and the slot-explicit API removes a real footgun.
+**The remaining CPU-side lever is CAVLC itself (7.1 ms, 57% of the frame), not
+scheduling around it.**
+
+### 24.5 Method notes
+
+**An exact oracle is only exact about what it compares.** The mask audit is a
+genuinely strong instrument — §19.4 built it precisely to catch a stale GPU→CPU
+buffer, and it did. It is still structurally incapable of catching a *uniform*
+slot shift, because it checks two buffers against each other rather than
+either against the frame they claim to describe. "Audit passed" is not
+"data is from the right frame". Before trusting any check, ask what it
+compares, not how strict it sounds.
+
+**A perf number can be a correctness signal.** `end_sync_ms` was being read as
+a throughput metric and was the only thing in the room telling the truth about
+a correctness bug. The reverse of §14's lesson: there, a bad instrument
+invented a defect; here, a good instrument reported a real one on a channel
+nobody was watching for correctness.
+
+**Validate the instrument on a known-bad build.** The buggy artifact was kept
+and re-measured rather than deleted once fixed, which is the only reason
+"`qsweep` can see this" is a fact here instead of an assumption — the same
+discipline §22 arrived at the hard way.
