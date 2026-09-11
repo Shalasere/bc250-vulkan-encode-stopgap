@@ -3604,6 +3604,18 @@ slice-boundary gating at all. That is both a data race waiting to happen and,
 independently, a probable multi-slice CABAC spec problem worth its own
 investigation - CABAC context must not cross a slice boundary.
 
+> 🚨 **CORRECTION (§26.5): the claim in the paragraph above is wrong, and was
+> wrong the moment it was written.** `start_mb` is not confined to
+> `luma_nc()`/`chroma_nc()` - `luma_cbf_neighbors()`, `chroma_cbf_neighbors()`,
+> `dc_cbf_neighbors()`, `chroma_dc_cbf_neighbors()`, and every inline
+> `mvd_x_abs`/`mvd_y_abs`/`cbp_nb`/`skip_flag`/`ctx_intra` read in
+> `encode_mb_i16x16_cabac()`, `encode_mb_p16x16_cabac()`, and the CABAC
+> per-slice loop already gate every left/top neighbor read with
+> `(mb - 1) >= start_mb` / `(mb - width_in_mbs) >= start_mb`, exactly
+> mirroring `luma_nc()`/`chroma_nc()`. `git blame` puts all of it at
+> `8f27dcd0` (2026-09-08, the original CABAC-feature commit) - three days
+> before this very paragraph was written. See §26.5 for the full audit.
+
 ### 26.3 And switching to CAVLC to collect the win costs ~24% bitrate
 
 Measured honestly at **fixed QP 26**, 1 slice, nominal drain (the earlier
@@ -3624,6 +3636,11 @@ from 1 → 4 slices, measured with rate control on).
 slice-boundary gating to the CABAC neighbour helpers (a correctness fix in its
 own right), and only then thread it. Threading CAVLC is not the win; CABAC is
 where the 9.4 ms actually is.
+
+> 🚨 The "add slice-boundary gating" step above is already done - see §26.5.
+> What is *not* done is the threading itself: today's audit only confirmed the
+> data-race precondition doesn't hold (there is nothing left unguarded for
+> concurrent slice threads to race on); it did not re-attempt the OpenMP work.
 
 ### 26.4 Method notes — two false greens in one session
 
@@ -3647,3 +3664,79 @@ invalid for. The rule was known, cited earlier in the same session, and still
 tripped over - because the *shape* of the evidence (threads change output)
 matched the feared bug so well that the content it was measured on went
 unexamined.
+
+### 26.5 Auditing §26.2's "no slice-boundary gating" claim: it was already false when written
+
+Went looking for the CABAC neighbour-gating fix §26.2/§26.3 said was still
+owed. It was not there to add.
+
+**What the audit actually found**, reading every CABAC context-derivation
+site in `encoder_h264.c` rather than trusting the earlier grep:
+`luma_cbf_neighbors()`, `chroma_cbf_neighbors()`, `dc_cbf_neighbors()`, and
+`chroma_dc_cbf_neighbors()` (all four, the direct CABAC analogues of
+`luma_nc()`/`chroma_nc()`) already gate every left/top neighbour read with
+`(mb - 1) >= start_mb` / `(mb - width_in_mbs) >= start_mb`. So does every
+inline read of `mvd_x_abs`/`mvd_y_abs`/`cbp_nb` in `encode_mb_p16x16_cabac()`
+and the CABAC P-slice loop, the `skip_flag`-based `ctx_skip` computation for
+`mb_skip_flag`, and the `ctx_intra` neighbour count for `mb_type` in
+`encode_mb_i16x16_cabac()`. The "unavailable" fallback at a slice boundary is
+the *same code path* as at a picture edge in every one of these (the
+`mbx > 0 && ...` / `mby > 0 && ...` checks that already handle the picture
+edge are the same `&&`-clause the `start_mb` check was added to, not a
+separate branch) - which is exactly what "treat a slice boundary like
+unavailability" means per spec, not a new value to invent. `git blame` dates
+all of it to `8f27dcd0`, 2026-09-08 - the commit that added CABAC support in
+the first place, three days before §26.2 was written. Whatever produced the
+"only in luma_nc/chroma_nc" grep result in §26.2 did not reproduce today; a
+fresh `grep -n start_mb src/encoder_h264.c` returns 30+ matches across both
+coders.
+
+**No source change followed from this** - CLAUDE.md's whole point is not to
+force a fix onto a claim that doesn't survive being checked, and there was
+nothing left to gate. Verified instead, on a build from this same,
+unmodified `agent/cabac-slice-gating` tree (worktree
+`bc250-wt-cabac-gating`, HEAD `9031d68`), on-board in
+`/var/home/user/agent-cabac-slice-gating/`:
+
+- `gcc -fsyntax-only -Wall -Wextra` on `encoder_h264.c` and `cabac.c`: clean.
+- Board build (Release, `BUILD_TESTS=ON`): `.so` + all 9 `.comp.spv` shaders
+  present; all 5 test binaries (`test_bitstream`, `test_cavlc`, `test_encode`,
+  `test_va_api`, `test_hevc_encode`) pass.
+- **1-slice byte-exactness, `testsrc`, all-intra (`-g 1`)**: this build vs.
+  the pre-existing `work-6f3567dc2514` baseline artifact, **byte-identical**
+  (`ce61c6af7f3daf9913c7f1c40fd75209`), reproducible across 3 isolated runs of
+  each. Confirms the gating (which was already there) is a true no-op at the
+  default single-slice config, as it must be.
+- **1-slice, `testsrc`, with P-frames (`-g 120`): NOT reproducible**, even
+  running the untouched `work-6f3567dc2514` baseline binary against itself
+  twice (four separate isolated runs, four different md5s, `BC250_FORCE_QP=26`
+  did not fix it either). This is a **new finding**, not caused by anything
+  in this session (no code changed): the GPU motion-estimation
+  non-determinism §19.6/CLAUDE.md documents for `testsrc2` also reaches plain
+  `testsrc` once P-frames are in play - `testsrc`'s own moving pattern is
+  apparently enough to trigger it. **CLAUDE.md's "byte-exactness is only a
+  valid oracle on testsrc" needs narrowing: it holds for all-intra testsrc,
+  not for testsrc with P-frames.** Anyone's `-g 120` byte-exact gate on
+  `testsrc` should be treated with the same suspicion §19.6 reserves for
+  `testsrc2`.
+- **Multi-slice sanity**: `testsrc2`, `BC250_SLICES_PER_FRAME=4`, 120 frames,
+  2560x1440, CABAC (default) - encoded at 75 fps, `ffmpeg -v error -i out.h264
+  -f null -` reported **zero decode errors**.
+- **Multi-slice quality vs. 1-slice**, both from this same unmodified build,
+  decoded to raw YUV and compared against a common raw `testsrc2` reference
+  per the §22 method (matching forced `-f rawvideo -s 2560x1440 -r 60` on both
+  sides, never raw `.h264` against a fresh `-lavfi` source):
+
+  | slices | PSNR avg (Y/U/V) | SSIM All |
+  |---|---|---|
+  | 1 | 41.844 (42.583 / 40.741 / 40.583) | 0.972606 |
+  | 4 | 41.909 (42.698 / 40.741 / 40.585) | 0.973341 |
+
+  4 slices is marginally *higher*, not lower, on both metrics - within the
+  noise this encoder already has on `testsrc2` (§19.6), but definitely not a
+  regression. Consistent with the gating being real and pre-existing: cutting
+  off stale cross-slice context has no measurable downside here.
+
+**Takeaway:** a DEVLOG claim reading as `grep`-verified is not automatically
+still true three sections later, let alone three days later on a file under
+active development - re-run the grep against HEAD, don't cite the old result.
