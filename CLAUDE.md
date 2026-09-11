@@ -5,6 +5,24 @@ hardware video engine is dead. Correctness and performance here are both
 *measured*, never argued — this file exists because the expensive mistakes on
 this project have all been measurement and process mistakes, not coding ones.
 
+## 🚨🚨 TOP PRIORITY: this driver has zero thread synchronization, anywhere
+
+`grep -rn 'pthread_mutex\|pthread_rwlock\|atomic_' src/` returns nothing.
+ffmpeg calls into this driver from ≥2 of its own concurrent OS threads
+(`encoder_thread`/`enc0:0:h264_vaa` and `filter_thread`/`vf#0:0`), and
+ThreadSanitizer confirms real, reproducible (2/2) data races on shared driver
+state — `va_backend.c`'s `bc250_CreateSurfaces`/`bc250_CreateBuffer` vs
+`bc250_DestroyBuffer` (plausibly the mechanism behind a flaky SIGSEGV, see
+DEVLOG §26.1.2), and `gpu_compute.c`'s double-buffer `current_buf` index
+racing between `gpu_compute_end_picture()` and `gpu_compute_submitted_slot()`.
+**This is not specific to any one code path (CAVLC, pipelining, etc.) — it is
+the driver's default, always-on calling contract, so the default CABAC/
+production path is exposed to the same race class.** ASan/UBSan cleanly
+missed it (12/12 runs) because neither instruments cross-thread ordering at
+all — only TSan can see this. No fix is shipped yet; see DEVLOG §26.1.2 for
+the full diagnosis and the locking-vs-deadlock trade-off that's still unaudited.
+Treat any further perf work as secondary to this until it's fixed.
+
 ## Before you assert a mechanism, grep the DEVLOG
 
 `docs/DEVLOG.md` is ~2600 lines and is the authoritative record. **Search it
@@ -38,10 +56,16 @@ the errors below.
 
 ## Hard-won rules
 
-- **Byte-exactness is only a valid oracle on `testsrc`.** This encoder is not
-  bit-reproducible on moving content — three runs of one config give three
-  different valid bitstreams. Using md5 on `testsrc2` made a *correct* change
-  look broken and nearly got it reverted. §19.6
+- **Byte-exactness is only a valid oracle on `testsrc`, and only all-intra
+  (`-g 1`).** This encoder is not bit-reproducible on moving content — three
+  runs of one config give three different valid bitstreams. Using md5 on
+  `testsrc2` made a *correct* change look broken and nearly got it reverted.
+  §19.6. ⚠️ **The GPU motion-estimation non-determinism reaches plain
+  `testsrc` too once P-frames are involved** (`-g 120`/`-g 10`) — confirmed
+  2026-09-11 by running the SAME unmodified baseline binary against itself
+  and getting different md5s on 4 separate runs. Only all-intra `testsrc` is
+  a trustworthy byte-exact oracle now; treat any `-g >1` testsrc byte diff
+  with the same suspicion §19.6 reserves for `testsrc2`. §26.5
 - **Never gate health on a SEGV count.** Sunshine SEGVs in its own teardown
   path (`libevdev_uinput_destroy`, `_dl_fini`) on nearly every stop on this
   box. That signal fires for healthy and broken builds alike and rolled back a
