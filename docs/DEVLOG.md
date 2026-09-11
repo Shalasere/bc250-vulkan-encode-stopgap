@@ -3405,6 +3405,181 @@ on the host with the runtime preloaded; `libasan`/`libubsan` are not installed
 in the container by default; and `gcc -print-file-name=libasan.so` returns a
 linker script, not the runtime (use `/usr/lib64/libasan.so.8`).
 
+#### 26.1.2 It's a data race between ffmpeg's own encoder and filter threads - confirmed by TSan, not by ASan
+
+Resumed exactly where §26.1.1 left off: rebuilt the sanitized driver at
+Release-matching flags and raised the frame count. Neither closed the gap by
+itself, but a fresh coredump plus a ThreadSanitizer build did. **Diagnosis
+confidence: high on "this is a real, currently-live data race between two
+ffmpeg-internal threads calling this driver concurrently, with zero
+synchronization anywhere in ~500KB of driver source." Confidence: not yet
+high enough to ship a fix - see the "why no fix" note below.**
+
+**Step 1 - matched-flags ASan+UBSan still doesn't reproduce it, at any frame
+count.** Hand-compiled `-fsanitize=address,undefined -O3 -march=znver2
+-mtune=znver2 -DNDEBUG -fno-omit-frame-pointer -g` (the exact
+`CMakeLists.txt` `SOURCES` list, `libasan.so.8`/`libubsan.so.1` copied out of
+the `driver-build` distrobox - Bazzite's host image has neither installed,
+and both containers are glibc 2.42/Fedora 43 so the copied `.so`s load fine
+on the host). 12/12 clean runs, rc=0, no report: 4x at 40 frames, 4x at 60,
+4x at 80. `UBSAN_OPTIONS=print_stacktrace=1` alongside the existing
+`ASAN_OPTIONS` changed nothing.
+
+**Step 2 - the same build pipeline, unsanitized, reproduces on demand
+(control experiment).** Before trusting 12/12 clean as meaningful, the exact
+same source tree was compiled the same way minus `-fsanitize` and run at 40
+frames: **2/4 crashed (rc=139)**, matching the documented ~50-75% flake rate.
+This rules out a setup problem (wrong shaders, stale artifact, wrong env)
+being the reason the sanitized build stayed clean - the harness reproduces
+the bug when the bug-causing code path is actually present.
+
+**Step 3 - `-march=znver2` is not required.** §26.1.1 flagged Release-only
+optimization as the leading suspect and named znver2 codegen as one
+candidate mechanism. A plain `-O3 -DNDEBUG` build with no `-march` at all
+still crashed 1/4 at 40 frames. So it is `-O3`-class optimization (or
+something it enables/removes, e.g. inlining, instruction timing, `NDEBUG`)
+that matters, not Zen-2-specific instruction selection specifically -
+narrows Step 1's asymmetry but doesn't explain it by itself.
+
+**Step 4 - a fresh coredump gave a sharper signature than the one on file.**
+Two fresh crashes (both plain `-march=znver2` Release-flags builds, 40
+frames) were captured and inspected with `coredumpctl gdb` rather than
+relying on the previously-captured backtraces. Both land in the identical
+call chain, not in `av_frame_unref`/`free`:
+
+```
+__memmove_avx_unaligned_erms (libc)
+  image_copy_plane -> image_copy -> av_image_copy -> av_frame_copy (libavutil)
+    vaapi_transfer_data_to -> av_hwframe_transfer_data (libavutil)
+      hwupload_filter_frame -> ff_filter_activate (libavfilter)
+        filter_thread (ffmpeg)
+```
+
+i.e. the SIGSEGV is a direct write fault during the hwupload path's own
+pixel copy into a VA-derived image, on ffmpeg's `filter_thread` - not a
+delayed heap-metadata explosion in a later, unrelated free(). (The
+`av_frame_unref`/`free` signature documented in §26.1 is not wrong; it is a
+second failure mode of the same underlying corruption. This session's two
+captures both landed the sharper way, which is what pointed at Step 5.)
+
+**Step 5 - the thread list at the moment of the fault is the finding.**
+Both coredumps show `filter_thread` (ffmpeg internally names it `vf#0:0`)
+mid-copy while a *second*, independent OS thread - `encoder_thread`
+(`enc0:0:h264_vaa`) - is concurrently inside this driver's own allocator
+(`bc250_CreateBuffer` -> `calloc` -> `_int_malloc`). This directly answers
+the open question in the task brief: **yes, ffmpeg calls into this driver
+from more than one of its own threads concurrently** (its "sch" scheduler
+runs filter and encode as separate pthreads, connected by frame queues, and
+both threads call VA-API entry points on the same `VADisplay`/driver
+instance without any serialization visible from the driver's side).
+
+**Step 6 - ThreadSanitizer confirms it directly, on the first run.** Built
+`-fsanitize=thread` (not combinable with ASan) at the same Release-matching
+flags, `libtsan.so.2` installed into the `driver-build` container
+(`sudo dnf install -y libtsan`) and copied out the same way as
+`libasan`/`libubsan`. **Every run so far (2/2, 40 frames) reports exactly 4
+warnings**, 3 of them squarely in this driver's own code, all of them races
+between `enc0:0:h264_vaa` (encoder thread) and `vf#0:0` (filter thread) on
+memory `bc250_Initialize()` allocated once at `vaInitialize()` time and never
+protected afterward:
+
+| site | encoder thread (`enc0:0:h264_vaa`) | filter thread (`vf#0:0`) |
+|---|---|---|
+| `va_backend.c:222`/`254`, `bc250_CreateSurfaces` | write @254 | read @222 |
+| `va_backend.c:560` `bc250_DestroyBuffer` vs `:407` `bc250_CreateBuffer` | write @560 (via `vaDestroyBuffer`) | read @407 (via `bc250_CreateImage`<-`bc250_DeriveImage`<-`vaDeriveImage`) |
+| `gpu_compute.c:2377` `gpu_compute_end_picture` vs `:2385` `gpu_compute_submitted_slot` | write @2377 (via `h264_encoder_submit_frame`<-`bc250_EndPicture`) | read @2385 (via `gpu_compute_sync`<-`bc250_SyncSurface`) |
+
+The third row is the clearest single mechanism: `gpu_compute_end_picture()`
+does `ctx->current_buf = (ctx->current_buf + 1) % 2` (the fence
+double-buffer index) on the encoder thread the moment a frame is submitted;
+`gpu_compute_submitted_slot()` reads that same `ctx->current_buf` on the
+filter thread via `bc250_SyncSurface() -> gpu_compute_sync()` - the
+non-slot-explicit sync path that `gpu_compute_sync_slot()`'s own comment
+block (line ~2388) already warns is only safe for a caller that sequences
+itself correctly. Nothing in that comment anticipated a caller on a
+*different OS thread*. The second row is the one that plausibly explains
+Step 4's exact crash site: `bc250_DeriveImage`/`bc250_CreateImage` (the
+hwupload path's route into this driver, on the filter thread) reads the
+same `data->buffers[]` slot fields that `bc250_DestroyBuffer` (encoder
+thread, freeing a previous frame's buffer) is concurrently writing - a
+buffer used to back a derived image is exactly the kind of object whose
+size/pointer, read half-updated, would make the subsequent `memmove` in
+`image_copy_plane` write out of bounds.
+
+A 4th warning (`ralloc_free`/`ralloc_size` inside `libvulkan_radeon.so`,
+Mesa's own RADV allocator) is not in this project's code and is left alone.
+
+`grep -rn 'pthread_mutex\|pthread_rwlock\|atomic_' src/` returns nothing:
+**this driver has no locking anywhere**, and none of its 42
+`ctx->vtable->va*` entry-point assignments in `bc250_Initialize()` document
+an expectation of single-threaded calling.
+
+**Why this was invisible to ASan/UBSan and not to TSan.** Neither
+`-fsanitize=address` nor `=undefined` instruments cross-thread ordering at
+all - they cannot see a data race by design, only memory-safety and
+UB-class violations. `-fsanitize=thread` is a separate, mutually-exclusive
+instrumentation mode built for exactly this. That ASan+UBSan's heavy
+overhead (redzone bookkeeping, poison shadow checks - roughly the reason
+whole classes of race timing shift under it) went 12/12 clean is exactly
+the expected outcome for a race the tool cannot detect and whose timing
+window it also perturbs - it is not evidence against a race, it is close to
+neutral evidence either way. This also now fully explains every asymmetry
+Steps 1-3 and §26.1.1 found: Release-level optimization changes how fast
+each thread's driver-side work completes relative to the other (opening or
+closing the race window) without needing `-march=znver2` specifically; and
+§26.1's own table (0/3 crashes with rate control *on* vs 2/2 with fixed-QP
+CAVLC) is the same effect - RC's extra per-frame work on the encoder thread
+shifts its timing relative to the filter thread's uploads, which changes
+whether the window gets hit, not whether CAVLC itself is implicated. CAVLC
+was never the mechanism; forcing it (and forcing fixed QP, and disabling RC
+drain) was only ever a way of shifting relative thread timing enough to hit
+an unrelated, pre-existing race more often.
+
+**Why no fix is included in this commit.** The diagnosis is well-supported
+(reproduced 2/2 under TSan with the identical 3 driver-side races both
+times; the crash-site coredump and the race sites plausibly connect through
+the buffer/derive-image path). A correct fix is not a small patch: the
+shared state that needs protecting spans at least three files
+(`va_backend.c`'s `surfaces[]`/`buffers[]`/`contexts[]` arrays,
+`gpu_compute.c`'s `current_buf` double-buffer index), and several of this
+driver's own entry points already call each other directly on the same
+call stack (`bc250_DeriveImage` -> `bc250_CreateImage` -> `bc250_CreateBuffer`;
+`bc250_CreateSurfaces` -> `bc250_DestroySurfaces` on its own partial-failure
+path) - a naive mutex taken at the top of every vtable-exposed function
+would self-deadlock on those paths unless made recursive, and even a
+recursive driver-wide lock needs an audit of whether any locked path blocks
+indefinitely on a GPU fence (`gpu_compute_sync_slot()`'s
+`vkWaitForFences(..., UINT64_MAX)` is the specific one already caught
+racing above) in a way that could stall the *other* thread's forward
+progress while it holds the same lock waiting to submit the work being
+waited on. That audit was not done this session. Shipping a lock without it
+risks trading a flaky SIGSEGV for an occasional deadlock/hang, which is
+worse - per this project's own rule, a correct diagnosis with no fix beats
+an unverified one.
+
+**Recommended next steps, in order:** (1) add a single `PTHREAD_MUTEX_RECURSIVE`
+lock to `bc250_driver_data`, held for the duration of every function
+assigned into `ctx->vtable->va*` (42 sites); (2) specifically trace whether
+any locked call path can block on `vkWaitForFences(..., UINT64_MAX)` (or any
+other unbounded wait) while holding it, and if so, narrow the lock's scope
+around that call or restructure so the wait happens unlocked; (3) re-run
+this exact TSan build across 40/60/80 frames and confirm 0 of the 3
+driver-side warnings remain; (4) re-run the plain `-march=znver2` Release
+build 10+ times at 40 frames and confirm the SIGSEGV rate drops to 0/10.
+None of this was done here for lack of confidence in (2) specifically within
+this session's scope.
+
+**Reproduction recipe for whoever resumes:** same repro command as §26.1
+(`BC250_USE_CABAC=0 BC250_FORCE_QP=26 BC250_RC_NOMINAL_DRAIN=1
+BC250_SLICES_PER_FRAME=1`, 1440p `testsrc`, 40+ frames). Build
+`-fsanitize=thread -O3 -march=znver2 -mtune=znver2 -DNDEBUG
+-fno-omit-frame-pointer -g` against the `CMakeLists.txt` `SOURCES` list,
+`LD_PRELOAD` a `libtsan.so.2` copied out of the `driver-build` distrobox
+(`sudo dnf install -y libtsan` there first; the host has neither `libtsan`
+nor `libasan`/`libubsan` installed by default), and run ffmpeg directly on
+the host as usual - the race reports appear without needing any crash to
+occur at all.
+
 ### 26.2 The threading works, and parallelises the wrong coder
 
 Mechanically it does what it should. `testsrc`, forced QP, all-intra, 4
