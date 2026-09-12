@@ -18,7 +18,7 @@ echo -e "${BLUE}${BOLD}        AMD BC-250 System Health & Benchmark         ${NC
 echo -e "${BLUE}======================================================${NC}"
 
 # 1. Hardware Detection
-echo -e "\n${BOLD}[1/4] Checking Hardware Identification...${NC}"
+echo -e "\n${BOLD}[1/5] Checking Hardware Identification...${NC}"
 if command -v lspci &> /dev/null; then
     if lspci -nn | grep -i "1002:13fe" > /dev/null; then
         echo -e "  ${GREEN}✓ APU Silicon: AMD BC-250 (Cyan Skillfish, PCI 1002:13fe)${NC}"
@@ -44,7 +44,7 @@ cores=$(nproc --all 2>/dev/null || echo "Unknown")
 echo -e "  ${GREEN}✓ CPU Processing Threads: ${cores}${NC}"
 
 # 2. Audio Subsystem
-echo -e "\n${BOLD}[2/4] Checking Audio Subsystem...${NC}"
+echo -e "\n${BOLD}[2/5] Checking Audio Subsystem...${NC}"
 if lsmod | grep bc250_audio_fix > /dev/null 2>&1; then
     echo -e "  ${GREEN}✓ bc250_audio_fix kernel module is ACTIVE${NC}"
 else
@@ -58,7 +58,7 @@ if command -v aplay &> /dev/null; then
 fi
 
 # 3. VA-API Driver Installation
-echo -e "\n${BOLD}[3/4] Checking VA-API Compute Driver...${NC}"
+echo -e "\n${BOLD}[3/5] Checking VA-API Compute Driver...${NC}"
 FOUND_DRIVER=0
 DRI_CANDIDATES=(
     "/var/lib/bc250/dri"
@@ -69,13 +69,23 @@ DRI_CANDIDATES=(
     "/usr/lib/dri"
 )
 
+FOUND_DRIVER_DIR=""
 for dri in "${DRI_CANDIDATES[@]}"; do
     if [ -f "$dri/bc250_drv_video.so" ]; then
         echo -e "  ${GREEN}✓ Found driver binary: $dri/bc250_drv_video.so${NC}"
         FOUND_DRIVER=1
+        FOUND_DRIVER_DIR="$dri"
         break
     fi
 done
+
+# libva's own compiled-in default search locations - a driver found in one of
+# these needs no LIBVA_DRIVERS_PATH at all. A driver found anywhere else in
+# DRI_CANDIDATES above (e.g. /var/lib/bc250/dri, used by an immutable-distro
+# install) is invisible to libva unless LIBVA_DRIVERS_PATH names it - checked
+# in step 5 below, since that's a second, independent place this exact
+# env-var-scope class of bug can hide.
+STANDARD_DRI_DIRS=("/usr/lib64/dri" "/usr/lib/x86_64-linux-gnu/dri" "/usr/lib/dri")
 
 if [ $FOUND_DRIVER -eq 0 ]; then
     echo -e "  ${RED}✗ bc250_drv_video.so not found in standard or immutable system DRI paths.${NC}"
@@ -99,7 +109,7 @@ if [ $FOUND_SHADERS -eq 0 ]; then
 fi
 
 # 4. VA-API Capabilities & Benchmark
-echo -e "\n${BOLD}[4/4] Testing VA-API Driver & Running Encode Benchmark...${NC}"
+echo -e "\n${BOLD}[4/5] Testing VA-API Driver & Running Encode Benchmark...${NC}"
 export LIBVA_DRIVER_NAME=bc250
 export LIBVA_DRIVERS_PATH="/var/lib/bc250/dri:/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri"
 
@@ -135,6 +145,113 @@ if command -v ffmpeg &> /dev/null; then
         echo -e "  ${YELLOW}Note: ffmpeg live bench test skipped (no renderD128 permissions or headless).${NC}"
     fi
     rm -f /tmp/bc250_bench.err
+fi
+
+# 5. Real-world service environment check
+#
+# WHY THIS STEP EXISTS: step 4 above deliberately exports LIBVA_DRIVER_NAME
+# (and LIBVA_DRIVERS_PATH) into its OWN subshell before testing vainfo/ffmpeg
+# - so it can only ever prove "the driver works when this variable is set",
+# never "the thing actually trying to stream has this variable set". Those
+# are different questions, and conflating them produces a specific, confusing
+# report: vainfo succeeds standalone, while Sunshine's own libva session
+# still loads radeonsi_drv_video.so and silently falls back to software
+# encoding - because `export FOO=bar` in an interactive shell only affects
+# that shell and its children, and Sunshine is normally a separately-launched
+# process (a systemd --user service, a desktop autostart entry, a Flatpak)
+# that never inherits it. This step checks the ACTUAL running Sunshine
+# process's environment instead of re-testing ours.
+echo -e "\n${BOLD}[5/5] Checking Sunshine's Actual Process Environment...${NC}"
+
+SUNSHINE_PID=$(pgrep -x sunshine 2>/dev/null | head -1)
+
+if [ -z "$SUNSHINE_PID" ]; then
+    echo -e "  ${YELLOW}! Sunshine is not currently running.${NC}"
+    echo -e "    Start it, then re-run this script while it's running - this"
+    echo -e "    check can only inspect a live process's real environment, not"
+    echo -e "    a config file, since Sunshine may be launched several"
+    echo -e "    different ways (systemd --user service, desktop autostart,"
+    echo -e "    Flatpak, manual shell) that each source its environment"
+    echo -e "    differently."
+elif [ ! -r "/proc/$SUNSHINE_PID/environ" ]; then
+    echo -e "  ${YELLOW}! Found Sunshine (PID ${SUNSHINE_PID}) but cannot read${NC}"
+    echo -e "    /proc/${SUNSHINE_PID}/environ (permission denied - it may be"
+    echo -e "    running as a different user). Re-run this script as that user,"
+    echo -e "    or with sudo, for this check to work."
+else
+    echo -e "  ${GREEN}✓ Found running Sunshine process (PID ${SUNSHINE_PID})${NC}"
+
+    SUNSHINE_ENV=$(tr '\0' '\n' < "/proc/$SUNSHINE_PID/environ" 2>/dev/null || true)
+    SUNSHINE_LIBVA_DRIVER=$(echo "$SUNSHINE_ENV" | grep '^LIBVA_DRIVER_NAME=' | cut -d= -f2-)
+    SUNSHINE_LIBVA_PATH=$(echo "$SUNSHINE_ENV" | grep '^LIBVA_DRIVERS_PATH=' | cut -d= -f2-)
+    NEEDS_FIX=0
+
+    if [ "$SUNSHINE_LIBVA_DRIVER" = "bc250" ]; then
+        echo -e "  ${GREEN}✓ Sunshine's own process environment has LIBVA_DRIVER_NAME=bc250${NC}"
+    elif [ -n "$SUNSHINE_LIBVA_DRIVER" ]; then
+        echo -e "  ${RED}✗ Sunshine's process environment has LIBVA_DRIVER_NAME=${SUNSHINE_LIBVA_DRIVER}, NOT bc250.${NC}"
+        echo -e "    It will use libva's default driver resolution (usually"
+        echo -e "    radeonsi) and silently fall back to software encoding -"
+        echo -e "    this is the exact 'vainfo works but Sunshine doesn't' report."
+        NEEDS_FIX=1
+    else
+        echo -e "  ${RED}✗ Sunshine's process environment has NO LIBVA_DRIVER_NAME at all.${NC}"
+        echo -e "    Exporting it in your shell (as step 4 above did, to test the"
+        echo -e "    driver itself) does not reach an already-running or"
+        echo -e "    independently-launched Sunshine process."
+        NEEDS_FIX=1
+    fi
+
+    if [ -n "$FOUND_DRIVER_DIR" ]; then
+        IS_STANDARD_DIR=0
+        for std in "${STANDARD_DRI_DIRS[@]}"; do
+            [ "$std" = "$FOUND_DRIVER_DIR" ] && IS_STANDARD_DIR=1
+        done
+        if [ "$IS_STANDARD_DIR" -eq 0 ]; then
+            case "$SUNSHINE_LIBVA_PATH" in
+                *"$FOUND_DRIVER_DIR"*) ;;
+                *)
+                    echo -e "  ${YELLOW}! The driver was found in a non-default path${NC}"
+                    echo -e "    ($FOUND_DRIVER_DIR), but Sunshine's own"
+                    echo -e "    LIBVA_DRIVERS_PATH does not include it (currently:"
+                    echo -e "    '${SUNSHINE_LIBVA_PATH:-<unset>}'). libva will not search"
+                    echo -e "    this location unless told to - same class of bug as above,"
+                    echo -e "    just a second variable."
+                    NEEDS_FIX=1
+                    ;;
+            esac
+        fi
+    fi
+
+    if [ "$NEEDS_FIX" -eq 1 ]; then
+        echo
+        echo -e "  ${BOLD}Fix:${NC} set the variable(s) in Sunshine's OWN environment, not"
+        echo -e "  your shell. If Sunshine runs as a systemd --user service (see any"
+        echo -e "  unit(s) listed below), the standard way is:"
+        echo -e "    systemctl --user edit <sunshine-unit-name>"
+        echo -e "  and add:"
+        echo -e "    [Service]"
+        echo -e "    Environment=LIBVA_DRIVER_NAME=bc250"
+        if [ -n "$FOUND_DRIVER_DIR" ]; then
+            IS_STANDARD_DIR=0
+            for std in "${STANDARD_DRI_DIRS[@]}"; do
+                [ "$std" = "$FOUND_DRIVER_DIR" ] && IS_STANDARD_DIR=1
+            done
+            [ "$IS_STANDARD_DIR" -eq 0 ] && echo -e "    Environment=LIBVA_DRIVERS_PATH=$FOUND_DRIVER_DIR"
+        fi
+        echo -e "  then: systemctl --user daemon-reload && systemctl --user restart <unit>"
+    fi
+fi
+
+# Surface any systemd --user units that look like Sunshine regardless of the
+# check above - helps identify the exact unit name to edit, since this varies
+# by install method (native package, source build, AppImage wrapper, etc.).
+if command -v systemctl &> /dev/null; then
+    SUNSHINE_UNITS=$(systemctl --user list-units --all --no-legend --plain 2>/dev/null | grep -i sunshine | awk '{print $1}')
+    if [ -n "$SUNSHINE_UNITS" ]; then
+        echo -e "\n  ${BOLD}Detected systemd --user unit(s) matching 'sunshine':${NC}"
+        echo "$SUNSHINE_UNITS" | sed 's/^/    /'
+    fi
 fi
 
 echo -e "\n${GREEN}======================================================${NC}"
