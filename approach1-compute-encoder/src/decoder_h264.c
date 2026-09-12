@@ -1,7 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-3.0-only
  *
  * decoder_h264.c - H.264/AVC Compute Shader Decoder Implementation
  */
@@ -62,7 +62,7 @@ int h264_decoder_decode_frame(h264_decoder_t *decoder,
 
     /* Execute decoding shaders (inverse quant, inverse transform, deblock) */
     gpu_compute_begin_picture(decoder->gpu, output_surface);
-    gpu_compute_dispatch_encode(decoder->gpu, output_surface, decoder->width, decoder->height);
+    gpu_compute_dispatch_encode(decoder->gpu, output_surface, decoder->width, decoder->height, 26, 0, 1);
     gpu_compute_end_picture(decoder->gpu);
     gpu_compute_sync(decoder->gpu);
 

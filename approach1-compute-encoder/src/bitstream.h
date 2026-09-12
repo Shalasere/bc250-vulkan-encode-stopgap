@@ -1,7 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project Contributors
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-3.0-only
  *
  * bitstream.h - Bit-level stream writer for H.264/H.265 NAL output
  *
@@ -60,13 +60,27 @@ extern "C" {
  * Writes bits MSB-first into a byte buffer. Tracks current byte/bit
  * position for sequential writes. Callers should ensure the buffer
  * is large enough before writing (or use bs_bytes_remaining()).
+ *
+ * PERF NOTE (perf/openh264-bitwriter-fallback): bit-level writes are
+ * accumulated in `accum` (an in-register bit buffer, right-justified,
+ * holding exactly `bit_offset` valid pending bits, 0-7) and only stored to
+ * `buffer` once a full byte is available - a single plain store, never a
+ * read-modify-write. This is the same accumulate-then-batch-store technique
+ * Cisco's openh264 uses in its encoder bitstream writer
+ * (codec/common/inc/golomb_common.h, BsWriteBits()/SBitStringAux), adapted
+ * here at byte granularity (openh264 batches to a 32-bit word) - see
+ * bitstream.c's top-of-file comment for the full writeup, including why
+ * byte granularity was chosen for this codebase specifically. `byte_offset`
+ * and `bit_offset` keep their original external meaning/range (0-7); only
+ * the internal write path changed.
  */
 typedef struct bitstream {
     uint8_t *buffer;       /* Output byte buffer */
     size_t   size;         /* Total buffer capacity in bytes */
-    size_t   byte_offset;  /* Current byte position */
-    int      bit_offset;   /* Current bit position within current byte (0-7, 0=MSB) */
+    size_t   byte_offset;  /* Bytes already physically committed to `buffer` */
+    int      bit_offset;   /* Valid pending bits held in `accum`, not yet flushed to `buffer` (0-7, 0=MSB-aligned/empty) */
     bool     overflow;     /* Set if any write exceeded buffer capacity */
+    uint32_t accum;        /* In-register pending-bit accumulator, right-justified low `bit_offset` bits */
 } bitstream_t;
 
 /**
@@ -126,8 +140,50 @@ typedef struct h264_pps {
 /** Initialize a bitstream writer over the given buffer. */
 void bs_init(bitstream_t *bs, uint8_t *buf, size_t size);
 
-/** Write `bits` bits of `val` into the stream (1-32 bits, MSB-first). */
-void bs_write_u(bitstream_t *bs, int bits, uint32_t val);
+/**
+ * Write `bits` bits of `val` into the stream (1-32 bits, MSB-first).
+ *
+ * PERF NOTE (perf/openh264-bitwriter-fallback): defined `static inline`
+ * here, in the header, rather than out-of-line in bitstream.c. Measured on
+ * real board hardware: making the accumulator rewrite in bitstream.c
+ * (see that file's top-of-file comment) an out-of-line function produced
+ * ~0% measured speedup end-to-end, despite a 20,000+-session differential
+ * fuzz test confirming it does strictly less work per call. Root cause,
+ * confirmed by this inlining change actually moving the number (see the
+ * branch's commit log / final report for before/after figures): this
+ * project's CMakeLists.txt does not build with -flto (measured previously
+ * and found not to help - see that file's comment), so cavlc.c's
+ * extremely hot per-bit call sites (cavlc_write_one_level()'s unary
+ * zero-run loops, trailing-one sign bits - millions of calls per second
+ * at real-time frame rates) were paying a full cross-translation-unit
+ * call/return (parameter marshaling, prologue/epilogue) on every single
+ * bit, which dominated over whatever arithmetic happened inside the
+ * function body - so a faster function body alone was invisible until the
+ * call boundary itself was removed by letting the compiler inline this
+ * function directly into cavlc.c's loops. */
+static inline void bs_write_u(bitstream_t *bs, int bits, uint32_t val) {
+    if (bs->overflow || bits <= 0) return;
+    if (bits < 32) {
+        val &= (1u << bits) - 1;
+    }
+
+    uint64_t combined = ((uint64_t)bs->accum << bits) | val;
+    int total_bits = bs->bit_offset + bits;
+    int nbytes = total_bits >> 3;
+    int rem = total_bits & 7;
+
+    for (int i = 0; i < nbytes; i++) {
+        if (bs->byte_offset >= bs->size) {
+            bs->overflow = true;
+            return;
+        }
+        int shift = (nbytes - 1 - i) * 8 + rem;
+        bs->buffer[bs->byte_offset] = (uint8_t)(combined >> shift);
+        bs->byte_offset++;
+    }
+    bs->accum = (rem == 0) ? 0u : (uint32_t)(combined & ((1u << rem) - 1));
+    bs->bit_offset = rem;
+}
 
 /** Write a single bit. */
 static inline void bs_write1(bitstream_t *bs, uint32_t val) {
@@ -161,11 +217,72 @@ void bs_flush(bitstream_t *bs);
 size_t bs_write_nal_header(bitstream_t *bs, int nal_ref_idc, int nal_type);
 
 /**
+ * Write an H.265/HEVC NAL start code + 2-byte HEVC NAL unit header (ITU-T
+ * H.265 7.3.1.2): forbidden_zero_bit(1) + nal_unit_type(6) + nuh_layer_id(6,
+ * always 0 - no scalable/multiview layers here) + nuh_temporal_id_plus1(3,
+ * always 1 - no temporal sublayers). Returns the byte offset where the NAL
+ * payload (RBSP) begins, same contract as bs_write_nal_header() above.
+ */
+size_t bs_write_nal_header_hevc(bitstream_t *bs, int nal_unit_type);
+
+/**
  * Perform RBSP-to-EBSP emulation prevention (stuffs 0x03 bytes).
  * Takes raw RBSP data, outputs EBSP. Returns output size.
  */
 size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size,
                        const uint8_t *src, size_t src_size);
+
+/**
+ * A filler_data_rbsp() NAL (see bs_write_filler()'s doc comment) with zero
+ * 0xFF payload bytes is still 4 (start code) + 1 (NAL header) + 1
+ * (rbsp_trailing_bits' single stop-bit byte) = 6 bytes. A caller wanting to
+ * close a real, positive shortfall smaller than this can't do so with a
+ * filler NAL without overshooting the target - see encoder_h264.c's
+ * maybe_append_filler().
+ */
+#define BS_FILLER_MIN_NAL_SIZE 6
+
+/**
+ * bs_write_filler - write one filler_data_rbsp() NAL unit (ITU-T H.264
+ * SS7.3.2.7 / SS7.4.2.7, nal_unit_type 12) directly into `buf`.
+ *
+ * Spec syntax is: repeated ff_byte (each == 0xFF) for as many bytes as the
+ * caller wants, then rbsp_trailing_bits() (a single '1' stop bit, then
+ * zero-padding to the next byte boundary - since the ff_byte run already
+ * ends byte-aligned, this is exactly one more byte, 0x80). A real decoder
+ * is required (7.4.2.7) to parse and discard this NAL without it affecting
+ * any decoded picture - it exists purely to let an encoder manufacture
+ * bytes it has no coded content for, to hit a genuine constant-bitrate
+ * target. x264 (GPL-2.0-or-later, compatible with this project's
+ * GPL-3.0-only license per "or any later version") does exactly this in
+ * encoder/set.c's x264_filler_write(): a loop of bs_write(s, 8, 0xff)
+ * followed by bs_rbsp_trailing(s) - confirming this is the real mechanism
+ * production encoders use, not an invented alternative. This function was
+ * written independently against the spec text and that confirmation, not
+ * by copying x264's code (its bitstream writer has a different internal
+ * contract than this project's bitstream_t).
+ *
+ * Unlike bs_write_sps()/bs_write_pps()/a coded slice, this NAL's RBSP is
+ * never passed through bs_rbsp_to_ebsp(): every payload byte is either
+ * 0xFF or (the final trailing-bits byte) 0x80, so the "two zero bytes
+ * followed by 0x00-0x03" pattern bs_rbsp_to_ebsp() escapes can never occur
+ * here - RBSP and EBSP are byte-identical for this specific payload shape,
+ * by construction, not by omission.
+ *
+ * @param buf              Destination (start code onward).
+ * @param buf_size         Bytes available at `buf`.
+ * @param filler_ff_count  Number of 0xFF payload bytes to emit (0 is legal:
+ *                         a bare 6-byte filler NAL). Total bytes written is
+ *                         exactly BS_FILLER_MIN_NAL_SIZE + filler_ff_count,
+ *                         or less if `buf_size` is too small (silently
+ *                         truncated the same way every other bs_write_*
+ *                         NAL helper in this file behaves on overflow -
+ *                         callers that can't tolerate truncation must
+ *                         check buf_size themselves first).
+ * @return Total bytes written (may be 0 if buf/buf_size can't even hold
+ *         the NAL header).
+ */
+size_t bs_write_filler(uint8_t *buf, size_t buf_size, size_t filler_ff_count);
 
 /* ===== H.264 parameter set serialization ===== */
 

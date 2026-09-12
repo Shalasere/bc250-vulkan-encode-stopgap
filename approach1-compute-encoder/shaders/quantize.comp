@@ -1,16 +1,38 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 #version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 layout(local_size_x = 32) in; // Wave32 aligned
 
 layout(std430, set = 0, binding = 0) readonly buffer InputCoeffs {
     int coeffs[];
 };
 
+/* Quantized coefficient levels, stored as int16_t (was int32). Verified this
+ * device/driver supports it natively (vulkaninfo: shaderInt16=true,
+ * storageBuffer16BitAccess=true, VK_KHR_16bit_storage present) - this is a
+ * real narrow load/store, not manual bit-packing. Levels are quantized 4x4
+ * transform coefficients for 8-bit video (QpBdOffsetC=0 per this project's
+ * own chroma_qp() comment); ITU-T H.264's coefficient magnitudes at this bit
+ * depth are nowhere near +-32767, so the clamp on write below is defensive
+ * (turn a theoretical overflow into a visible saturation, never a silent
+ * wraparound) rather than an expected code path - see PERF note in
+ * gpu_compute.h's quant_levels_buffer comment for the byte-exact validation
+ * this shipped with. */
 layout(std430, set = 0, binding = 1) writeonly buffer OutputLevels {
-    int levels[];
+    int16_t levels[];
 };
 
-layout(std430, set = 0, binding = 2) writeonly buffer NonZeroCount {
+/* Per-4x4-block nonzero BITMASK (bit p set iff levels[p] != 0), one uint per
+ * block. This used to hold a plain nonzero COUNT that nothing ever read - the
+ * buffer was device-local with no host staging and no CPU consumer. A mask is
+ * strictly more informative than the count (the count is its popcount) and is
+ * what encoder_h264.c actually needs: every "does this block have a nonzero
+ * coefficient in positions [start,end)" question it asks - the P_Skip
+ * decision, cbp_luma, cbp_chroma, the CAVLC per-block early-out - becomes a
+ * bit test against this instead of a fresh 64-byte read out of the (22MB at
+ * 1440p) quant_levels readback. See gpu_compute.h's nz_staging_buffers. */
+layout(std430, set = 0, binding = 2) writeonly buffer NonZeroMask {
     uint nzc[];
 };
 
@@ -47,6 +69,25 @@ int get_pos_type(int idx) {
     return 2;
 }
 
+/* ITU-T H.264 Table 8-15: QPc = f(qPI), qPI = Clip3(-QpBdOffsetC, 51, QPy +
+ * chroma_qp_index_offset). This project always signals
+ * chroma_qp_index_offset = 0 (bitstream.c) and 8-bit-only (QpBdOffsetC = 0),
+ * so qPI reduces to QPy itself, clamped to [0,51] (QPy is already in that
+ * range by construction). Identity for qPI<30; a real decoder applies this
+ * exact table to derive the chroma quantizer from the signaled luma QP -
+ * this was previously MISSING, so chroma was quantized/dequantized at QPy
+ * directly instead of QPc, silently diverging further from a real decoder's
+ * reconstruction as QP rises past 30 (QPc grows much slower than QPy up
+ * there). Confirmed on real hardware: at QP=42 this cost ~13dB of chroma
+ * PSNR against a real decode, while luma was unaffected - see
+ * docs/DEVLOG.md for the measurement. */
+int chroma_qp(int qpy) {
+    if (qpy < 30) return qpy;
+    const int table[22] = {29,30,31,32,32,33,34,34,35,35,36,36,37,37,37,38,38,38,39,39,39,39};
+    int idx = qpy - 30;
+    return table[idx < 22 ? idx : 21];
+}
+
 void main() {
     uint mb_x = gl_WorkGroupID.x;
     uint mb_y = gl_WorkGroupID.y;
@@ -58,12 +99,16 @@ void main() {
     uint mb_idx = mb_y * pcs.width_in_mbs + mb_x;
     uint global_block_idx = mb_idx * 24 + block_idx;
 
-    int qp_per = int(pcs.qp / 6);
-    int qp_rem = int(pcs.qp % 6);
+    /* Blocks 0-15 are luma (4x4 each), 16-23 are chroma (8x 4x4: 4 Cb + 4
+     * Cr) - see this file's callers / the file-top layout comment in
+     * reconstruct.comp. Chroma must quantize at QPc, not QPy. */
+    int qp_used = (block_idx < 16) ? int(pcs.qp) : chroma_qp(int(pcs.qp));
+    int qp_per = qp_used / 6;
+    int qp_rem = qp_used % 6;
 
     // Rounding offset: 1/3 for intra, 1/6 for inter
     int f = (1 << (15 + qp_per)) / (pcs.is_intra == 1 ? 3 : 6);
-    uint count = 0;
+    uint nz_mask = 0;
 
     for (int i = 0; i < 16; i++) {
         int coeff = coeffs[global_block_idx * 16 + i];
@@ -74,9 +119,9 @@ void main() {
         int level = (abs_coeff * MF[qp_rem][pos_type] + f) >> (15 + qp_per);
         level *= sign;
 
-        levels[global_block_idx * 16 + i] = level;
-        if (level != 0) count++;
+        levels[global_block_idx * 16 + i] = int16_t(clamp(level, -32768, 32767));
+        if (level != 0) nz_mask |= (1u << uint(i));
     }
 
-    nzc[global_block_idx] = count;
+    nzc[global_block_idx] = nz_mask;
 }

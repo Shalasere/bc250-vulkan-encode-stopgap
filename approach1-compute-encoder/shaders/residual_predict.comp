@@ -1,0 +1,631 @@
+/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+#version 450
+layout(local_size_x = 256) in; // one thread per luma pixel (16x16 MB)
+
+/*
+ * residual_predict.comp - real intra/inter prediction + residual generation.
+ *
+ * Replaces the constant-128 stopgap that used to live in
+ * motion_estimation.comp (see that shader's remaining comments / git history
+ * for the prior state). This is the first stage in the pipeline that
+ * actually predicts pixels instead of transmitting raw source amplitude as
+ * "residual":
+ *
+ *  - I-slices (pcs.is_intra==1): real H.264 8.3.3 Intra_16x16 prediction
+ *    (DC/Vertical/Horizontal/Plane), mode chosen per-MB by whichever
+ *    candidate has the lowest SAD against the real source pixels - the same
+ *    "no rate-distortion, SAD-only" mode decision a real encoder's fast path
+ *    uses. This ALSO resolves what would otherwise be a circular dependency:
+ *    mode selection used to run on the CPU AFTER DCT/quantize, derived from a
+ *    nonzero-coefficient-count heuristic - impossible once the residual
+ *    itself depends on knowing the mode first. Mode decision now happens
+ *    here, before DCT, from real pixel-domain SAD, and is published to
+ *    PredModeOut for the CPU-side CAVLC header writer to read back verbatim
+ *    instead of re-deriving it (see encoder_h264.c's gpu_pred_mode_i16()).
+ *    Chroma NOW ALSO gets a real SAD-based mode decision (ITU-T 8.3.4
+ *    DC/Horizontal/Vertical/Plane - see this file's "chroma mode-decision"
+ *    comment near the shared variable declarations below), packed into
+ *    PredModeOut's bits 2-3 and read back via encoder_h264.c's
+ *    gpu_chroma_pred_mode(). Previously hardcoded to DC-only unconditionally
+ *    ("real directional chroma modes are not implemented") - that was the
+ *    root cause of the gradient-boundary row-wide artifact investigated on
+ *    fix/gradient-boundary-mc-v2: DC-only blends a macroblock's ENTIRE top
+ *    neighbor row into its chroma prediction even when that neighbor is
+ *    wildly different content (e.g. the scrolling gradient bar sitting
+ *    directly above a macroblock row of otherwise-static color bars),
+ *    producing a badly wrong chroma color already at the first IDR frame
+ *    that then persists for the rest of the GOP once written into recon.
+ *
+ *  - P-slices (pcs.is_intra==0): real motion-compensated LUMA and CHROMA
+ *    residual using the ACTUAL per-MB motion vector this pipeline computes
+ *    in motion_estimation.comp (mv_buffer) - previously computed but never
+ *    consumed for residual at all, wastefully duplicated by a separate,
+ *    much cruder CPU-side heuristic (encoder_h264.c's old
+ *    choose_mv_heuristic).
+ *
+ *    SUB-PEL UPDATE: motion_estimation.comp now refines its integer-pel
+ *    diamond-search winner down to real quarter-pel precision (half-pel via
+ *    the spec 6-tap filter, then quarter-pel via averaging - see that
+ *    shader's top-of-file comment) and stores mv_buffer in QUARTER-LUMA-PEL
+ *    units directly. This shader must reconstruct the EXACT same
+ *    interpolated sample a real H.264 decoder would (ITU-T 8.4.2.2.1) at
+ *    that fractional position, since this reconstruction is both what gets
+ *    subtracted to form the transmitted residual AND (via reconstruct.comp)
+ *    what becomes next frame's reference - any mismatch here would corrupt
+ *    every P-frame that follows. See interp_luma_qpel() below (duplicated
+ *    from motion_estimation.comp's identical function - no #include support
+ *    in this build's shader compilation, see that shader's comment for the
+ *    full derivation). Chroma uses direct eighth-pel bilinear interpolation
+ *    (no 6-tap filter - see the chroma motion-compensation note below).
+ *
+ * DELIBERATE SIMPLIFICATION (neighbor pixel source): a real H.264 decoder
+ * reconstructs macroblocks in strict raster order within a slice, so intra
+ * prediction reads already-RECONSTRUCTED (post-residual) neighbor pixels.
+ * There IS now a real reconstruction stage (see reconstruct.comp, dispatched
+ * after quantize.comp) that dequantizes+inverse-transforms each MB's
+ * residual and adds it back to the prediction value this shader computed
+ * (retained via PredOut/binding 7 below), and gpu_compute.c populates
+ * recon_image from THAT for the next frame's P-slice inter prediction. But
+ * this shader still dispatches every MB of the frame in parallel with no
+ * cross-MB ordering, so within a single frame there is still no notion of
+ * "already decoded" neighbor pixels for INTRA prediction specifically (that
+ * would require diagonal-wavefront MB ordering - see reconstruct.comp/
+ * gpu_compute.c for whether that has been implemented). This shader instead
+ * reads the CURRENT
+ * (source) frame's neighbor MB pixels directly from currentImage/currentUV -
+ * not bit-exact with what a real decoder reconstructs (whose neighbors carry
+ * quantization error this encoder's neighbor pixels don't), but it is a
+ * correctly-formed, fully parallel, real per-MB prediction that captures
+ * actual picture structure - a large accuracy improvement over the constant
+ * predictor it replaces, in the same spirit as this codebase's other
+ * documented simplifications (see quantize_dc()'s comment in
+ * encoder_h264.c).
+ *
+ * P-slice chroma is now real motion-compensated residual too (see
+ * referenceUV below), using real eighth-chroma-pel bilinear interpolation
+ * (ITU-T 8.4.1.4 + 8.4.2.2.2): mvCLX = mvLX numerically unchanged for 4:2:0
+ * chroma (no /2, no separate derivation) - since mv_buffer's value is now
+ * in quarter-LUMA-pel units and chroma sits at half the luma resolution,
+ * applying that SAME raw integer value against the chroma pixel grid is
+ * exactly what gives eighth-CHROMA-pel precision there, per spec. I-slice
+ * chroma is unchanged (spatial DC, see 8.3.4.1 below).
+ *
+ * SLICE BOUNDARIES: this project's own installed environment defaults to
+ * BC250_SLICES_PER_FRAME=4 (see encoder_h264.c), so multi-slice is the
+ * common case, not an edge case - and the CPU already had to fix exactly
+ * this failure mode once before (see git history: ffmpeg rejects
+ * Intra_16x16_Vertical/Horizontal/Plane with "left/top block unavailable
+ * for requested intra mode" when the encoder picks one of those modes
+ * using a neighbor MB that belongs to a different slice, even though that
+ * neighbor is otherwise a normal in-picture MB). The GPU dispatches the
+ * whole frame in one pass with no notion of "the current slice" built in,
+ * so this shader is given pcs.num_slices and independently recomputes
+ * which slice a macroblock belongs to (slice_of() below), replicating the
+ * CPU's `start_mb = s*total_mbs/num_slices` partitioning exactly (a
+ * standard floor-partition identity: the slice containing MB m is
+ * floor(m*num_slices/total_mbs), the inverse of the CPU's boundary
+ * formula). top_avail/left_avail require BOTH frame-boundary and
+ * same-slice membership. The diagonal top-left neighbor used only to fill
+ * in the Plane predictor's p[-1,-1] corner sample is NOT separately
+ * slice-gated (it can only ever be read once top_avail && left_avail are
+ * both true, i.e. Plane is already legally selectable per spec - getting
+ * the corner sample itself from the wrong slice at worst makes Plane's
+ * SAD estimate marginally less accurate, it can never make Plane, Vertical
+ * or Horizontal illegally selectable).
+ */
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;   // Y, current (source) frame
+layout(set = 0, binding = 1, rg8) uniform readonly image2D currentUV;    // Cb/Cr, current (source) frame, NV12 half-res
+layout(set = 0, binding = 2, r8) uniform readonly image2D referenceImage; // Y, previous frame (for P MC)
+layout(set = 0, binding = 6, rg8) uniform readonly image2D referenceUV;  // Cb/Cr, previous frame (for P chroma MC)
+
+struct MotionVector {
+    ivec2 mv;
+    uint sad;
+};
+layout(std430, set = 0, binding = 3) readonly buffer MVs {
+    MotionVector mvs[];
+};
+
+layout(std430, set = 0, binding = 4) writeonly buffer OutputResidual {
+    int res[];
+};
+
+layout(std430, set = 0, binding = 5) writeonly buffer PredModeOut {
+    uint pred_modes[];
+};
+
+/* Retained prediction value per residual position, same indexing/layout as
+ * OutputResidual (res[]) above: global_block_idx*16 + pos_in_block. Added so
+ * reconstruct.comp can add the EXACT SAME prediction value back to the
+ * dequantized/inverse-transformed residual, instead of recomputing
+ * prediction independently (which would risk the two paths drifting out of
+ * sync - see reconstruct.comp's top-of-file comment). */
+layout(std430, set = 0, binding = 7) writeonly buffer PredOut {
+    int pred_out[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint frame_width;
+    uint frame_height;
+    uint width_in_mbs;
+    uint height_in_mbs;
+    uint qp;
+    uint is_intra;
+    uint color_space;
+    uint lambda_motion;
+    uint num_slices;
+} pcs;
+
+/* Which slice MB `mb` belongs to, replicating the CPU's
+ * start_mb(s) = floor(s*total_mbs/num_slices) partitioning - see the
+ * SLICE BOUNDARIES note above. */
+uint slice_of(uint mb) {
+    uint total_mbs = pcs.width_in_mbs * pcs.height_in_mbs;
+    return (mb * pcs.num_slices) / total_mbs;
+}
+
+/* Intra 16x16 prediction modes - MUST match cavlc.h's H264_I16x16_* values,
+ * since pred_modes[] is read directly as the CAVLC header's pred_mode. */
+const uint MODE_VERT  = 0u;
+const uint MODE_HORIZ = 1u;
+const uint MODE_DC    = 2u;
+const uint MODE_PLANE = 3u;
+
+shared int current_mb[16][16];
+shared int top_row[16];
+shared int left_col[16];
+shared int corner;
+shared bool top_avail, left_avail;
+
+shared int dc_value;
+shared int plane_a, plane_b, plane_c;
+shared uint sad_dc, sad_v, sad_h, sad_plane;
+shared uint chosen_mode;
+
+shared ivec2 top_uv[8];
+shared ivec2 left_uv[8];
+shared ivec2 corner_uv;
+shared int cb_dc[4], cr_dc[4];
+shared int cur_cb[8][8], cur_cr[8][8];
+
+/*
+ * Real chroma intra prediction mode decision (ITU-T 8.3.4), added to fix the
+ * gradient-boundary row-wide artifact: this used to be DC-only,
+ * unconditionally, for every intra macroblock (see this file's original
+ * top-of-file design comment). DC blends the WHOLE top row and WHOLE left
+ * column of neighbor chroma samples - fine when a macroblock's neighbors are
+ * reasonably similar to its own content, badly wrong when they are not, e.g.
+ * a macroblock immediately below quality_test.sh's horizontally-scrolling
+ * rainbow gradient bar: its TOP neighbor row is genuine, highly-saturated,
+ * fast-changing gradient content, while the macroblock's OWN true content is
+ * a flat, static color-bar/circle region completely unrelated to that
+ * neighbor. Averaging that mismatched top-neighbor chroma into the DC value
+ * produces a badly wrong reconstructed chroma color on the very first (IDR)
+ * frame of the affected macroblocks - confirmed directly on real board
+ * output (BC250_DUMP_RECON_FRAMES showed wrong chroma already present at the
+ * first IDR frame, e.g. true (Y,U,V)=(170,167,13) reconstructing as
+ * (168,162,230) at mbx=21,mby=59 - a full color flip, cyan vs red-ish). Once
+ * wrong at the IDR, that macroblock's near-static true content gives every
+ * later P-frame almost no residual to correct it with (see
+ * encoder_h264.c's mv_predictor doc comment on P-frames of static content
+ * legitimately coding near-zero residual), so the bad color just persists,
+ * slowly drifting, for the rest of the GOP - exactly matching the reported
+ * "entire macroblock row bordering the gradient bar" artifact, independent
+ * of which color region a given macroblock in that row belongs to.
+ *
+ * Fix: give chroma the same real SAD-based mode decision luma I16x16 already
+ * has above (DC/Horizontal/Vertical/Plane, ITU-T 8.3.4.1-8.3.4.4) instead of
+ * hardcoding DC, so a macroblock whose top neighbor is a bad predictor (like
+ * this one) can fall back to its left neighbor (Horizontal) or otherwise
+ * whichever real candidate best matches its own true content. The chosen
+ * mode is packed into pred_modes[mb_idx] bits 2-3 (luma's own I16x16 mode
+ * already occupies bits 0-1) and transmitted via intra_chroma_pred_mode in
+ * the bitstream (see encoder_h264.c's gpu_chroma_pred_mode()/
+ * cavlc_write_mb_i16x16_header() call) - required so a real decoder
+ * reconstructs with the SAME mode this shader assumed, not always DC.
+ */
+shared int cb_plane_a, cb_plane_b, cb_plane_c;
+shared int cr_plane_a, cr_plane_b, cr_plane_c;
+shared uint csad_dc, csad_h, csad_v, csad_plane;
+shared uint chosen_cmode;
+
+int clip1(int v) { return clamp(v, 0, 255); }
+
+/*
+ * Real ITU-T H.264 8.4.2.2.1 quarter-pel luma interpolation - 1:1 duplicate
+ * of motion_estimation.comp's identical function (see that shader's
+ * top-of-file comment for the full derivation/labeling; no #include support
+ * in this project's shader build, see the SUB-PEL UPDATE note above). Reads
+ * `referenceImage` directly with edge clamping. `ref_qpel` is an absolute
+ * sample position in quarter-luma-sample units (pixel*4 + fractional 0..3).
+ */
+int sampleRefY(ivec2 p) {
+    ivec2 c = clamp(p, ivec2(0), ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1));
+    return int(round(imageLoad(referenceImage, c).r * 255.0));
+}
+int hpel_h_raw(int x, int y) {
+    return sampleRefY(ivec2(x - 2, y)) - 5 * sampleRefY(ivec2(x - 1, y)) + 20 * sampleRefY(ivec2(x, y))
+         + 20 * sampleRefY(ivec2(x + 1, y)) - 5 * sampleRefY(ivec2(x + 2, y)) + sampleRefY(ivec2(x + 3, y));
+}
+int hpel_v_raw(int x, int y) {
+    return sampleRefY(ivec2(x, y - 2)) - 5 * sampleRefY(ivec2(x, y - 1)) + 20 * sampleRefY(ivec2(x, y))
+         + 20 * sampleRefY(ivec2(x, y + 1)) - 5 * sampleRefY(ivec2(x, y + 2)) + sampleRefY(ivec2(x, y + 3));
+}
+int clip_round5(int v) { return clip1((v + 16) >> 5); }
+int qavg(int a, int b) { return (a + b + 1) >> 1; }
+
+int interp_luma_qpel(ivec2 ref_qpel) {
+    int ix = ref_qpel.x >> 2, iy = ref_qpel.y >> 2;
+    int fx = ref_qpel.x - (ix << 2), fy = ref_qpel.y - (iy << 2); /* always 0..3 */
+
+    if (fx == 0 && fy == 0) return sampleRefY(ivec2(ix, iy)); /* G: no filtering */
+
+    int G = sampleRefY(ivec2(ix, iy));
+    int H = sampleRefY(ivec2(ix + 1, iy));
+    int M = sampleRefY(ivec2(ix, iy + 1));
+    int b = clip_round5(hpel_h_raw(ix, iy));
+    int h = clip_round5(hpel_v_raw(ix, iy));
+    int m = clip_round5(hpel_v_raw(ix + 1, iy));
+    int s = clip_round5(hpel_h_raw(ix, iy + 1));
+    int j1 = hpel_h_raw(ix, iy - 2) - 5 * hpel_h_raw(ix, iy - 1) + 20 * hpel_h_raw(ix, iy)
+           + 20 * hpel_h_raw(ix, iy + 1) - 5 * hpel_h_raw(ix, iy + 2) + hpel_h_raw(ix, iy + 3);
+    int j = clip1((j1 + 512) >> 10);
+
+    switch (fy * 4 + fx) {
+        case 1:  return qavg(G, b);   /* a (0.25, 0)    */
+        case 2:  return b;            /* b (0.5,  0)    */
+        case 3:  return qavg(b, H);   /* c (0.75, 0)    */
+        case 4:  return qavg(G, h);   /* d (0,    0.25) */
+        case 5:  return qavg(b, h);   /* e (0.25, 0.25) - diagonal halves */
+        case 6:  return qavg(b, j);   /* f (0.5,  0.25) */
+        case 7:  return qavg(b, m);   /* g (0.75, 0.25) - diagonal halves */
+        case 8:  return h;            /* h (0,    0.5)  */
+        case 9:  return qavg(h, j);   /* i (0.25, 0.5)  */
+        case 10: return j;            /* j (0.5,  0.5)  */
+        case 11: return qavg(j, m);   /* k (0.75, 0.5)  */
+        case 12: return qavg(h, M);   /* n (0,    0.75) */
+        case 13: return qavg(h, s);   /* p (0.25, 0.75) - diagonal halves */
+        case 14: return qavg(j, s);   /* q (0.5,  0.75) */
+        case 15: return qavg(m, s);   /* r (0.75, 0.75) - diagonal halves */
+    }
+    return G; /* unreachable */
+}
+
+void main() {
+    uint mb_x = gl_WorkGroupID.x;
+    uint mb_y = gl_WorkGroupID.y;
+    if (mb_x >= pcs.width_in_mbs || mb_y >= pcs.height_in_mbs) return;
+
+    uint mb_idx = mb_y * pcs.width_in_mbs + mb_x;
+    uint local_id = gl_LocalInvocationIndex;
+    ivec2 mb_pos = ivec2(mb_x * 16, mb_y * 16);
+    ivec2 frame_max = ivec2(int(pcs.frame_width) - 1, int(pcs.frame_height) - 1);
+    /* Plain buffer read, no synchronization needed - every thread computes
+     * the same value redundantly. Unused (but still safely readable) on
+     * I-slices. Used by both the luma and chroma P-paths below. */
+    ivec2 mb_mv = mvs[mb_idx].mv;
+
+    uint px = local_id % 16u;
+    uint py = local_id / 16u;
+    ivec2 coord = clamp(mb_pos + ivec2(px, py), ivec2(0), frame_max);
+    current_mb[py][px] = int(round(imageLoad(currentImage, coord).r * 255.0));
+
+    uint my_slice = slice_of(mb_idx);
+    bool top_exists = mb_y > 0u;
+    bool left_exists = mb_x > 0u;
+
+    if (local_id == 0u) {
+        /* Same-slice check, not just frame-boundary - see the SLICE
+         * BOUNDARIES note above. */
+        top_avail = top_exists && (slice_of(mb_idx - pcs.width_in_mbs) == my_slice);
+        left_avail = left_exists && (slice_of(mb_idx - 1u) == my_slice);
+    }
+
+    /* Top/left/corner neighbor samples come from the CURRENT frame - see the
+     * "neighbor pixel source" simplification note above. */
+    if (local_id < 16u) {
+        ivec2 tc = clamp(mb_pos + ivec2(local_id, -1), ivec2(0), frame_max);
+        top_row[local_id] = top_exists ? int(round(imageLoad(currentImage, tc).r * 255.0)) : 128;
+        ivec2 lc = clamp(mb_pos + ivec2(-1, local_id), ivec2(0), frame_max);
+        left_col[local_id] = left_exists ? int(round(imageLoad(currentImage, lc).r * 255.0)) : 128;
+    }
+    if (local_id == 0u) {
+        ivec2 cc = clamp(mb_pos + ivec2(-1, -1), ivec2(0), frame_max);
+        corner = (left_exists && top_exists) ? int(round(imageLoad(currentImage, cc).r * 255.0)) : 128;
+    }
+
+    barrier();
+
+    if (pcs.is_intra == 1u) {
+        /* --- Candidate predictor construction (thread 0 only - cheap, 16
+         * samples per candidate at most) --- */
+        if (local_id == 0u) {
+            int sum_top = 0, sum_left = 0;
+            for (int i = 0; i < 16; i++) { sum_top += top_row[i]; sum_left += left_col[i]; }
+
+            if (top_avail && left_avail) dc_value = (sum_top + sum_left + 16) >> 5;
+            else if (top_avail) dc_value = (sum_top + 8) >> 4;
+            else if (left_avail) dc_value = (sum_left + 8) >> 4;
+            else dc_value = 128;
+
+            if (top_avail && left_avail) {
+                /* ITU-T H.264 8.3.3.4 Intra_16x16_Plane. */
+                /* p[6-x',-1] runs off the left edge of top_row (index -1) at
+                 * x'==7 and must read the corner sample there instead - same
+                 * for p[-1,6-y'] into left_col at y'==7. */
+                int H = 0, V = 0;
+                for (int xp = 0; xp < 8; xp++) {
+                    int left_sample = (6 - xp >= 0) ? top_row[6 - xp] : corner;
+                    H += (xp + 1) * (top_row[8 + xp] - left_sample);
+                }
+                for (int yp = 0; yp < 8; yp++) {
+                    int above_sample = (6 - yp >= 0) ? left_col[6 - yp] : corner;
+                    V += (yp + 1) * (left_col[8 + yp] - above_sample);
+                }
+                plane_a = 16 * (left_col[15] + top_row[15]);
+                plane_b = (5 * H + 32) >> 6;
+                plane_c = (5 * V + 32) >> 6;
+            }
+
+            sad_dc = 0u; sad_v = 0u; sad_h = 0u; sad_plane = 0u;
+        }
+        barrier();
+
+        int src = current_mb[py][px];
+        atomicAdd(sad_dc, uint(abs(src - dc_value)));
+        if (top_avail) atomicAdd(sad_v, uint(abs(src - top_row[px])));
+        if (left_avail) atomicAdd(sad_h, uint(abs(src - left_col[py])));
+        if (top_avail && left_avail) {
+            int pv = clip1((plane_a + plane_b * (int(px) - 7) + plane_c * (int(py) - 7) + 16) >> 5);
+            atomicAdd(sad_plane, uint(abs(src - pv)));
+        }
+        barrier();
+
+        if (local_id == 0u) {
+            uint best = sad_dc;
+            uint mode = MODE_DC;
+            if (top_avail && sad_v < best) { best = sad_v; mode = MODE_VERT; }
+            if (left_avail && sad_h < best) { best = sad_h; mode = MODE_HORIZ; }
+            if (top_avail && left_avail && sad_plane < best) { best = sad_plane; mode = MODE_PLANE; }
+            chosen_mode = mode;
+            pred_modes[mb_idx] = mode;
+        }
+        barrier();
+
+        int pred_val;
+        if (chosen_mode == MODE_VERT) pred_val = top_row[px];
+        else if (chosen_mode == MODE_HORIZ) pred_val = left_col[py];
+        else if (chosen_mode == MODE_PLANE)
+            pred_val = clip1((plane_a + plane_b * (int(px) - 7) + plane_c * (int(py) - 7) + 16) >> 5);
+        else
+            pred_val = dc_value;
+
+        int residual = src - pred_val;
+
+        uint bx = px / 4u, by = py / 4u;
+        uint block = by * 4u + bx;
+        uint pos_in_block = (py % 4u) * 4u + (px % 4u);
+        uint global_block_idx = mb_idx * 24u + block;
+        res[global_block_idx * 16u + pos_in_block] = residual;
+        pred_out[global_block_idx * 16u + pos_in_block] = pred_val;
+    } else {
+        /* P16x16: real motion-compensated luma residual using this MB's
+         * actual searched motion vector, now real quarter-pel precision
+         * (mb_mv is in quarter-luma-pel units - see the SUB-PEL UPDATE note
+         * above and interp_luma_qpel()). */
+        if (local_id == 0u) pred_modes[mb_idx] = MODE_DC; /* unused by the CPU P-path; keep the buffer defined */
+
+        ivec2 ref_qpel = (mb_pos + ivec2(px, py)) * 4 + mb_mv;
+        int ref_val = interp_luma_qpel(ref_qpel);
+        int residual = current_mb[py][px] - ref_val;
+
+        uint bx = px / 4u, by = py / 4u;
+        uint block = by * 4u + bx;
+        uint pos_in_block = (py % 4u) * 4u + (px % 4u);
+        uint global_block_idx = mb_idx * 24u + block;
+        res[global_block_idx * 16u + pos_in_block] = residual;
+        pred_out[global_block_idx * 16u + pos_in_block] = ref_val;
+    }
+
+    /* --- Chroma: I-slices use DC-only prediction from current-frame
+     * spatial neighbors (computed here); P-slices use real motion
+     * compensation via referenceUV (applied below, per-pixel, alongside
+     * luma's equivalent). 128 threads needed (4 blocks * 2 planes * 16
+     * positions); this workgroup has 256, so gate on local_id < 128. --- */
+    ivec2 mb_pos_uv = mb_pos / 2;
+    ivec2 uv_max = ivec2(int(pcs.frame_width) / 2 - 1, int(pcs.frame_height) / 2 - 1);
+
+    if (local_id < 8u) {
+        ivec2 tc = clamp(mb_pos_uv + ivec2(local_id, -1), ivec2(0), uv_max);
+        vec2 tv = top_avail ? imageLoad(currentUV, tc).rg : vec2(128.0 / 255.0);
+        top_uv[local_id] = ivec2(round(tv * 255.0));
+
+        ivec2 lc = clamp(mb_pos_uv + ivec2(-1, local_id), ivec2(0), uv_max);
+        vec2 lv = left_avail ? imageLoad(currentUV, lc).rg : vec2(128.0 / 255.0);
+        left_uv[local_id] = ivec2(round(lv * 255.0));
+    }
+    if (local_id == 0u) {
+        /* Corner sample p[-1,-1], needed by the chroma Plane predictor
+         * (ITU-T 8.3.4.4) exactly like luma's `corner` above. */
+        ivec2 cc = clamp(mb_pos_uv + ivec2(-1, -1), ivec2(0), uv_max);
+        vec2 cv = (left_avail && top_avail) ? imageLoad(currentUV, cc).rg : vec2(128.0 / 255.0);
+        corner_uv = ivec2(round(cv * 255.0));
+    }
+    if (pcs.is_intra == 1u && local_id < 64u) {
+        /* Full current 8x8 Cb/Cr blocks, needed to SAD-score all 4 chroma
+         * mode candidates against this macroblock's REAL own content (see
+         * the chroma mode-decision comment above) - P-slices don't need
+         * this (chroma residual there is always real MC, no mode choice). */
+        uint cx = local_id % 8u, cy = local_id / 8u;
+        ivec2 cuv = clamp(mb_pos_uv + ivec2(cx, cy), ivec2(0), uv_max);
+        vec2 uv_sample = imageLoad(currentUV, cuv).rg;
+        ivec2 s255 = ivec2(round(uv_sample * 255.0));
+        cur_cb[cy][cx] = s255.x;
+        cur_cr[cy][cx] = s255.y;
+    }
+    barrier();
+
+    if (pcs.is_intra == 1u && local_id == 0u) {
+        /* Per ITU-T H.264 8.3.4.1: block (xO,yO) in {(0,0),(4,0),(0,4),(4,4)}
+         * of each 8x8 chroma plane, sub-block index blk = (yO/4)*2+(xO/4). */
+        for (int plane = 0; plane < 2; plane++) {
+            int sum_top4[2], sum_left4[2]; /* [0]=first 4 samples, [1]=last 4 */
+            sum_top4[0] = top_uv[0][plane] + top_uv[1][plane] + top_uv[2][plane] + top_uv[3][plane];
+            sum_top4[1] = top_uv[4][plane] + top_uv[5][plane] + top_uv[6][plane] + top_uv[7][plane];
+            sum_left4[0] = left_uv[0][plane] + left_uv[1][plane] + left_uv[2][plane] + left_uv[3][plane];
+            sum_left4[1] = left_uv[4][plane] + left_uv[5][plane] + left_uv[6][plane] + left_uv[7][plane];
+
+            int dc_tl, dc_tr, dc_bl, dc_br;
+            /* TL (0,0): prefer both, else either, else 128 */
+            if (top_avail && left_avail) dc_tl = (sum_top4[0] + sum_left4[0] + 4) >> 3;
+            else if (top_avail) dc_tl = (sum_top4[0] + 2) >> 2;
+            else if (left_avail) dc_tl = (sum_left4[0] + 2) >> 2;
+            else dc_tl = 128;
+
+            /* TR (4,0): prefer top[4..7], else left[0..3], else 128 */
+            if (top_avail) dc_tr = (sum_top4[1] + 2) >> 2;
+            else if (left_avail) dc_tr = (sum_left4[0] + 2) >> 2;
+            else dc_tr = 128;
+
+            /* BL (0,4): prefer left[4..7], else top[0..3], else 128 */
+            if (left_avail) dc_bl = (sum_left4[1] + 2) >> 2;
+            else if (top_avail) dc_bl = (sum_top4[0] + 2) >> 2;
+            else dc_bl = 128;
+
+            /* BR (4,4): prefer both, else either, else 128 */
+            if (top_avail && left_avail) dc_br = (sum_top4[1] + sum_left4[1] + 4) >> 3;
+            else if (top_avail) dc_br = (sum_top4[1] + 2) >> 2;
+            else if (left_avail) dc_br = (sum_left4[1] + 2) >> 2;
+            else dc_br = 128;
+
+            if (plane == 0) { cb_dc[0] = dc_tl; cb_dc[1] = dc_tr; cb_dc[2] = dc_bl; cb_dc[3] = dc_br; }
+            else            { cr_dc[0] = dc_tl; cr_dc[1] = dc_tr; cr_dc[2] = dc_bl; cr_dc[3] = dc_br; }
+
+            /* ITU-T H.264 8.3.4.4 Intra_Chroma_Plane, one instance per plane
+             * (unlike luma's single 16x16 Plane, chroma's 8x8 block uses the
+             * 17/(x-3)/(y-3) constants below - see spec for the derivation).
+             * Only meaningful when top_avail && left_avail (same gate as
+             * luma Plane); left uncomputed (and un-selectable, see the SAD
+             * loop below) otherwise. */
+            if (top_avail && left_avail) {
+                int H = 0, V = 0;
+                for (int xp = 0; xp < 4; xp++) {
+                    int left_sample = (2 - xp >= 0) ? top_uv[2 - xp][plane] : corner_uv[plane];
+                    H += (xp + 1) * (top_uv[4 + xp][plane] - left_sample);
+                }
+                for (int yp = 0; yp < 4; yp++) {
+                    int above_sample = (2 - yp >= 0) ? left_uv[2 - yp][plane] : corner_uv[plane];
+                    V += (yp + 1) * (left_uv[4 + yp][plane] - above_sample);
+                }
+                int pa = 16 * (left_uv[7][plane] + top_uv[7][plane]);
+                int pb = (17 * H + 16) >> 5;
+                int pc = (17 * V + 16) >> 5;
+                if (plane == 0) { cb_plane_a = pa; cb_plane_b = pb; cb_plane_c = pc; }
+                else            { cr_plane_a = pa; cr_plane_b = pb; cr_plane_c = pc; }
+            }
+        }
+
+        /* SAD-score all 4 chroma candidates against this MB's REAL current
+         * 8x8 Cb+Cr content (combined across both planes - ITU-T 8.3.4
+         * chooses ONE intra_chroma_pred_mode for both planes together, not
+         * independently). Cheap: 64 positions x 2 planes, thread 0 only,
+         * same pattern this file already uses for luma's DC/Plane setup
+         * above. */
+        csad_dc = 0u; csad_h = 0u; csad_v = 0u; csad_plane = 0u;
+        for (int cy = 0; cy < 8; cy++) {
+            for (int cx = 0; cx < 8; cx++) {
+                int sub = (cy / 4) * 2 + (cx / 4);
+                int cb_src = cur_cb[cy][cx], cr_src = cur_cr[cy][cx];
+                csad_dc += uint(abs(cb_src - cb_dc[sub])) + uint(abs(cr_src - cr_dc[sub]));
+                if (top_avail) {
+                    csad_v += uint(abs(cb_src - top_uv[cx][0])) + uint(abs(cr_src - top_uv[cx][1]));
+                }
+                if (left_avail) {
+                    csad_h += uint(abs(cb_src - left_uv[cy][0])) + uint(abs(cr_src - left_uv[cy][1]));
+                }
+                if (top_avail && left_avail) {
+                    int cb_pv = clip1((cb_plane_a + cb_plane_b * (cx - 3) + cb_plane_c * (cy - 3) + 16) >> 5);
+                    int cr_pv = clip1((cr_plane_a + cr_plane_b * (cx - 3) + cr_plane_c * (cy - 3) + 16) >> 5);
+                    csad_plane += uint(abs(cb_src - cb_pv)) + uint(abs(cr_src - cr_pv));
+                }
+            }
+        }
+
+        uint cbest = csad_dc;
+        chosen_cmode = 0u; /* H264_CHROMA_DC */
+        if (left_avail && csad_h < cbest) { cbest = csad_h; chosen_cmode = 1u; /* H264_CHROMA_HORIZ */ }
+        if (top_avail && csad_v < cbest) { cbest = csad_v; chosen_cmode = 2u; /* H264_CHROMA_VERT */ }
+        if (top_avail && left_avail && csad_plane < cbest) { cbest = csad_plane; chosen_cmode = 3u; /* H264_CHROMA_PLANE */ }
+
+        /* Pack into pred_modes[mb_idx]: luma's own I16x16 mode in bits 0-1,
+         * chroma's mode in bits 2-3. PredModeOut is writeonly (see its
+         * binding declaration) so this combines from `chosen_mode` (the
+         * shared variable the luma section above already set, still valid -
+         * same invocation, no re-read of the SSBO) rather than reading the
+         * buffer back. */
+        pred_modes[mb_idx] = chosen_mode | (chosen_cmode << 2);
+    }
+    barrier();
+
+    if (local_id < 128u) {
+        uint idx = local_id;               // 0..127
+        uint block = 16u + idx / 16u;      // 16..23
+        uint pos_in_block = idx % 16u;     // 0..15
+        uint sub = (block - 16u) % 4u;     // 0=TL,1=TR,2=BL,3=BR
+        bool is_cr = block >= 20u;
+
+        uint xO = (sub % 2u) * 4u, yO = (sub / 2u) * 4u;
+        uint px_off = xO + (pos_in_block % 4u), py_off = yO + (pos_in_block / 4u);
+        ivec2 uv_coord = clamp(mb_pos_uv + ivec2(px_off, py_off), ivec2(0), uv_max);
+        vec2 uv = imageLoad(currentUV, uv_coord).rg;
+        int src_val = int(round((is_cr ? uv.g : uv.r) * 255.0));
+
+        int pred_val;
+        if (pcs.is_intra == 1u) {
+            /* Use whichever mode the SAD-based decision above picked - see
+             * the chroma mode-decision comment near this file's shared
+             * variable declarations. */
+            if (chosen_cmode == 1u) { /* HORIZ */
+                pred_val = is_cr ? left_uv[py_off][1] : left_uv[py_off][0];
+            } else if (chosen_cmode == 2u) { /* VERT */
+                pred_val = is_cr ? top_uv[px_off][1] : top_uv[px_off][0];
+            } else if (chosen_cmode == 3u) { /* PLANE */
+                pred_val = is_cr
+                    ? clip1((cr_plane_a + cr_plane_b * (int(px_off) - 3) + cr_plane_c * (int(py_off) - 3) + 16) >> 5)
+                    : clip1((cb_plane_a + cb_plane_b * (int(px_off) - 3) + cb_plane_c * (int(py_off) - 3) + 16) >> 5);
+            } else { /* DC */
+                pred_val = is_cr ? cr_dc[sub] : cb_dc[sub];
+            }
+        } else {
+            /* Real eighth-chroma-pel bilinear interpolation (ITU-T 8.4.1.4 +
+             * 8.4.2.2.2) - see the chroma motion-compensation note at the
+             * top of this file. mvCLX = mvLX numerically (mb_mv, unchanged)
+             * for 4:2:0 chroma; applying that same quarter-luma-pel-valued
+             * mv against the half-resolution chroma grid gives eighth-
+             * chroma-pel precision. No 6-tap filter for chroma - direct
+             * bilinear from the 4 nearest integer chroma samples. */
+            ivec2 base_uv = mb_pos_uv + ivec2(px_off, py_off);
+            ivec2 full_uv = base_uv * 8 + mb_mv;
+            int ixc = full_uv.x >> 3, iyc = full_uv.y >> 3;
+            int fxc = full_uv.x - (ixc << 3), fyc = full_uv.y - (iyc << 3); /* 0..7 */
+            ivec2 c00 = clamp(ivec2(ixc, iyc),         ivec2(0), uv_max);
+            ivec2 c10 = clamp(ivec2(ixc + 1, iyc),     ivec2(0), uv_max);
+            ivec2 c01 = clamp(ivec2(ixc, iyc + 1),     ivec2(0), uv_max);
+            ivec2 c11 = clamp(ivec2(ixc + 1, iyc + 1), ivec2(0), uv_max);
+            vec2 uvA = imageLoad(referenceUV, c00).rg;
+            vec2 uvB = imageLoad(referenceUV, c10).rg;
+            vec2 uvC = imageLoad(referenceUV, c01).rg;
+            vec2 uvD = imageLoad(referenceUV, c11).rg;
+            int A = int(round((is_cr ? uvA.g : uvA.r) * 255.0));
+            int B = int(round((is_cr ? uvB.g : uvB.r) * 255.0));
+            int C = int(round((is_cr ? uvC.g : uvC.r) * 255.0));
+            int D = int(round((is_cr ? uvD.g : uvD.r) * 255.0));
+            pred_val = ((8 - fxc) * (8 - fyc) * A + fxc * (8 - fyc) * B
+                      + (8 - fxc) * fyc * C + fxc * fyc * D + 32) >> 6;
+        }
+
+        res[(mb_idx * 24u + block) * 16u + pos_in_block] = src_val - pred_val;
+        pred_out[(mb_idx * 24u + block) * 16u + pos_in_block] = pred_val;
+    }
+}

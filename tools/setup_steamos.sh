@@ -94,8 +94,12 @@ else
             $SUDO pacman -Sy --noconfirm base-devel cmake libva libdrm vulkan-devel glslang libva-utils || true
         else
             echo -e "${RED}Error: 'cmake' not found and pre-built binary was not provided.${NC}"
-            echo -e "Please download the pre-compiled release package from:"
-            echo -e "  ${BOLD}https://github.com/Kai/bc250-vcn-driver/releases${NC}"
+            echo -e "Download bc250_drv_video.so and the shaders/ directory of compiled"
+            echo -e "shaders from:"
+            echo -e "  ${BOLD}https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases${NC}"
+            echo -e "and place both at the repository root before re-running this script,"
+            echo -e "or install build tools (cmake, gcc, libva, libdrm, vulkan-devel, glslang)"
+            echo -e "to build from source."
             exit 1
         fi
     fi
@@ -117,26 +121,47 @@ $SUDO cp -f "$DRIVER_BIN" "$INSTALL_LIB_DIR/bc250_drv_video.so"
 $SUDO mkdir -p /usr/local/lib/dri 2>/dev/null || true
 $SUDO cp -f "$DRIVER_BIN" /usr/local/lib/dri/bc250_drv_video.so 2>/dev/null || true
 
-# Copy compute shaders
+# Copy compute shaders. The driver loads compiled SPIR-V (.spv) at runtime -
+# the raw .comp GLSL sources under approach1-compute-encoder/shaders/ are
+# build-time input only and are useless to the running driver on their own.
+# A pre-built release package (matching build_and_install.sh's own
+# convention) ships its compiled .spv files in a top-level shaders/
+# directory alongside bc250_drv_video.so; a local from-source build instead
+# produces them in approach1-compute-encoder/build/. Check both - checking
+# only the local build/ directory (as this script previously did) meant
+# installing from a pre-built .so with no local build/ present copied *only*
+# the non-functional .comp sources and still reported success.
+echo -e "  -> Installing compiled shaders to $INSTALL_SHADER_DIR/"
 if [ -d "$REPO_ROOT/shaders" ]; then
-    echo -e "  -> Copying shaders from $REPO_ROOT/shaders to $INSTALL_SHADER_DIR/"
-    $SUDO cp -f "$REPO_ROOT/shaders"/* "$INSTALL_SHADER_DIR/" 2>/dev/null || true
-elif [ -d "$REPO_ROOT/approach1-compute-encoder/shaders" ]; then
-    echo -e "  -> Copying shaders to $INSTALL_SHADER_DIR/"
-    if [ -d "$REPO_ROOT/approach1-compute-encoder/build" ]; then
-        $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/build"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
-    fi
-    $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/shaders"/*.comp "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+    $SUDO cp -f "$REPO_ROOT/shaders"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
+fi
+if [ -d "$REPO_ROOT/approach1-compute-encoder/build" ]; then
+    $SUDO cp -f "$REPO_ROOT/approach1-compute-encoder/build"/*.spv "$INSTALL_SHADER_DIR/" 2>/dev/null || true
 fi
 
 # Also mirror shaders to /usr/local/share if writable
 $SUDO mkdir -p /usr/local/share/bc250/shaders 2>/dev/null || true
-$SUDO cp -f "$INSTALL_SHADER_DIR"/* /usr/local/share/bc250/shaders/ 2>/dev/null || true
+$SUDO cp -f "$INSTALL_SHADER_DIR"/*.spv /usr/local/share/bc250/shaders/ 2>/dev/null || true
 
 # Set world-readable permissions so unprivileged Steam / Gamescope / Sunshine processes can access them
 $SUDO chmod 755 /var/lib/bc250 "$INSTALL_LIB_DIR" "$INSTALL_SHADER_DIR" 2>/dev/null || true
 $SUDO chmod 755 "$INSTALL_LIB_DIR/bc250_drv_video.so" 2>/dev/null || true
 $SUDO chmod 644 "$INSTALL_SHADER_DIR"/* 2>/dev/null || true
+
+SPV_COUNT=$(find "$INSTALL_SHADER_DIR" -maxdepth 1 -name '*.spv' 2>/dev/null | wc -l)
+if [ "$SPV_COUNT" -eq 0 ]; then
+    echo -e "\n${RED}Error: no compiled .spv shaders were found to install.${NC}"
+    echo -e "${RED}A driver install with no compiled shaders will fail at runtime.${NC}"
+    echo -e "Expected compiled .spv files in one of:"
+    echo -e "  ${BOLD}$REPO_ROOT/shaders/${NC}          (pre-built release package)"
+    echo -e "  ${BOLD}$REPO_ROOT/approach1-compute-encoder/build/${NC}  (local from-source build)"
+    echo -e "If you only have bc250_drv_video.so, you also need its matching compiled"
+    echo -e "shaders/ directory from the same build - get both from:"
+    echo -e "  ${BOLD}https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases${NC}"
+    echo -e "or build from source (requires cmake, gcc, libva, libdrm, vulkan-devel, glslang)."
+    exit 1
+fi
+echo -e "  ${GREEN}✓ Installed $SPV_COUNT compiled shader(s)${NC}"
 
 echo -e "\n${BOLD}[4/5] Configuring SteamOS Gamescope & Session Environment...${NC}"
 # /etc/environment.d is persistent across SteamOS updates and read by Gamescope / systemd
@@ -176,7 +201,7 @@ echo -e "\n${BOLD}[5/5] Setting Up Audio Clock Fix...${NC}"
 if [ -d "$REPO_ROOT/audio-fix" ]; then
     cd "$REPO_ROOT/audio-fix"
     if command -v dkms &> /dev/null; then
-        if $SUDO ./install_dkms.sh; then
+        if $SUDO bash ./install_dkms.sh; then
             echo -e "  ${GREEN}✓ Audio fix installed via DKMS (auto-rebuilds on kernel updates).${NC}"
         else
             echo -e "  ${YELLOW}! DKMS setup encountered an issue (kernel headers may be needed).${NC}"

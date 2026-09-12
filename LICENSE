@@ -1,11 +1,43 @@
-                    GNU GENERAL PUBLIC LICENSE
-                       Version 2, June 1991
+SPDX-License-Identifier: GPL-3.0-only
 
- Copyright (C) 1989, 1991 Free Software Foundation, Inc.,
- 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
- Everyone is permitted to copy and distribute verbatim copies
- of this license document, but changing it is not allowed.
+Copyright (c) 2026 bc250-vcn-driver contributors
 
-                            Preamble
-[... Full GPL-2.0 Text Omitted for brevity, assuming standard GPLv2 ...]
+This program (the userspace VA-API driver, Vulkan compute shaders, and
+tools in this repository) is free software: you can redistribute it
+and/or modify it under the terms of the GNU General Public License,
+version 3, as published by the Free Software Foundation. This is
+GPL-3.0-only: there is no "or any later version" grant, so redistribution
+must be under version 3 specifically.
 
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details.
+
+The full text of the GNU General Public License, version 3, is available
+at: https://www.gnu.org/licenses/gpl-3.0.html
+
+Chosen deliberately over a permissive license: GPL-3.0's copyleft
+requires anyone who distributes a modified or combined version of this
+software to release their source under the same terms, and its
+anti-tivoization provisions specifically prevent shipping this code
+inside a locked-down device that prevents the end user from installing
+their own modified build — a real, relevant scenario for driver code
+running on physical hardware, which a permissive license would not have
+stopped.
+
+---
+
+NOTE: this license covers the userspace VA-API driver, Vulkan compute
+shaders, and tools in this repository. The DisplayPort/HDMI audio-clock
+DKMS kernel module under audio-fix/ is licensed separately, under
+GPL-2.0-only (not GPL-3.0) — see audio-fix/LICENSE. That module's own
+source (MODULE_LICENSE("GPL v2") in bc250_audio_fix.c) predates this
+project's current maintainership and was inherited as-is; its license
+was not and could not be unilaterally changed here, since doing so
+would misrepresent a license choice this project does not hold the
+copyright to alter. GPL-2.0 and GPL-3.0 are not compatible for a single
+combined/linked binary, but no such combination exists here — the
+kernel module and the userspace driver are separate, unlinked binaries,
+so there is no conflict in having each licensed under a different GPL
+version.

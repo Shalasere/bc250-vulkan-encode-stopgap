@@ -1,0 +1,34 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+This DisplayPort/HDMI audio-clock fix (bc250_audio_fix) is a Linux kernel
+module and is licensed under the GNU General Public License, version 2
+(GPL-2.0-only), as published by the Free Software Foundation.
+
+This program is free software; you can redistribute it and/or modify it
+under the terms of the GNU General Public License version 2 as published
+by the Free Software Foundation.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details.
+
+The full text of the GNU General Public License, version 2, is available
+at: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+It is also distributed with, and licenses, the Linux kernel itself
+(as the file COPYING in any Linux kernel source tree) — required here
+because this module links against and runs inside the Linux kernel,
+which itself requires GPL-compatible licensing for loadable modules.
+
+---
+
+NOTE: this GPL-2.0-only license applies only to this audio-fix/
+subdirectory (the DKMS kernel module) and is unchanged from how this
+module's own source (MODULE_LICENSE("GPL v2") in bc250_audio_fix.c) has
+always declared itself. The rest of this repository (the userspace
+VA-API driver, Vulkan compute shaders, and tools) is licensed separately
+under GPL-3.0-only — see the top-level LICENSE file. GPL-2.0 and GPL-3.0
+are not compatible for a single combined/linked binary, but no such
+combination exists here: this kernel module and the userspace driver are
+separate, unlinked binaries, so there is no conflict.
