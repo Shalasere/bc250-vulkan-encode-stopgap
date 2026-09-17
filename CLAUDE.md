@@ -173,31 +173,45 @@ with SSH available throughout. The machine always reaches
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
-- **Commit straight to `origin/main`.** `origin` is
-  `simpmix/bc250-encoding-decoding-fix` (Mix's, renamed from
-  `bc250-vcn-driver`); collaborator access granted 2026-09-13. Mix's call
-  2026-09-15, after a personal `shalasere` branch was tried and dropped —
-  work directly on `main`, no personal long-lived branch, no PR round-trip
-  for ordinary changes. `fork` (`Shalasere/bc250-vulkan-encode-stopgap`) is
-  a backup mirror and the home of Shalasere's own release artifacts (v0.2.1
-  through v0.3.2); `origin` carries no releases — Mix owns the real release
-  process.
+- **This repo is independent as of 2026-09-17.** `origin` is
+  `Shalasere/bc250-vulkan-encode-stopgap` — the only place work goes.
+  `upstream` (`simpmix/bc250-encoding-decoding-fix`) is **fetch-only**: its
+  push URL is set to `no_push`, so a stray `git push` cannot reach it. That
+  is deliberate and should stay. Do not push there, open PRs there, or
+  comment on its issues without being asked each time.
 
-  - **`git pull --ff-only` before every session and before every push.** Two
-    people commit to this `main` with no branch protection, and Mix pushes
-    often — he landed 630 lines of HEVC work overnight on 2026-09-15. Every
-    push in practice needs a fetch first.
-  - **Never force-push `main`.** Either collaborator doing so silently
-    erases the other's work, and nothing mechanically prevents it.
-  - CI (`.github/workflows/build.yml`) runs on pushes to `main` and on PRs
-    into it — so committing directly means **CI validates only after the
-    push has already landed**. For anything that could plausibly break the
-    build, run the tests locally first (`cmake --build` + `ctest`) rather
-    than letting the shared tree be the test. A PR is still the right tool
-    for a change big enough to want review or pre-merge CI.
-  - `main` on `origin` has **no branch protection** as of this writing, so
-    nothing mechanically enforces any of the above. Never force-push `main`
-    — either collaborator doing so can silently erase the other's work.
+  History diverges at `c5a7942`, the last commit on the shared tree.
+
+  ⚠️ **The fork point inherits the CPU-SIMD/governor layer *with* known
+  defects.** `cpu_simd_me.c` and `dynamic_governor.c` landed in `62327c3`,
+  which is *before* `c5a7942` — and all six of upstream's 2026-09-17 `fix(…)`
+  commits touch files present here:
+
+  | upstream commit | fixes, in code this tree has |
+  |---|---|
+  | `c35dd09` | buffer boundary overrun on non-16-multiple resolutions (`encoder_h264.c`, `encoder_h265.c`) — memory safety |
+  | `de31caa` | Tier 3 latch, a `vkMapMemory` leak, SIMD ME spatial predictor |
+  | `636e0d1` / `80d11f5` | `cpu_simd_me.c` early-exit and `_GNU_SOURCE`/`#ifdef _OPENMP` balance |
+  | `5479947` | governor downward-hysteresis transition logic |
+  | `0c20d49` | OpenMP passive wait policy, slice-thread cap |
+
+  So this code is either **removed** (which is what "driver-level" most
+  plausibly means — the bugs go with it, and nothing needs cherry-picking
+  from a repo we've split from) or those six fixes get applied. Do not leave
+  it sitting here unfixed and assume it works; upstream found real bugs in it
+  within a day of writing it.
+
+  - `git pull --ff-only` before a session is still worth it, but this is now
+    a single-author tree: no other committer, no race, and CI runs on push.
+  - GPL-3.0-only. A fork is squarely within the license; the obligations are
+    to keep the license files and the copyright/attribution headers intact,
+    and the preserved git history is the attribution record — **do not
+    squash or rewrite it away.** `src/cabac.c` is adapted from x264
+    (GPL-2.0-or-later); that notice must survive. `audio-fix/` is
+    GPL-2.0-only and is a separate work from the GPL-3.0 driver — keep them
+    separately licensed and separately built.
+  - `main` has no branch protection. Never force-push it — with the history
+    now being the provenance record, a rewrite costs more than it used to.
 - **Repeatedly ssh'ing into the board during a long job crashes it**
   (systemd-logind exhaustion). Launch once, wait, read once.
 - `ssh -n` is mandatory (ssh in a pipeline eats stdin), and `-n` nulls stdin
