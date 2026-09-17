@@ -369,24 +369,6 @@ static const int levelScale[6] = { 40, 45, 51, 57, 64, 72 };
 #define HEVC_BDSHIFT 5
 #define HEVC_FLAT_M  16
 
-static int32_t dequant_level(int32_t level, int qp) {
-    int per = qp / 6, rem = qp % 6;
-    int64_t val = (int64_t)level * HEVC_FLAT_M * levelScale[rem];
-    val <<= per;
-    val = (val + (1 << (HEVC_BDSHIFT - 1))) >> HEVC_BDSHIFT;
-    return clip_coeff((int32_t)val);
-}
-
-static int32_t quantize_coeff(int32_t coeff_raw, int qp) {
-    int per = qp / 6, rem = qp % 6;
-    int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
-    int sign = coeff_raw < 0 ? -1 : 1;
-    int64_t mag = coeff_raw < 0 ? -(int64_t)coeff_raw : (int64_t)coeff_raw;
-    int64_t num = mag << HEVC_BDSHIFT;
-    int64_t level = (num + denom / 2) / denom;
-    return (int32_t)(sign * level);
-}
-
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]) {
     int32_t raw[16];

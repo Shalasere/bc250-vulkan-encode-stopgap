@@ -19,7 +19,6 @@
 #include "gpu_compute.h"
 #include "encoder_h264.h"
 #include "encoder_h265.h"
-#include "decoder_h264.h"
 
 #ifndef VAConfigAttribEncQualityRange
 #define VAConfigAttribEncQualityRange 21
@@ -99,7 +98,6 @@ struct bc250_context {
     /* Encoders & Decoders */
     h264_encoder_t *h264_enc;
     hevc_encoder_t *hevc_enc;
-    h264_decoder_t *h264_dec;
 
     /* BC250_PIPELINE=1 only: one frame whose GPU work is in flight and whose
      * CPU entropy coding has not been done yet. At most one - the pipeline is

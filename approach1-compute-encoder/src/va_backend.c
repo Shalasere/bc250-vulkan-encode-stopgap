@@ -435,8 +435,6 @@ VAStatus bc250_CreateContext(VADriverContextP ctx, VAConfigID config_id, int pic
                         }
                     }
                 }
-            } else if (entry == VAEntrypointVLD) {
-                c->h264_dec = h264_decoder_create(&data->gpu, picture_width, picture_height);
             }
 
             *context = i;
@@ -470,10 +468,6 @@ VAStatus bc250_DestroyContext(VADriverContextP ctx, VAContextID context) {
     if (c->hevc_enc) {
         hevc_encoder_destroy(c->hevc_enc);
         c->hevc_enc = NULL;
-    }
-    if (c->h264_dec) {
-        h264_decoder_destroy(c->h264_dec);
-        c->h264_dec = NULL;
     }
     if (c->render_targets) {
         free(c->render_targets);
