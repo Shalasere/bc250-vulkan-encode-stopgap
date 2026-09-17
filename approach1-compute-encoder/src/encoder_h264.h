@@ -92,22 +92,10 @@ typedef struct {
  *
  * Returns 0 on success (pending filled in), -1 on bad arguments.
  */
-int h264_encoder_encode_frame_ext(h264_encoder_t *encoder,
-                                  bc250_gpu_context_t *gpu_ctx,
-                                  gpu_image_t input_surface,
-                                  gpu_memory_t input_memory,
-                                  uint8_t *output_buf, size_t output_size);
-
 int h264_encoder_submit_frame(h264_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               gpu_image_t input_surface,
                               h264_pending_frame_t *pending);
-
-int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
-                                  bc250_gpu_context_t *gpu_ctx,
-                                  gpu_image_t input_surface,
-                                  gpu_memory_t input_memory,
-                                  h264_pending_frame_t *pending);
 
 /**
  * h264_encoder_finish_frame - second half: wait for the submitted GPU work,

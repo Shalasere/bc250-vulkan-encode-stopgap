@@ -1032,8 +1032,8 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
              * EndPicture, or bc250_SyncSurface()/bc250_MapBuffer() if the
              * client reads before submitting another frame. */
             h264_pending_frame_t just_submitted;
-            bool submitted = (h264_encoder_submit_frame_ext(c->h264_enc, &data->gpu,
-                                                            surf->image, surf->memory, &just_submitted) == 0);
+            bool submitted = (h264_encoder_submit_frame(c->h264_enc, &data->gpu,
+                                                        surf->image, &just_submitted) == 0);
 
             bc250_finish_pending_frame(data, c);
 
@@ -1045,7 +1045,7 @@ VAStatus bc250_EndPicture(VADriverContextP ctx, VAContextID context) {
             /* written stays -1: nothing to report for this frame yet. The
              * segment header is filled in by the deferred finish. */
         } else if (c->h264_enc) {
-            written = h264_encoder_encode_frame_ext(c->h264_enc, &data->gpu, surf->image, surf->memory, dest, max_payload);
+            written = h264_encoder_encode_frame(c->h264_enc, &data->gpu, surf->image, dest, max_payload);
         } else if (c->hevc_enc) {
             written = hevc_encoder_encode_frame(c->hevc_enc, &data->gpu, surf->image, surf->memory, dest, max_payload);
         }

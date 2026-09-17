@@ -1952,11 +1952,10 @@ uint32_t h264_encoder_get_max_frame_size(const h264_encoder_t *encoder) {
 /* Choose frame type and QP and put this frame's GPU work in flight without
  * waiting for it. See h264_encoder_submit_frame()'s header doc for why the
  * split exists and what it costs (rate control runs one frame ahead). */
-int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
-                                  bc250_gpu_context_t *gpu_ctx,
-                                  gpu_image_t input_surface,
-                                  gpu_memory_t input_memory,
-                                  h264_pending_frame_t *pending)
+int h264_encoder_submit_frame(h264_encoder_t *encoder,
+                              bc250_gpu_context_t *gpu_ctx,
+                              gpu_image_t input_surface,
+                              h264_pending_frame_t *pending)
 {
     if (!encoder || !pending) return -1;
 
@@ -2006,38 +2005,18 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
     return 0;
 }
 
-int h264_encoder_submit_frame(h264_encoder_t *encoder,
-                              bc250_gpu_context_t *gpu_ctx,
-                              gpu_image_t input_surface,
-                              h264_pending_frame_t *pending)
-{
-    gpu_memory_t dummy_mem = {0};
-    return h264_encoder_submit_frame_ext(encoder, gpu_ctx, input_surface, dummy_mem, pending);
-}
-
-int h264_encoder_encode_frame_ext(h264_encoder_t *encoder,
-                                  bc250_gpu_context_t *gpu_ctx,
-                                  gpu_image_t input_surface,
-                                  gpu_memory_t input_memory,
-                                  uint8_t *output_buf, size_t output_size)
-{
-    if (!encoder || !output_buf) return -1;
-
-    h264_pending_frame_t pending;
-    if (h264_encoder_submit_frame_ext(encoder, gpu_ctx, input_surface, input_memory, &pending) != 0)
-        return -1;
-    return h264_encoder_finish_frame(encoder, gpu_ctx,
-                                     output_buf, output_size, &pending);
-}
-
 int h264_encoder_encode_frame(h264_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               gpu_image_t input_surface,
                               uint8_t *output_buf, size_t output_size)
 {
-    gpu_memory_t dummy_mem = {0};
-    return h264_encoder_encode_frame_ext(encoder, gpu_ctx, input_surface, dummy_mem,
-                                         output_buf, output_size);
+    if (!encoder || !output_buf) return -1;
+
+    h264_pending_frame_t pending;
+    if (h264_encoder_submit_frame(encoder, gpu_ctx, input_surface, &pending) != 0)
+        return -1;
+    return h264_encoder_finish_frame(encoder, gpu_ctx,
+                                     output_buf, output_size, &pending);
 }
 
 int h264_encoder_finish_frame(h264_encoder_t *encoder,

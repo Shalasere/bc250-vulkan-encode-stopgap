@@ -410,9 +410,6 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
  * Must match the num_slices the caller will actually partition the CAVLC
  * bitstream into (encoder_h264.c's BC250_SLICES_PER_FRAME). */
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
-/* Extended dispatch: allows passing dynamic ME mode and CPU-computed motion vectors.
- * If cpu_mvs != NULL, Stage 2 (Vulkan motion estimation) is skipped and CPU MVs are uploaded. */
-int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices, int me_mode, const gpu_mv_t *cpu_mvs);
 double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);

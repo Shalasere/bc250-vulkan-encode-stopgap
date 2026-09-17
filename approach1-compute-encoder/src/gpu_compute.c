@@ -1936,7 +1936,7 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
     return 0;
 }
 
-int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices, int me_mode, const gpu_mv_t *cpu_mvs) {
+int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices) {
     if (!ctx) return -1;
     if (num_slices < 1) num_slices = 1;
 
@@ -2084,27 +2084,7 @@ int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_targe
     /* Stage 1: Color Convert (Skipped: inputs in VA-API are already NV12) */
 
     /* Stage 2: Motion Estimation */
-    if (cpu_mvs != NULL) {
-        /* Dynamic Governor Tier 2: CPU SIMD Motion Estimation offload.
-         * Copy CPU-computed motion vectors into mv_staging_buffers and transfer
-         * to device-local mv_buffer, skipping the expensive GPU compute shader. */
-        size_t mv_bytes = (size_t)width_mbs * height_mbs * sizeof(gpu_mv_t);
-        if (ctx->mv_staging_mapped[perf_buf]) {
-            memcpy(ctx->mv_staging_mapped[perf_buf], cpu_mvs, mv_bytes);
-            VkBufferCopy mv_copy = {
-                .srcOffset = 0,
-                .dstOffset = 0,
-                .size = mv_bytes
-            };
-            vkCmdCopyBuffer(cmd_buf, ctx->mv_staging_buffers[perf_buf], ctx->mv_buffer, 1, &mv_copy);
-            insert_compute_barrier(cmd_buf);
-        }
-    } else if (ctx->motion_est_pipeline) {
-        if (me_mode == 1) {
-            /* Tier 1: Fast ME mode - higher lambda and fast diamond */
-            pc[6] = 1;
-            pc[7] = 8;
-        }
+    if (ctx->motion_est_pipeline) {
         vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_pipeline);
         vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->motion_est_layout, 0, 1, &ctx->me_desc_set, 0, NULL);
         vkCmdPushConstants(cmd_buf, ctx->motion_est_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
@@ -2371,10 +2351,6 @@ int gpu_compute_dispatch_encode_ext(gpu_context_t *ctx, gpu_image_t render_targe
     }
 
     return 0;
-}
-
-int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices) {
-    return gpu_compute_dispatch_encode_ext(ctx, render_target, width, height, qp, is_intra, num_slices, 0, NULL);
 }
 
 int gpu_compute_end_picture(gpu_context_t *ctx) {
