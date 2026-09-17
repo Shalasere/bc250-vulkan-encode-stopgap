@@ -109,8 +109,6 @@ int h264_encoder_submit_frame_ext(h264_encoder_t *encoder,
                                   gpu_memory_t input_memory,
                                   h264_pending_frame_t *pending);
 
-int h264_encoder_get_governor_tier(const h264_encoder_t *encoder);
-
 /**
  * h264_encoder_finish_frame - second half: wait for the submitted GPU work,
  * read it back, and produce the whole Annex B frame.

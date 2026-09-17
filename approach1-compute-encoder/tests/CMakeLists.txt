@@ -44,22 +44,9 @@ add_executable(test_hevc_encode test_hevc_encode.c)
 target_include_directories(test_hevc_encode PRIVATE ../src ${Vulkan_INCLUDE_DIRS} ${LIBVA_INCLUDE_DIRS} ${DRM_INCLUDE_DIRS})
 target_link_libraries(test_hevc_encode PRIVATE bc250_drv_video ${Vulkan_LIBRARIES} ${LIBVA_LIBRARIES} ${DRM_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT} m)
 
-# Unit tests for Dynamic Governor and CPU SIMD Motion Estimation
-add_executable(test_cpu_simd_me test_cpu_simd_me.c ../src/cpu_simd_me.c)
-target_include_directories(test_cpu_simd_me PRIVATE ../src ${Vulkan_INCLUDE_DIRS})
-target_link_libraries(test_cpu_simd_me PRIVATE m)
-if(TARGET OpenMP::OpenMP_C)
-    target_link_libraries(test_cpu_simd_me PRIVATE OpenMP::OpenMP_C)
-endif()
-
-add_executable(test_dynamic_governor test_dynamic_governor.c ../src/dynamic_governor.c)
-target_include_directories(test_dynamic_governor PRIVATE ../src)
-
 enable_testing()
 add_test(NAME BitstreamTest COMMAND test_bitstream)
 add_test(NAME CavlcUnitTest COMMAND test_cavlc)
 add_test(NAME VaApiDriverTest COMMAND test_va_api)
 add_test(NAME EncodeBitstreamTest COMMAND test_encode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 add_test(NAME HevcEncodeBitstreamTest COMMAND test_hevc_encode WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-add_test(NAME CpuSimdMeTest COMMAND test_cpu_simd_me)
-add_test(NAME DynamicGovernorTest COMMAND test_dynamic_governor)
