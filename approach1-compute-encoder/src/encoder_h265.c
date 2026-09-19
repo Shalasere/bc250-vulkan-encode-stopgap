@@ -273,7 +273,30 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
     bs_write1(&bs, 0);   /* tiles_enabled_flag */
     bs_write1(&bs, 0);   /* entropy_coding_sync_enabled_flag */
     bs_write1(&bs, 1);   /* pps_loop_filter_across_slices_enabled_flag */
-    bs_write1(&bs, 0);   /* deblocking_filter_control_present_flag (defaults apply: enabled, offsets 0) */
+    /* deblocking_filter_control_present_flag=0 means "defaults apply", and
+     * HEVC's default is deblocking ENABLED (ITU-T H.265 7.4.3.3.1) - a real
+     * encoder/decoder mismatch, since this encoder's own reconstruction
+     * never simulates deblocking (same class of compromise as this
+     * project's H.264 path's own documented "reads source not reconstructed
+     * neighbours" gap, README's Known Limitations, ~3.7dB, not visually
+     * significant).
+     *
+     * TRIED explicitly signaling deblocking_filter_control_present_flag=1 +
+     * pps_deblocking_filter_disabled_flag=1 here (2026-09-19) to make the
+     * bitstream honest about what the encoder does, expecting a free,
+     * low-risk win - measured on real hardware instead: PSNR collapsed from
+     * 19.5-34.2dB (this file's known-correct MPM-fixed baseline) to a
+     * uniform 4.85-9.78dB, WORSE than before and more uniform than the
+     * original MPM bug's pattern - meaning that PPS edit introduced a
+     * genuine bitstream syntax error of its own, not the cheap fix it
+     * looked like from spec pseudocode recalled from memory. Reverted
+     * rather than compounded. Do not re-attempt without cross-checking the
+     * EXACT PPS RBSP bit layout against a live reference (x265/HM source or
+     * a hex/bit-level trace of a real encoder's PPS, not memory of the
+     * spec table) and re-verifying PSNR on real hardware before trusting
+     * it - this file has now hit this exact failure mode (a "safe-looking"
+     * syntax change silently desyncing the whole bitstream) twice. */
+    bs_write1(&bs, 0);   /* deblocking_filter_control_present_flag */
     bs_write1(&bs, 0);   /* pps_scaling_list_data_present_flag */
     bs_write1(&bs, 0);   /* lists_modification_present_flag */
     bs_write_ue(&bs, 0); /* log2_parallel_merge_level_minus2 */
