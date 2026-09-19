@@ -506,11 +506,10 @@ bool cabac_write_qp_delta(cabac_engine_t *cb, int dqp, bool last_dqp_nonzero) {
 }
 
 /* Per-category tables (ITU-T Table 9-42 restricted to this project's 5
- * categories) - see this file's top-of-file context-index map. */
-static const int cabac_count_m1[5]  = { 15, 14, 15, 3, 14 };
-static const int cabac_sig_base[5]  = { 105, 120, 134, 149, 152 };
-static const int cabac_last_base[5] = { 166, 181, 195, 210, 213 };
-static const int cabac_level_base[5]= { 227, 237, 247, 257, 266 };
+ * categories) - see this file's top-of-file context-index map.
+ * cabac_count_m1/cabac_sig_base/cabac_last_base/cabac_level_base and the
+ * level1_ctx/levelgt1_ctx/level_transition tables moved to cabac.h - see
+ * cabac_write_residual_block()'s doc comment there for why. */
 static const int cabac_cbf_base[5]  = { 85, 89, 93, 97, 101 };
 
 int cabac_count_coeffs(cabac_ctx_block_cat_t cat) {
@@ -521,75 +520,4 @@ void cabac_write_coded_block_flag(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
                                    int nA, int nB, bool cbf) {
     int ctx = cabac_cbf_base[cat] + 2 * (nB ? 1 : 0) + (nA ? 1 : 0);
     cabac_encode_decision(cb, ctx, cbf ? 1 : 0);
-}
-
-/* node ctx: 0..3 = abs-level-1 run (with abs-level>1 count==0);
- *           4..7 = abs-level>1 seen (+3) - see x264's encoder/cabac.c
- *           coeff_abs_level1_ctx/coeff_abs_levelgt1_ctx/
- *           coeff_abs_level_transition, copied verbatim. */
-static const uint8_t cabac_level1_ctx[8]    = { 1, 2, 3, 4, 0, 0, 0, 0 };
-static const uint8_t cabac_levelgt1_ctx[8]  = { 5, 5, 5, 5, 6, 7, 8, 9 };
-static const uint8_t cabac_level_transition[2][8] = {
-    { 1, 2, 3, 3, 4, 5, 6, 7 },
-    { 4, 4, 4, 4, 5, 6, 7, 7 },
-};
-
-void cabac_write_residual_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat, const int *scanned) {
-    int count_m1 = cabac_count_m1[cat];
-    int ctx_sig = cabac_sig_base[cat];
-    int ctx_last = cabac_last_base[cat];
-    int ctx_level = cabac_level_base[cat];
-
-    int last = -1;
-    for (int i = count_m1; i >= 0; i--) {
-        if (scanned[i] != 0) { last = i; break; }
-    }
-    if (last < 0) return; /* caller must gate this call on cbf==1 */
-
-    int coeffs[16];
-    int coeff_idx = -1;
-    int i = 0;
-    for (;;) {
-        if (scanned[i] != 0) {
-            coeffs[++coeff_idx] = scanned[i];
-            cabac_encode_decision(cb, ctx_sig + i, 1);
-            if (i == last) {
-                cabac_encode_decision(cb, ctx_last + i, 1);
-                break;
-            } else {
-                cabac_encode_decision(cb, ctx_last + i, 0);
-            }
-        } else {
-            cabac_encode_decision(cb, ctx_sig + i, 0);
-        }
-        if (++i == count_m1) {
-            coeffs[++coeff_idx] = scanned[i];
-            break;
-        }
-    }
-
-    int node_ctx = 0;
-    do {
-        int coeff = coeffs[coeff_idx];
-        int abs_coeff = coeff < 0 ? -coeff : coeff;
-        int sign = coeff < 0 ? 1 : 0;
-        int ctx = cabac_level1_ctx[node_ctx] + ctx_level;
-
-        if (abs_coeff > 1) {
-            cabac_encode_decision(cb, ctx, 1);
-            ctx = cabac_levelgt1_ctx[node_ctx] + ctx_level;
-            int capped = abs_coeff < 15 ? abs_coeff : 15;
-            for (int k = capped - 2; k > 0; k--)
-                cabac_encode_decision(cb, ctx, 1);
-            if (abs_coeff < 15)
-                cabac_encode_decision(cb, ctx, 0);
-            else
-                cabac_encode_ue_bypass(cb, 0, abs_coeff - 15);
-            node_ctx = cabac_level_transition[1][node_ctx];
-        } else {
-            cabac_encode_decision(cb, ctx, 0);
-            node_ctx = cabac_level_transition[0][node_ctx];
-        }
-        cabac_encode_bypass(cb, sign);
-    } while (--coeff_idx >= 0);
 }
