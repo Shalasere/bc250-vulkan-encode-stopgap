@@ -501,7 +501,20 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
         int mx = px / 4, my = py / 4;
         int left_avail = px > 0;
-        int above_avail = py > 0;
+        /* Rec. ITU-T H.265 8.4.2: candIntraPredModeB (the "above" MPM
+         * candidate) must be forced unavailable whenever the above
+         * neighbour is in a different CTU row, unconditionally - not just
+         * when py==0. This mirrors the picture-boundary check but for CTU
+         * rows, and is easy to miss because the neighbour pixel data IS
+         * genuinely available/reconstructed; the spec still mandates
+         * treating it as absent for MPM derivation. Getting this wrong
+         * silently changes mpm[]'s candidate ORDER (and hence what
+         * mpm_idx/rem_intra_luma_pred_mode means) for one whole PU-row
+         * per CTU, producing a structurally valid but wrong-meaning
+         * bitstream that only misdecodes once real (non-flat/non-DC)
+         * directional content exercises those modes - hence "busy
+         * directional content only" as the symptom. */
+        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
         int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
         int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
         hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);
