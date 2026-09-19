@@ -279,6 +279,48 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
  * will not close the file descriptor"). Returns 0 on success. */
 int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd);
 
+/* Best-effort CPU-read/GPU-write synchronization for a surface's dma-buf
+ * memory, via the kernel's DMA_BUF_IOCTL_SYNC. Needed because a live
+ * Sunshine session writes into a surface's exported DMA-BUF directly via
+ * its own OpenGL/EGL blit (see gpu_compute_export_nv12_dmabuf() and
+ * va_backend.c's bc250_ExportSurfaceHandle()) - a completely separate GPU
+ * context/API/process from this driver's Vulkan one, with no shared
+ * semaphore or fence between them. A CPU-side vkMapMemory() read of that
+ * same memory (gpu_compute_download_nv12(), used by bc250_GetImage() and
+ * gpu_compute_debug_dump_real_input(), and hevc_encoder_encode_frame()'s
+ * real-time encode-input read) therefore has nothing stopping it from
+ * racing Sunshine's still-in-flight GL writes: rows the blit already
+ * finished read correctly, rows still in flight read torn/stale data -
+ * exactly the content-dependent block corruption confirmed via
+ * BC250_DUMP_REAL_INPUT dumps of the raw captured frame.
+ *
+ * DMA_BUF_IOCTL_SYNC(START|READ) is the kernel's standard, portable,
+ * cross-process, cross-API answer: it requires no cooperation or code
+ * change from Sunshine, and - for a DRM/GEM-backed exporter like amdgpu -
+ * blocks until any GPU work already recorded against the buffer's
+ * reservation object (i.e. Sunshine's GL write) has completed, via the
+ * exporter's begin_cpu_access callback. SYNC_END closes out the access
+ * session. Call sync_start() immediately before, and sync_end()
+ * immediately after, any CPU read of memory an external GPU API could
+ * plausibly have just written. Do NOT wrap a CPU read of memory only ever
+ * written by this driver's OWN GPU work (e.g. ctx->recon_memory) - that is
+ * already correctly ordered by a real Vulkan fence (gpu_compute_sync()),
+ * and this ioctl is a kernel round-trip, not a free no-op.
+ *
+ * Both derive their dma-buf fd the same way gpu_compute_export_nv12_dmabuf()
+ * does (vkGetMemoryFdKHR - the Vulkan spec allows querying it repeatedly for
+ * the same VkDeviceMemory) and close it again before returning, so they
+ * never accumulate fds across frames. Best-effort: returns 0 if the sync
+ * ioctl was attempted and succeeded, -1 on any failure (memory isn't
+ * dma-buf-exportable, get_memory_fd_khr unavailable, or the ioctl itself
+ * failed, e.g. ENOTTY/EINVAL because this particular memory turned out not
+ * to be a real dma-buf-backed allocation). Callers must treat -1 as
+ * "proceed without the barrier" rather than fatal - this is a best-effort
+ * synchronization for a real allocation that may, in some caller paths,
+ * never actually have been GL-written. */
+int gpu_compute_dmabuf_sync_start(gpu_context_t *ctx, gpu_memory_t memory);
+int gpu_compute_dmabuf_sync_end(gpu_context_t *ctx, gpu_memory_t memory);
+
 /* Test-harness instrumentation (tools/quality_test.sh): dumps raw NV12
  * frame bytes to BC250_DUMP_DIR (default /tmp/bc250_dump_frames) when
  * BC250_DUMP_INPUT_FRAMES=1 is set in the environment; a no-op otherwise.

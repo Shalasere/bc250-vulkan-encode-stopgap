@@ -11,6 +11,9 @@
 #include <string.h>
 #include <errno.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
@@ -1297,6 +1300,65 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
     return 0;
 }
 
+/* Shared implementation for gpu_compute_dmabuf_sync_start()/_end() - see
+ * their doc comment in gpu_compute.h. `flags` is one of
+ * DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ or DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ.
+ * Only READ is ever requested here: every current caller is a CPU read of
+ * surface memory, never a CPU write racing a GPU reader. */
+static int gpu_compute_dmabuf_cpu_sync(gpu_context_t *ctx, gpu_memory_t memory, __u64 flags) {
+    if (!ctx || !memory.memory) return -1;
+
+    /* Gets its own, short-lived fd (vkGetMemoryFdKHR hands back a new fd
+     * each call per the Vulkan spec - the same call
+     * gpu_compute_export_nv12_dmabuf() already makes for the real VA-API
+     * export path) purely to issue this one ioctl, and closes it again
+     * below - it must not be confused with, or leaked alongside, any
+     * longer-lived fd a caller obtained from gpu_compute_export_nv12_dmabuf()
+     * for actual DMA-BUF export. */
+    int fd = -1;
+    if (gpu_compute_export_nv12_dmabuf(ctx, memory, &fd) != 0) return -1;
+
+    struct dma_buf_sync sync = { .flags = flags };
+    int ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    if (ret != 0) {
+        /* ENOTTY/EINVAL mean this memory, while a valid VkDeviceMemory, did
+         * not actually resolve to something the kernel treats as a
+         * sync-able dma-buf (e.g. no exporter driver support, or this
+         * allocation was never really shared with anything external) -
+         * expected in some caller paths, not a bug. Log once rather than
+         * every frame (this runs per-frame on the debug-dump and HEVC
+         * encode-input paths) so a genuinely unsupported case doesn't spam
+         * stderr for the life of the process, but still surfaces the fact
+         * once so it's visible during debugging. Any other errno is
+         * unexpected and always logged, still without treating it as fatal
+         * - this is a best-effort barrier, not a hard requirement. */
+        static bool warned_notty = false;
+        if (errno == ENOTTY || errno == EINVAL) {
+            if (!warned_notty) {
+                fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_SYNC not supported for this memory "
+                                "(errno=%d: %s) - proceeding without CPU/GPU dma-buf sync\n",
+                        errno, strerror(errno));
+                warned_notty = true;
+            }
+        } else {
+            fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_SYNC failed (flags=0x%llx): %s\n",
+                    (unsigned long long)flags, strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+int gpu_compute_dmabuf_sync_start(gpu_context_t *ctx, gpu_memory_t memory) {
+    return gpu_compute_dmabuf_cpu_sync(ctx, memory, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+}
+
+int gpu_compute_dmabuf_sync_end(gpu_context_t *ctx, gpu_memory_t memory) {
+    return gpu_compute_dmabuf_cpu_sync(ctx, memory, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+}
+
 /* Test-harness instrumentation (tools/quality_test.sh): dump raw NV12 frame
  * bytes to disk when BC250_DUMP_INPUT_FRAMES=1 is set, building a
  * byte-exact ground-truth reference of what the driver actually received
@@ -2173,8 +2235,21 @@ void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, g
     uint8_t *uv_buf = malloc(uv_size);
     if (!y_buf || !uv_buf) { free(y_buf); free(uv_buf); return; }
 
-    if (gpu_compute_download_nv12(ctx, image, memory,
-                                   y_buf, width, uv_buf, width, width, height) == 0) {
+    /* This reads back the surface exactly as a real Sunshine session leaves
+     * it - written via Sunshine's own GL blit into this surface's exported
+     * DMA-BUF, completely outside this driver's Vulkan queue (see
+     * gpu_compute.h's gpu_compute_dmabuf_sync_start() doc comment). Bracket
+     * the CPU read with the dma-buf CPU-access sync ioctl so this debug dump
+     * doesn't itself race that GL write - without this, BC250_DUMP_REAL_INPUT
+     * dumps could show the very torn/stale-content corruption this
+     * instrumentation exists to diagnose, rather than a race-free capture of
+     * what the encoder is really about to see. */
+    gpu_compute_dmabuf_sync_start(ctx, memory);
+    int download_ok = gpu_compute_download_nv12(ctx, image, memory,
+                                   y_buf, width, uv_buf, width, width, height);
+    gpu_compute_dmabuf_sync_end(ctx, memory);
+
+    if (download_ok == 0) {
         char dump_path[600];
         snprintf(dump_path, sizeof(dump_path), "%s/real_%05d.nv12", dump_dir, dump_frame_index);
         FILE *dumpf = fopen(dump_path, "wb");

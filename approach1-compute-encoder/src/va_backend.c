@@ -972,10 +972,21 @@ VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         if (copy_width > surf->width) copy_width = surf->width;
         if (copy_height > surf->height) copy_height = surf->height;
 
+        /* surf->memory can be the same live surface a real Sunshine session
+         * writes into directly via its own GL blit, into this surface's
+         * exported DMA-BUF - a separate GPU context/API/process from this
+         * driver's Vulkan one, with nothing shared between them to order
+         * this CPU read against that write (see gpu_compute.h's
+         * gpu_compute_dmabuf_sync_start() doc comment). Bracket the read so
+         * a vaGetImage() call doesn't race that write the same way the
+         * real-time encode-input read and BC250_DUMP_REAL_INPUT debug dump
+         * did. */
+        gpu_compute_dmabuf_sync_start(&data->gpu, surf->memory);
         gpu_compute_download_nv12(&data->gpu, &surf->image, surf->memory,
                                   dst_y, y_pitch,
                                   dst_uv, uv_pitch,
                                   copy_width, copy_height);
+        gpu_compute_dmabuf_sync_end(&data->gpu, surf->memory);
     }
     return VA_STATUS_SUCCESS;
 }

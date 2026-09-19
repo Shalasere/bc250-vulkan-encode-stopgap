@@ -705,10 +705,24 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         gpu_compute_end_picture(gpu_ctx);
         gpu_compute_sync(gpu_ctx);
 
+        /* input_surface/input_memory is the live VA-API surface a real
+         * Sunshine session writes into directly via its own GL blit, into
+         * this surface's exported DMA-BUF - a completely separate GPU
+         * context/API/process from this driver's Vulkan one, with nothing
+         * shared between them to order this CPU read against that write
+         * (see gpu_compute.h's gpu_compute_dmabuf_sync_start() doc comment,
+         * and gpu_compute_debug_dump_real_input(), whose dumps are what
+         * first confirmed this race as content-dependent block corruption
+         * in the raw captured frame). This is the real, on-the-encode-path
+         * equivalent of that debug dump: without the sync bracket here,
+         * whatever HEVC actually encodes is subject to the exact same race,
+         * not just a diagnostic capture of it. */
+        gpu_compute_dmabuf_sync_start(gpu_ctx, input_memory);
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
                                    encoder->dl_y, (int)encoder->width,
                                    encoder->dl_uv, (int)encoder->width,
                                    (int)encoder->width, (int)encoder->height);
+        gpu_compute_dmabuf_sync_end(gpu_ctx, input_memory);
     } else {
         memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
         memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);
