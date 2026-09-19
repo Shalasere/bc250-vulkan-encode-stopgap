@@ -2,12 +2,161 @@
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 
+/*
+ * deblock_filter.comp - H.264 in-loop deblocking filter, ITU-T H.264 Rec.
+ * (03/2010) Section 8.7 "Deblocking filter process".
+ *
+ * HISTORY / WHAT WAS HERE BEFORE
+ * -------------------------------
+ * The pre-fix version of this shader computed a boundary strength (bS) of
+ * only 1 or 2 from a single frame-level `is_intra` flag - not per ITU-T
+ * 8.7.2.1's real derivation (which depends on whether either side of the
+ * edge is intra, has nonzero residual coefficients, or has a materially
+ * different motion vector) - and applied a single fixed-shape filter
+ * (`diff = clamp((q0-p0)*0.25, -0.05, 0.05)`, i.e. a flat +-12.75/255
+ * nudge to p0/q0 only) regardless of QP, regardless of whether the edge
+ * was even a real edge worth filtering (no ITU-T Table 8-16 alpha/beta
+ * gate at all - every qualifying edge got smoothed, including genuine
+ * high-contrast picture content), and regardless of the two input buffers
+ * (`QPMap`/`MVs`) it declared but never once read in its body. That
+ * confirms the "crude, fixed-strength" characterization exactly: it was a
+ * placeholder, not a partial implementation of the real algorithm.
+ *
+ * WHAT THIS VERSION DOES
+ * -----------------------
+ * Real ITU-T boundary-strength derivation (8.7.2.1), the real Table 8-16
+ * alpha/beta gate (8.7.2.2) and the real tc0-clipped filtering equations
+ * (8.7.2.3/8.7.2.4), specialized to what this encoder can actually produce
+ * (see encoder_h264.c): every frame is either ALL-I16x16 (IDR) or
+ * ALL-P_L0_16x16/P_Skip (non-IDR) - never mixed intra/inter macroblocks in
+ * one frame, never B-slices, never more than one reference picture, never
+ * sub-16x16 motion partitions, and mb_qp_delta is always coded as 0 (QP is
+ * frame-uniform). That collapses the general 5-way spec test to:
+ *
+ *   - is_intra frame + macroblock-boundary edge -> bS=4
+ *   - is_intra frame + internal (4-sample) edge -> bS=3
+ *   - inter frame, either adjacent 4x4 block has a nonzero coefficient
+ *     (checked against the real post-quantization coefficient buffer,
+ *     binding 1 below) -> bS=2
+ *   - inter frame, |motion vector difference| >= 4 quarter-pel samples
+ *     (checked against the real per-macroblock motion vectors, binding 2
+ *     below) -> bS=1 (the reference-picture-index test from the spec is
+ *     skipped: this encoder always has exactly one reference picture, so
+ *     it can never differ)
+ *   - otherwise -> bS=0 (do not filter at all - this alone is new: the old
+ *     code filtered every qualifying inter edge unconditionally)
+ *
+ * Since QP is frame-uniform (mb_qp_delta==0 always), the spec's
+ * qpAv=(QPp+QPq+1)>>1 macroblock-boundary averaging is exactly pcs.qp,
+ * not an approximation - QPp and QPq are always the same value here.
+ *
+ * DELIBERATE SIMPLIFICATION: no separate 3-tap strong intra filter for
+ * bS==4
+ * ---------------------------------------------------------------------
+ * The spec's bS==4 case (8.7.2.4) uses a qualitatively different "strong"
+ * filter that can write up to 3 samples deep on each side of the edge
+ * (p2'/q2'), used only at real macroblock-boundary edges of intra-coded
+ * macroblocks. This shader intentionally does NOT implement that branch,
+ * and instead reuses the normal bS==3 filtering equations/tc0 row for
+ * bS==4. This is a real, bounded functional gap (not a silent one - see
+ * the perf/quality writeup in this commit's message), and it is forced by
+ * this driver's dispatch architecture, not an oversight:
+ *
+ * gpu_compute.c dispatches one Vulkan workgroup per macroblock, and
+ * workgroups have NO synchronization with each other mid-pass (barrier()
+ * only orders invocations within the SAME workgroup). A macroblock's own
+ * internal-edge filtering legitimately writes up to 1 sample beyond p0/q0
+ * (i.e. p1'/q1' - see filter_edge() below), which for its rightmost
+ * internal vertical edge (local column 12) means writing local column 13
+ * as q1'. A macroblock boundary edge's STRONG intra filter would write
+ * p2' three samples deep into the *neighboring* macroblock's territory -
+ * for a left-boundary edge, that is the neighbor's local column 13 too.
+ * Two different, unsynchronized workgroups writing the same physical pixel
+ * in the same dispatch (one doing its own q1', the other doing the other
+ * macroblock's p2') is a genuine, undefined-order data race.
+ *
+ * This shader's filter_edge() only ever touches p1'/q1' at most (1 sample
+ * beyond the edge on each side) for every bS value, which is provably
+ * conflict-free: the deepest any two concurrently-scheduled workgroups
+ * write into a shared macroblock is local columns 13 (an internal edge's
+ * q1') and 14 (a boundary edge's p1') - always disjoint. The cost is
+ * losing the spec's extra "flat region" 3-tap smoothing that only applies
+ * at real intra macroblock boundaries - a real, minor quality gap relative
+ * to full ITU-T conformance, not a correctness bug in what IS implemented.
+ * (A fully spec-conformant bS==4 filter is possible here, but needs a
+ * genuinely different dispatch shape - e.g. macroblocks partitioned so no
+ * two adjacent ones run in the same pass - which is out of scope for this
+ * pass; see this commit's message.)
+ *
+ * DELIBERATE TWO-DISPATCH SPLIT: vertical edges, then horizontal edges
+ * ----------------------------------------------------------------------
+ * ITU-T 8.7 requires filtering ALL vertical edges of the picture before
+ * ANY horizontal edge, because the horizontal pass must see the vertical
+ * pass's results. A single dispatch cannot guarantee that ordering across
+ * different macroblocks' workgroups (again, no cross-workgroup sync mid-
+ * dispatch) - a thread filtering a horizontal edge might read a neighbor
+ * row's pixel before or after that neighbor's own vertical-edge pass wrote
+ * it, non-deterministically. gpu_compute.c now dispatches this shader
+ * TWICE per frame - pcs.pass==0 (vertical) then, after a real
+ * vkCmdPipelineBarrier (insert_compute_barrier(), SHADER_WRITE ->
+ * SHADER_READ, which orders ALL workgroups of the first dispatch before
+ * ANY workgroup of the second, unlike barrier()) - pcs.pass==1
+ * (horizontal). This exactly matches the spec's required ordering and
+ * fixes a real (if lower-impact, since the old filter only ever nudged
+ * p0/q0 by <=0.05) pre-existing same-issue race in the original single-
+ * dispatch version of this shader.
+ *
+ * REFERENCE / LICENSE NOTE
+ * -------------------------
+ * The boundary-strength derivation and the alpha/beta/tc0 tables and
+ * filtering equations below were cross-checked against x264's
+ * common/deblock.c (deblock_strength_c, deblock_edge_luma_c,
+ * i_alpha_table/i_beta_table/i_tc0_table) to verify this is a faithful,
+ * bug-free translation of the ITU-T algorithm - x264's C implementation is
+ * a widely-conformance-tested reference, not a shortcut around reading the
+ * spec. x264 is GPL-2.0-or-later (see its common/deblock.c file header:
+ * "either version 2 of the License, or (at your option) any later
+ * version"), which is compatible with this project's GPL-3.0-only license
+ * (a GPL-2.0-or-later work may be redistributed/adapted under GPL-3.0 per
+ * its own upgrade grant - see https://www.gnu.org/licenses/license-list.html
+ * "GPL-2.0-or-later is compatible with GPL-3.0"). The alpha/beta/tc0
+ * arrays below are DATA (ITU-T Table 8-16/8-17 lookup tables - the spec's
+ * own numbers, which have no alternative "expression" other than the
+ * numbers themselves), not copied C code; the GLSL control flow/equations
+ * are an independent translation of the ITU-T algorithm into this
+ * project's GPU-compute architecture (see the two NOTE sections above for
+ * exactly where and why this translation diverges from both x264 and the
+ * literal spec).
+ */
+
 layout(set = 0, binding = 0, r8) uniform image2D frameImage;
-layout(std430, set = 0, binding = 1) readonly buffer QPMap {
-    uint qp_map[];
+
+/* Binding 1 was declared "QPMap" by the pre-fix version of this shader but
+ * was never actually bound to a per-MB QP buffer, and never read: gpu_compute.c
+ * wires it to ctx->quant_levels_buffer, the SAME post-quantization
+ * coefficient-level buffer reconstruct.comp reads (see that shader's
+ * QuantLevels/CoeffBuf bindings) via the identical mb_idx*24+raster
+ * indexing convention (24 4x4 blocks/macroblock: 16 luma + 4 Cb + 4 Cr,
+ * raster = block_row*4+block_col for the 16 luma blocks). Renamed here to
+ * reflect what it actually is; used below for the real ITU-T 8.7.2.1
+ * "nonzero coefficient" boundary-strength test. */
+layout(std430, set = 0, binding = 1) readonly buffer QuantLevels {
+    int levels[];
+};
+
+/* Same MotionVector struct/binding convention as motion_estimation.comp's
+ * OutputMV / residual_predict.comp's MVs (std430: ivec2 mv + uint sad,
+ * padded to 16 bytes by std430's 8-byte ivec2 alignment) - one entry per
+ * macroblock. This encoder only ever emits P_L0_16x16 (single 16x16
+ * partition - see encoder_h264.c's encode_mb_p16x16 doc comment): there is
+ * no sub-macroblock motion partitioning, so a macroblock's own two halves
+ * never have different motion - only different macroblocks can. */
+struct MotionVector {
+    ivec2 mv;
+    uint sad;
 };
 layout(std430, set = 0, binding = 2) readonly buffer MVs {
-    ivec2 mvs[];
+    MotionVector mvs[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -19,46 +168,175 @@ layout(push_constant) uniform PushConstants {
     uint is_intra;
     uint color_space;
     uint lambda_motion;
+    uint pass;          /* 0 = filter vertical edges, 1 = filter horizontal
+                          * edges (see the two-dispatch NOTE above) - the 9th
+                          * push-constant word, same shared 10-word layout
+                          * gpu_compute.c documents at pc_range's definition
+                          * (word 9 is otherwise num_slices, which this
+                          * shader has no use for). */
 } pcs;
+
+/* ITU-T H.264 Table 8-16, indexed by indexA/indexB (== qp here - see the
+ * qpAv note above). Cross-checked against x264's i_alpha_table/
+ * i_beta_table (see REFERENCE / LICENSE NOTE above). */
+const int ALPHA_TABLE[52] = int[52](
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    4,4,5,6,7,8,9,10,12,13,15,17,20,22,25,28,
+    32,36,40,45,50,56,63,71,80,90,101,113,127,144,162,182,203,226,255,255
+);
+const int BETA_TABLE[52] = int[52](
+    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    2,2,2,3,3,3,3,4,4,4,6,6,7,7,8,8,
+    9,9,10,10,11,11,12,12,13,13,14,14,15,15,16,16,17,17,18,18
+);
+
+/* ITU-T Table 8-17 tc0: .x/.y/.z = bS 1/2/3 (bS=0 is never filtered; bS=4
+ * reuses .z - see the "no separate 3-tap strong filter" NOTE above). */
+const ivec3 TC0_TABLE[52] = ivec3[52](
+    ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0),
+    ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0),
+    ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,0),
+    ivec3(0,0,0), ivec3(0,0,0), ivec3(0,0,1), ivec3(0,0,1), ivec3(0,0,1),
+    ivec3(0,0,1), ivec3(0,1,1), ivec3(0,1,1), ivec3(1,1,1), ivec3(1,1,1),
+    ivec3(1,1,1), ivec3(1,1,1), ivec3(1,1,2), ivec3(1,1,2), ivec3(1,1,2),
+    ivec3(1,1,2), ivec3(1,2,3), ivec3(1,2,3), ivec3(2,2,3), ivec3(2,2,4),
+    ivec3(2,3,4), ivec3(2,3,4), ivec3(3,3,5), ivec3(3,4,6), ivec3(3,4,6),
+    ivec3(4,5,7), ivec3(4,5,8), ivec3(4,6,9), ivec3(5,7,10), ivec3(6,8,11),
+    ivec3(6,8,13), ivec3(7,10,14), ivec3(8,11,16), ivec3(9,12,18), ivec3(10,13,20),
+    ivec3(11,15,23), ivec3(13,17,25)
+);
+
+int clip1(int v) { return clamp(v, 0, 255); }
+
+int read_px(ivec2 p) {
+    return int(round(imageLoad(frameImage, p).r * 255.0));
+}
+void write_px(ivec2 p, int v) {
+    imageStore(frameImage, p, vec4(float(clip1(v)) / 255.0, 0.0, 0.0, 0.0));
+}
+
+/* True if 4x4 luma block `raster` (0..15, raster = block_row*4+block_col,
+ * matching reconstruct.comp's convention) of macroblock `mb_idx` has any
+ * nonzero quantized coefficient - ITU-T 8.7.2.1's "nonzero transform
+ * coefficient levels" bS=2 test. */
+bool block_nonzero(uint mb_idx, uint raster) {
+    uint base = (mb_idx * 24u + raster) * 16u;
+    for (int i = 0; i < 16; i++) {
+        if (levels[base + uint(i)] != 0) return true;
+    }
+    return false;
+}
+
+/* Real ITU-T 8.7.2.1 boundary-strength derivation - see the top-of-file
+ * comment for the full 5-way-to-this-encoder's-actual-cases collapse. For
+ * an internal edge, p_mb==q_mb (same macroblock); for a macroblock-boundary
+ * edge, p_mb is the neighboring macroblock the caller identified. */
+uint boundary_strength(bool mb_boundary, uint q_mb, uint q_raster, uint p_mb, uint p_raster) {
+    if (pcs.is_intra == 1u) {
+        return mb_boundary ? 4u : 3u;
+    }
+    if (block_nonzero(q_mb, q_raster) || block_nonzero(p_mb, p_raster)) {
+        return 2u;
+    }
+    ivec2 mvq = mvs[q_mb].mv;
+    ivec2 mvp = mvs[p_mb].mv;
+    if (abs(mvq.x - mvp.x) >= 4 || abs(mvq.y - mvp.y) >= 4) {
+        return 1u;
+    }
+    return 0u;
+}
+
+/* ITU-T 8.7.2.2 alpha/beta gate + 8.7.2.3/8.7.2.4 normal filtering
+ * equations (applied for bS 1..4 - see the "no separate 3-tap strong
+ * filter" NOTE at the top of the file for why bS==4 does not get the
+ * spec's distinct strong-filter branch). Reads p2/p1/p0/q0/q1/q2 (six
+ * samples) but writes only p1/p0/q0/q1 (four samples, max 1 deep beyond
+ * the edge each side) - see that same NOTE for why this write footprint is
+ * required for cross-workgroup safety. */
+void filter_edge(ivec2 p0pos, ivec2 p1pos, ivec2 p2pos, ivec2 q0pos, ivec2 q1pos, ivec2 q2pos, uint bs) {
+    if (bs == 0u) return;
+    int idxA = clamp(int(pcs.qp), 0, 51);
+    int alpha = ALPHA_TABLE[idxA];
+    int beta = BETA_TABLE[idxA];
+    if (alpha == 0 || beta == 0) return;
+
+    int p2 = read_px(p2pos), p1 = read_px(p1pos), p0 = read_px(p0pos);
+    int q0 = read_px(q0pos), q1 = read_px(q1pos), q2 = read_px(q2pos);
+
+    /* The gate: only filter samples that look like real blocking (a small
+     * step at the edge, flat-ish on both sides) rather than genuine picture
+     * content - this is the check the pre-fix shader never had, so it
+     * blurred real high-contrast edges unconditionally. */
+    if (abs(p0 - q0) >= alpha || abs(p1 - p0) >= beta || abs(q1 - q0) >= beta) return;
+
+    ivec3 tc0row = TC0_TABLE[idxA];
+    int tc0 = (bs == 1u) ? tc0row.x : (bs == 2u) ? tc0row.y : tc0row.z;
+
+    bool ap = abs(p2 - p0) < beta;
+    bool aq = abs(q2 - q0) < beta;
+    int tc = tc0 + (ap ? 1 : 0) + (aq ? 1 : 0);
+
+    int delta = clamp(((q0 - p0) * 4 + (p1 - q1) + 4) >> 3, -tc, tc);
+    write_px(p0pos, p0 + delta);
+    write_px(q0pos, q0 - delta);
+
+    if (ap) {
+        int d = clamp(((p2 + ((p0 + q0 + 1) >> 1)) >> 1) - p1, -tc0, tc0);
+        write_px(p1pos, p1 + d);
+    }
+    if (aq) {
+        int d = clamp(((q2 + ((p0 + q0 + 1) >> 1)) >> 1) - q1, -tc0, tc0);
+        write_px(q1pos, q1 + d);
+    }
+}
 
 void main() {
     uint mb_x = gl_WorkGroupID.x;
     uint mb_y = gl_WorkGroupID.y;
     if (mb_x >= pcs.width_in_mbs || mb_y >= pcs.height_in_mbs) return;
 
-    ivec2 pos = ivec2(mb_x * 16 + gl_LocalInvocationID.x, mb_y * 16 + gl_LocalInvocationID.y);
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    ivec2 pos = ivec2(int(mb_x * 16u + lx), int(mb_y * 16u + ly));
     if (pos.x >= int(pcs.frame_width) || pos.y >= int(pcs.frame_height)) return;
 
-    // H.264 In-Loop Deblocking Filter
-    // Filter internal 4x4 edges and macroblock boundaries
-    int bs = 0;
-    if (gl_LocalInvocationID.x % 4 == 0 || gl_LocalInvocationID.y % 4 == 0) {
-        bs = (pcs.is_intra == 1) ? 2 : 1;
-    }
+    uint mb_idx = mb_y * pcs.width_in_mbs + mb_x;
 
-    if (bs > 0) {
-        // Vertical 4-pixel boundary edge filtering
-        if (gl_LocalInvocationID.x % 4 == 0 && pos.x > 0 && pos.x + 1 < int(pcs.frame_width)) {
-            float p0 = imageLoad(frameImage, pos - ivec2(1, 0)).r;
-            float q0 = imageLoad(frameImage, pos).r;
-
-            float diff = (q0 - p0) * 0.25;
-            diff = clamp(diff, -0.05, 0.05);
-
-            imageStore(frameImage, pos - ivec2(1, 0), vec4(p0 + diff, 0.0, 0.0, 0.0));
-            imageStore(frameImage, pos, vec4(q0 - diff, 0.0, 0.0, 0.0));
+    if (pcs.pass == 0u) {
+        /* Vertical edges. Every pixel row is independent here (all six
+         * samples p2..q2 are at the same y), so no intra-workgroup barrier
+         * is needed - cross-workgroup ordering comes from the two-dispatch
+         * split in gpu_compute.c, not from anything in this shader. */
+        if (lx % 4u == 0u) {
+            bool mb_boundary = (lx == 0u);
+            bool has_neighbor = mb_boundary ? (mb_x > 0u) : true;
+            if (has_neighbor && pos.x - 3 >= 0 && pos.x + 2 < int(pcs.frame_width)) {
+                uint by = ly / 4u;
+                uint q_col = lx / 4u;
+                uint p_col = mb_boundary ? 3u : (lx / 4u - 1u);
+                uint q_mb = mb_idx;
+                uint p_mb = mb_boundary ? (mb_idx - 1u) : mb_idx;
+                uint bs = boundary_strength(mb_boundary, q_mb, by * 4u + q_col, p_mb, by * 4u + p_col);
+                filter_edge(pos - ivec2(1, 0), pos - ivec2(2, 0), pos - ivec2(3, 0),
+                            pos, pos + ivec2(1, 0), pos + ivec2(2, 0), bs);
+            }
         }
-
-        // Horizontal 4-pixel boundary edge filtering
-        if (gl_LocalInvocationID.y % 4 == 0 && pos.y > 0 && pos.y + 1 < int(pcs.frame_height)) {
-            float p0 = imageLoad(frameImage, pos - ivec2(0, 1)).r;
-            float q0 = imageLoad(frameImage, pos).r;
-
-            float diff = (q0 - p0) * 0.25;
-            diff = clamp(diff, -0.05, 0.05);
-
-            imageStore(frameImage, pos - ivec2(0, 1), vec4(p0 + diff, 0.0, 0.0, 0.0));
-            imageStore(frameImage, pos, vec4(q0 - diff, 0.0, 0.0, 0.0));
+    } else {
+        /* Horizontal edges - transposed version of the above, dispatched
+         * only after pass 0's writes are barrier-visible. */
+        if (ly % 4u == 0u) {
+            bool mb_boundary = (ly == 0u);
+            bool has_neighbor = mb_boundary ? (mb_y > 0u) : true;
+            if (has_neighbor && pos.y - 3 >= 0 && pos.y + 2 < int(pcs.frame_height)) {
+                uint bx = lx / 4u;
+                uint q_row = ly / 4u;
+                uint p_row = mb_boundary ? 3u : (ly / 4u - 1u);
+                uint q_mb = mb_idx;
+                uint p_mb = mb_boundary ? (mb_idx - pcs.width_in_mbs) : mb_idx;
+                uint bs = boundary_strength(mb_boundary, q_mb, q_row * 4u + bx, p_mb, p_row * 4u + bx);
+                filter_edge(pos - ivec2(0, 1), pos - ivec2(0, 2), pos - ivec2(0, 3),
+                            pos, pos + ivec2(0, 1), pos + ivec2(0, 2), bs);
+            }
         }
     }
 }

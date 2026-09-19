@@ -32,13 +32,21 @@ extern "C" {
 /**
  * Write an Intra 16x16 macroblock header and parameters to the bitstream.
  *
- * @param bs          Bitstream context
- * @param pred_mode   Intra 16x16 prediction mode (0=VERT, 1=HORIZ, 2=DC, 3=PLANE)
- * @param cbp_chroma  Coded block pattern for chroma: 0 (none), 1 (DC only), 2 (DC+AC)
- * @param cbp_luma    0 if no AC coefficients, 15 if AC coefficients present
- * @param qp_delta    Quantizer delta from previous macroblock (or slice QP)
+ * @param bs               Bitstream context
+ * @param pred_mode        Intra 16x16 prediction mode (0=VERT, 1=HORIZ, 2=DC, 3=PLANE)
+ * @param chroma_pred_mode Intra chroma prediction mode (0=DC, 1=HORIZ, 2=VERT,
+ *                         3=PLANE - see H264_CHROMA_* above; ITU-T 8.3.4 - a
+ *                         real per-MB mode decision, not hardcoded DC, since a
+ *                         macroblock whose top spatial neighbor is very
+ *                         different content from its own (e.g. straddling a
+ *                         hard color-region boundary) gets a badly wrong
+ *                         chroma DC blend otherwise - see
+ *                         residual_predict.comp's chroma mode-decision comment)
+ * @param cbp_chroma       Coded block pattern for chroma: 0 (none), 1 (DC only), 2 (DC+AC)
+ * @param cbp_luma         0 if no AC coefficients, 15 if AC coefficients present
+ * @param qp_delta         Quantizer delta from previous macroblock (or slice QP)
  */
-void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int cbp_chroma, int cbp_luma, int qp_delta);
+void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int chroma_pred_mode, int cbp_chroma, int cbp_luma, int qp_delta);
 
 /**
  * Write mb_skip_run (ITU-T H.264 7.3.4 slice_data()). MUST be called exactly

@@ -13,7 +13,71 @@
 #include "encoder_h264.h"
 #include "bitstream.h"
 
+/*
+ * Regression test for the Intra16x16 luma DC transpose bug fixed in commit
+ * d95b840 ("fix(encoder): transpose Intra16x16 luma DC array before CAVLC -
+ * closes remaining luma corruption"). This is a pure-math, no-GPU-context
+ * test: h264_encoder_create(NULL, ...) below skips encode_mb_i16x16()
+ * entirely (falls back to an all-zero-residual MB - see
+ * h264_encoder_encode_frame's "No GPU residual data available" branch), so
+ * the full end-to-end test in main() never exercises this code path at all;
+ * this is why neither this file's original test nor any CAVLC unit test
+ * caught the bug.
+ *
+ * Reproduces the investigation's "DC shuffle" methodology: 16 distinct,
+ * known flat DC values (one per luma 4x4 sub-block), spatially varying
+ * enough that any misassignment of a value to the wrong (row,col) is
+ * immediately detectable. Rather than hardcoding expected Hadamard-domain
+ * numbers (which would make this test a tautological re-statement of
+ * luma_dc_hadamard()'s own arithmetic), this checks the actual INVARIANT
+ * the fix establishes: the array handed to CAVLC (dc_out) must be the
+ * transpose of the raw quantized Hadamard output (dc_out_pretranspose).
+ * Before commit d95b840, dc_out was a straight copy of the pretranspose
+ * array (no transpose at all) - for this asymmetric fixture, that fails
+ * the check below exactly the way it failed against a real decoder on
+ * real, spatially-varying content.
+ */
+static void test_intra16_dc_transpose(void) {
+    printf("[test_encode] Regression: Intra16x16 luma DC transpose (commit d95b840)...\n");
+
+    int dc_flat[16] = { 16,  28,  40,  52,
+                         64,  76,  88, 100,
+                        112, 124, 136, 148,
+                        160, 172, 184, 196 };
+    int dc_in[4][4];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++)
+            dc_in[r][c] = dc_flat[r * 4 + c];
+
+    int dc_out[16], pretranspose[16];
+    h264_intra16_luma_dc_transform(dc_in, 26 /* qp */, dc_out, pretranspose);
+
+    /* Sanity check on the fixture itself: confirm the pre-transpose array
+     * really is asymmetric, otherwise a missing transpose (the bug) would
+     * pass the check below vacuously and this wouldn't be a valid
+     * regression test. */
+    bool asymmetric = false;
+    for (int r = 0; r < 4 && !asymmetric; r++) {
+        for (int c = r + 1; c < 4; c++) {
+            if (pretranspose[r * 4 + c] != pretranspose[c * 4 + r]) { asymmetric = true; break; }
+        }
+    }
+    assert(asymmetric && "fixture produced a symmetric pre-transpose array - not a valid regression test");
+
+    /* The actual regression check: dc_out must be the transpose of
+     * pretranspose, i.e. dc_out[row][col] == pretranspose[col][row]. */
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            assert(dc_out[r * 4 + c] == pretranspose[c * 4 + r]);
+        }
+    }
+
+    printf("[test_encode] Intra16x16 luma DC transpose verified (dc_out == transpose(pretranspose)).\n");
+}
+
 int main(void) {
+    test_intra16_dc_transpose();
+
     printf("[test_encode] Starting H.264 end-to-end bitstream encoding test...\n");
 
     const uint32_t width = 1920;

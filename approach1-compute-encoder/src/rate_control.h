@@ -34,7 +34,8 @@ typedef struct {
     int64_t error_integral;
 } rate_control_t;
 
-void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps);
+void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
+             uint32_t width, uint32_t height);
 int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad);
 void rc_update_stats(rate_control_t *rc, int bits_used);
 
