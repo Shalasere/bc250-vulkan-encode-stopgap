@@ -1552,6 +1552,35 @@ static void insert_compute_barrier(VkCommandBuffer cmd_buf) {
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
 }
 
+/* insert_compute_barrier() above only covers a compute shader reading
+ * another compute shader's write (COMPUTE_SHADER->COMPUTE_SHADER,
+ * SHADER_WRITE->SHADER_READ). It does NOT cover vkCmdCopyBuffer, which
+ * executes in the TRANSFER stage with VK_ACCESS_TRANSFER_READ_BIT access -
+ * neither that stage nor that access mask is in scope of the barrier above.
+ * gpu_compute_dispatch_encode() below copies entropy_buffer/quant_levels_buffer/
+ * coeff_buffer/pred_mode_buffer/mv_buffer (all written by earlier compute
+ * dispatches in this same command buffer: motion_estimation.comp, predict/
+ * intra_wavefront, quantize/intra_wavefront, entropy) into their HOST_CACHED
+ * staging buffers via vkCmdCopyBuffer, with no barrier between the writes and
+ * those copies covering the TRANSFER stage - per the Vulkan spec, without an
+ * execution+memory dependency covering both the writing stage/access and
+ * TRANSFER/TRANSFER_READ, the copy is not guaranteed to observe the compute
+ * shaders' writes, and can race them on real hardware. One VkMemoryBarrier
+ * (not five per-buffer VkBufferMemoryBarriers) is sufficient here: this is a
+ * single-queue, serially-recorded command buffer, so placing this barrier
+ * once, immediately before the block of 5 vkCmdCopyBuffer calls, orders
+ * after every one of those buffers' last writes (all recorded earlier in
+ * this same command buffer) and before every one of the 5 copies. */
+static void insert_compute_to_transfer_barrier(VkCommandBuffer cmd_buf) {
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+    };
+    vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
 /* Diagnostic-only (BC250_PERF_STATS=1): millisecond delta between two
  * CLOCK_MONOTONIC timespecs. Used below to isolate vkQueueSubmit() and
  * vkWaitForFences() as their own real wall-clock brackets - see the
@@ -1957,6 +1986,13 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     if (ctx->perf_stats_enabled) {
         vkCmdWriteTimestamp(cmd_buf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx->timestamp_pools[perf_buf], 8);
     }
+
+    /* GPU-side write-then-copy dependency for the 5 vkCmdCopyBuffer calls
+     * below - see insert_compute_to_transfer_barrier()'s doc comment. Placed
+     * once here, after every compute dispatch that writes entropy_buffer/
+     * quant_levels_buffer/coeff_buffer/pred_mode_buffer/mv_buffer this frame
+     * and before all 5 copies that read them. */
+    insert_compute_to_transfer_barrier(cmd_buf);
 
     /* Copy entropy output buffer to current staging buffer for overlapped CPU readback */
     VkDeviceSize copy_size = width * height;
