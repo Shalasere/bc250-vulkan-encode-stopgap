@@ -5,22 +5,40 @@ hardware video engine is dead. Correctness and performance here are both
 *measured*, never argued — this file exists because the expensive mistakes on
 this project have all been measurement and process mistakes, not coding ones.
 
-## 🚨🚨 TOP PRIORITY: this driver has zero thread synchronization, anywhere
+## Thread synchronization — FIXED, keep it that way
 
-`grep -rn 'pthread_mutex\|pthread_rwlock\|atomic_' src/` returns nothing.
 ffmpeg calls into this driver from ≥2 of its own concurrent OS threads
-(`encoder_thread`/`enc0:0:h264_vaa` and `filter_thread`/`vf#0:0`), and
-ThreadSanitizer confirms real, reproducible (2/2) data races on shared driver
-state — `va_backend.c`'s `bc250_CreateSurfaces`/`bc250_CreateBuffer` vs
+(`encoder_thread`/`enc0:0:h264_vaa` and `filter_thread`/`vf#0:0`), and this
+was once a real, TSan-confirmed (2/2 reproducible) data race on shared driver
+state: `va_backend.c`'s `bc250_CreateSurfaces`/`bc250_CreateBuffer` vs
 `bc250_DestroyBuffer` (plausibly the mechanism behind a flaky SIGSEGV, see
 DEVLOG §26.1.2), and `gpu_compute.c`'s double-buffer `current_buf` index
 racing between `gpu_compute_end_picture()` and `gpu_compute_submitted_slot()`.
-**This is not specific to any one code path (CAVLC, pipelining, etc.) — it is
-the driver's default, always-on calling contract, so the default CABAC/
-production path is exposed to the same race class.** ASan/UBSan cleanly
-missed it (12/12 runs) because neither instruments cross-thread ordering at
-all — only TSan can see this. Implemented on branch `simpmix`:
-recursive driver mutex (`PTHREAD_MUTEX_RECURSIVE`), lock-free GPU fence wait (DEVLOG §26.6), and Rate Control improvements: CQP mode support, VAConfig rate control attribute negotiation, and real GPU motion SAD feeding (DEVLOG §26.7). Unit & concurrency tests added to test_va_api.c and test_encode.c.
+ASan/UBSan missed it (12/12 runs) because neither instruments cross-thread
+ordering — only TSan can see this class of bug.
+
+**Fixed on `main`** (`5dcd69a`, merged via PR #6, 2026-09-13): a recursive
+`pthread_mutex_t` (`data->lock`, `DRIVER_LOCK`/`DRIVER_UNLOCK` in
+`va_backend.h`) guards every public VA-API entry point that touches driver
+state. `gpu_compute.c` itself has no internal locking - the second race is
+closed by external-locking discipline instead: every call site that reads or
+writes `current_buf` (`gpu_compute_end_picture()` at the `bc250_EndPicture()`
+call site, `gpu_compute_submitted_slot()` at the `bc250_SyncSurface()` call
+site) is wrapped in the same `DRIVER_LOCK`/`DRIVER_UNLOCK` pair. **If you ever
+call either of those two functions from a new call site, wrap it in
+`DRIVER_LOCK`/`DRIVER_UNLOCK` too - the mutex only works because every
+accessor takes it, not because of anything internal to `gpu_compute.c`.**
+`PTHREAD_MUTEX_RECURSIVE` specifically, to avoid self-deadlock on internal
+re-entrancy (e.g. `vaDeriveImage` → `vaCreateImage` → `vaCreateBuffer`).
+
+`bc250_SyncSurface()` reads the submitted slot under the lock, then
+**releases it before** calling `gpu_compute_sync_slot()`, so one thread's
+unbounded `vkWaitForFences()` can't block every other VA-API call for the
+life of the wait - don't "simplify" this back into one locked span.
+
+A concurrency unit test (step 10, `test_va_api.c`) runs a filter-thread
+worker and an encoder-thread worker racing for 100 iterations. Run it as
+part of `tools/lab units <key>`.
 
 ## Before you assert a mechanism, grep the DEVLOG
 
