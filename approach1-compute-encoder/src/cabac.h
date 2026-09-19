@@ -121,6 +121,37 @@
 extern "C" {
 #endif
 
+/* None of the functions in this file are ever called from outside this
+ * shared object (confirmed by grep across src/, tests/, tools/ - only
+ * cabac.c's own syntax-element encoders and encoder_h264.c's CABAC MB loop
+ * reference them). Left at the default ELF visibility, a call to one of
+ * these from a different translation unit still goes through the PLT,
+ * because the dynamic linker has to allow for another loaded module
+ * preempting the symbol.
+ *
+ * Real, measured cost: perf on real BC-250 hardware (2026-09-18, testsrc2,
+ * representative YUV-native content) showed cabac_encode_decision as the
+ * single hottest function in the entire profile (20.52% of all CPU cycles),
+ * with a separate, non-trivial cabac_encode_decision@plt entry (1.34%) -
+ * pure call-overhead a direct/GOT-relative call would skip.
+ * `__attribute__((visibility("hidden")))` (via the push/pop pragma pair
+ * below) marks that declaration - and, since cabac.c also includes this
+ * header, its definition - as non-preemptible, so intra-.so calls compile
+ * to a direct call instead of a PLT stub. Measured effect, isolated to just
+ * this one function: PLT entry eliminated, ~1.5-3% real throughput/CPU-time
+ * improvement (tools/lab bench, testsrc2, 5 repeats), byte-identical output
+ * on the all-intra testsrc gate (the only content this project treats as a
+ * valid byte-exactness oracle - see DEVLOG/CLAUDE.md's byte-exactness rule).
+ *
+ * This is applied PER-FUNCTION, not as one blanket push/pop around the
+ * whole file, because it is NOT safe to do that here: hiding
+ * cabac_write_residual_block specifically changes the CABAC bitstream
+ * output on that same all-intra oracle - see that function's own doc
+ * comment for the full bisection writeup. Do not apply this pragma to
+ * another function in this file without re-running that same gate
+ * (`tools/lab gate <key> <baseline>`) and confirming gop=1 byte-exactness
+ * survives it. */
+
 /* Total number of CABAC contexts this project ever indexes (ctxIdx 0..275).
  * Real H.264 CABAC has up to 1024 contexts (4:4:4 High profile); this
  * project never emits 4:4:4, 8x8-transform, B-slice, multi-ref, or
@@ -166,7 +197,9 @@ void cabac_context_init(cabac_engine_t *cb, bool is_intra_slice, int cabac_init_
 
 /* Encode one regular (context-modeled) bin using context ctx_idx, updating
  * that context's adaptive state. */
+#pragma GCC visibility push(hidden)
 void cabac_encode_decision(cabac_engine_t *cb, int ctx_idx, int bit);
+#pragma GCC visibility pop
 
 /* Encode one bypass-coded bin (equiprobable, no context/adaptation). */
 void cabac_encode_bypass(cabac_engine_t *cb, int bit);
@@ -314,7 +347,24 @@ void cabac_write_coded_block_flag(cabac_engine_t *cb, cabac_ctx_block_cat_t cat,
  * zigzag (or, for CABAC_CAT_CHROMA_DC, raw row-major - no zigzag exists for
  * the 2x2 case) scan order, matching this project's existing CAVLC
  * convention (see cavlc.c's cavlc_write_4x4_block/_ac_block/
- * _chroma_dc_block for the identical scan/ordering contract). */
+ * _chroma_dc_block for the identical scan/ordering contract).
+ *
+ * DELIBERATELY NOT hidden-visibility, unlike this file's other functions -
+ * bisected on real hardware (2026-09-19): marking this one hidden changes
+ * the actual CABAC bitstream output on all-intra testsrc (the ONE oracle
+ * this project treats as a valid byte-exactness check - DEVLOG/CLAUDE.md
+ * §19.6), reproducibly, e.g. 5551200 -> 5547635 bytes for a fixed 200-frame
+ * gop=1 clip. Isolated by bisection to this exact function (cabac_encode_
+ * decision alone is confirmed safe and byte-identical); NOT fixed by
+ * -fno-ipa-cp-clone, so it is not the same constant-propagation-cloning
+ * mechanism that made cabac_encode_decision faster. Manual review of this
+ * function's own logic against the ITU-T 9.3.3.1.3 residual syntax (the
+ * significant/last-coefficient scan, the coeffs[] population, the reverse-
+ * order level loop, the level1/levelgt1/transition tables) found no
+ * algorithmic bug and no out-of-bounds table access. Root cause NOT fully
+ * identified - do not re-add hidden visibility here without re-verifying
+ * byte-exactness on real hardware (`tools/lab gate <key> <baseline>`, gop=1
+ * specifically) first. */
 void cabac_write_residual_block(cabac_engine_t *cb, cabac_ctx_block_cat_t cat, const int *scanned);
 
 /* Number of coefficients in a block of category `cat` (maxNumCoeff). */
