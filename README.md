@@ -1,6 +1,6 @@
 # AMD BC-250 Custom Driver & VA-API Video Encoder
 
-[![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-encoding-decoding-fix/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-encoding-decoding-fix/actions/workflows/build.yml)
+[![Build & Release BC-250 Drivers](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml/badge.svg)](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/Driver%20License-GPL--3.0-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
@@ -13,14 +13,9 @@ Software H.264 (Vulkan compute accelerated) and H.265/HEVC (CABAC, IDR/P-frame G
 
 ## Background
 
-The BC-250 is a repurposed PS5 APU (Zen 2, up to 40 unlocked RDNA 2 CUs) whose hardware VCN video engine was permanently unprovisioned/eFused off at the factory. Without a working VCN block, applications requiring hardware encode (Sunshine, OBS, Steam Link) fall back to software encoding. This project solves this by running video encoding as Vulkan compute shaders on the APU's CUs, exposed as a standard VA-API driver (`bc250_drv_video.so`).
+The BC-250 is a repurposed PS5 APU (Zen 2, up to 40 unlocked RDNA 2 CUs) whose hardware VCN video engine was permanently unprovisioned/eFused off at the factory — no driver or software patch can revive permanently fused silicon. Without a working VCN block, applications requiring hardware encode (Sunshine, OBS, Steam Link) fall back to software encoding. This project solves that by running video encoding as Vulkan compute shaders directly across the GPU's RDNA 2 Compute Units, exposed as a standard VA-API driver (`bc250_drv_video.so`), alongside an unrelated audio clock fix.
 
 > [!NOTE]
-> **Project & Repository Rename (`bc250-encoding-decoding-fix`):**
-> This repository was renamed from `bc250-vcn-driver` to **`bc250-encoding-decoding-fix`** to eliminate confusion and avoid misleading anyone into believing that the physical VCN (Video Core Next) cores have been magically unlocked or revived.
->
-> On the BC-250 mining APU, AMD permanently unprovisioned and eFused off the hardware VCN silicon at the factory. No driver or software patch can revive permanently fused silicon. Instead, this project provides a from-scratch, high-performance **VA-API hardware driver replacement** powered by custom Vulkan Compute shaders executed directly across the GPU's RDNA 2 Compute Units, coupled with real-time CPU SIMD motion estimation offloading and an audio clock fix.
->
 > **40 CU vs 24 CU Unlock**: The physical chip has 40 CUs (20 WGPs). Stock mining board firmware often limits the APU to 24 CUs. Unlocking all 40 CUs requires an `amdgpu` kernel patch ([duggasco/bc250-40cu-unlock](https://github.com/duggasco/bc250-40cu-unlock)) or an APU-optimized distribution like **Bazzite** or **SkillFishOS**. This project does *not* bundle a kernel unlock patch, but automatically scales its compute shaders across all 40 CUs when unlocked (taking <3–5% of GPU resources).
 
 ---
@@ -37,14 +32,12 @@ Validated on physical hardware.
 **Performance**: 267 fps @ 640x480, 179 @ 720p, 100-134 @ 1080p, 67-80 @ 1440p — real-time or above throughout. GPU shaders are <1.5% of frame time; the remaining bottlenecks are CPU/memory-side.
 
 > [!TIP]
-> **Dynamic CPU/GPU Hybrid Load Balancing**: Compute shader encoders naturally contend with 3D games running on the same CUs. To prevent stream frame drops when games saturate the GPU, this driver includes a **Real-Time Dynamic Saturation Governor** and **Vectorized CPU SIMD Motion Estimation Engine**. When GPU CU saturation is detected, the governor shifts Motion Estimation (~70% of encoder compute work) to 2 idle Zen 2 CPU worker threads via SSE2 SIMD intrinsics over the APU's unified 16 GB GDDR6 memory bus, maintaining locked 60 fps game streaming without user intervention.
->
-> **Every throughput figure here is measured with an otherwise idle GPU.** Under heavy 3D titles, the dynamic governor automatically engages Tier 1 (Fast GPU ME) or Tier 2 (CPU SIMD Offload) to preserve stream frame pacing.
+> **Every throughput figure here is measured with an otherwise idle GPU.** Compute shader encoding shares the same CUs a running game uses, so under real GPU contention throughput drops — a heavy compute-bound title can cost this encoder up to ~45x (measured 66.2 → 1.48 fps at 1440p under a synthetic worst-case load generator). There is no dynamic CPU/GPU load-balancing in this driver by design — see [Known Limitations](#known-limitations) for why an earlier attempt at that was removed.
 
 On moving 1440p content the encode ceiling is **67 fps, up 46% from 46 fps** (static content: 92 fps, up 42%), from two changes to what crosses the GPU→CPU boundary. The GPU now hands the CPU a per-4x4-block nonzero bitmask, so the ~90-96% of blocks that quantize to all-zero are never read out of the 22 MB coefficient buffer; and the pre-quantization coefficient buffer is no longer staged to the host at all, since all 13 CPU reads of it wanted only each block's DC term — the GPU writes those to a compact buffer 1/16th the size. Together that cut CAVLC time ~40% and dropped host-visible staging from 44.2 MB to 2.8 MB per encoder context. `docs/DEVLOG.md` §19–§20.
 
 - `tools/setup_bazzite.sh` — verified end-to-end on real Bazzite (installs, persists, `vainfo` sees it).
-- Test suite: all 7 test suites run and pass (`BitstreamTest`, `CavlcUnitTest`, `VaApiDriverTest`, `EncodeBitstreamTest`, `HevcEncodeBitstreamTest`, `CpuSimdMeTest`, `DynamicGovernorTest`).
+- Test suite: all 5 test suites run and pass (`BitstreamTest`, `CavlcUnitTest`, `VaApiDriverTest`, `EncodeBitstreamTest`, `HevcEncodeBitstreamTest`).
 - **CABAC** (`feature/h264-cabac`, ITU-T 9.3, adapted from x264, GPL-2.0-or-later): auto-selected for Main/High profile or via `BC250_USE_CABAC=1`. 10-13% smaller output than CAVLC at matched QP, ~28% more CPU, still well above real-time. Scope: I_16x16 intra / P_L0_16x16 inter only.
 
 ## Known Limitations
@@ -55,6 +48,7 @@ On moving 1440p content the encode ceiling is **67 fps, up 46% from 46 fps** (st
 - **Display must not be asleep** when Sunshine initializes capture, or it reads the output as `0x0` and fails with *"Failed to initialize video capture/encoding"* (Moonlight Error 503) — including on a client launching an app hours after Sunshine started, since each launch re-initializes capture. Disable screen blanking on the host (on KDE: PowerDevil "Screen Energy Saving" off). This is the single most likely reason a working install appears broken. `docs/DEVLOG.md` §14.4.
 - **`qp_min=12` is deliberate, and lowering it is a measured net loss** — don't "fix" it. At 1440p the encoder settles at QP 12 spending ~15-19 of 31 Mbps, which looks like wasted bandwidth; taking the floor to 8 spent 14% more bits for **−22% encode throughput and no visible quality change**. QP 12 is past the point of visible return on desktop content. `docs/DEVLOG.md` §18.
 - **Do not install `tools/bc250_sunshine_shim.c`.** It is kept only as a documented technique for `LD_PRELOAD`ing into an `AT_SECURE` binary. It was written to work around what turned out to be a rate-control bug (§16), was never load-bearing, and costs roughly 40% of your frame rate by forcing Sunshine off its zero-copy capture path. `docs/DEVLOG.md` §17.
+- **There is no dynamic CPU/GPU load-balancing governor, and that is deliberate.** An earlier attempt shifted motion estimation to CPU SIMD threads under detected GPU contention, but it was removed: policy decisions like CPU-offload tiering are a system-management concern, not something a VA-API driver should decide for the calling application, and the implementation carried real defects (including a buffer overrun on non-16-multiple resolutions) that removing the feature retired outright rather than patched. Motion estimation always runs on the GPU now.
 - **Rate control caveat**: `rc_estimate_base_qp()` saturates at `qp_min` for any target above roughly 31 Mbps at 1440p30, so it cannot differentiate high bitrate targets from each other.
 - **Releases before `v0.3.1` can crash the host app on startup.** `bc250_gpu_init()` eagerly allocated every encoding buffer for 3840x2160 (~431 MB per encoder context) even at 1080p, and Sunshine's encoder probe creates **20 contexts** — ~8.6 GB against the ~7.95 GB of memory Vulkan exposes here (a 2.65 GiB host-visible heap plus a 5.30 GiB device-local one), with the host-visible heap exhausting first. Allocations failed, the failures were unchecked, and they surfaced as a SEGV rather than a clean fallback. Fixed by allocating lazily at the real resolution and checking every allocation (`Vulkan error -2` per Sunshine start: 9 → 0). If you are on an older build and Sunshine dies at startup with `status=11/SEGV` in `bc250_gpu_init`, this is it. `docs/DEVLOG.md` §19.7, corrected in §21.
 - **The `512 MB` in `mem_info_vram_total` is not a limit worth chasing**, and don't try to raise it. This is a unified-memory APU: all 16 GB is one pool of GDDR6, the GPU reaches it through GART/GTT, and Vulkan reports ~7.95 GiB across two heaps. The 512 MB is only the slice amdgpu labels "VRAM" — there is no faster tier behind it, so enlarging it buys nothing. It also isn't settable: `amdgpu.vramlimit`/`vis_vramlimit` only restrict, and the BIOS/APCB route is a known dead end on this board. The genuine ceiling is the GART aperture, `amdgpu.gttsize` (auto = half of system RAM). `docs/DEVLOG.md` §21.
@@ -72,20 +66,20 @@ The long-standing "corruption during on-screen motion" report is **fixed** as of
 
 **A — Immutable/atomic distros** (Bazzite, SteamOS, HoloISO, ChimeraOS):
 ```bash
-git clone https://github.com/simpmix/bc250-encoding-decoding-fix.git
-cd bc250-encoding-decoding-fix
+git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
+cd bc250-vulkan-encode-stopgap
 sudo ./tools/setup_bazzite.sh   # or setup_steamos.sh
 ```
 
 **B — Traditional distros** (Fedora, Ubuntu, Arch, openSUSE):
 ```bash
-git clone https://github.com/simpmix/bc250-encoding-decoding-fix.git
-cd bc250-encoding-decoding-fix
+git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
+cd bc250-vulkan-encode-stopgap
 ./build_and_install.sh
 ```
 
 **C — Pre-built release** (fastest — no compiling or dev packages needed):
-Download `bc250-driver-linux-x86_64.tar.gz` from [Releases](https://github.com/simpmix/bc250-encoding-decoding-fix/releases) (`v0.3.0`+):
+Download `bc250-driver-linux-x86_64.tar.gz` from [Releases](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases):
 ```bash
 tar -xzvf bc250-driver-linux-x86_64.tar.gz
 cd bc250-driver
@@ -236,7 +230,7 @@ Carried over as-is; out of scope for this project's correctness work.
 
 ## Contributing / CI
 
-`.github/workflows/build.yml` builds 64-bit and 32-bit drivers, runs all 7 automated test suites (`ctest`), and strictly validates both generated H.264 and H.265/HEVC bitstreams against the external FFmpeg reference decoder oracle.
+`.github/workflows/build.yml` builds 64-bit and 32-bit drivers, runs all 5 automated test suites (`ctest`), and strictly validates both generated H.264 and H.265/HEVC bitstreams against the external FFmpeg reference decoder oracle.
 
 Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
@@ -248,4 +242,4 @@ Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
 Copyleft: derivatives must ship source under the same terms; GPL-3.0's anti-tivoization clauses block shipping this inside a locked-down device that prevents installing a modified build.
 
-<!-- bc250-encoding-decoding-fix v0.4.0 -->
+<!-- bc250-vulkan-encode-stopgap -->
