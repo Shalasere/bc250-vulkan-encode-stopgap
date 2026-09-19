@@ -13,6 +13,8 @@
 #include <va/va_enc_h264.h>
 #include <va/va_enc_hevc.h>
 #include <va/va_vpp.h>
+#include <va/va_drmcommon.h>
+#include <drm_fourcc.h>
 #include "gpu_compute.h"
 #include "encoder_h264.h"
 #include "encoder_h265.h"
@@ -45,6 +47,17 @@ struct bc250_surface {
     gpu_image_t image;
     gpu_memory_t memory;
     int ref_count;
+    /* Set by bc250_DestroySurfaces() the moment the application asks to
+     * destroy this surface. From that point on the VASurfaceID is invalid
+     * for any further application-facing VA call (vaBeginPicture,
+     * vaDeriveImage, vaGetImage/vaPutImage, vaSyncSurface, ...), even
+     * though `allocated` may still be 1 and the underlying Vulkan
+     * image/memory may still be alive because a derived VAImage created via
+     * vaDeriveImage() is keeping ref_count above zero. This lets the
+     * driver honor normal VA-API surface-destroy semantics from the
+     * caller's point of view while still deferring the actual Vulkan
+     * teardown until the last outstanding derived image is destroyed. */
+    int pending_destroy;
 };
 
 struct bc250_config {
@@ -100,6 +113,12 @@ struct bc250_buffer {
     int mapped;
     int is_derived;
     VkDeviceMemory gpu_mem;
+    /* Only meaningful when is_derived is set: the surface whose Vulkan
+     * memory this buffer aliases (via vaDeriveImage()). Used to release
+     * the reference that buffer took on that surface when this buffer is
+     * torn down (bc250_DestroyBuffer). VA_INVALID_SURFACE when this slot
+     * does not currently back a derived image. */
+    VASurfaceID derived_surface;
 };
 
 struct bc250_image {
@@ -163,6 +182,7 @@ VAStatus bc250_DestroyImage(VADriverContextP ctx, VAImageID image);
 VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *image);
 VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y, unsigned int width, unsigned int height, VAImageID image);
 VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height);
+VAStatus bc250_ExportSurfaceHandle(VADriverContextP ctx, VASurfaceID surface_id, uint32_t mem_type, uint32_t flags, void *descriptor);
 VAStatus bc250_SetImagePalette(VADriverContextP ctx, VAImageID image, unsigned char *palette);
 
 /* Subpictures (unsupported - stubs required by the libva driver contract) */
