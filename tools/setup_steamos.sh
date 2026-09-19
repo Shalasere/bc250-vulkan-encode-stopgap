@@ -173,6 +173,16 @@ LIBVA_DRIVERS_PATH=/var/lib/bc250/dri:/usr/local/lib/dri:/usr/local/lib64/dri:/u
 BC250_FAST_MODE=1
 BC250_SLICES_PER_FRAME=4
 BC250_SHADER_DIR=/var/lib/bc250/shaders
+# Fixes a measured bug (2026-09-18 hardware measurement), not a preference:
+# without these, libgomp's default active/spin wait for the per-frame CAVLC
+# slice threading above pins ~1300% aggregate host CPU for zero throughput
+# gain over BC250_SLICES_PER_FRAME=1. Must be set here (before ffmpeg starts)
+# - libgomp reads them once at its own init, too early for the driver's own
+# vaInitialize() to change them after the fact.
+OMP_WAIT_POLICY=PASSIVE
+GOMP_SPINCOUNT=0
+OMP_NUM_THREADS=2
+OMP_DYNAMIC=FALSE
 EOF
 $SUDO chmod 644 /etc/environment.d/99-bc250.conf
 echo -e "  ${GREEN}✓ Configured persistent environment in /etc/environment.d/99-bc250.conf${NC}"
@@ -186,6 +196,11 @@ export LIBVA_DRIVERS_PATH=/var/lib/bc250/dri:/usr/local/lib/dri:/usr/local/lib64
 export BC250_FAST_MODE=1
 export BC250_SLICES_PER_FRAME=4
 export BC250_SHADER_DIR=/var/lib/bc250/shaders
+# See the matching comment in the environment.d block above.
+export OMP_WAIT_POLICY=PASSIVE
+export GOMP_SPINCOUNT=0
+export OMP_NUM_THREADS=2
+export OMP_DYNAMIC=FALSE
 EOF
 $SUDO chmod 644 /etc/profile.d/bc250.sh
 echo -e "  ${GREEN}✓ Configured persistent environment in /etc/profile.d/bc250.sh${NC}"

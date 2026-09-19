@@ -173,12 +173,28 @@ fi
 # /usr/local DRI paths in LIBVA_DRIVERS_PATH: libva's compiled-in default search
 # path does NOT include /usr/local, so a driver installed only there (the only
 # path that actually succeeds on an ostree system) would otherwise never be found.
+#
+# The four OMP_*/GOMP_* vars below fix a measured bug, not a preference: with
+# BC250_SLICES_PER_FRAME=4 (also set here), encoder_h264.c's per-frame
+# `#pragma omp parallel for` (CAVLC slice entropy coding) hits libgomp's
+# default active/spin wait policy. Measured on real BC-250 hardware
+# (2026-09-18): 16 idle-most-of-the-time slice-worker threads pinned aggregate
+# host CPU at ~1300%, for byte-identical throughput to BC250_SLICES_PER_FRAME=1
+# (92 vs 94 fps) - a 4x+ CPU cost bought nothing, at machine-wide scope since
+# this file is read by every application using this driver via ffmpeg, not
+# just this project's own benchmarks. Setting OMP_NUM_THREADS=2/PASSIVE/
+# GOMP_SPINCOUNT=0 here (not inside the driver's own vaInitialize()) measured
+# at ~354% aggregate CPU and fps=102 - both better, not a tradeoff. It has to
+# live here: libgomp reads these once, at its own first internal
+# initialization, which happens too early for a setenv() call inside a
+# dynamically-loaded driver's init function to still have any effect -
+# confirmed by direct measurement, not assumed.
 if [ -d "/etc/environment.d" ]; then
-    printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
+    printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\nOMP_WAIT_POLICY=PASSIVE\nGOMP_SPINCOUNT=0\nOMP_NUM_THREADS=2\nOMP_DYNAMIC=FALSE\n" | $SUDO tee /etc/environment.d/99-bc250.conf > /dev/null 2>&1 || true
     echo -e "  -> Configured system-wide environment in /etc/environment.d/99-bc250.conf"
 elif [ -f "/etc/environment" ]; then
     if ! grep -q "LIBVA_DRIVER_NAME=bc250" /etc/environment 2>/dev/null; then
-        printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
+        printf "LIBVA_DRIVER_NAME=bc250\nLIBVA_DRIVERS_PATH=/usr/local/lib64/dri:/usr/local/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib64/dri:/usr/lib/dri:/usr/lib32/dri:/usr/lib/i386-linux-gnu/dri\nBC250_FAST_MODE=1\nBC250_SLICES_PER_FRAME=4\nOMP_WAIT_POLICY=PASSIVE\nGOMP_SPINCOUNT=0\nOMP_NUM_THREADS=2\nOMP_DYNAMIC=FALSE\n" | $SUDO tee -a /etc/environment > /dev/null 2>&1 || true
         echo -e "  -> Configured system-wide environment in /etc/environment"
     fi
 fi
