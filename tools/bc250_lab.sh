@@ -477,7 +477,14 @@ run_encode() {
     # wall_s  wall_ms/frame  fps  cpu_s  cpu_ms/frame  maxrss_kb
     local cpu_s=0 rss=0
     if [ -f "${out}.time" ]; then
-        read -r _e _u _s _m < "${out}.time"
+        # IFS=' ': this function's own --env= parsing above sets a
+        # function-scoped `local IFS=,` that a bare `read` here would still
+        # be sitting under (bash's `local` restores on function return, not
+        # on the enclosing loop/block exiting) - collapsing this
+        # whitespace-separated line into $_e alone and leaving cpu_s/rss
+        # silently 0 on every run that passes --env=. Confirmed by tracing:
+        # `_e=3.75 10.68 0.44 346232 _u= _s= _m=`.
+        IFS=' ' read -r _e _u _s _m < "${out}.time"
         cpu_s=$(awk -v u="${_u:-0}" -v s="${_s:-0}" 'BEGIN{printf "%.4f", u+s}')
         rss="${_m:-0}"
     fi
