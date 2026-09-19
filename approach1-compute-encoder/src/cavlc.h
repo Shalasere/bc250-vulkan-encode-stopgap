@@ -1,7 +1,7 @@
 /* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
 /*
  * Copyright (c) 2026 BC-250 Project
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: GPL-3.0-only
  *
  * cavlc.h - Spec-compliant H.264 CAVLC (Context-Adaptive Variable-Length Coding)
  *           per ITU-T H.264 / ISO/IEC 14496-10 Section 9.2.
