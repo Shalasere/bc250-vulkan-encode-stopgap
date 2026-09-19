@@ -59,8 +59,6 @@ int rc_get_frame_qp(rate_control_t *rc, uint64_t est_sad);
 void rc_update_stats(rate_control_t *rc, int bits_used);
 
 void rc_set_max_frame_size(rate_control_t *rc, uint32_t max_frame_bits);
-uint32_t rc_get_max_frame_size(const rate_control_t *rc);
 void rc_set_quality_level(rate_control_t *rc, uint32_t quality_level);
-uint32_t rc_get_quality_level(const rate_control_t *rc);
 
 #endif

@@ -192,11 +192,6 @@ size_t bs_bytes_written(const bitstream_t *bs) {
     return bs->byte_offset + (bs->bit_offset > 0 ? 1 : 0);
 }
 
-size_t bs_bytes_remaining(const bitstream_t *bs) {
-    if (bs->size <= bs_bytes_written(bs)) return 0;
-    return bs->size - bs_bytes_written(bs);
-}
-
 void bs_flush(bitstream_t *bs) {
     if (!bs || bs->overflow) return;
     if (bs->bit_offset == 0) return; /* already byte-aligned, nothing pending */

@@ -59,7 +59,7 @@ extern "C" {
  *
  * Writes bits MSB-first into a byte buffer. Tracks current byte/bit
  * position for sequential writes. Callers should ensure the buffer
- * is large enough before writing (or use bs_bytes_remaining()).
+ * is large enough before writing.
  *
  * PERF NOTE (perf/openh264-bitwriter-fallback): bit-level writes are
  * accumulated in `accum` (an in-register bit buffer, right-justified,
@@ -201,9 +201,6 @@ void bs_rbsp_trailing_bits(bitstream_t *bs);
 
 /** Get total bytes written so far (rounded up if mid-byte). */
 size_t bs_bytes_written(const bitstream_t *bs);
-
-/** Get remaining capacity in bytes. */
-size_t bs_bytes_remaining(const bitstream_t *bs);
 
 /** Flush any partial byte (zero-pad remaining bits in current byte). */
 void bs_flush(bitstream_t *bs);

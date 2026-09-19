@@ -410,7 +410,6 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
  * Must match the num_slices the caller will actually partition the CAVLC
  * bitstream into (encoder_h264.c's BC250_SLICES_PER_FRAME). */
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
-double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
 
@@ -432,30 +431,6 @@ int gpu_compute_get_quant_staging_data_slot(gpu_context_t *ctx, int slot, void *
 int gpu_compute_get_dc_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
 int gpu_compute_get_pred_mode_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
 int gpu_compute_get_mv_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
-int gpu_compute_get_nz_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
-int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);
-int gpu_compute_release_staging_data(gpu_context_t *ctx);
-
-/* Real per-coefficient residual readback (see quant_staging_buffers above).
- * Follows the same double-buffer contract as gpu_compute_get_staging_data():
- * call after gpu_compute_sync(), data points at the buffer that was written by the
- * frame BEFORE the one just submitted (fence-safe to read from the CPU). Layout is
- * num_mbs*24*16 ints, int index = (mb_idx*24+block_idx)*16+pos (raster position within
- * the 4x4 block, NOT zigzag). */
-int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *size);
-
-/* Compact PRE-quantization DC readback: one int per 4x4 block, num_mbs*24
- * entries, index = mb_idx*24 + block_idx. Replaces the former full-coeff
- * staging buffer, of which only these values were ever read - see
- * dc_coeff_buffer's comment above. Same fence-safe contract. */
-int gpu_compute_get_dc_staging_data(gpu_context_t *ctx, void **data, size_t *size);
-
-/* Real per-MB I16x16 prediction mode (see residual_predict.comp), one uint32
- * per MB, values match cavlc.h's H264_I16x16_* constants. Only meaningful for
- * I-slices. Same fence-safe double-buffer contract as above. */
-int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size_t *size);
-
-int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 
 /* Per-4x4-block nonzero bitmask from quantize.comp, one uint32 per block laid
  * out as num_mbs*24 entries, index = mb_idx*24 + block_idx, with bit p set iff
@@ -463,7 +438,10 @@ int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *siz
  * from the same `level != 0` test that produces quant_levels, so a bit test on
  * this is equivalent to - not an approximation of - scanning the block itself.
  * Same fence-safe double-buffer contract as above. */
-int gpu_compute_get_nz_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+int gpu_compute_get_nz_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);
+
+int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size);
 
 /* TEMPORARY debug instrumentation for Part A (reconstruction) verification -
  * see gpu_compute.c for details. No-op unless BC250_DUMP_RECON_FRAMES=1. */

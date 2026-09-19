@@ -2050,7 +2050,7 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
         shadow_copy_enabled = (sc_env && strcmp(sc_env, "0") == 0) ? 0 : 1;
     }
     /* PERF/verification toggle (BC250_NZ_MASK=0 disables) - see the
-     * gpu_compute_get_nz_staging_data() call below. */
+     * gpu_compute_get_nz_staging_data_slot() call below. */
     static int nz_mask_disabled = -1;
     if (nz_mask_disabled < 0) {
         const char *nz_env = getenv("BC250_NZ_MASK");

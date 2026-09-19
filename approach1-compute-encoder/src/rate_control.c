@@ -303,19 +303,11 @@ void rc_set_max_frame_size(rate_control_t *rc, uint32_t max_frame_bits) {
     }
 }
 
-uint32_t rc_get_max_frame_size(const rate_control_t *rc) {
-    return rc ? rc->max_frame_bits : 0;
-}
-
 void rc_set_quality_level(rate_control_t *rc, uint32_t quality_level) {
     if (rc) {
         if (quality_level < 1) quality_level = 1;
         if (quality_level > 7) quality_level = 7;
         rc->quality_level = quality_level;
     }
-}
-
-uint32_t rc_get_quality_level(const rate_control_t *rc) {
-    return rc ? rc->quality_level : 4;
 }
 

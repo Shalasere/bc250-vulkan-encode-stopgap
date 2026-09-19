@@ -2327,8 +2327,8 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     vkCmdCopyBuffer(cmd_buf, ctx->dc_coeff_buffer, ctx->dc_staging_buffers[ctx->current_buf], 1, &dc_copy_region);
 
     /* Same for the real per-MB I16x16 pred mode and motion vectors residual_predict.comp
-     * / motion_estimation.comp computed this frame - see gpu_compute_get_pred_mode_staging_data()
-     * / gpu_compute_get_mv_staging_data(). */
+     * / motion_estimation.comp computed this frame - see
+     * gpu_compute_get_pred_mode_staging_data_slot() / gpu_compute_get_mv_staging_data(). */
     VkBufferCopy pred_mode_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->pred_mode_staging_size };
     vkCmdCopyBuffer(cmd_buf, ctx->pred_mode_buffer, ctx->pred_mode_staging_buffers[ctx->current_buf], 1, &pred_mode_copy_region);
     VkBufferCopy mv_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->mv_staging_size };
@@ -2337,7 +2337,7 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
     /* And quantize.comp's per-block nonzero bitmask - 1/16th the size of the
      * quant_levels copy above, and it lets the CPU answer every
      * "is this block/MB all zero" question without reading quant_levels at
-     * all. See gpu_compute_get_nz_staging_data(). */
+     * all. See gpu_compute_get_nz_staging_data_slot(). */
     VkBufferCopy nz_copy_region = { .srcOffset = 0, .dstOffset = 0, .size = ctx->nz_staging_size };
     vkCmdCopyBuffer(cmd_buf, ctx->nz_count_buffer, ctx->nz_staging_buffers[ctx->current_buf], 1, &nz_copy_region);
 
@@ -2538,22 +2538,12 @@ int gpu_compute_sync(gpu_context_t *ctx) {
     return gpu_compute_sync_slot(ctx, gpu_compute_submitted_slot(ctx));
 }
 
-double gpu_compute_get_last_latency_ms(const gpu_context_t *ctx) {
-    return ctx ? ctx->last_gpu_duration_ms : 0.0;
-}
-
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
     if (!ctx || !data || !size) return -1;
     int prev_buf = (ctx->current_buf + 1) % 2;
     *size = ctx->staging_size;
     *data = ctx->staging_mapped[prev_buf];
     return (*data != NULL) ? 0 : -1;
-}
-
-int gpu_compute_release_staging_data(gpu_context_t *ctx) {
-    (void)ctx;
-    /* Persistently mapped: zero syscall overhead */
-    return 0;
 }
 
 /* See gpu_compute_sync_slot()'s comment for why a pipelined caller must pass
@@ -2586,21 +2576,6 @@ int gpu_compute_get_mv_staging_data_slot(gpu_context_t *ctx, int slot, void **da
     return (*data != NULL) ? 0 : -1;
 }
 
-int gpu_compute_get_quant_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx) return -1;
-    return gpu_compute_get_quant_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
-}
-
-int gpu_compute_get_dc_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx) return -1;
-    return gpu_compute_get_dc_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
-}
-
-int gpu_compute_get_pred_mode_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx) return -1;
-    return gpu_compute_get_pred_mode_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
-}
-
 int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
     if (!ctx) return -1;
     return gpu_compute_get_mv_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
@@ -2611,11 +2586,6 @@ int gpu_compute_get_nz_staging_data_slot(gpu_context_t *ctx, int slot, void **da
     *size = ctx->nz_staging_size;
     *data = ctx->nz_staging_mapped[slot];
     return (*data != NULL) ? 0 : -1;
-}
-
-int gpu_compute_get_nz_staging_data(gpu_context_t *ctx, void **data, size_t *size) {
-    if (!ctx) return -1;
-    return gpu_compute_get_nz_staging_data_slot(ctx, gpu_compute_submitted_slot(ctx), data, size);
 }
 
 /* Opt-in debug instrumentation, originally added for Part A verification

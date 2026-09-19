@@ -1364,8 +1364,8 @@ VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
     return VA_STATUS_SUCCESS;
 }
 
-VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height) {
-    (void)src_x; (void)src_y; (void)src_width; (void)src_height;
+VAStatus bc250_PutImage(VADriverContextP ctx, VASurfaceID surface, VAImageID image, int src_x, int req_src_y, unsigned int src_width, unsigned int src_height, int dest_x, int dest_y, unsigned int dest_width, unsigned int dest_height) {
+    (void)src_x; (void)req_src_y; (void)src_width; (void)src_height;
     (void)dest_x; (void)dest_y; (void)dest_width; (void)dest_height;
     bc250_driver_data *data = get_driver_data(ctx);
     if (!data) return VA_STATUS_ERROR_INVALID_CONTEXT;
