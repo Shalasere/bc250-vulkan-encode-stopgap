@@ -1,4 +1,4 @@
-/* bc250-encoding-decoding-fix v0.4.0 - https://github.com/simpmix/bc250-encoding-decoding-fix */
+/* bc250-vulkan-encode-stopgap v0.4.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap */
 /*
  * bc250_audio_fix.c - AMD BC-250 (Cyan Skillfish) Audio Clock & DTO Fix Driver
  *

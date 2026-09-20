@@ -1,7 +1,8 @@
-# BC-250 Compute Driver (bc250-encoding-decoding-fix) — Development Log
+# BC-250 Compute Driver (bc250-vulkan-encode-stopgap) — Development Log
 
 A running record of the correctness, performance, and integration work on
-`bc250-encoding-decoding-fix` (formerly `bc250-vcn-driver`). Written to be picked up cold by anyone (including a
+`bc250-vulkan-encode-stopgap` (formerly `bc250-encoding-decoding-fix`,
+formerly `bc250-vcn-driver`). Written to be picked up cold by anyone (including a
 future session with no memory of how any of this happened) — every claim
 below is backed by a real, on-hardware measurement, not inference.
 
@@ -11,12 +12,14 @@ below is backed by a real, on-hardware measurement, not inference.
 This is a real, actively-used gaming console, not a disposable test rig —
 every change below was validated with that in mind.
 
-**Repos**: upstream `simpmix/bc250-encoding-decoding-fix` (origin), fork
-`Shalasere/bc250-vulkan-encode-stopgap` (fork remote — renamed from
-`bc250-encoding-decoding-fix` partway through this project to better
-reflect what this actually is: a Vulkan-compute stopgap for a VCN block
-that isn't usable, not a fix to VCN itself). All work below happened on
-the fork; nothing has been proposed upstream yet.
+**Repo**: `Shalasere/bc250-vulkan-encode-stopgap` — the only one, and
+`origin`. It was renamed twice over the life of this project
+(`bc250-vcn-driver` → `bc250-encoding-decoding-fix` →
+`bc250-vulkan-encode-stopgap`), the last rename to better reflect what
+this actually is: a Vulkan-compute stopgap for a VCN block that isn't
+usable, not a fix to VCN itself. Entries below that predate the renames
+may refer to it by an older name. There is no upstream remote and
+nothing is proposed anywhere else.
 
 **License**: GPL-3.0-only (relicensed from the original MIT placeholder),
 specifically so this can't be privatized into a closed derivative — see

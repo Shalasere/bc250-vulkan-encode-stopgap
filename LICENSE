@@ -1,6 +1,7 @@
 SPDX-License-Identifier: GPL-3.0-only
 
-Copyright (c) 2026 bc250-encoding-decoding-fix (formerly bc250-vcn-driver) contributors
+Copyright (c) 2026 bc250-vulkan-encode-stopgap (formerly
+bc250-encoding-decoding-fix, formerly bc250-vcn-driver) contributors
 
 This program (the userspace VA-API driver, Vulkan compute shaders, and
 tools in this repository) is free software: you can redistribute it

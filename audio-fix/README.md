@@ -70,4 +70,4 @@ patch -p1 < /path/to/0002-hdmi-audio-adapter-compat.patch
 make && sudo make modules_install install
 ```
 
-<!-- bc250-encoding-decoding-fix v0.4.0 -->
+<!-- bc250-vulkan-encode-stopgap v0.4.0 -->

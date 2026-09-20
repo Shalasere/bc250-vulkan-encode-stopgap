@@ -1,5 +1,6 @@
+/* bc250-vulkan-encode-stopgap v0.4.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap */
 #version 450
-/* bc250-vcn-driver - HEVC intra reconstruction on the GPU
+/* HEVC intra reconstruction on the GPU
  *
  * Copyright (c) 2026 BC-250 Project Contributors
  * SPDX-License-Identifier: GPL-3.0-only

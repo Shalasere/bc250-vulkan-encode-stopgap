@@ -191,43 +191,29 @@ with SSH available throughout. The machine always reaches
 ## Board and repo operations
 
 - Board is `user@10.0.0.104`. Builds happen in `distrobox enter driver-build`.
-- **This repo is independent as of 2026-09-17.** `origin` is
-  `Shalasere/bc250-vulkan-encode-stopgap` — the only place work goes.
-  `upstream` (`simpmix/bc250-encoding-decoding-fix`) is **fetch-only**: its
-  push URL is set to `no_push`, so a stray `git push` cannot reach it. That
-  is deliberate and should stay. Do not push there, open PRs there, or
-  comment on its issues without being asked each time.
+- **`Shalasere/bc250-vulkan-encode-stopgap` is the only repo that exists**,
+  and it is `origin`. There is no upstream remote, no fork relationship to
+  maintain, and nothing is ever proposed anywhere else. Do not add a second
+  remote, and do not treat any other repository as authoritative for this
+  code.
 
-  History diverges at `c5a7942`, the last commit on the shared tree.
+  The project has been renamed twice (`bc250-vcn-driver` →
+  `bc250-encoding-decoding-fix` → `bc250-vulkan-encode-stopgap`), so older
+  DEVLOG entries and commit messages refer to it by earlier names. Those are
+  the same repo, not different projects.
 
-  ⚠️ **The fork point inherits the CPU-SIMD/governor layer *with* known
-  defects.** `cpu_simd_me.c` and `dynamic_governor.c` landed in `62327c3`,
-  which is *before* `c5a7942` — and all six of upstream's 2026-09-17 `fix(…)`
-  commits touch files present here:
+  The CPU-SIMD/governor layer (`cpu_simd_me.c`, `dynamic_governor.c`) that a
+  previous version of this file warned about has been **removed** from the
+  tree; the defects went with it and there is nothing left to cherry-pick.
 
-  | upstream commit | fixes, in code this tree has |
-  |---|---|
-  | `c35dd09` | buffer boundary overrun on non-16-multiple resolutions (`encoder_h264.c`, `encoder_h265.c`) — memory safety |
-  | `de31caa` | Tier 3 latch, a `vkMapMemory` leak, SIMD ME spatial predictor |
-  | `636e0d1` / `80d11f5` | `cpu_simd_me.c` early-exit and `_GNU_SOURCE`/`#ifdef _OPENMP` balance |
-  | `5479947` | governor downward-hysteresis transition logic |
-  | `0c20d49` | OpenMP passive wait policy, slice-thread cap |
-
-  So this code is either **removed** (which is what "driver-level" most
-  plausibly means — the bugs go with it, and nothing needs cherry-picking
-  from a repo we've split from) or those six fixes get applied. Do not leave
-  it sitting here unfixed and assume it works; upstream found real bugs in it
-  within a day of writing it.
-
-  - `git pull --ff-only` before a session is still worth it, but this is now
-    a single-author tree: no other committer, no race, and CI runs on push.
-  - GPL-3.0-only. A fork is squarely within the license; the obligations are
-    to keep the license files and the copyright/attribution headers intact,
-    and the preserved git history is the attribution record — **do not
-    squash or rewrite it away.** `src/cabac.c` is adapted from x264
-    (GPL-2.0-or-later); that notice must survive. `audio-fix/` is
-    GPL-2.0-only and is a separate work from the GPL-3.0 driver — keep them
-    separately licensed and separately built.
+  - `git pull --ff-only` before a session is still worth it, but this is a
+    single-author tree: no other committer, no race, and CI runs on push.
+  - GPL-3.0-only. The obligations are to keep the license files and the
+    copyright/attribution headers intact, and the preserved git history is
+    the attribution record — **do not squash or rewrite it away.**
+    `src/cabac.c` is adapted from x264 (GPL-2.0-or-later); that notice must
+    survive. `audio-fix/` is GPL-2.0-only and is a separate work from the
+    GPL-3.0 driver — keep them separately licensed and separately built.
   - `main` has no branch protection. Never force-push it — with the history
     now being the provenance record, a rewrite costs more than it used to.
 - **Repeatedly ssh'ing into the board during a long job crashes it**

@@ -15,8 +15,8 @@
 ## Known Hardware Realities
 1. **Physical VCN is Unusable & Permanently Fused**:
    - Factory eFuses permanently disable the hardware VCN block. Upstream Mesa 25.1 added native `gfx1013` RADV Vulkan support, but does not provide hardware VCN decoding/encoding. Physical VCN cannot be unlocked.
-   - This driver (`bc250-encoding-decoding-fix`, formerly `bc250-vcn-driver`) provides the community's sole hardware-accelerated encoding solution by translating VA-API calls into Vulkan Compute shaders executed on the RDNA2 CUs.
+   - This driver (`bc250-vulkan-encode-stopgap`, formerly `bc250-encoding-decoding-fix`, formerly `bc250-vcn-driver`) provides the community's sole hardware-accelerated encoding solution by translating VA-API calls into Vulkan Compute shaders executed on the RDNA2 CUs.
 2. **DisplayPort / HDMI Audio Clock Divisor**:
    - The display controller (`dc`) calculates an incorrect audio sample clock divisor for 44.1/48 kHz audio. The included `bc250_audio_fix` DKMS module writes the proper clock ratios directly to APU DCCG registers (`0x05E0`, `0x05E4`, `0x05E8`).
 
-<!-- bc250-encoding-decoding-fix v0.4.0 -->
+<!-- bc250-vulkan-encode-stopgap v0.4.0 -->
