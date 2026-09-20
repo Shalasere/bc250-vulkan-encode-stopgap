@@ -1,6 +1,6 @@
 # 🎮 AMD BC-250 Custom Driver & VA-API Video Encoder
 
-[![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml)
+[![Build & Release BC-250 Drivers](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml/badge.svg)](https://github.com/Shalasere/bc250-vulkan-encode-stopgap/actions/workflows/build.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/Driver%20License-GPL--3.0-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
@@ -74,8 +74,8 @@ If you are running **Valve SteamOS 3.x / HoloISO** or **Bazzite (Fedora Silverbl
 If you prefer compiling locally, the automated setup script handles everything (including automatically installing missing packages for Ubuntu, Fedora, Arch, and openSUSE):
 
 ```bash
-git clone https://github.com/simpmix/bc250-vcn-driver.git
-cd bc250-vcn-driver
+git clone https://github.com/Shalasere/bc250-vulkan-encode-stopgap.git
+cd bc250-vulkan-encode-stopgap
 chmod +x build_and_install.sh tools/*.sh
 ./build_and_install.sh
 ```
