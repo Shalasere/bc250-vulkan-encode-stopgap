@@ -909,6 +909,64 @@ static void build_matrix(int log2n, int use_dst, int16_t M[HEVC_MAX_TB_SIZE][HEV
             M[i][j] = (int16_t)hevc_transform_matrix(log2n, i, j);
 }
 
+/* One-dimensional forward transform of (1<<log2n) samples, unshifted:
+ * out[i] = sum_j M[i][j] * src[j].
+ *
+ * Done as HEVC's partial butterfly rather than a plain matrix multiply.
+ * The decomposition falls straight out of the mirror symmetry the matrix
+ * table already relies on, M[i][N-1-j] == (-1)^i * M[i][j]:
+ *
+ *   E[k] = src[k] + src[N-1-k],  O[k] = src[k] - src[N-1-k]
+ *   even outputs  = the (N/2)-point transform of E   (because the even
+ *                   rows of M_N restricted to the first half ARE M_{N/2},
+ *                   which is the same nesting the table is built on)
+ *   odd outputs   = sum_j M[2k+1][j] * O[j]
+ *
+ * That is N^2/4 multiplies plus a recursion instead of N^2, about 3x
+ * fewer overall, and it is bit-identical - the same integer sums in a
+ * different association order, with no intermediate that can overflow
+ * int32 (32 terms * 90 * 2^15 fits with room to spare).
+ *
+ * Worth doing on its own merits: the forward transform was 37% of the
+ * frame once 16x16 CUs started using 16x16 transforms. It is also
+ * exactly the shape this has to take on the GPU, so the CPU version is
+ * the reference the shader will be checked against.
+ *
+ * Note the odd-row reads index DCT32_HALF directly: j only ever runs to
+ * N/2-1 <= 15, so the mirrored half is never touched here. */
+static void fwd_1d(const int32_t *src, int32_t *dst, int log2n) {
+    /* Bounds the recursion for the compiler as well as for us: without
+     * it, nothing tells the optimizer that the half-size arrays below are
+     * fully written before the recursive call reads them. */
+    if (log2n < HEVC_MIN_LOG2_TB || log2n > HEVC_MAX_LOG2_TB) return;
+
+    int n = 1 << log2n;
+    int stride = 1 << (5 - log2n);
+
+    if (log2n == 2) {
+        for (int i = 0; i < 4; i++) {
+            const int8_t *row = DCT32_HALF[i << 3];
+            dst[i] = row[0] * src[0] + row[1] * src[1] + row[2] * src[2] + row[3] * src[3];
+        }
+        return;
+    }
+
+    int h = n >> 1;
+    int32_t E[HEVC_MAX_TB_SIZE / 2], O[HEVC_MAX_TB_SIZE / 2], evens[HEVC_MAX_TB_SIZE / 2];
+    for (int k = 0; k < h; k++) {
+        E[k] = src[k] + src[n - 1 - k];
+        O[k] = src[k] - src[n - 1 - k];
+    }
+    fwd_1d(E, evens, log2n - 1);
+    for (int k = 0; k < h; k++) dst[2 * k] = evens[k];
+    for (int k = 0; k < h; k++) {
+        const int8_t *row = DCT32_HALF[(2 * k + 1) * stride];
+        int32_t s = 0;
+        for (int j = 0; j < h; j++) s += row[j] * O[j];
+        dst[2 * k + 1] = s;
+    }
+}
+
 /* Forward 2D separable transform. The shifts are size-dependent:
  * (log2n + BitDepth - 9, log2n + 6), which for log2n == 2 is the (1, 8)
  * the 4x4-only code used, so this is a strict generalization of a path
@@ -918,8 +976,10 @@ static void build_matrix(int log2n, int use_dst, int16_t M[HEVC_MAX_TB_SIZE][HEV
  * and dividing by 2^(log2n+BitDepth-9) * 2^(log2n+6) = 32*n^2 leaves
  * 128*v - exactly what the normative inverse's fixed (7, 20-BitDepth)
  * shifts turn back into v. */
-static void forward_transform(const int16_t *residual, int log2n,
-                               const int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE], int32_t *out) {
+/* DCT-II only, which is all this path ever needs: the alternative DST is
+ * legal for 4x4 luma intra alone (8.6.4.1) and that size is handled by
+ * forward_transform_4() above. */
+static void forward_transform(const int16_t *residual, int log2n, int32_t *out) {
     int n = 1 << log2n;
     int shift1 = log2n + 8 - 9;
     int shift2 = log2n + 6;
@@ -930,18 +990,16 @@ static void forward_transform(const int16_t *residual, int log2n,
      * mutable scratch would be a real race. 4 KB at the largest size. */
     int32_t tmp[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
 
-    for (int c = 0; c < n; c++)
-        for (int i = 0; i < n; i++) {
-            int32_t sum = 0;
-            for (int r = 0; r < n; r++) sum += (int32_t)M[i][r] * residual[r * n + c];
-            tmp[i * n + c] = (sum + add1) >> shift1;
-        }
-    for (int i = 0; i < n; i++)
-        for (int j = 0; j < n; j++) {
-            int32_t sum = 0;
-            for (int c = 0; c < n; c++) sum += (int32_t)M[j][c] * tmp[i * n + c];
-            out[i * n + j] = (sum + add2) >> shift2;
-        }
+    int32_t col[HEVC_MAX_TB_SIZE], res[HEVC_MAX_TB_SIZE];
+    for (int c = 0; c < n; c++) {
+        for (int r = 0; r < n; r++) col[r] = residual[r * n + c];
+        fwd_1d(col, res, log2n);
+        for (int i = 0; i < n; i++) tmp[i * n + c] = (res[i] + add1) >> shift1;
+    }
+    for (int i = 0; i < n; i++) {
+        fwd_1d(&tmp[i * n], res, log2n);
+        for (int j = 0; j < n; j++) out[i * n + j] = (res[j] + add2) >> shift2;
+    }
 }
 
 /* Inverse 2D separable transform, matrix applied transposed, with the
@@ -1034,10 +1092,8 @@ void hevc_transform_quant(const int16_t *residual, int log2_size, int qp, int us
         return;
     }
     int n = 1 << log2_size;
-    int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE];
     int32_t raw[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
-    build_matrix(log2_size, use_dst, M);
-    forward_transform(residual, log2_size, M, raw);
+    forward_transform(residual, log2_size, raw);
     for (int i = 0; i < n * n; i++) {
         int32_t level = quantize_coeff_sz(raw[i], qp, log2_size);
         if (level > 32767) level = 32767;
