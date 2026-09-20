@@ -64,6 +64,9 @@
 #   --repeat=N                   default 1    (>1 gives real sd)
 #   --load=none|gpu|cpu|both     default none
 #   --env=K=V,K=V                extra driver env (e.g. BC250_NZ_MASK=0)
+#   --codec=h264|hevc            default h264. hevc implies BC250_ENABLE_HEVC=1,
+#                                since HEVC is not advertised by default; add
+#                                --env=BC250_HEVC_GPU=1 for the GPU intra path
 #   --audit                      also enable BC250_NZ_AUDIT=1
 #
 set -uo pipefail
@@ -421,7 +424,7 @@ trap stop_load EXIT INT TERM
 # hardware, not to beat its own previous commit.
 run_encode() {
     local key="$1" content="$2" res="$3" frames="$4" gop="$5" bitrate="$6" \
-          envs="$7" audit="$8" out="$9"
+          envs="$7" audit="$8" out="$9" codec="${10:-h264}"
     local t0 t1
     t0=$(date +%s.%N)
     # /usr/bin/time rather than the `times` builtin: the builtin accumulates
@@ -466,15 +469,23 @@ run_encode() {
         local bd; bd=$(art_dir "$key")
         local -a envv=(BC250_PERF_STATS=1)
         [ "$audit" = 1 ] && envv+=(BC250_NZ_AUDIT=1)
+        # HEVC is not advertised by default (va_backend.c's hevc_advertised()),
+        # so without this the encoder open fails with "No usable encoding
+        # profile found" and the run looks like a driver bug rather than an
+        # opt-in that was not taken. Set before $envs so a caller can still
+        # override it explicitly.
+        [ "$codec" = hevc ] && envv+=(BC250_ENABLE_HEVC=1)
         if [ -n "$envs" ]; then
             local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
         fi
+        local venc=h264_vaapi fmt=h264
+        [ "$codec" = hevc ] && { venc=hevc_vaapi; fmt=hevc; }
         "${TIMER[@]}" env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
             BC250_SHADER_DIR="$bd" "${envv[@]}" \
             ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
             -frames:v "$frames" -g "$gop" -vaapi_device "$RENDER" \
-            -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v "$bitrate" \
-            -f h264 "${out}.h264" > "${out}.log" 2>&1
+            -vf 'format=nv12,hwupload' -c:v "$venc" -b:v "$bitrate" \
+            -f "$fmt" "${out}.${fmt}" > "${out}.log" 2>&1
     fi
     local rc=$?
     t1=$(date +%s.%N)
@@ -504,7 +515,7 @@ BENCH_FIELDS="tag,p_wall_ms,p_wall_ms_sd,p_fps_ceiling,cavlc_ms,shadow_ms,gpu_to
 bench() {
     local key="${1:?bench <key> [opts]}"; shift
     local content=testsrc res=2560x1440 frames=300 gop=120 bitrate=31M
-    local repeat=1 load=none envs="" audit=0 quiet=0
+    local repeat=1 load=none envs="" audit=0 quiet=0 codec=h264
     for a in "$@"; do
         case "$a" in
             --content=*) content="${a#*=}";;
@@ -515,13 +526,15 @@ bench() {
             --repeat=*)  repeat="${a#*=}";;
             --load=*)    load="${a#*=}";;
             --env=*)     envs="${a#*=}";;
+            --codec=*)   codec="${a#*=}";;
             --audit)     audit=1;;
             --quiet)     quiet=1;;
             *) die "bench: unknown option '$a'";;
         esac
     done
+    case "$codec" in h264|hevc) ;; *) die "bench: --codec must be h264 or hevc (got '$codec')";; esac
     local stamp; stamp=$(date +%Y%m%d-%H%M%S)
-    local outdir="$RUNS/$stamp-$key-$content-$res-$load"
+    local outdir="$RUNS/$stamp-$key-$codec-$content-$res-$load"
     mkdir -p "$outdir"
 
     start_load "$load" "$outdir"
@@ -529,7 +542,7 @@ bench() {
     for i in $(seq 1 "$repeat"); do
         local base="$outdir/run$i"
         local rc; rc=$(run_encode "$key" "$content" "$res" "$frames" "$gop" \
-                                  "$bitrate" "$envs" "$audit" "$base")
+                                  "$bitrate" "$envs" "$audit" "$base" "$codec")
         if [ "$rc" != 0 ]; then
             note "ENCODE FAILED (rc=$rc) run$i - see $base.log"; tail -5 "$base.log" >&2
             continue

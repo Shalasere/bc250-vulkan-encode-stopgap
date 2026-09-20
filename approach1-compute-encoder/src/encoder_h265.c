@@ -393,6 +393,19 @@ struct hevc_encoder {
      * 16x16 luma TU and 8x8 chroma. The GPU path is all-intra only - it has
      * no inter/merge path at all, so it forces every frame to IDR. */
     bool use_gpu;
+
+    /* Set when this frame's QP has already been chosen, so the encode_core*
+     * functions don't choose it a second time.
+     *
+     * The GPU path MUST decide QP before dispatch, because the shader
+     * quantizes with the value it is handed - deciding afterwards quantized
+     * at the previous frame's QP while signalling the new one, which is a
+     * real decoder-visible corruption, not just a rate miss (see the call
+     * site in hevc_encoder_encode_frame). And rc_get_frame_qp() is NOT a
+     * pure getter: it advances current_qp and error_integral, so calling it
+     * twice in one frame double-steps rate control. Hence a flag rather
+     * than just calling it again. */
+    bool qp_already_decided;
 };
 
 static uint32_t round_up16(uint32_t v) { return (v + 15u) & ~15u; }
@@ -1321,6 +1334,19 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
  * (GPU-surface readback) and hevc_encoder_encode_raw() (direct host
  * pointers, no GPU involved - see encoder_h265.h) fill those in their own
  * way and then share everything from here on. */
+/* Choose this frame's QP, exactly once. Idempotent per frame via
+ * qp_already_decided, because rc_get_frame_qp() advances rate-control state
+ * (current_qp and error_integral) rather than just reporting it. */
+static void pick_frame_qp(hevc_encoder_t *encoder, uint64_t est_sad)
+{
+    if (encoder->qp_already_decided) return;
+    if (encoder->rc.mode != RC_CQP) {
+        int target_qp = rc_get_frame_qp(&encoder->rc, est_sad);
+        if (target_qp >= 1 && target_qp <= 51) encoder->qp = target_qp;
+    }
+    encoder->qp_already_decided = true;
+}
+
 static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size)
 {
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
@@ -1329,13 +1355,10 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         encoder->poc = 0;
     }
 
-    /* In VBR/CBR/LOW_LATENCY mode, update QP via rate control model */
-    if (encoder->rc.mode != RC_CQP) {
-        int target_qp = rc_get_frame_qp(&encoder->rc, is_idr ? 0 : encoder->last_frame_sad);
-        if (target_qp >= 1 && target_qp <= 51) {
-            encoder->qp = target_qp;
-        }
-    }
+    /* In VBR/CBR/LOW_LATENCY mode, update QP via rate control model.
+     * A no-op if the GPU path already chose it before dispatching. */
+    pick_frame_qp(encoder, is_idr ? 0 : encoder->last_frame_sad);
+    encoder->qp_already_decided = false;
     encoder->last_frame_sad = 0;
 
     pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
@@ -1496,10 +1519,11 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
     encoder->force_idr = false;
     encoder->poc = 0;
 
-    if (encoder->rc.mode != RC_CQP) {
-        int target_qp = rc_get_frame_qp(&encoder->rc, 0);
-        if (target_qp >= 1 && target_qp <= 51) encoder->qp = target_qp;
-    }
+    /* Already chosen before the dispatch - the shader quantized with it.
+     * Re-deriving here would signal a QP the coefficients were not
+     * quantized at. */
+    pick_frame_qp(encoder, 0);
+    encoder->qp_already_decided = false;
     encoder->last_frame_sad = 0;
 
     memset(encoder->luma_mode_map, 0,
@@ -1644,6 +1668,19 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
      * NULL because this is the first frame - falls through to the CPU path
      * rather than producing a broken frame. */
     if (encoder->use_gpu && gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        /* Decide the QP BEFORE dispatching: the shader quantizes with the
+         * value handed to it here, and encode_core_gpu() then signals that
+         * same value in the slice header. Deciding afterwards (as this
+         * originally did) quantized every frame at the PREVIOUS frame's QP
+         * while signalling the new one, so the decoder dequantized
+         * coefficients against the wrong step size. Measured symptom: the
+         * GPU path's output size was pinned near 520 KB whether the
+         * requested bitrate was 1M or 8M - rate control could not move it
+         * at all - and ffmpeg reported CABAC_MAX_BIN errors once the two
+         * QPs diverged far enough that the coded levels no longer matched
+         * the signalled step. */
+        pick_frame_qp(encoder, 0);
+
         gpu_compute_begin_picture(gpu_ctx, input_surface);
         int rc = gpu_compute_hevc_dispatch_intra(gpu_ctx, input_surface,
                                                  (int)encoder->coded_width, (int)encoder->coded_height,
