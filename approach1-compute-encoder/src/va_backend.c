@@ -6,6 +6,7 @@
  * va_backend.c - Complete VA-API Backend Driver Implementation for AMD BC-250
  */
 #include "va_backend.h"
+#include <va/va_enc_hevc.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,7 +22,7 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
     if (!ctx || !num_profiles) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     if (!profile_list) {
-        *num_profiles = 4;
+        *num_profiles = 5;
         return VA_STATUS_SUCCESS;
     }
 
@@ -37,6 +38,12 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
 #endif
     profile_list[i++] = VAProfileH264Main;
     profile_list[i++] = VAProfileH264High;
+    /* HEVC Main. bc250_CreateContext() already builds a real HEVC encoder for
+     * this profile and bc250_EndPicture() drives it, but the profile was never
+     * advertised, so ffmpeg's hevc_vaapi - which builds its candidate list from
+     * vaQueryConfigProfiles() - always failed the open with "No usable encoding
+     * profile found". HEVC was therefore unreachable through VA-API. */
+    profile_list[i++] = VAProfileHEVCMain;
 
     *num_profiles = i;
     return VA_STATUS_SUCCESS;
@@ -52,7 +59,8 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
     int is_supported_profile = (profile == VAProfileH264ConstrainedBaseline ||
                                 profile == VAProfileH264Baseline ||
                                 profile == VAProfileH264Main ||
-                                profile == VAProfileH264High);
+                                profile == VAProfileH264High ||
+                                profile == VAProfileHEVCMain);
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -570,6 +578,15 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
         bc250_buffer *b = &data->buffers[buf_id];
         switch (b->type) {
             case VAEncSequenceParameterBufferType:
+                if (c->hevc_enc) {
+                    /* An HEVC context sends VAEncSequenceParameterBufferHEVC,
+                     * a different layout entirely; this used to memcpy it into
+                     * h264_state.seq_param whenever the byte count happened to
+                     * be large enough. Nothing in the HEVC path reads it today
+                     * (geometry and rate come from hevc_encoder_create()), so
+                     * simply don't misparse it. */
+                    break;
+                }
                 if (b->size >= sizeof(VAEncSequenceParameterBufferH264)) {
                     memcpy(&c->h264_state.seq_param, b->data, sizeof(VAEncSequenceParameterBufferH264));
                     c->h264_state.has_seq = 1;
@@ -585,6 +602,24 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                 }
                 break;
             case VAEncPictureParameterBufferType:
+                if (c->hevc_enc) {
+                    /* ffmpeg's hevc_vaapi sends VAEncPictureParameterBufferHEVC,
+                     * whose coded_buf lives at a different offset than the H.264
+                     * struct's (VAPictureHEVC vs VAPictureH264 elements, and 15
+                     * vs 16 reference entries). Reading it through the H.264 type
+                     * produced a garbage VABufferID, so c->coded_buf_id never
+                     * became valid; bc250_EndPicture()'s "is there a coded buffer
+                     * to write into" guard then failed and it silently took the
+                     * bare-dispatch path that emits no bitstream. Every HEVC
+                     * frame came out as a zero-byte packet - ffmpeg reported
+                     * "30 frames encoded; 30 packets muxed (0 bytes)". */
+                    if (b->size >= sizeof(VAEncPictureParameterBufferHEVC)) {
+                        VAEncPictureParameterBufferHEVC *hp =
+                            (VAEncPictureParameterBufferHEVC *)b->data;
+                        c->coded_buf_id = hp->coded_buf;
+                    }
+                    break;
+                }
                 if (b->size >= sizeof(VAEncPictureParameterBufferH264)) {
                     VAEncPictureParameterBufferH264 *pic = (VAEncPictureParameterBufferH264*)b->data;
                     memcpy(&c->h264_state.pic_param, pic, sizeof(VAEncPictureParameterBufferH264));
@@ -907,7 +942,8 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
 
     if (buf && surf->memory.memory) {
         void *mapped = NULL;
-        if (vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped) == VK_SUCCESS) {
+        VkResult map_res = vkMapMemory(data->gpu.device, surf->memory.memory, 0, surf->memory.size, 0, &mapped);
+        if (map_res == VK_SUCCESS) {
             if (buf->data) free(buf->data);
             buf->data = mapped;
             buf->mapped = 1;
@@ -931,7 +967,20 @@ VAStatus bc250_DeriveImage(VADriverContextP ctx, VASurfaceID surface, VAImage *i
             surf->ref_count++;
             buf->derived_surface = surface;
             img->surface_id = surface;
+        } else {
+            /* This used to fall through and still return VA_STATUS_SUCCESS with
+             * buf->data never assigned, so a caller doing the documented
+             * zero-copy upload (ffmpeg's hwupload -> av_frame_copy ->
+             * av_image_copy) would memcpy into a stale/NULL pointer and
+             * segfault rather than see an error. */
+            fprintf(stderr, "[bc250] DeriveImage: vkMapMemory failed (vr=%d) for surface %u\n",
+                    (int)map_res, (unsigned)surface);
+            return VA_STATUS_ERROR_ALLOCATION_FAILED;
         }
+    } else {
+        fprintf(stderr, "[bc250] DeriveImage: no buffer/memory for surface %u\n",
+                (unsigned)surface);
+        return VA_STATUS_ERROR_ALLOCATION_FAILED;
     }
     return VA_STATUS_SUCCESS;
 }
