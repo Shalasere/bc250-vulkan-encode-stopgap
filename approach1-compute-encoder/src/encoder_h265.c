@@ -44,12 +44,13 @@
  *     coefficient group - no sig_coeff_group_flag/coded_sub_block_flag
  *     complexity anywhere (see hevc_cabac.h's scope note).
  *
- * Real per-4x4-block intra prediction (Planar/DC/Horizontal/Vertical, the
- * same four candidates the GPU's own I16x16 SAD decision already knows how
- * to choose between, conceptually) with proper z-scan reconstruction
- * chaining, real DST-VII (luma) / DCT-II (chroma) transform + real HEVC
+ * Real per-4x4-block intra prediction over the full HEVC luma mode set
+ * (Planar, DC and all 33 angular modes), chosen per PU by a rate-aware
+ * coarse-then-refine search, with proper z-scan reconstruction chaining,
+ * real DST-VII (luma) / DCT-II (chroma) transform + real HEVC
  * quantization, and real CABAC entropy coding are implemented in
- * hevc_intra.c and hevc_cabac.c respectively - see those files.
+ * hevc_intra.c and hevc_cabac.c respectively - see those files. Chroma is
+ * still DC-only; that one is genuinely scoped-out, not broken.
  *
  * The one piece of the existing GPU/Vulkan infrastructure this file DOES
  * reuse unmodified is gpu_compute_download_nv12() - the real, already-
@@ -412,37 +413,108 @@ static int any_nonzero16(const int16_t *c) {
     return 0;
 }
 
-static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y) {
+/* Rec. ITU-T H.265 8.4.2 MPM derivation for the 4x4 luma PU at (px,py),
+ * reading the neighbouring PUs' already-decided modes out of
+ * enc->luma_mode_map. */
+static void derive_pu_mpm(hevc_encoder_t *enc, int px, int py, int mpm_out[3]) {
+    int mx = px / 4, my = py / 4;
+    int left_avail = px > 0;
+    /* Rec. ITU-T H.265 8.4.2: candIntraPredModeB (the "above" MPM
+     * candidate) must be forced unavailable whenever the above neighbour
+     * is in a different CTU row, unconditionally - not just when py==0.
+     * This mirrors the picture-boundary check but for CTU rows, and is
+     * easy to miss because the neighbour pixel data IS genuinely
+     * available/reconstructed; the spec still mandates treating it as
+     * absent for MPM derivation. Getting this wrong silently changes
+     * mpm[]'s candidate ORDER (and hence what mpm_idx /
+     * rem_intra_luma_pred_mode means) for one whole PU-row per CTU,
+     * producing a structurally valid but wrong-meaning bitstream that
+     * only misdecodes once real (non-flat/non-DC) directional content
+     * exercises those modes - hence "busy directional content only" as
+     * the symptom. */
+    int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
+    int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
+    int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
+    hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm_out);
+}
+
+/* One complete luma pass over a CU's four 4x4 blocks: decide (or accept a
+ * forced) mode per block, predict, transform, quantize and reconstruct, in
+ * z-order so each block sees its predecessors' real reconstruction. Every
+ * output needed to either commit the pass or throw it away and re-run it
+ * differently is captured in the struct. */
+typedef struct {
+    int      mode[4];
+    int16_t  coeff[4][16];
+    int      cbf[4];
+    uint8_t  recon[64];   /* the CU's 8x8 luma block, row-major */
+    long     sad;         /* summed prediction error over the 4 blocks */
+    int      mode_bits;   /* summed cost of signalling those modes */
+} cu_luma_pass_t;
+
+static void save_cu_luma(const hevc_encoder_t *enc, int cu_x, int cu_y, uint8_t out[64]) {
+    uint32_t cw = enc->coded_width;
+    for (int y = 0; y < 8; y++)
+        memcpy(out + y * 8, enc->recon_y + (size_t)(cu_y + y) * cw + cu_x, 8);
+}
+
+static void restore_cu_luma(hevc_encoder_t *enc, int cu_x, int cu_y, const uint8_t in[64]) {
+    uint32_t cw = enc->coded_width;
+    for (int y = 0; y < 8; y++)
+        memcpy(enc->recon_y + (size_t)(cu_y + y) * cw + cu_x, in + y * 8, 8);
+}
+
+/* forced_mode < 0 searches per block (the PART_NxN shape); forced_mode >= 0
+ * applies that one mode to all four blocks (the PART_2Nx2N shape, where
+ * only one mode is signalled but prediction and reconstruction are still
+ * per-4x4-transform-block, exactly as a decoder does it). */
+static void run_luma_pass(hevc_encoder_t *enc, int cu_x, int cu_y, int forced_mode,
+                           cu_luma_pass_t *p) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
-    uint32_t ccw = cw / 2, cch = ch / 2;
 
-    hevc_cabac_code_part_mode_intra(cab, 0 /* PART_NxN */);
+    p->sad = 0;
+    p->mode_bits = 0;
 
-    int pu_modes[4];
-    int16_t luma_coeff[4][16];
-    int cbf_luma[4];
-
-    /* Step 1: decide + reconstruct all 4 luma PUs in z-order (needed so
-     * each later PU's neighbor gathering sees real reconstructed samples
-     * from the earlier PUs of the SAME CU, exactly like a real decoder). */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mode = hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py);
-        pu_modes[pu] = mode;
+
+        /* The MPM list is derived here, before the mode is chosen, because
+         * the decision is rate-aware (see hevc_choose_luma_mode()) and an
+         * MPM is 3-4 bits cheaper to signal than an arbitrary mode - at
+         * 4x4 granularity that side information is a large fraction of the
+         * whole frame. Deriving it this early is safe and yields exactly
+         * the lists step 2 below will re-derive for the actual signalling,
+         * because every neighbour an MPM list reads (left and above) is
+         * strictly earlier in z-order than the PU reading it: TL has no
+         * in-CU neighbours, TR reads TL, BL reads TL, BR reads BL and TR. */
+        int mpm[3];
+        derive_pu_mpm(enc, px, py, mpm);
+
+        int mode = (forced_mode >= 0)
+                 ? forced_mode
+                 : hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch,
+                                          px, py, mpm, qp);
+        p->mode[pu] = mode;
+        /* Only PU 0's signalling cost is real under PART_2Nx2N; the caller
+         * accounts for that, this just reports the per-shape total. */
+        p->mode_bits += hevc_mode_signal_bits(mode, mpm);
 
         uint8_t pred[16];
         hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, pred);
 
         int16_t residual[16];
         for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                residual[y * 4 + x] = (int16_t)(enc->src_y[(py + y) * cw + (px + x)] - pred[y * 4 + x]);
+            for (int x = 0; x < 4; x++) {
+                int d = enc->src_y[(py + y) * cw + (px + x)] - pred[y * 4 + x];
+                residual[y * 4 + x] = (int16_t)d;
+                p->sad += d < 0 ? -d : d;
+            }
 
         int16_t coeff[16];
         hevc_transform_quant_4x4(residual, qp, 1 /* DST for 4x4 luma intra */, coeff);
-        memcpy(luma_coeff[pu], coeff, sizeof(coeff));
-        cbf_luma[pu] = any_nonzero16(coeff);
+        memcpy(p->coeff[pu], coeff, sizeof(coeff));
+        p->cbf[pu] = any_nonzero16(coeff);
 
         int16_t recon_residual[16];
         hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
@@ -452,6 +524,100 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
 
         enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = (int8_t)mode;
     }
+
+    save_cu_luma(enc, cu_x, cu_y, p->recon);
+}
+
+static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y) {
+    int qp = enc->qp;
+    uint32_t cw = enc->coded_width, ch = enc->coded_height;
+    uint32_t ccw = cw / 2, cch = ch / 2;
+
+    /* ------------------------------------------------------------------
+     * Step 1: luma. Choose between PART_NxN (four signalled 4x4 modes) and
+     * PART_2Nx2N (one signalled mode for the whole 8x8 CU).
+     *
+     * This choice is worth making rather than hardcoding NxN, because at
+     * this CU size intra-mode side information dominates the bitstream
+     * outright: measured on a 1080p desktop frame, going from QP 27 to QP
+     * 32 moved the frame size by under 7%, i.e. residual was already
+     * almost nothing and essentially the entire stream was 130560 PUs'
+     * worth of intra_luma_pred_mode at ~1.9 bits each. Signalling one mode
+     * per CU instead of four removes up to three quarters of that.
+     *
+     * Crucially the two shapes produce the SAME transform tree here, so
+     * nothing else in this encoder has to change: the CU is 8x8 and
+     * MaxTbLog2SizeY is 2, so log2TrafoSize (3) > MaxTbLog2SizeY at
+     * trafoDepth 0 and ITU-T H.265 7.4.9.8 INFERS split_transform_flag = 1
+     * with no bit spent - the same four 4x4 luma TUs and the same single
+     * 4x4 chroma pair that IntraSplitFlag used to force under NxN. The
+     * only syntax difference between the two is the part_mode bin's value
+     * and how many intra_luma_pred_modes follow it. (PART_NxN remains
+     * legal only because 8x8 is MinCbSizeY.)
+     * ------------------------------------------------------------------ */
+    uint8_t entry_recon[64];
+    save_cu_luma(enc, cu_x, cu_y, entry_recon);
+    int8_t entry_modes[4];
+    for (int pu = 0; pu < 4; pu++)
+        entry_modes[pu] = enc->luma_mode_map[((cu_y + pu_off_y[pu]) / 4) * enc->mode_map_stride +
+                                              ((cu_x + pu_off_x[pu]) / 4)];
+
+    cu_luma_pass_t nxn;
+    run_luma_pass(enc, cu_x, cu_y, -1, &nxn);
+
+    int part_2nx2n = 0;
+    cu_luma_pass_t *chosen = &nxn;
+    cu_luma_pass_t sq;
+
+    if (nxn.mode[0] == nxn.mode[1] && nxn.mode[0] == nxn.mode[2] && nxn.mode[0] == nxn.mode[3]) {
+        /* All four blocks independently wanted the same mode, so the
+         * PART_2Nx2N encode is bit-for-bit the same prediction and
+         * reconstruction for strictly fewer signalled modes. Free win, no
+         * second pass needed. */
+        part_2nx2n = 1;
+    } else {
+        /* Otherwise it is a real trade: one mode costs less to signal but
+         * predicts the dissenting blocks worse. Re-run the CU forced to the
+         * most popular of the four chosen modes and compare on the same
+         * SAD-vs-bits scale hevc_choose_luma_mode() already uses
+         * internally, so the two decision levels cannot disagree about what
+         * a bit is worth. */
+        int best_m = nxn.mode[0], best_count = 0;
+        for (int i = 0; i < 4; i++) {
+            int count = 0;
+            for (int j = 0; j < 4; j++) if (nxn.mode[j] == nxn.mode[i]) count++;
+            if (count > best_count) { best_count = count; best_m = nxn.mode[i]; }
+        }
+
+        restore_cu_luma(enc, cu_x, cu_y, entry_recon);
+        for (int pu = 0; pu < 4; pu++)
+            enc->luma_mode_map[((cu_y + pu_off_y[pu]) / 4) * enc->mode_map_stride +
+                                ((cu_x + pu_off_x[pu]) / 4)] = entry_modes[pu];
+
+        run_luma_pass(enc, cu_x, cu_y, best_m, &sq);
+
+        long lambda = hevc_lambda_sad_q8(qp);
+        /* PART_2Nx2N signals PU 0's mode only; run_luma_pass() summed all
+         * four, so take a quarter of its (identical, same-mode) total. */
+        long cost_nxn = nxn.sad + ((lambda * nxn.mode_bits) >> 8);
+        long cost_sq  = sq.sad  + ((lambda * (sq.mode_bits / 4)) >> 8);
+
+        if (cost_sq <= cost_nxn) {
+            part_2nx2n = 1;
+            chosen = &sq;
+        } else {
+            restore_cu_luma(enc, cu_x, cu_y, nxn.recon);
+            for (int pu = 0; pu < 4; pu++)
+                enc->luma_mode_map[((cu_y + pu_off_y[pu]) / 4) * enc->mode_map_stride +
+                                    ((cu_x + pu_off_x[pu]) / 4)] = (int8_t)nxn.mode[pu];
+        }
+    }
+
+    hevc_cabac_code_part_mode_intra(cab, part_2nx2n);
+
+    int *pu_modes = chosen->mode;
+    int16_t (*luma_coeff)[16] = chosen->coeff;
+    int *cbf_luma = chosen->cbf;
 
     /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only (matching
      * this codebase's existing H.264 "chroma directional modes not
@@ -484,43 +650,31 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
         }
 
-    /* Step 2: emit the 4 PUs' real intra_luma_pred_mode syntax. ITU-T
-     * H.265 7.3.8.5's coding_unit() codes this as TWO separate passes over
-     * all 4 PUs - every prev_intra_luma_pred_flag first, THEN every
-     * mpm_idx/rem_intra_luma_pred_mode - not interleaved per PU (see
+    /* Step 2: emit the real intra_luma_pred_mode syntax - once for
+     * PART_2Nx2N, or once per PU for PART_NxN. ITU-T H.265 7.3.8.5's
+     * coding_unit() codes this as TWO separate passes over the PUs - every
+     * prev_intra_luma_pred_flag first, THEN every mpm_idx /
+     * rem_intra_luma_pred_mode - not interleaved per PU (see
      * hevc_cabac_code_intra_luma_flag()/_data()'s comment; getting this
      * order wrong was this encoder's first real bug, caught by comparing
      * this encoder's own reconstruction - which matched the source fine -
      * against ffmpeg's actual decode of the resulting bitstream, which
      * didn't: a CABAC bit-order mistake still produces a structurally
      * valid, crash-free bitstream, just one that decodes to noise from
-     * that point on). */
+     * that point on).
+     *
+     * The MPM lists are re-derived here rather than reused from the
+     * decision pass because the decision pass may have been re-run and
+     * rolled back; luma_mode_map now holds the committed modes, which is
+     * what a decoder will have too. */
+    int npu = part_2nx2n ? 1 : 4;
     int mpm[4][3];
     int pred_idx[4];
-    for (int pu = 0; pu < 4; pu++) {
-        int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mx = px / 4, my = py / 4;
-        int left_avail = px > 0;
-        /* Rec. ITU-T H.265 8.4.2: candIntraPredModeB (the "above" MPM
-         * candidate) must be forced unavailable whenever the above
-         * neighbour is in a different CTU row, unconditionally - not just
-         * when py==0. This mirrors the picture-boundary check but for CTU
-         * rows, and is easy to miss because the neighbour pixel data IS
-         * genuinely available/reconstructed; the spec still mandates
-         * treating it as absent for MPM derivation. Getting this wrong
-         * silently changes mpm[]'s candidate ORDER (and hence what
-         * mpm_idx/rem_intra_luma_pred_mode means) for one whole PU-row
-         * per CTU, producing a structurally valid but wrong-meaning
-         * bitstream that only misdecodes once real (non-flat/non-DC)
-         * directional content exercises those modes - hence "busy
-         * directional content only" as the symptom. */
-        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
-        int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
-        int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
-        hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);
+    for (int pu = 0; pu < npu; pu++) {
+        derive_pu_mpm(enc, cu_x + pu_off_x[pu], cu_y + pu_off_y[pu], mpm[pu]);
         pred_idx[pu] = hevc_cabac_code_intra_luma_flag(cab, pu_modes[pu], mpm[pu]);
     }
-    for (int pu = 0; pu < 4; pu++)
+    for (int pu = 0; pu < npu; pu++)
         hevc_cabac_code_intra_luma_data(cab, pu_modes[pu], pred_idx[pu], mpm[pu]);
 
     /* Step 3: chroma mode (always DC; luma_mode_pu0 decides whether that's

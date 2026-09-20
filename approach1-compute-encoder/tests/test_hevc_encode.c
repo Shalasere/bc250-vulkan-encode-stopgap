@@ -51,6 +51,132 @@ static void test_transform_round_trip(void) {
     printf("[test_hevc_encode] Transform round-trip OK.\n");
 }
 
+/*
+ * Angular intra prediction (ITU-T H.265 8.4.4.2.6) against hand-derived
+ * spec values.
+ *
+ * Block (8,16) of a 32x32 luma plane is used because it is the rare
+ * position where ALL FIVE neighbour groups - left, above, above-right,
+ * below-left and the corner - are genuinely z-scan available (ranks 33,
+ * 14, 15, 35 and 11 against the block's own 36, see hevc_intra.c's
+ * zorder_rank()). That matters: anywhere else the 8.4.4.2.2 substitution
+ * scan would rewrite some references, and the expected values below would
+ * be testing the substitution rather than the angular derivation. The
+ * whole reference set is therefore just direct plane reads.
+ */
+static void test_angular_prediction(void) {
+    printf("[test_hevc_encode] Angular intra prediction vs. spec-derived values...\n");
+    enum { S = 32, X0 = 8, Y0 = 16 };
+    static uint8_t plane[S * S];
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++)
+            plane[y * S + x] = (uint8_t)((x * 7 + y * 13 + ((x * y) & 31)) & 0xff);
+
+    uint8_t left[8], top[8], corner = plane[(Y0 - 1) * S + (X0 - 1)];
+    for (int i = 0; i < 8; i++) {
+        left[i] = plane[(Y0 + i) * S + (X0 - 1)];
+        top[i]  = plane[(Y0 - 1) * S + (X0 + i)];
+    }
+
+    uint8_t pred[16];
+
+    /* Mode 34: intraPredAngle = +32, vertical family. iIdx = y+1 and
+     * iFact = 0 for every row, so predSamples[x][y] = ref[x+y+2] and
+     * ref[k>=1] is p[k-1][-1]. */
+    hevc_predict_4x4(plane, S, S, S, X0, Y0, 34, 1, pred);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            assert(pred[y * 4 + x] == top[x + y + 1] && "mode 34 must read straight down the top row");
+
+    /* Mode 2: same angle, horizontal family - the exact transpose, reading
+     * the left column instead. */
+    hevc_predict_4x4(plane, S, S, S, X0, Y0, 2, 1, pred);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            assert(pred[y * 4 + x] == left[x + y + 1] && "mode 2 must read straight down the left column");
+
+    /* Mode 18: intraPredAngle = -32, the one diagonal that needs the
+     * negative half of ref[] projected from the opposite edge via
+     * invAngle (Table 8-6 entry -256). iFact = 0, so predSamples[x][y] =
+     * ref[x-y] exactly: the corner on the main diagonal, the top row above
+     * it, the left column below it. */
+    hevc_predict_4x4(plane, S, S, S, X0, Y0, 18, 1, pred);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            uint8_t want = (x == y) ? corner : (x > y ? top[x - y - 1] : left[y - x - 1]);
+            assert(pred[y * 4 + x] == want && "mode 18 diagonal / invAngle projection wrong");
+        }
+
+    /* Modes 26 and 10 are angle 0 - pure copy - plus the luma-only edge
+     * gradient filter on the first column / first row (8.4.4.2.6's
+     * cIdx == 0 && nTbS < 32 clauses). */
+    hevc_predict_4x4(plane, S, S, S, X0, Y0, 26, 1, pred);
+    for (int y = 0; y < 4; y++) {
+        int want0 = top[0] + ((left[y] - corner) >> 1);
+        want0 = want0 < 0 ? 0 : (want0 > 255 ? 255 : want0);
+        assert(pred[y * 4] == want0 && "mode 26 luma edge filter wrong");
+        for (int x = 1; x < 4; x++) assert(pred[y * 4 + x] == top[x]);
+    }
+    hevc_predict_4x4(plane, S, S, S, X0, Y0, 10, 1, pred);
+    for (int x = 0; x < 4; x++) {
+        int want0 = left[0] + ((top[x] - corner) >> 1);
+        want0 = want0 < 0 ? 0 : (want0 > 255 ? 255 : want0);
+        assert(pred[x] == want0 && "mode 10 luma edge filter wrong");
+    }
+    for (int y = 1; y < 4; y++)
+        for (int x = 0; x < 4; x++) assert(pred[y * 4 + x] == left[y]);
+
+    /* Chroma takes no edge filter at all, so 26 and 10 are pure copies. */
+    hevc_predict_4x4(plane, S, S, S, X0, Y0, 26, 0, pred);
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) assert(pred[y * 4 + x] == pred[x] && "chroma mode 26 must not be edge-filtered");
+
+    /* Every angular mode interpolates between two reference samples, so no
+     * output can escape the reference set's own range. This is the check
+     * that catches an off-by-one or sign error in ref[] indexing even for
+     * the modes with no hand-derived expectation above - including the
+     * negative-angle ones whose projected entries are easiest to get
+     * wrong. */
+    int lo = corner, hi = corner;
+    for (int i = 0; i < 8; i++) {
+        if (left[i] < lo) lo = left[i];
+        if (left[i] > hi) hi = left[i];
+        if (top[i] < lo) lo = top[i];
+        if (top[i] > hi) hi = top[i];
+    }
+    for (int mode = 2; mode <= 34; mode++) {
+        if (mode == 10 || mode == 26) continue; /* edge filter can leave the range by design */
+        hevc_predict_4x4(plane, S, S, S, X0, Y0, mode, 0, pred);
+        for (int i = 0; i < 16; i++)
+            assert(pred[i] >= lo && pred[i] <= hi && "angular prediction escaped its reference range");
+    }
+
+    printf("[test_hevc_encode] Angular intra prediction OK (all 33 angular modes).\n");
+}
+
+/* The mode decision must only ever return a mode this encoder can actually
+ * signal and a decoder can actually reproduce (0..34). */
+static void test_mode_decision_range(void) {
+    printf("[test_hevc_encode] Mode decision range...\n");
+    enum { S = 64 };
+    static uint8_t src[S * S], recon[S * S];
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            src[y * S + x] = (uint8_t)((x * 3) ^ (y * 5));
+            recon[y * S + x] = (uint8_t)((x + y) * 2);
+        }
+    int mpm[3];
+    hevc_derive_mpm(HEVC_MODE_DC, 1, HEVC_MODE_VERTICAL, 1, mpm);
+    for (int y = 0; y < S; y += 4)
+        for (int x = 0; x < S; x += 4) {
+            int m = hevc_choose_luma_mode(src, recon, S, S, S, x, y, mpm, 27);
+            assert(m >= 0 && m < HEVC_MODE_COUNT && "mode decision returned an unsignalable mode");
+            int m2 = hevc_choose_luma_mode(src, recon, S, S, S, x, y, NULL, 27);
+            assert(m2 >= 0 && m2 < HEVC_MODE_COUNT);
+        }
+    printf("[test_hevc_encode] Mode decision range OK.\n");
+}
+
 static void test_mpm_derivation(void) {
     printf("[test_hevc_encode] MPM derivation sanity...\n");
     int mpm[3];
@@ -98,6 +224,8 @@ static int check_nal_sequence(const uint8_t *buf, size_t len, const int *expecte
 int main(void) {
     test_transform_round_trip();
     test_mpm_derivation();
+    test_angular_prediction();
+    test_mode_decision_range();
 
     printf("[test_hevc_encode] Starting H.265 end-to-end bitstream encoding test (GPU-free)...\n");
 

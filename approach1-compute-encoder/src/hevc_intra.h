@@ -52,15 +52,14 @@
 extern "C" {
 #endif
 
-/* The only four HEVC intra modes this encoder ever chooses (mirroring the
- * four H.264 Intra16x16 modes the GPU shaders already know how to pick
- * between by SAD, conceptually - DC, Planar, Horizontal, Vertical), applied
- * per-4x4-block with real chained reconstruction rather than GPU-computed
- * whole-macroblock prediction. See hevc_intra.c's mode-decision comment. */
+/* Named HEVC intra modes. The full set 0..34 (Planar, DC, and the 33
+ * angular modes 2..34) is implemented; these four just get names because
+ * the surrounding code refers to them by role. */
 #define HEVC_MODE_PLANAR      0
 #define HEVC_MODE_DC          1
 #define HEVC_MODE_HORIZONTAL 10
 #define HEVC_MODE_VERTICAL   26
+#define HEVC_MODE_COUNT      35
 
 /* Rec. ITU-T H.265 Table 8-10 (scan derivation for intra 4x4/8x8 luma, and
  * 4:4:4 chroma - not applicable to our 4:2:0 chroma, which always scans
@@ -68,18 +67,40 @@ extern "C" {
  * else SCAN_DIAG(0). Matches hevc_cabac.c's scan_idx numbering. */
 int hevc_scan_idx_for_mode(int mode);
 
-/* Real intra mode decision (SAD-minimizing among the 4 supported modes,
- * the same "no rate-distortion, SAD-only" criterion the GPU's own I16x16
- * decision uses) for one 4x4 luma block at pixel position (x0,y0). Each
- * candidate mode's prediction is built from `recon_y` (real already-
- * reconstructed neighbor pixels, or the substituted default where
+/* Real intra mode decision for one 4x4 luma block at pixel position
+ * (x0,y0). Each candidate mode's prediction is built from `recon_y` (real
+ * already-reconstructed neighbor pixels, or the substituted default where
  * unavailable per 8.4.4.2.2 - the same values a real decoder's own
  * prediction will see), then compared against the real SOURCE pixels at
  * (x0,y0) in `src_y` (both planes share `stride`/`width`/`height`) - the
  * comparison target for "which mode is best" is always the true picture
- * content, not the neighbor data used to build the candidate. */
+ * content, not the neighbor data used to build the candidate.
+ *
+ * `mpm` (the 3 most-probable modes from hevc_derive_mpm(), which the
+ * caller must derive BEFORE deciding, not after) and `qp` turn this into a
+ * real rate-aware decision rather than pure SAD: an MPM costs 2-3 bits to
+ * signal and anything else costs 6, and at 4x4 granularity that side
+ * information is a large fraction of an intra frame's total bits, so
+ * picking a marginally-better-SAD non-MPM angular mode can easily cost
+ * more than it saves. Cost is SAD + lambda(qp) * estimated mode bits.
+ *
+ * Pass mpm == NULL to get the pure-SAD decision with no rate term. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0);
+                           int width, int height, int x0, int y0,
+                           const int mpm[3], int qp);
+
+/* The Lagrangian multiplier hevc_choose_luma_mode() weighs signalling bits
+ * against SAD with, in 1/256ths. Exposed so callers making higher-level
+ * rate decisions (e.g. encoder_h265.c's PART_2Nx2N vs PART_NxN choice)
+ * weigh bits on exactly the same scale rather than inventing a second
+ * one. */
+int hevc_lambda_sad_q8(int qp);
+
+/* Bits needed to signal `mode` for a PU whose MPM list is `mpm`:
+ * prev_intra_luma_pred_flag plus either mpm_idx or a 5-bit
+ * rem_intra_luma_pred_mode. Matches what hevc_cabac_code_intra_luma_
+ * flag()/_data() actually emit. Returns 0 if mpm is NULL. */
+int hevc_mode_signal_bits(int mode, const int mpm[3]);
 
 /* Derive the 3 most-probable-mode candidates for a 4x4 luma PU at (x0,y0)
  * from its already-decided left/above neighbor block modes, per 8.4.2.
@@ -94,10 +115,10 @@ void hevc_derive_mpm(int left_mode, int left_avail, int above_mode, int above_av
 /* Predict one 4x4 block (luma if is_luma, else one of Cb/Cr) at pixel
  * position (x0,y0) in a `stride`-wide plane of size width x height, using
  * already-reconstructed neighbor samples (recon_plane) and Rec. ITU-T
- * H.265 8.4.4.2.2's neighbor-substitution + 8.4.4.2.5-7's Planar/DC/
- * angular sample derivation (including the DC/Horizontal/Vertical luma
- * edge-filtering steps - chroma never gets edge-filtered, matching this
- * project's existing H.264 "chroma is simpler" precedent). Writes 16
+ * H.265 8.4.4.2.2's neighbor-substitution + 8.4.4.2.4-6's DC/Planar/
+ * angular sample derivation (including the DC/mode-10/mode-26 luma
+ * edge-filtering steps - chroma never gets edge-filtered, per the spec's
+ * own cIdx==0 conditions). `mode` may be any of 0..34. Writes 16
  * predicted samples, row-major (pred[y*4+x]). */
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
                       int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]);
