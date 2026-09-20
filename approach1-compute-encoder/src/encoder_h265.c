@@ -1558,14 +1558,41 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
             uint32_t ctu = row * encoder->width_ctu + col;
             int ctu_x = (int)col * HEVC_CTU_SIZE, ctu_y = (int)row * HEVC_CTU_SIZE;
 
+            /* Clamp both GPU-supplied decisions. These cross a device->host
+             * staging boundary, and a stale or partially-written buffer
+             * would otherwise index the MPM tables or the chroma
+             * candidate list out of range. */
+            /* 35 intra modes, 0..34 (Planar, DC, and 33 angular). This tree
+             * has no HEVC_MODE_COUNT constant, hence the literal. */
             int mode = gmodes[ctu];
+            if (mode < 0 || mode > 34) mode = HEVC_MODE_DC;
             uint32_t flags = gcbf[ctu];
             int cbf_luma = (int)(flags & 1u);
             int cbf_cb   = (int)((flags >> 1) & 1u);
             int cbf_cr   = (int)((flags >> 2) & 1u);
             int chroma_idx = (int)((flags >> 8) & 0xFFu);
+            if (chroma_idx > 4) chroma_idx = 4;
 
-            hevc_cabac_code_split_cu_flag(&cab, 0, (col > 0 ? 1 : 0) + (row > 0 ? 1 : 0));
+            /* ctxInc is 0, ALWAYS - not the neighbour-availability sum the
+             * CPU path uses. 9.3.4.2.2 derives it as condL + condA where
+             * condL = availableL && CtDepth[left] > cqtDepth (and likewise
+             * above): the test is whether the neighbour is DEEPER, not
+             * whether it exists. Every CU on this path is one undivided
+             * 16x16 at depth 0, so no neighbour is ever deeper and both
+             * terms are always 0.
+             *
+             * Copying encode_ctu()'s `cond_l + cond_a` here - correct there,
+             * because that path splits every CTU to depth 1 - was a real
+             * decoder-visible corruption: the encoder coded this bin against
+             * ctx 1 or 2 while the decoder used ctx 0, so their probability
+             * states diverged. The signature was diagnostic in hindsight -
+             * CTU (0,0) decoded EXACTLY right (col=0,row=0 gives ctx 0, which
+             * happens to match), CTU rows 1-3 degraded, and everything from
+             * row 4 down was solid black. Measured: 5.0 dB PSNR and a luma
+             * mean of 4.4 against the source's 126.0. It still decoded
+             * without a single ffmpeg error, which is why the decode-silence
+             * check alone did not catch it. */
+            hevc_cabac_code_split_cu_flag(&cab, 0, 0);
 
             /* MPM. candIntraPredModeB is unconditionally INTRA_DC here: this
              * CU starts at a CTU boundary, so yCb-1 always crosses into the
