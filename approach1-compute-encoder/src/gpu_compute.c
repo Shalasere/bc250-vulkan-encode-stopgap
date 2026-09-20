@@ -1113,6 +1113,26 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     VkDescriptorSetLayoutCreateInfo intra_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 9, .pBindings = intra_wavefront_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &intra_wavefront_layout_info, NULL, &ctx->intra_wavefront_desc_layout);
 
+    /* HEVC intra (hevc_intra_wavefront.comp). Same first four bindings as
+     * the H.264 wavefront - source Y/UV in, recon Y/UV in-out - but bindings
+     * 4/5/6 are HEVC's own mode / coefficient / cbf buffers rather than
+     * quant_levels / coeff / pred_mode. It has no equivalent of bindings 7
+     * and 8 (nonzero mask, compact DC): HEVC's CPU side reads the full
+     * coefficient array, so there is nothing to compact.
+     * See gpu_compute.h's hevc_wavefront_pipeline comment for why this is a
+     * separate layout instead of a reuse of the one above. */
+    VkDescriptorSetLayoutBinding hevc_wavefront_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+    };
+    VkDescriptorSetLayoutCreateInfo hevc_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = hevc_wavefront_bindings };
+    vkCreateDescriptorSetLayout(ctx->device, &hevc_wavefront_layout_info, NULL, &ctx->hevc_wavefront_desc_layout);
+
     /* Descriptor Pool */
     /* Headroom, not a tight fit. The nine layouts above bind 24 storage
      * buffers and 14 storage images today; adding the nonzero mask and the
@@ -1183,6 +1203,11 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     layout_info.pSetLayouts = &ctx->intra_wavefront_desc_layout;
     vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->intra_wavefront_layout);
 
+    /* hevc_intra_wavefront.comp declares 8 push-constant words; the shared
+     * pc_range above is 10, which covers it. */
+    layout_info.pSetLayouts = &ctx->hevc_wavefront_desc_layout;
+    vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->hevc_wavefront_layout);
+
     /* Allocate Descriptor Sets */
     VkDescriptorSetAllocateInfo alloc_set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1216,6 +1241,9 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     alloc_set_info.pSetLayouts = &ctx->intra_wavefront_desc_layout;
     vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->intra_wavefront_desc_set);
+
+    alloc_set_info.pSetLayouts = &ctx->hevc_wavefront_desc_layout;
+    vkAllocateDescriptorSets(ctx->device, &alloc_set_info, &ctx->hevc_wavefront_desc_set);
 
     /* Shaders & Pipelines */
     VkShaderModule me_shader = load_spirv_shader(ctx->device, "motion_estimation.comp.spv");
@@ -1273,6 +1301,19 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     } else {
         fprintf(stderr, "[bc250-gpu] FAILED to load intra_wavefront.comp.spv shader module\n");
     }
+    /* HEVC intra. Unlike the H.264 shaders above, a missing SPIR-V here is
+     * not an error worth shouting about on every context creation: the HEVC
+     * encoder falls back to its CPU path on a NULL pipeline, and an H.264-only
+     * install is a legitimate configuration. Keep it quiet unless it loaded
+     * and then failed to build, which IS a real problem. */
+    VkShaderModule hevc_wavefront_shader = load_spirv_shader(ctx->device, "hevc_intra_wavefront.comp.spv");
+    if (hevc_wavefront_shader) {
+        ctx->hevc_wavefront_pipeline = create_compute_pipeline(ctx->device, hevc_wavefront_shader, ctx->hevc_wavefront_layout);
+        vkDestroyShaderModule(ctx->device, hevc_wavefront_shader, NULL);
+        if (!ctx->hevc_wavefront_pipeline) {
+            fprintf(stderr, "[bc250-gpu] FAILED to create hevc_wavefront_pipeline (shader loaded but pipeline creation failed)\n");
+        }
+    }
 
     /* Encoding buffers are allocated LAZILY, on the first
      * gpu_compute_dispatch_encode() at the real resolution (and again on any
@@ -1323,6 +1364,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->color_convert_pipeline) vkDestroyPipeline(ctx->device, ctx->color_convert_pipeline, NULL);
     if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
     if (ctx->intra_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->intra_wavefront_pipeline, NULL);
+    if (ctx->hevc_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_wavefront_pipeline, NULL);
 
     if (ctx->motion_est_layout) vkDestroyPipelineLayout(ctx->device, ctx->motion_est_layout, NULL);
     if (ctx->predict_layout) vkDestroyPipelineLayout(ctx->device, ctx->predict_layout, NULL);
@@ -1333,6 +1375,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->color_convert_layout) vkDestroyPipelineLayout(ctx->device, ctx->color_convert_layout, NULL);
     if (ctx->reconstruct_layout) vkDestroyPipelineLayout(ctx->device, ctx->reconstruct_layout, NULL);
     if (ctx->intra_wavefront_layout) vkDestroyPipelineLayout(ctx->device, ctx->intra_wavefront_layout, NULL);
+    if (ctx->hevc_wavefront_layout) vkDestroyPipelineLayout(ctx->device, ctx->hevc_wavefront_layout, NULL);
 
     if (ctx->me_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->me_desc_layout, NULL);
     if (ctx->predict_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->predict_desc_layout, NULL);
@@ -1343,6 +1386,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->cc_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->cc_desc_layout, NULL);
     if (ctx->reconstruct_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->reconstruct_desc_layout, NULL);
     if (ctx->intra_wavefront_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->intra_wavefront_desc_layout, NULL);
+    if (ctx->hevc_wavefront_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->hevc_wavefront_desc_layout, NULL);
 
     if (ctx->desc_pool) vkDestroyDescriptorPool(ctx->device, ctx->desc_pool, NULL);
 
@@ -1354,6 +1398,9 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->quant_levels_buffer) { vkDestroyBuffer(ctx->device, ctx->quant_levels_buffer, NULL); vkFreeMemory(ctx->device, ctx->quant_levels_memory, NULL); }
     if (ctx->nz_count_buffer) { vkDestroyBuffer(ctx->device, ctx->nz_count_buffer, NULL); vkFreeMemory(ctx->device, ctx->nz_count_memory, NULL); }
     if (ctx->pred_mode_buffer) { vkDestroyBuffer(ctx->device, ctx->pred_mode_buffer, NULL); vkFreeMemory(ctx->device, ctx->pred_mode_memory, NULL); }
+    if (ctx->hevc_mode_buffer) { vkDestroyBuffer(ctx->device, ctx->hevc_mode_buffer, NULL); vkFreeMemory(ctx->device, ctx->hevc_mode_memory, NULL); }
+    if (ctx->hevc_coeff_buffer) { vkDestroyBuffer(ctx->device, ctx->hevc_coeff_buffer, NULL); vkFreeMemory(ctx->device, ctx->hevc_coeff_memory, NULL); }
+    if (ctx->hevc_cbf_buffer) { vkDestroyBuffer(ctx->device, ctx->hevc_cbf_buffer, NULL); vkFreeMemory(ctx->device, ctx->hevc_cbf_memory, NULL); }
     if (ctx->entropy_buffer) { vkDestroyBuffer(ctx->device, ctx->entropy_buffer, NULL); vkFreeMemory(ctx->device, ctx->entropy_memory, NULL); }
     for (int i = 0; i < 2; i++) {
         if (ctx->staging_mapped[i]) {
@@ -1403,6 +1450,30 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
         if (ctx->nz_staging_buffers[i]) {
             vkDestroyBuffer(ctx->device, ctx->nz_staging_buffers[i], NULL);
             vkFreeMemory(ctx->device, ctx->nz_staging_memories[i], NULL);
+        }
+        if (ctx->hevc_mode_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_mode_staging_memories[i]);
+            ctx->hevc_mode_staging_mapped[i] = NULL;
+        }
+        if (ctx->hevc_mode_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_mode_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_mode_staging_memories[i], NULL);
+        }
+        if (ctx->hevc_coeff_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_coeff_staging_memories[i]);
+            ctx->hevc_coeff_staging_mapped[i] = NULL;
+        }
+        if (ctx->hevc_coeff_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_coeff_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_coeff_staging_memories[i], NULL);
+        }
+        if (ctx->hevc_cbf_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_cbf_staging_memories[i]);
+            ctx->hevc_cbf_staging_mapped[i] = NULL;
+        }
+        if (ctx->hevc_cbf_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_cbf_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_cbf_staging_memories[i], NULL);
         }
     }
 
@@ -1879,6 +1950,248 @@ static void insert_compute_barrier(VkCommandBuffer cmd_buf) {
     };
     vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+/* Compute-write -> transfer-read. insert_compute_barrier() above orders
+ * compute against compute only, which is NOT enough before a
+ * vkCmdCopyBuffer() that reads what the last dispatch wrote - without this
+ * the copy is free to read stale memory. The HEVC path needs it because it
+ * stages its results out in the same command buffer that produced them. */
+static void insert_compute_to_transfer_barrier(VkCommandBuffer cmd_buf) {
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT
+    };
+    vkCmdPipelineBarrier(cmd_buf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, NULL, 0, NULL);
+}
+
+/* Release whatever hevc_alloc_buffers() last allocated. Safe to call on a
+ * context that never ran an HEVC frame (all handles VK_NULL_HANDLE). */
+static void hevc_free_buffers(gpu_context_t *ctx) {
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hevc_mode_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_mode_staging_memories[i]);
+            ctx->hevc_mode_staging_mapped[i] = NULL;
+        }
+        if (ctx->hevc_mode_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_mode_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_mode_staging_memories[i], NULL);
+            ctx->hevc_mode_staging_buffers[i] = VK_NULL_HANDLE;
+        }
+        if (ctx->hevc_coeff_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_coeff_staging_memories[i]);
+            ctx->hevc_coeff_staging_mapped[i] = NULL;
+        }
+        if (ctx->hevc_coeff_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_coeff_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_coeff_staging_memories[i], NULL);
+            ctx->hevc_coeff_staging_buffers[i] = VK_NULL_HANDLE;
+        }
+        if (ctx->hevc_cbf_staging_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_cbf_staging_memories[i]);
+            ctx->hevc_cbf_staging_mapped[i] = NULL;
+        }
+        if (ctx->hevc_cbf_staging_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_cbf_staging_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_cbf_staging_memories[i], NULL);
+            ctx->hevc_cbf_staging_buffers[i] = VK_NULL_HANDLE;
+        }
+    }
+    if (ctx->hevc_mode_buffer) {
+        vkDestroyBuffer(ctx->device, ctx->hevc_mode_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->hevc_mode_memory, NULL);
+        ctx->hevc_mode_buffer = VK_NULL_HANDLE;
+    }
+    if (ctx->hevc_coeff_buffer) {
+        vkDestroyBuffer(ctx->device, ctx->hevc_coeff_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->hevc_coeff_memory, NULL);
+        ctx->hevc_coeff_buffer = VK_NULL_HANDLE;
+    }
+    if (ctx->hevc_cbf_buffer) {
+        vkDestroyBuffer(ctx->device, ctx->hevc_cbf_buffer, NULL);
+        vkFreeMemory(ctx->device, ctx->hevc_cbf_memory, NULL);
+        ctx->hevc_cbf_buffer = VK_NULL_HANDLE;
+    }
+    ctx->hevc_alloc_width = 0;
+    ctx->hevc_alloc_height = 0;
+}
+
+/* Allocate (or reallocate) the HEVC device buffers and their host-visible
+ * staging pairs for `width`x`height` CODED pixels. Returns 0 on success.
+ *
+ * Every allocation is checked and a partial failure tears the whole set back
+ * down, so the caller sees either a complete set or nothing - the same
+ * discipline allocate_encoding_buffers() adopted after ignored return values
+ * turned OOM into a SEGV in the dispatch path. */
+static int hevc_alloc_buffers(gpu_context_t *ctx, uint32_t width, uint32_t height) {
+    hevc_free_buffers(ctx);
+
+    uint32_t wc = (width + 15u) / 16u;
+    uint32_t hc = (height + 15u) / 16u;
+    uint32_t nctu = wc * hc;
+    if (nctu == 0) return -1;
+
+    VkDeviceSize mode_size  = (VkDeviceSize)nctu * sizeof(int32_t);
+    VkDeviceSize coeff_size = (VkDeviceSize)nctu * 384u * sizeof(int32_t);
+    VkDeviceSize cbf_size   = (VkDeviceSize)nctu * sizeof(uint32_t);
+
+    /* Same HOST_CACHED preference the other staging buffers use - reads off
+     * an uncached mapping on this APU are slow enough to dominate the frame
+     * (DEVLOG's BC250_STAGING_CACHED discussion), and the HEVC coefficient
+     * readback is the largest single one here. */
+    VkMemoryPropertyFlags cached_pref = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    VkMemoryPropertyFlags visible_req = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    {
+        const char *sc = getenv("BC250_STAGING_CACHED");
+        if (sc && strcmp(sc, "0") == 0) cached_pref = visible_req;
+    }
+
+    VkBufferUsageFlags dev_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    int rc = 0;
+    rc |= create_buffer_with_memory(ctx, mode_size,  dev_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->hevc_mode_buffer,  &ctx->hevc_mode_memory);
+    rc |= create_buffer_with_memory(ctx, coeff_size, dev_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->hevc_coeff_buffer, &ctx->hevc_coeff_memory);
+    rc |= create_buffer_with_memory(ctx, cbf_size,   dev_usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &ctx->hevc_cbf_buffer,   &ctx->hevc_cbf_memory);
+    for (int i = 0; i < 2; i++) {
+        rc |= create_buffer_with_memory_preferred(ctx, mode_size,  VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->hevc_mode_staging_buffers[i],  &ctx->hevc_mode_staging_memories[i]);
+        rc |= create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->hevc_coeff_staging_buffers[i], &ctx->hevc_coeff_staging_memories[i]);
+        rc |= create_buffer_with_memory_preferred(ctx, cbf_size,   VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->hevc_cbf_staging_buffers[i],   &ctx->hevc_cbf_staging_memories[i]);
+    }
+    if (rc != 0) {
+        fprintf(stderr, "[bc250-gpu] HEVC buffer allocation failed at %ux%u (%.1f MB requested) - falling back to the CPU encoder\n",
+                width, height, (double)(mode_size + coeff_size + cbf_size) * 3.0 / (1024.0 * 1024.0));
+        hevc_free_buffers(ctx);
+        return -1;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        vkMapMemory(ctx->device, ctx->hevc_mode_staging_memories[i],  0, mode_size,  0, &ctx->hevc_mode_staging_mapped[i]);
+        vkMapMemory(ctx->device, ctx->hevc_coeff_staging_memories[i], 0, coeff_size, 0, &ctx->hevc_coeff_staging_mapped[i]);
+        vkMapMemory(ctx->device, ctx->hevc_cbf_staging_memories[i],   0, cbf_size,   0, &ctx->hevc_cbf_staging_mapped[i]);
+        if (!ctx->hevc_mode_staging_mapped[i] || !ctx->hevc_coeff_staging_mapped[i] || !ctx->hevc_cbf_staging_mapped[i]) {
+            fprintf(stderr, "[bc250-gpu] HEVC staging vkMapMemory failed - falling back to the CPU encoder\n");
+            hevc_free_buffers(ctx);
+            return -1;
+        }
+    }
+
+    ctx->hevc_mode_staging_size  = mode_size;
+    ctx->hevc_coeff_staging_size = coeff_size;
+    ctx->hevc_cbf_staging_size   = cbf_size;
+    ctx->hevc_alloc_width  = width;
+    ctx->hevc_alloc_height = height;
+
+    update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 4, ctx->hevc_mode_buffer,  mode_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 5, ctx->hevc_coeff_buffer, coeff_size);
+    update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 6, ctx->hevc_cbf_buffer,   cbf_size);
+    return 0;
+}
+
+int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
+                                    int width, int height,
+                                    int src_width, int src_height, int qp) {
+    if (!ctx || !ctx->hevc_wavefront_pipeline) return -1;
+    if (width <= 0 || height <= 0) return -1;
+    if (src.y_view == VK_NULL_HANDLE) return -1;
+
+    if (ctx->hevc_mode_buffer == VK_NULL_HANDLE ||
+        ctx->hevc_alloc_width != (uint32_t)width ||
+        ctx->hevc_alloc_height != (uint32_t)height) {
+        if (hevc_alloc_buffers(ctx, (uint32_t)width, (uint32_t)height) != 0) return -1;
+    }
+
+    /* The recon image is shared with the H.264 path; create it on the same
+     * terms gpu_compute_dispatch_encode() does if this is the first frame. */
+    if (ctx->recon_image.y_plane == VK_NULL_HANDLE ||
+        ctx->recon_image.width != (uint32_t)width ||
+        ctx->recon_image.height != (uint32_t)height) {
+        if (ctx->recon_image.y_plane != VK_NULL_HANDLE)
+            gpu_compute_destroy_image(ctx, ctx->recon_image, ctx->recon_memory);
+        gpu_compute_create_image(ctx, width, height, 0, &ctx->recon_image, &ctx->recon_memory);
+        ctx->has_recon_frame = false;
+    }
+    if (ctx->recon_image.y_view == VK_NULL_HANDLE) return -1;
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+
+    update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 0, src.y_view);
+    update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 1,
+                                    src.uv_view ? src.uv_view : src.y_view);
+    update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 2, ctx->recon_image.y_view);
+    update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 3,
+                                    ctx->recon_image.uv_view ? ctx->recon_image.uv_view : ctx->recon_image.y_view);
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hevc_wavefront_pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            ctx->hevc_wavefront_layout, 0, 1, &ctx->hevc_wavefront_desc_set, 0, NULL);
+
+    uint32_t wc = ((uint32_t)width  + 15u) / 16u;
+    uint32_t hc = ((uint32_t)height + 15u) / 16u;
+
+    /* Wavefront steps. CTU (x,y) belongs to step s = 2*y + x, so the last
+     * step is 2*(hc-1) + (wc-1) and there are 2*(hc-1) + wc of them. */
+    uint32_t nsteps = 2u * (hc - 1u) + wc;
+
+    for (uint32_t s = 0; s < nsteps; s++) {
+        /* Rows carrying a CTU on this step: x = s - 2*y must lie in
+         * [0, wc-1], which bounds y to [ceil((s-wc+1)/2), floor(s/2)]. */
+        int y_lo = 0;
+        if ((int)s - (int)wc + 1 > 0) y_lo = ((int)s - (int)wc + 2) / 2;
+        int y_hi = (int)s / 2;
+        if (y_hi > (int)hc - 1) y_hi = (int)hc - 1;
+        if (y_hi < y_lo) continue;
+        uint32_t count = (uint32_t)(y_hi - y_lo + 1);
+
+        uint32_t pcw[8] = { (uint32_t)width, (uint32_t)height, wc, hc, (uint32_t)qp, s,
+                            (uint32_t)src_width, (uint32_t)src_height };
+        vkCmdPushConstants(cmd_buf, ctx->hevc_wavefront_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcw), pcw);
+        vkCmdDispatch(cmd_buf, count, 1, 1);
+        insert_compute_barrier(cmd_buf);
+    }
+
+    /* Hand the decisions back. Without this the shader's output never leaves
+     * device memory and the CPU has nothing to entropy-code. The barrier is
+     * the write-then-copy dependency the copies need - the compute barriers
+     * above only order compute against compute. */
+    insert_compute_to_transfer_barrier(cmd_buf);
+    {
+        VkBufferCopy r;
+        r = (VkBufferCopy){ .srcOffset = 0, .dstOffset = 0, .size = ctx->hevc_mode_staging_size };
+        vkCmdCopyBuffer(cmd_buf, ctx->hevc_mode_buffer,
+                        ctx->hevc_mode_staging_buffers[ctx->current_buf], 1, &r);
+        r = (VkBufferCopy){ .srcOffset = 0, .dstOffset = 0, .size = ctx->hevc_coeff_staging_size };
+        vkCmdCopyBuffer(cmd_buf, ctx->hevc_coeff_buffer,
+                        ctx->hevc_coeff_staging_buffers[ctx->current_buf], 1, &r);
+        r = (VkBufferCopy){ .srcOffset = 0, .dstOffset = 0, .size = ctx->hevc_cbf_staging_size };
+        vkCmdCopyBuffer(cmd_buf, ctx->hevc_cbf_buffer,
+                        ctx->hevc_cbf_staging_buffers[ctx->current_buf], 1, &r);
+    }
+
+    ctx->has_recon_frame = true;
+    return 0;
+}
+
+int gpu_compute_get_hevc_mode_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->hevc_mode_staging_size;
+    *data = ctx->hevc_mode_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_hevc_coeff_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->hevc_coeff_staging_size;
+    *data = ctx->hevc_coeff_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_hevc_cbf_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->hevc_cbf_staging_size;
+    *data = ctx->hevc_cbf_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
 }
 
 /* Diagnostic-only (BC250_PERF_STATS=1): millisecond delta between two

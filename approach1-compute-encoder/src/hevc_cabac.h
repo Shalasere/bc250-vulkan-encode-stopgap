@@ -87,7 +87,14 @@ extern "C" {
 #define HEVC_CTX_PRED_MODE  125   /* 1 context: inter (0) vs intra (1) */
 #define HEVC_CTX_MERGE_FLAG 126   /* 1 context: merge_flag */
 #define HEVC_CTX_MERGE_IDX  127   /* 1 context: merge_idx bin 0 */
-#define HEVC_NUM_CTX        128
+/* Needed only once a transform block is larger than 4x4, i.e. by the GPU
+ * reconstruction path: a lone 4x4 TU is exactly one coefficient group
+ * (so coded_sub_block_flag is inferred) inside a transform tree whose
+ * only split is inferred too. Appended after the inter banks above so
+ * every existing context index is unchanged. */
+#define HEVC_CTX_SIG_CG     128   /* 4 contexts: 0-1 luma, 2-3 chroma */
+#define HEVC_CTX_TRANS_SUBDIV 132 /* 3 contexts: split_transform_flag, by 5-log2TrafoSize */
+#define HEVC_NUM_CTX        135
 
 typedef struct {
     /* Output sink: a plain bit-level bitstream_t (bitstream.h/.c, the same
@@ -203,6 +210,43 @@ void hevc_cabac_code_cbf_chroma(hevc_cabac_t *cb, int cbf, int trafo_depth);
  * hevc_scan_idx_for_mode()). */
 void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
                                    int is_luma, int scan_idx);
+
+/* ---- transform blocks larger than 4x4 -------------------------------
+ * Used by the GPU reconstruction path (hevc_intra_wavefront.comp), which
+ * codes one 16x16 luma TU and one 8x8 chroma pair per CTU. The CPU path
+ * above is unchanged and still goes through the 4x4 coder.
+ *
+ * residual_coding() for a transform block of any HEVC size: log2_size in
+ * 2..5, coefficients row-major with stride (1<<log2_size), known to have
+ * at least one nonzero (the caller checks cbf and skips otherwise).
+ *
+ * Above 4x4 a transform block is several 4x4 coefficient groups, which
+ * brings in everything the 4x4-only coder can skip: coded_sub_block_flag
+ * with its neighbour-derived context, the last-position prefix's
+ * size-dependent context offset/shift plus a bypass suffix, the
+ * neighbouring-group pattern that drives sig_coeff_flag contexts, a
+ * ctxSet that carries greater1 state across groups, and per-group
+ * Golomb-Rice reset. */
+void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_size,
+                               int is_luma, int scan_idx);
+
+/* split_transform_flag. Only coded when the transform tree has a real
+ * choice (7.3.8.8): log2TrafoSize <= MaxTbLog2SizeY, > MinTbLog2SizeY,
+ * trafoDepth < MaxTrafoDepth, and not already forced by IntraSplitFlag
+ * at depth 0. ctxInc is 5 - log2TrafoSize. */
+void hevc_cabac_code_split_transform_flag(hevc_cabac_t *cb, int split, int log2_size);
+
+/* Rec. ITU-T H.265 8.4.3 / Tables 8-2 and 8-3: resolve an
+ * intra_chroma_pred_mode index (0..4) against the CU's luma mode into
+ * the real chroma prediction mode. 4 is DM_CHROMA; a candidate that
+ * collides with the luma mode is replaced by 34. */
+int hevc_chroma_mode_from_idx(int idx, int luma_mode_pu0);
+
+/* intra_chroma_pred_mode by INDEX rather than by resolved mode. The
+ * existing entry point above always signals DC and takes the luma mode
+ * to decide how; this one takes the syntax element's own value, which a
+ * caller that made a real chroma mode decision already has. */
+void hevc_cabac_code_intra_chroma_pred_mode_idx(hevc_cabac_t *cb, int idx);
 
 #ifdef __cplusplus
 }

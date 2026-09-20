@@ -1,0 +1,729 @@
+#version 450
+/* bc250-vcn-driver - HEVC intra reconstruction on the GPU
+ *
+ * Copyright (c) 2026 BC-250 Project Contributors
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * =====================================================================
+ * WHY THIS EXISTS
+ * =====================================================================
+ * The CPU HEVC encoder is correct and compresses well, but runs at ~9
+ * fps for 1080p on the BC-250 against H.264's 82, because H.264 does
+ * prediction and transform on the GPU and HEVC did not. Profiling put
+ * ~94% of the HEVC frame in per-block arithmetic - prediction,
+ * transform, quantization, reconstruction - leaving CABAC, the one part
+ * that must stay serial on the CPU. (CABAC's share scales with BITRATE,
+ * not with pixels: ~1 ms on a 3 KB desktop frame but ~18 ms on a 79 KB
+ * one, so the CPU remainder is content-dependent.)
+ *
+ * So the reconstruction loop moves here; the CPU reads back the modes
+ * and coefficients this shader decides and does entropy coding only.
+ *
+ * =====================================================================
+ * THE SCHEDULE, AND WHY IT IS NOT intra_wavefront.comp's
+ * =====================================================================
+ * The H.264 shader walks anti-diagonals d = mbx+mby, which is sound
+ * there because an Intra16x16 macroblock reads only top[0..15],
+ * left[0..15] and the corner - all on strictly earlier diagonals.
+ *
+ * HEVC cannot use that. Reference construction reads up to 2*nTbS
+ * samples along each edge (8.4.4.2.2), so a CTU also needs its
+ * ABOVE-RIGHT neighbour, and for a CTU at (x,y) that is (x+1,y-1) with
+ * (x+1)+(y-1) == x+y - the SAME anti-diagonal. It would be co-scheduled
+ * and not yet reconstructed, so the H.264 schedule would silently read
+ * undecoded pixels here.
+ *
+ * The fix is the 2:1 slope, which is what HEVC's own Wavefront Parallel
+ * Processing uses:
+ *
+ *     step s = 2*ctby + ctbx
+ *
+ *   left        (x-1,y  ) -> s-1   earlier
+ *   above       (x  ,y-1) -> s-2   earlier
+ *   above-right (x+1,y-1) -> s-1   earlier
+ *   below-left  (x-1,y+1) -> s+1   LATER, and that is fine:
+ *
+ * for a CTU-aligned block the below-left samples lie in the CTU
+ * below-left, which is later in raster order and therefore not z-scan
+ * available anyway (6.4.1). The substitution process fills them, just
+ * as on the CPU.
+ *
+ * One workgroup per CTU. Cross-CTU ordering is the host's pipeline
+ * barrier between dispatches - deliberately NOT an in-shader spin on an
+ * atomic flag, which would assume all workgroups are co-resident and
+ * deadlock once the dependency graph exceeds occupancy.
+ *
+ * =====================================================================
+ * SHARED MEMORY, DELIBERATELY
+ * =====================================================================
+ * Every thread in a workgroup predicts a different sample of the SAME
+ * block from the SAME reference set. Giving each thread its own copy of
+ * that set would be ~512 bytes x 256 threads of scratch per workgroup
+ * and would spill catastrophically, so the references - raw, smoothed,
+ * and the DC value derived from them - all live in shared memory and
+ * are computed once per candidate mode.
+ *
+ * =====================================================================
+ * SCOPE
+ * =====================================================================
+ * Every CTU is one undivided 16x16 CU: one intra mode, one 16x16 luma
+ * transform, one 8x8 Cb and Cr. That is a legal configuration the CPU
+ * encoder already emits for flat CTUs, and both luma and chroma are
+ * verified bit-exact against the CPU. Split CUs, mode refinement and
+ * the MPM rate term are not implemented here yet.
+ *
+ * =====================================================================
+ * THREADING: ONE THREAD PER COEFFICIENT, NOT PER LINE
+ * =====================================================================
+ * Measured, this shader is workgroup-LATENCY bound, not throughput
+ * bound: per-step time was ~54 us at both 720p and 1080p even though
+ * the two have very different numbers of workgroups per step. So what
+ * matters is the critical path through one workgroup, and leaving 240
+ * of 256 threads idle is the thing to avoid.
+ *
+ * That inverts the CPU's tradeoff. The CPU transforms with a partial
+ * butterfly because it has one thread and wants fewer multiplies; a
+ * butterfly is inherently per-LINE, so here it could only occupy 16
+ * threads at ~85 multiplies each. The plain matrix product spreads
+ * across all 256 at 16 multiplies each, and is bit-identical - the same
+ * integer sums in a different association order.
+ */
+
+#define N      16
+#define LOG2N   4
+#define SIDE   (2 * N)
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    /* CODED dimensions - they drive the CTU grid and the extent of the
+     * reconstruction, and are a whole number of CTUs. */
+    uint width;
+    uint height;
+    uint width_ctu;
+    uint height_ctu;
+    uint qp;
+    uint step;
+    /* The SOURCE image's real dimensions, which may be smaller (1080 is
+     * not a multiple of 16). Source reads clamp to these, replicating
+     * the edge exactly as the CPU's pad_replicate() does - an unclamped
+     * imageLoad past the edge returns 0, not the edge pixel, which would
+     * feed a black border into the bottom row's residual. */
+    uint src_width;
+    uint src_height;
+} pc;
+
+layout(set = 0, binding = 0, r8)  uniform readonly image2D srcY;
+layout(set = 0, binding = 1, rg8) uniform readonly image2D srcUV;
+layout(set = 0, binding = 2, r8)  uniform image2D reconY;      /* read AND write */
+layout(set = 0, binding = 3, rg8) uniform image2D reconUV;     /* read AND write */
+layout(std430, set = 0, binding = 4) buffer ModeOut  { int  modes[];  };
+layout(std430, set = 0, binding = 5) buffer CoeffOut { int  coeffs[]; };
+layout(std430, set = 0, binding = 6) buffer CbfOut   { uint cbf[];    };
+
+/* Rec. ITU-T H.265 8.6.4.2 transMatrix, left half of each row; the right
+ * half is the mirror M[i][N-1-j] == (-1)^i * M[i][j] and every smaller
+ * size is M32[i*32/N][j]. Same table and same nesting as the CPU, so the
+ * two cannot drift apart about what the transform is. */
+const int DCT32[32][16] = {
+ { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+ { 90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13,  4},
+ { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90},
+ { 90, 82, 67, 46, 22, -4,-31,-54,-73,-85,-90,-88,-78,-61,-38,-13},
+ { 89, 75, 50, 18,-18,-50,-75,-89,-89,-75,-50,-18, 18, 50, 75, 89},
+ { 88, 67, 31,-13,-54,-82,-90,-78,-46, -4, 38, 73, 90, 85, 61, 22},
+ { 87, 57,  9,-43,-80,-90,-70,-25, 25, 70, 90, 80, 43, -9,-57,-87},
+ { 85, 46,-13,-67,-90,-73,-22, 38, 82, 88, 54, -4,-61,-90,-78,-31},
+ { 83, 36,-36,-83,-83,-36, 36, 83, 83, 36,-36,-83,-83,-36, 36, 83},
+ { 82, 22,-54,-90,-61, 13, 78, 85, 31,-46,-90,-67,  4, 73, 88, 38},
+ { 80,  9,-70,-87,-25, 57, 90, 43,-43,-90,-57, 25, 87, 70, -9,-80},
+ { 78, -4,-82,-73, 13, 85, 67,-22,-88,-61, 31, 90, 54,-38,-90,-46},
+ { 75,-18,-89,-50, 50, 89, 18,-75,-75, 18, 89, 50,-50,-89,-18, 75},
+ { 73,-31,-90,-22, 78, 67,-38,-90,-13, 82, 61,-46,-88, -4, 85, 54},
+ { 70,-43,-87,  9, 90, 25,-80,-57, 57, 80,-25,-90, -9, 87, 43,-70},
+ { 67,-54,-78, 38, 85,-22,-90,  4, 90, 13,-88,-31, 82, 46,-73,-61},
+ { 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64},
+ { 61,-73,-46, 82, 31,-88,-13, 90, -4,-90, 22, 85,-38,-78, 54, 67},
+ { 57,-80,-25, 90, -9,-87, 43, 70,-70,-43, 87,  9,-90, 25, 80,-57},
+ { 54,-85, -4, 88,-46,-61, 82, 13,-90, 38, 67,-78,-22, 90,-31,-73},
+ { 50,-89, 18, 75,-75,-18, 89,-50,-50, 89,-18,-75, 75, 18,-89, 50},
+ { 46,-90, 38, 54,-90, 31, 61,-88, 22, 67,-85, 13, 73,-82,  4, 78},
+ { 43,-90, 57, 25,-87, 70,  9,-80, 80, -9,-70, 87,-25,-57, 90,-43},
+ { 38,-88, 73, -4,-67, 90,-46,-31, 85,-78, 13, 61,-90, 54, 22,-82},
+ { 36,-83, 83,-36,-36, 83,-83, 36, 36,-83, 83,-36,-36, 83,-83, 36},
+ { 31,-78, 90,-61,  4, 54,-88, 82,-38,-22, 73,-90, 67,-13,-46, 85},
+ { 25,-70, 90,-80, 43,  9,-57, 87,-87, 57, -9,-43, 80,-90, 70,-25},
+ { 22,-61, 85,-90, 73,-38, -4, 46,-78, 90,-82, 54,-13,-31, 67,-88},
+ { 18,-50, 75,-89, 89,-75, 50,-18,-18, 50,-75, 89,-89, 75,-50, 18},
+ { 13,-38, 61,-78, 88,-90, 85,-73, 54,-31,  4, 22,-46, 67,-82, 90},
+ {  9,-25, 43,-57, 70,-80, 87,-90, 90,-87, 80,-70, 57,-43, 25, -9},
+ {  4,-13, 22,-31, 38,-46, 54,-61, 67,-73, 78,-82, 85,-88, 90,-90}
+};
+
+/* M_N[i][j] for N == 1<<log2n. */
+int tmat(int log2n, int i, int j) {
+    int row = i << (5 - log2n);
+    int nn = 1 << log2n;
+    if (j < 16) return DCT32[row][j];
+    int v = DCT32[row][nn - 1 - j];
+    return ((row & 1) != 0) ? -v : v;
+}
+
+/* Branch-free accessors for the two sizes this shader transforms. Both
+ * have N <= 16, so the column index never reaches the mirrored half of
+ * the table and the general form's test is dead weight in the innermost
+ * loop of the whole shader. */
+int m16(int i, int j) { return DCT32[i << 1][j]; }
+int m8 (int i, int j) { return DCT32[i << 2][j]; }
+
+const int ANGLE[35] = int[35](
+      0,   0,  32,  26,  21,  17,  13,   9,   5,   2,   0,  -2,
+     -5,  -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,  -9,
+     -5,  -2,   0,   2,   5,   9,  13,  17,  21,  26,  32 );
+const int INVANG[15] = int[15](
+    -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
+     -482,  -630, -910, -1638, -4096 );
+const int LEVELSCALE[6] = int[6]( 40, 45, 51, 57, 64, 72 );
+/* Table 8-2's intra_chroma_pred_mode candidate list. */
+const int CHROMA_CAND[4] = int[4]( 0, 26, 10, 1 );
+
+#define NC      8        /* chroma block side for a 16x16 CU, 4:2:0 */
+#define LOG2NC  3
+#define SIDE_C  (2 * NC)
+
+/* 8.4.3: resolve an intra_chroma_pred_mode index against the luma mode.
+ * A candidate colliding with luma would be redundant - DM_CHROMA already
+ * reaches it - so the spec substitutes mode 34 in that slot. */
+int chroma_mode_from_idx(int idx, int luma) {
+    if (idx == 4) return luma;                 /* DM_CHROMA */
+    int m = CHROMA_CAND[idx];
+    return (m == luma) ? 34 : m;
+}
+
+/* ---- shared state, one CTU's worth ---- */
+shared int  s_ctbx, s_ctby;
+shared int  s_scan[4 * N + 1];     /* references in 8.4.4.2.2 scan order */
+/* Two reference sets, built once: [0] as gathered, [1] smoothed per
+ * 8.4.4.2.3. filterFlag is binary, so a mode selects a set rather than
+ * causing a re-smooth - which is what lets the mode search run with no
+ * barrier at all between candidates. */
+shared int  s_refl[2][SIDE];       /* p[-1][0..2N-1], substituted        */
+shared int  s_reft[2][SIDE];       /* p[0..2N-1][-1], substituted        */
+shared int  s_refc[2];
+shared int  s_dc;
+shared int  s_pred[N * N];
+shared int  s_blk[N * N];          /* residual, then coefficients, reused */
+shared int  s_tmp[N * N];
+shared uint s_sad[35];
+shared int  s_best_mode;
+
+/* Chroma, both planes: [0] = Cb, [1] = Cr. They share one signalled
+ * mode, so the candidate search scores them together. */
+shared int  s_cl[2][SIDE_C], s_ct[2][SIDE_C], s_cc[2];
+shared int  s_cdc[2];
+shared int  s_cpred[2][NC * NC];
+shared int  s_cblk[2][NC * NC];
+shared int  s_ctmp[2][NC * NC];
+shared uint s_csad[5];
+shared int  s_cidx, s_cmode;
+shared uint s_nzl;          /* luma cbf, held until the chroma flags join it */
+shared uint s_nzcb, s_nzcr;
+shared int  s_firstidx;     /* first available reference in scan order */
+
+int clip8(int v) { return clamp(v, 0, 255); }
+int srcLuma(int x, int y) {
+    ivec2 p = ivec2(min(x, int(pc.src_width) - 1), min(y, int(pc.src_height) - 1));
+    return int(imageLoad(srcY, p).r * 255.0 + 0.5);
+}
+int recLuma(int x, int y) { return int(imageLoad(reconY, ivec2(x, y)).r * 255.0 + 0.5); }
+
+/* ---- 8.4.4.2.2 gather + substitution ----
+ * Availability for a CTU-aligned block is just picture edges here: left,
+ * above and above-right are earlier CTUs in raster order and so z-scan
+ * available; below-left is a later CTU and never is. */
+void gather(int bx, int by) {
+    uint t = gl_LocalInvocationID.x;
+    int total = 4 * N + 1;
+
+    if (t < uint(total)) {
+        int i = int(t);
+        int v = -1;
+        if (i < SIDE) {
+            int y = SIDE - 1 - i;
+            if (y < N && bx > 0 && (by + y) < int(pc.height)) v = recLuma(bx - 1, by + y);
+        } else if (i == SIDE) {
+            if (bx > 0 && by > 0) v = recLuma(bx - 1, by - 1);
+        } else {
+            int x = i - SIDE - 1;
+            bool ok = (x < N) ? (by > 0) : (by > 0 && (bx + N) < int(pc.width));
+            if (ok && (bx + x) < int(pc.width)) v = recLuma(bx + x, by - 1);
+        }
+        s_scan[i] = v;
+    }
+    if (t == 0u) s_firstidx = 1 << 20;
+    barrier();
+    if (t < uint(total) && s_scan[int(t)] >= 0) atomicMin(s_firstidx, int(t));
+    barrier();
+
+    /* 8.4.4.2.2's fill is defined as a sequential scan, but it does not
+     * have to be executed as one: the value at position i is simply the
+     * nearest available entry at or before i, or - if there is none -
+     * the first available entry anywhere. Each thread resolves its own
+     * position by walking back from it, in parallel.
+     *
+     * Done serially on thread 0 this was ~130 dependent shared-memory
+     * accesses per gather, three gathers per CTU, on a shader whose
+     * critical path is one workgroup's latency. */
+    int subst = 128;
+    if (t < uint(total)) {
+        if (s_firstidx > total) {
+            subst = 128;                       /* nothing available at all */
+        } else {
+            int j = int(t);
+            while (j >= 0 && s_scan[j] < 0) j--;
+            subst = (j >= 0) ? s_scan[j] : s_scan[s_firstidx];
+        }
+    }
+    barrier();
+    if (t < uint(total)) s_scan[int(t)] = subst;
+    barrier();
+
+    if (t < uint(SIDE)) {
+        s_refl[0][t] = s_scan[SIDE - 1 - int(t)];
+        s_reft[0][t] = s_scan[SIDE + 1 + int(t)];
+    }
+    if (t == 0u) {
+        s_refc[0] = s_scan[SIDE];
+        int sum = N;
+        for (int i = 0; i < N; i++) sum += s_scan[SIDE - 1 - i] + s_scan[SIDE + 1 + i];
+        s_dc = sum >> (LOG2N + 1);   /* DC is never filtered, so this is fixed */
+    }
+    barrier();
+
+    /* Build the smoothed set once. */
+    if (t < uint(SIDE)) {
+        int i = int(t);
+        if (i == 0) {
+            s_refl[1][0] = (s_refc[0] + 2 * s_refl[0][0] + s_refl[0][1] + 2) >> 2;
+            s_reft[1][0] = (s_refc[0] + 2 * s_reft[0][0] + s_reft[0][1] + 2) >> 2;
+        } else if (i == SIDE - 1) {
+            s_refl[1][i] = s_refl[0][i];
+            s_reft[1][i] = s_reft[0][i];
+        } else {
+            s_refl[1][i] = (s_refl[0][i - 1] + 2 * s_refl[0][i] + s_refl[0][i + 1] + 2) >> 2;
+            s_reft[1][i] = (s_reft[0][i - 1] + 2 * s_reft[0][i] + s_reft[0][i + 1] + 2) >> 2;
+        }
+    }
+    if (t == 0u) s_refc[1] = (s_refl[0][0] + 2 * s_refc[0] + s_reft[0][0] + 2) >> 2;
+    barrier();
+}
+
+/* 8.4.4.2.3: which reference set a mode uses. 0 for DC and for modes
+ * within intraHorVerDistThres (1 at nTbS 16) of exactly horizontal or
+ * vertical; 1 otherwise. */
+int refset_for(int mode) {
+    if (mode == 1) return 0;
+    if (mode == 0) return 1;
+    return (min(abs(mode - 26), abs(mode - 10)) > 1) ? 1 : 0;
+}
+
+/* One predicted sample from reference set `rs`. Reads only shared
+ * state, so candidates can be evaluated back to back with no barrier. */
+int predict(int rs, int mode, int x, int y) {
+    if (mode == 0) {                                   /* 8.4.4.2.5 planar */
+        int v = (N - 1 - x) * s_refl[rs][y] + (x + 1) * s_reft[rs][N] +
+                (N - 1 - y) * s_reft[rs][x] + (y + 1) * s_refl[rs][N] + N;
+        return v >> (LOG2N + 1);
+    }
+    if (mode == 1) {                                   /* 8.4.4.2.4 DC */
+        int dc = s_dc;
+        if (x == 0 && y == 0) return (s_refl[rs][0] + 2 * dc + s_reft[rs][0] + 2) >> 2;
+        if (y == 0) return (s_reft[rs][x] + 3 * dc + 2) >> 2;
+        if (x == 0) return (s_refl[rs][y] + 3 * dc + 2) >> 2;
+        return dc;
+    }
+
+    /* 8.4.4.2.6 angular. The two families are transposes; `i` indexes
+     * along the reference array, `j` drives the slope. */
+    int ang  = ANGLE[mode];
+    bool vert = (mode >= 18);
+    int i = vert ? x : y;
+    int j = vert ? y : x;
+    int idx  = ((j + 1) * ang) >> 5;
+    int fact = ((j + 1) * ang) & 31;
+
+    int r0 = 0, r1 = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int k = i + idx + 1 + pass;
+        int v;
+        if (k == 0) v = s_refc[rs];
+        else if (k > 0) v = vert ? s_reft[rs][min(k - 1, SIDE - 1)]
+                                 : s_refl[rs][min(k - 1, SIDE - 1)];
+        else {
+            int m = -1 + ((k * INVANG[mode - 11] + 128) >> 8);   /* Table 8-6 */
+            if (m < 0) v = s_refc[rs];
+            else v = vert ? s_refl[rs][min(m, SIDE - 1)] : s_reft[rs][min(m, SIDE - 1)];
+        }
+        if (pass == 0) r0 = v; else r1 = v;
+    }
+    int p = (fact != 0) ? (((32 - fact) * r0 + fact * r1 + 16) >> 5) : r0;
+
+    /* exactly-vertical / exactly-horizontal edge filter (luma, N < 32) */
+    if (mode == 26 && x == 0) return clip8(s_reft[rs][0] + ((s_refl[rs][y] - s_refc[rs]) >> 1));
+    if (mode == 10 && y == 0) return clip8(s_refl[rs][0] + ((s_reft[rs][x] - s_refc[rs]) >> 1));
+    return p;
+}
+
+/* ---- chroma ------------------------------------------------------
+ * Same structure as luma at 8x8, minus everything the spec gates on
+ * cIdx == 0: no 8.4.4.2.3 reference smoothing, no DC edge filter, no
+ * mode 10/26 edge filter. Availability is identical - left, above and
+ * above-right are earlier CTUs, below-left is a later one. */
+int recCb(int x, int y) { return int(imageLoad(reconUV, ivec2(x, y)).r * 255.0 + 0.5); }
+int recCr(int x, int y) { return int(imageLoad(reconUV, ivec2(x, y)).g * 255.0 + 0.5); }
+
+void gather_chroma(int plane, int cx, int cy, int cw, int chh) {
+    uint t = gl_LocalInvocationID.x;
+    int total = 4 * NC + 1;
+
+    if (t < uint(total)) {
+        int i = int(t);
+        int v = -1;
+        int sx = -1, sy = -1;
+        if (i < SIDE_C) {
+            int yy = SIDE_C - 1 - i;
+            if (yy < NC && cx > 0 && (cy + yy) < chh) { sx = cx - 1; sy = cy + yy; }
+        } else if (i == SIDE_C) {
+            if (cx > 0 && cy > 0) { sx = cx - 1; sy = cy - 1; }
+        } else {
+            int xx = i - SIDE_C - 1;
+            bool ok = (xx < NC) ? (cy > 0) : (cy > 0 && (cx + NC) < cw);
+            if (ok && (cx + xx) < cw) { sx = cx + xx; sy = cy - 1; }
+        }
+        if (sx >= 0) v = (plane == 0) ? recCb(sx, sy) : recCr(sx, sy);
+        s_scan[i] = v;
+    }
+    if (t == 0u) s_firstidx = 1 << 20;
+    barrier();
+    if (t < uint(total) && s_scan[int(t)] >= 0) atomicMin(s_firstidx, int(t));
+    barrier();
+    int subst = 128;
+    if (t < uint(total)) {
+        if (s_firstidx <= total) {
+            int j = int(t);
+            while (j >= 0 && s_scan[j] < 0) j--;
+            subst = (j >= 0) ? s_scan[j] : s_scan[s_firstidx];
+        }
+    }
+    barrier();
+    if (t < uint(total)) s_scan[int(t)] = subst;
+    barrier();
+
+    if (t < uint(SIDE_C)) {
+        s_cl[plane][t] = s_scan[SIDE_C - 1 - int(t)];
+        s_ct[plane][t] = s_scan[SIDE_C + 1 + int(t)];
+    }
+    if (t == 0u) {
+        s_cc[plane] = s_scan[SIDE_C];
+        int sum = NC;
+        for (int i = 0; i < NC; i++) sum += s_scan[SIDE_C - 1 - i] + s_scan[SIDE_C + 1 + i];
+        s_cdc[plane] = sum >> (LOG2NC + 1);
+    }
+    barrier();
+}
+
+int predict_c(int plane, int mode, int x, int y) {
+    if (mode == 0) {
+        int v = (NC - 1 - x) * s_cl[plane][y] + (x + 1) * s_ct[plane][NC] +
+                (NC - 1 - y) * s_ct[plane][x] + (y + 1) * s_cl[plane][NC] + NC;
+        return v >> (LOG2NC + 1);
+    }
+    if (mode == 1) return s_cdc[plane];        /* no edge filter for chroma */
+
+    int ang = ANGLE[mode];
+    bool vert = (mode >= 18);
+    int i = vert ? x : y;
+    int j = vert ? y : x;
+    int idx  = ((j + 1) * ang) >> 5;
+    int fact = ((j + 1) * ang) & 31;
+
+    int r0 = 0, r1 = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int k = i + idx + 1 + pass;
+        int v;
+        if (k == 0) v = s_cc[plane];
+        else if (k > 0) v = vert ? s_ct[plane][min(k - 1, SIDE_C - 1)]
+                                 : s_cl[plane][min(k - 1, SIDE_C - 1)];
+        else {
+            int m = -1 + ((k * INVANG[mode - 11] + 128) >> 8);
+            if (m < 0) v = s_cc[plane];
+            else v = vert ? s_cl[plane][min(m, SIDE_C - 1)] : s_ct[plane][min(m, SIDE_C - 1)];
+        }
+        if (pass == 0) r0 = v; else r1 = v;
+    }
+    return (fact != 0) ? (((32 - fact) * r0 + fact * r1 + 16) >> 5) : r0;
+}
+
+
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    /* which CTU? s = 2*ctby + ctbx, so ctbx = s - 2*ctby */
+    if (t == 0u) {
+        int s  = int(pc.step);
+        int Wc = int(pc.width_ctu), Hc = int(pc.height_ctu);
+        int y_lo = max(0, (s - Wc + 2) / 2);
+        int yy = y_lo + int(gl_WorkGroupID.x);
+        int xx = s - 2 * yy;
+        s_ctby = (yy < Hc && xx >= 0 && xx < Wc) ? yy : -1;
+        s_ctbx = xx;
+    }
+    barrier();
+    if (s_ctby < 0) return;
+
+    int bx = s_ctbx * N, by = s_ctby * N;
+    int px = int(t) & (N - 1), py = int(t) >> LOG2N;
+
+    gather(bx, by);
+
+    int src = srcLuma(bx + px, by + py);
+
+    /* ---- mode search over the coarse grid plus planar/DC ---- */
+    /* No barrier inside this loop: both reference sets are already
+     * built and never change, and the accumulators are per-mode atomics.
+     * Re-smoothing per candidate used to cost two barriers each, ~20 in
+     * all, on a shader whose critical path is barrier-dominated. */
+    if (t < 35u) s_sad[t] = 0u;
+    barrier();
+    for (int m = 0; m < 35; m++) {
+        if (m >= 2 && ((m - 2) % 4) != 0) continue;     /* coarse grid */
+        atomicAdd(s_sad[m], uint(abs(src - predict(refset_for(m), m, px, py))));
+    }
+    barrier();
+    if (t == 0u) {
+        int best = 1; uint bc = 0xffffffffu;
+        for (int m = 0; m < 35; m++) {
+            if (m >= 2 && ((m - 2) % 4) != 0) continue;
+            if (s_sad[m] < bc) { bc = s_sad[m]; best = m; }
+        }
+        s_best_mode = best;
+    }
+    barrier();
+
+    int mode = s_best_mode;
+    s_pred[t] = predict(refset_for(mode), mode, px, py);
+    barrier();
+    s_blk[t] = src - s_pred[t];
+    barrier();
+
+    /* ---- forward transform, columns then rows ----
+     *
+     * One thread per COEFFICIENT, not per line. The CPU uses a partial
+     * butterfly because it has one thread and wants fewer multiplies;
+     * here the constraint is the opposite. A butterfly is inherently
+     * per-line, so it can only occupy 16 of the 256 threads and each of
+     * those does ~85 multiplies; the plain matrix product spreads over
+     * all 256 with 16 multiplies each. Same integer sums in a different
+     * association order, so bit-identical - verified against the CPU. */
+    int shift1 = LOG2N + 8 - 9, shift2 = LOG2N + 6;
+    int trow = int(t) >> LOG2N, tcol = int(t) & (N - 1);
+    {
+        int acc = 0;
+        for (int r = 0; r < N; r++) acc += m16(trow, r) * s_blk[r * N + tcol];
+        int v = (acc + (1 << (shift1 - 1))) >> shift1;
+        barrier();
+        s_tmp[trow * N + tcol] = v;
+    }
+    barrier();
+    {
+        int acc = 0;
+        for (int c = 0; c < N; c++) acc += m16(tcol, c) * s_tmp[trow * N + c];
+        int v = (acc + (1 << (shift2 - 1))) >> shift2;
+        barrier();
+        s_blk[trow * N + tcol] = v;
+    }
+    barrier();
+
+    /* ---- quantize (8.6.3), bdShift = BitDepth + log2n - 5 ---- */
+    int qp = int(pc.qp);
+    int per = qp / 6, rem = qp - per * 6;
+    int bdshift = 8 + LOG2N - 5;
+    int denom = (LEVELSCALE[rem] * 16) << per;
+    int raw = s_blk[t];
+    int lvl = (raw < 0 ? -1 : 1) * (((abs(raw) << bdshift) + denom / 2) / denom);
+    s_blk[t] = clamp(lvl, -32768, 32767);
+    barrier();
+
+    /* 384 ints per CTU: 256 luma, then 64 Cb, then 64 Cr. That is exactly
+     * what the existing coefficient buffer provides per macroblock-sized
+     * unit (24 blocks x 16), so nothing had to be resized. */
+    uint ctu = uint(s_ctby * int(pc.width_ctu) + s_ctbx);
+    coeffs[ctu * 384u + t] = s_blk[t];
+    if (t == 0u) { modes[ctu] = mode; s_nzl = 0u; }
+    barrier();
+    /* cbf by atomicOr across all 256 threads rather than one thread
+     * scanning 256 entries - it is one shared op per thread against a
+     * serial chain the length of the block. */
+    if (s_blk[t] != 0) atomicOr(s_nzl, 1u);
+
+    /* ---- dequantize + inverse transform + reconstruct ---- */
+    int dq = (s_blk[t] * 16 * LEVELSCALE[rem]) << per;
+    s_tmp[t] = clamp((dq + (1 << (bdshift - 1))) >> bdshift, -32768, 32767);
+    barrier();
+
+    {                                                    /* inverse, columns */
+        int acc = 0;
+        for (int k = 0; k < N; k++) acc += m16(k, trow) * s_tmp[k * N + tcol];
+        int v = clamp((acc + 64) >> 7, -32768, 32767);
+        barrier();
+        s_blk[trow * N + tcol] = v;
+    }
+    barrier();
+    {                                                    /* inverse, rows */
+        int acc = 0;
+        for (int k = 0; k < N; k++) acc += m16(k, tcol) * s_blk[trow * N + k];
+        int v = clamp((acc + 2048) >> 12, -32768, 32767);
+        barrier();
+        s_tmp[trow * N + tcol] = v;
+    }
+    barrier();
+
+    imageStore(reconY, ivec2(bx + px, by + py),
+               vec4(float(clip8(s_pred[t] + s_tmp[t])) / 255.0, 0.0, 0.0, 1.0));
+
+    /* ================= chroma: one 8x8 Cb and Cr per CTU ============= */
+    int cw = int(pc.width) / 2, chh = int(pc.height) / 2;
+    int cx = bx / 2, cy = by / 2;
+    /* 128 threads, not 64: thread t handles ONE sample of ONE plane
+     * (t>>6 selects Cb or Cr). Doing both planes on 64 threads left half
+     * the workgroup idle and made a chroma candidate cost 0.52 ms
+     * against a luma candidate's 0.28, despite chroma being a quarter
+     * the samples. */
+    int cpl   = int(t) >> 6;                /* 0 = Cb, 1 = Cr */
+    int cidxn = int(t) & 63;
+    int cpx = cidxn & (NC - 1), cpy = cidxn >> LOG2NC;
+    int crow = cpy, ccol = cpx;
+    bool cthread  = (t < uint(NC * NC));            /* one plane's worth */
+    bool c2thread = (t < uint(2 * NC * NC));        /* both planes */
+
+    gather_chroma(0, cx, cy, cw, chh);
+    gather_chroma(1, cx, cy, cw, chh);
+
+    int csrc = 0;
+    if (c2thread) {
+        ivec2 sp = ivec2(min(cx + cpx, int(pc.src_width) / 2 - 1),
+                         min(cy + cpy, int(pc.src_height) / 2 - 1));
+        vec2 uv = imageLoad(srcUV, sp).rg;
+        csrc = (cpl == 0) ? int(uv.r * 255.0 + 0.5) : int(uv.g * 255.0 + 0.5);
+    }
+
+    /* Both planes accumulate into the same per-index total - that is
+     * what "one shared signalled mode" means - but each thread now
+     * contributes ONE plane's sample instead of both. Chroma is never
+     * smoothed, so no barrier is needed between candidates. */
+    if (t < 5u) s_csad[t] = 0u;
+    barrier();
+    if (c2thread) {
+        for (int idx = 0; idx < 5; idx++)
+            atomicAdd(s_csad[idx],
+                      uint(abs(csrc - predict_c(cpl, chroma_mode_from_idx(idx, mode), cpx, cpy))));
+    }
+    barrier();
+    if (t == 0u) {
+        int bi = 4; uint bc = 0xffffffffu;
+        for (int idx = 0; idx < 5; idx++) if (s_csad[idx] < bc) { bc = s_csad[idx]; bi = idx; }
+        s_cidx = bi;
+        s_cmode = chroma_mode_from_idx(bi, mode);
+    }
+    barrier();
+
+    int cmode = s_cmode;
+    if (c2thread) {
+        s_cpred[cpl][cidxn] = predict_c(cpl, cmode, cpx, cpy);
+        s_cblk[cpl][cidxn]  = csrc - s_cpred[cpl][cidxn];
+    }
+    barrier();
+
+    int cshift1 = LOG2NC + 8 - 9, cshift2 = LOG2NC + 6;
+    int cbdshift = 8 + LOG2NC - 5;
+    int cdenom = (LEVELSCALE[rem] * 16) << per;
+
+    /* One thread per chroma coefficient, both planes at once - the plain
+     * matrix product across 128 threads rather than a per-line butterfly
+     * on 8. */
+    {
+        int acc = 0;
+        if (c2thread) for (int r = 0; r < NC; r++) acc += m8(crow, r) * s_cblk[cpl][r * NC + ccol];
+        int v = (acc + (1 << (cshift1 - 1))) >> cshift1;
+        barrier();
+        if (c2thread) s_ctmp[cpl][crow * NC + ccol] = v;
+    }
+    barrier();
+    {
+        int acc = 0;
+        if (c2thread) for (int c = 0; c < NC; c++) acc += m8(ccol, c) * s_ctmp[cpl][crow * NC + c];
+        int v = (acc + (1 << (cshift2 - 1))) >> cshift2;
+        barrier();
+        if (c2thread) s_cblk[cpl][crow * NC + ccol] = v;
+    }
+    barrier();
+
+    if (c2thread) {
+        int rawc = s_cblk[cpl][cidxn];
+        int l = (rawc < 0 ? -1 : 1) * (((abs(rawc) << cbdshift) + cdenom / 2) / cdenom);
+        s_cblk[cpl][cidxn] = clamp(l, -32768, 32767);
+    }
+    barrier();
+
+    if (c2thread)
+        coeffs[ctu * 384u + 256u + uint(cpl) * 64u + uint(cidxn)] = s_cblk[cpl][cidxn];
+
+    /* cbf MUST be read off s_cblk here, before the inverse transform
+     * below reuses it as scratch. Again by atomicOr rather than a
+     * serial scan on one thread. */
+    if (t == 0u) { s_nzcb = 0u; s_nzcr = 0u; }
+    barrier();
+    if (c2thread && s_cblk[cpl][cidxn] != 0) {
+        /* The atomic target must be a real l-value, not a ternary. */
+        if (cpl == 0) atomicOr(s_nzcb, 1u); else atomicOr(s_nzcr, 1u);
+    }
+    barrier();
+    if (t == 0u)   /* cbf_luma | cbf_cb<<1 | cbf_cr<<2 | chroma_idx<<8 */
+        cbf[ctu] = s_nzl | (s_nzcb << 1) | (s_nzcr << 2) | (uint(s_cidx) << 8);
+    barrier();
+
+    /* dequantize + inverse transform */
+    if (c2thread) {
+        int dqc = (s_cblk[cpl][cidxn] * 16 * LEVELSCALE[rem]) << per;
+        s_ctmp[cpl][cidxn] = clamp((dqc + (1 << (cbdshift - 1))) >> cbdshift, -32768, 32767);
+    }
+    barrier();
+    {
+        int acc = 0;
+        if (c2thread) for (int k = 0; k < NC; k++) acc += m8(k, crow) * s_ctmp[cpl][k * NC + ccol];
+        int v = clamp((acc + 64) >> 7, -32768, 32767);
+        barrier();
+        if (c2thread) s_cblk[cpl][crow * NC + ccol] = v;
+    }
+    barrier();
+    {
+        int acc = 0;
+        if (c2thread) for (int k = 0; k < NC; k++) acc += m8(k, ccol) * s_cblk[cpl][crow * NC + k];
+        int v = clamp((acc + 2048) >> 12, -32768, 32767);
+        barrier();
+        if (c2thread) s_ctmp[cpl][crow * NC + ccol] = v;
+    }
+    barrier();
+
+    /* ONE thread writes both components of the packed rg8 texel. Split
+     * across two threads this would be a read-modify-write race on the
+     * same texel - the H.264 shader hit exactly that. */
+    if (cthread) {
+        int rcb = clip8(s_cpred[0][t] + s_ctmp[0][t]);
+        int rcr = clip8(s_cpred[1][t] + s_ctmp[1][t]);
+        imageStore(reconUV, ivec2(cx + cpx, cy + cpy),
+                   vec4(float(rcb) / 255.0, float(rcr) / 255.0, 0.0, 1.0));
+    }
+
+}

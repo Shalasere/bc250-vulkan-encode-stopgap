@@ -131,6 +131,19 @@ static const uint8_t INIT_PRED_MODE    = 149;
 static const uint8_t INIT_MERGE_FLAG   = 110;
 static const uint8_t INIT_MERGE_IDX    = 122;
 
+/* Banks that only a transform block larger than 4x4 needs - see
+ * hevc_cabac.h. Same row convention as the tables above: row 0 is the
+ * P-slice initialiser, row 1 the I-slice one. ITU-T H.265 Tables 9-25
+ * (split_transform_flag) and 9-30 (coded_sub_block_flag). */
+static const uint8_t INIT_SIG_CG_FLAG[2][4] = {
+    { 121, 140,  61, 154 }, /* P-slice */
+    {  91, 171, 134, 141 }, /* I-slice */
+};
+static const uint8_t INIT_TRANS_SUBDIV[2][3] = {
+    { 124, 138,  94 },      /* P-slice */
+    { 153, 138, 138 },      /* I-slice */
+};
+
 /* ===================== context init formula (Rec. ITU-T H.265 9.3.2.2) === */
 
 static uint8_t hevc_sbac_init_state(int qp, int init_value) {
@@ -163,6 +176,8 @@ void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp, int slice_type) {
     init_bank(&cb->ctx[HEVC_CTX_LAST_Y], INIT_LAST[type_idx], 18, slice_qp);
     init_bank(&cb->ctx[HEVC_CTX_ONE_FLAG], INIT_ONE_FLAG[type_idx], 24, slice_qp);
     init_bank(&cb->ctx[HEVC_CTX_ABS_FLAG], INIT_ABS_FLAG[type_idx], 6, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_SIG_CG], INIT_SIG_CG_FLAG[type_idx], 4, slice_qp);
+    init_bank(&cb->ctx[HEVC_CTX_TRANS_SUBDIV], INIT_TRANS_SUBDIV[type_idx], 3, slice_qp);
 
     if (slice_type == 1) {
         init_bank(&cb->ctx[HEVC_CTX_SKIP_FLAG], INIT_SKIP_FLAG, 3, slice_qp);
@@ -509,5 +524,284 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
             base_level = 2;
             idx++;
         } while (idx < num_nonzero);
+    }
+}
+
+
+/* ===================== residual_coding() for any TU size ==================
+ *
+ * Added for the GPU reconstruction path, which codes one 16x16 luma TU
+ * and one 8x8 chroma pair per CTU. The 4x4 coder above is untouched and
+ * is still what the CPU path uses.
+ * ======================================================================== */
+
+/* Rec. ITU-T H.265 Table 9-40's group index / minimum-in-group tables for
+ * last_sig_coeff_{x,y}. A position's prefix is its group; groups above 3
+ * carry a fixed-length bypass suffix selecting within the group. The 4x4
+ * coder gets away with a 4-entry table because a 4x4 block's last
+ * position never exceeds 3 and so never needs a suffix. */
+static const uint8_t g_group_idx[32] = {
+    0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7,
+    8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9
+};
+static const uint8_t g_min_in_group[10] = { 0, 1, 2, 3, 4, 6, 8, 12, 16, 24 };
+
+/* Rec. ITU-T H.265 6.5.3 up-right diagonal scan, plus horizontal and
+ * vertical, generated for a blk x blk grid into raster indices. Used for
+ * the coefficient-group grid (up to 8x8 for a 32x32 TU); the scans
+ * within a group stay the static g_hevc_scan4x4 tables. */
+static void build_cg_scan(int blk, int scan_idx, uint8_t *out) {
+    int i = 0;
+    if (scan_idx == 1) {                       /* horizontal */
+        for (int y = 0; y < blk; y++)
+            for (int x = 0; x < blk; x++) out[i++] = (uint8_t)(y * blk + x);
+        return;
+    }
+    if (scan_idx == 2) {                       /* vertical */
+        for (int x = 0; x < blk; x++)
+            for (int y = 0; y < blk; y++) out[i++] = (uint8_t)(y * blk + x);
+        return;
+    }
+    int x = 0, y = 0;
+    while (i < blk * blk) {
+        while (y >= 0) {
+            if (x < blk && y < blk) out[i++] = (uint8_t)(y * blk + x);
+            y--; x++;
+        }
+        y = x; x = 0;
+    }
+}
+
+/* 9.3.4.2.5 sig_coeff_flag context, for transform sizes above 4x4. */
+static int sig_ctx_large(int xc, int yc, int log2_size, int is_luma, int scan_idx,
+                          const uint8_t *csbf, int cg_blk) {
+    if (xc + yc == 0) return is_luma ? 0 : 27;   /* DC always its own context */
+
+    int xs = xc >> 2, ys = yc >> 2;
+    int prev = 0;
+    if (xs < cg_blk - 1) prev += csbf[ys * cg_blk + xs + 1];
+    if (ys < cg_blk - 1) prev += csbf[(ys + 1) * cg_blk + xs] << 1;
+
+    int xp = xc & 3, yp = yc & 3;
+    int sig;
+    if (prev == 0)      sig = (xp + yp == 0) ? 2 : (xp + yp < 3) ? 1 : 0;
+    else if (prev == 1) sig = (yp == 0) ? 2 : (yp == 1) ? 1 : 0;
+    else if (prev == 2) sig = (xp == 0) ? 2 : (xp == 1) ? 1 : 0;
+    else                sig = 2;
+
+    if (is_luma) {
+        if (xs + ys > 0) sig += 3;
+        sig += (log2_size == 3) ? ((scan_idx == 0) ? 9 : 15) : 21;
+        return sig;
+    }
+    sig += (log2_size == 3) ? 9 : 12;
+    return 27 + sig;
+}
+
+void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_size,
+                               int is_luma, int scan_idx) {
+    int n = 1 << log2_size;
+    int log2_cg = log2_size - 2;
+    int cg_blk = 1 << log2_cg;              /* coefficient groups per side */
+    int num_cg = cg_blk * cg_blk;
+    const uint8_t *sub_scan = g_hevc_scan4x4[scan_idx];   /* within a 4x4 group */
+    uint8_t cg_scan[64];
+    if (num_cg == 1) cg_scan[0] = 0; else build_cg_scan(cg_blk, scan_idx, cg_scan);
+
+    /* ---- locate the last significant coefficient in scan order ---- */
+    int last_cg = -1, last_sp = -1;
+    for (int ci = num_cg - 1; ci >= 0 && last_cg < 0; ci--) {
+        int cgr = cg_scan[ci];
+        int cx = (cgr & (cg_blk - 1)) * 4, cy = (cgr >> log2_cg) * 4;
+        for (int sp = 15; sp >= 0; sp--) {
+            int r = sub_scan[sp];
+            int xc = cx + (r & 3), yc = cy + (r >> 2);
+            if (coeff[yc * n + xc]) { last_cg = ci; last_sp = sp; break; }
+        }
+    }
+    if (last_cg < 0) return;   /* caller must not call this when cbf == 0 */
+
+    int last_cgr = cg_scan[last_cg];
+    int last_r = sub_scan[last_sp];
+    int last_x = (last_cgr & (cg_blk - 1)) * 4 + (last_r & 3);
+    int last_y = (last_cgr >> log2_cg) * 4 + (last_r >> 2);
+
+    /* ---- last_sig_coeff_{x,y}_prefix / _suffix (9.3.4.2.3) ---- */
+    {
+        int px = last_x, py = last_y;
+        if (scan_idx == 2) { int t = px; px = py; py = t; }  /* vertical swaps axes */
+
+        int offset, shift;
+        if (is_luma) {
+            offset = 3 * (log2_size - 2) + ((log2_size - 1) >> 2);
+            shift  = (log2_size + 1) >> 2;
+        } else {
+            offset = 15;
+            shift  = log2_size - 2;
+        }
+        int max_group = (log2_size << 1) - 1;
+        int pos[2] = { px, py };
+        for (int i = 0; i < 2; i++) {
+            int bank = (i == 0) ? HEVC_CTX_LAST_X : HEVC_CTX_LAST_Y;
+            int group = g_group_idx[pos[i]];
+            for (int b = 0; b < group; b++)
+                hevc_cabac_encode_bin(cb, bank + offset + (b >> shift), 1);
+            if (group < max_group)
+                hevc_cabac_encode_bin(cb, bank + offset + (group >> shift), 0);
+        }
+        /* Suffixes are bypass and both follow both prefixes. */
+        for (int i = 0; i < 2; i++) {
+            int group = g_group_idx[pos[i]];
+            if (group > 3) {
+                int len = (group >> 1) - 1;
+                hevc_cabac_encode_bypass_bins(cb, (uint32_t)(pos[i] - g_min_in_group[group]), len);
+            }
+        }
+    }
+
+    /* ---- coefficient groups, from the last one down to DC ---- */
+    uint8_t csbf[64];
+    memset(csbf, 0, (size_t)num_cg);
+    csbf[last_cgr] = 1;
+
+    int sig_base = is_luma ? 0 : 27;
+    int one_bank = HEVC_CTX_ONE_FLAG + (is_luma ? 0 : 16);
+    int abs_bank = HEVC_CTX_ABS_FLAG + (is_luma ? 0 : 4);
+    uint32_t c1 = 1;   /* carries ACROSS groups - this is what ctxSet reads */
+
+    for (int ci = last_cg; ci >= 0; ci--) {
+        int cgr = cg_scan[ci];
+        int xs = cgr & (cg_blk - 1), ys = cgr >> log2_cg;
+        int cx = xs * 4, cy = ys * 4;
+
+        /* 7.3.8.11 codes the flag only for groups that are neither the
+         * last nor the DC group; both of those are inferred to 1 by
+         * 7.4.9.11. Whether it was CODED (not merely 1) is what arms the
+         * DC-coefficient inference below, so track it explicitly. */
+        int explicit_csbf = (ci != last_cg && ci != 0);
+        int coded;
+        if (!explicit_csbf) {
+            coded = 1;
+            csbf[cgr] = 1;
+        } else {
+            coded = 0;
+            for (int sp = 0; sp < 16 && !coded; sp++) {
+                int r = sub_scan[sp];
+                if (coeff[(cy + (r >> 2)) * n + cx + (r & 3)]) coded = 1;
+            }
+            int ctx = 0;
+            if (xs < cg_blk - 1) ctx += csbf[ys * cg_blk + xs + 1];
+            if (ys < cg_blk - 1) ctx += csbf[(ys + 1) * cg_blk + xs];
+            if (ctx > 1) ctx = 1;
+            hevc_cabac_encode_bin(cb, HEVC_CTX_SIG_CG + ctx + (is_luma ? 0 : 2), (uint32_t)coded);
+            csbf[cgr] = (uint8_t)coded;
+            if (!coded) continue;
+        }
+
+        /* ---- sig_coeff_flag over this group ---- */
+        int16_t abs_coeff[16], sign[16];
+        int num_nonzero = 0;
+        int start = (ci == last_cg) ? last_sp - 1 : 15;
+        if (ci == last_cg) {                       /* last position is inferred */
+            int v = coeff[last_y * n + last_x];
+            abs_coeff[0] = (int16_t)(v < 0 ? -v : v);
+            sign[0] = (int16_t)(v < 0);
+            num_nonzero = 1;
+        }
+        for (int sp = start; sp >= 0; sp--) {
+            int r = sub_scan[sp];
+            int xc = cx + (r & 3), yc = cy + (r >> 2);
+            int v = coeff[yc * n + xc];
+            int sig = (v != 0);
+            /* inferSbDcSigCoeffFlag (7.3.8.11): a group whose
+             * coded_sub_block_flag was explicitly coded as 1 must contain
+             * something, so if every other coefficient signalled zero the
+             * DC one is inferred significant and not coded. ONLY for
+             * explicitly-coded groups - the DC group's flag is inferred
+             * rather than coded, so its own DC coefficient is always
+             * signalled and may legitimately be zero. */
+            int infer = (sp == 0 && num_nonzero == 0 && explicit_csbf);
+            if (!infer) {
+                int ctx = (log2_size == 2)
+                        ? (sig_base + g_hevc_sig_ctx4[r])
+                        : sig_ctx_large(xc, yc, log2_size, is_luma, scan_idx, csbf, cg_blk);
+                hevc_cabac_encode_bin(cb, HEVC_CTX_SIG_FLAG + ctx, (uint32_t)sig);
+            }
+            if (sig || infer) {
+                abs_coeff[num_nonzero] = (int16_t)(v < 0 ? -v : v);
+                sign[num_nonzero] = (int16_t)(v < 0);
+                num_nonzero++;
+            }
+        }
+        if (!num_nonzero) continue;
+
+        /* ---- ctxSet (9.3.4.2.6): depends on whether this is the DC
+         * group and on whether the PREVIOUS group had a level above 1,
+         * which is what makes c1 carry across groups. ---- */
+        int ctx_set = (ci > 0 && is_luma) ? 2 : 0;
+        if (c1 == 0) ctx_set++;
+        c1 = 1;
+
+        int one_base = one_bank + ctx_set * 4;
+        int abs_base = abs_bank + ctx_set;
+
+        uint32_t c1_next = 0xFFFFFFFEu;
+        int first_c2_idx = 8, first_c2_flag = 2;
+        int num_c1_flag = num_nonzero < C1FLAG_NUMBER ? num_nonzero : C1FLAG_NUMBER;
+        for (int idx = 0; idx < num_c1_flag; idx++) {
+            int symbol1 = abs_coeff[idx] > 1;
+            int symbol2 = abs_coeff[idx] > 2;
+            hevc_cabac_encode_bin(cb, one_base + (int)c1, (uint32_t)symbol1);
+            if (symbol1) c1_next = 0;
+            if (symbol1 + first_c2_flag == 3) first_c2_flag = symbol2;
+            if (symbol1 + first_c2_idx == 9) first_c2_idx = idx;
+            c1 = c1_next & 3;
+            c1_next >>= 2;
+        }
+        if (!c1)
+            hevc_cabac_encode_bin(cb, abs_base, (uint32_t)first_c2_flag);
+
+        for (int idx = 0; idx < num_nonzero; idx++)
+            hevc_cabac_encode_bypass(cb, (uint32_t)sign[idx]);
+
+        if (!c1 || num_nonzero > C1FLAG_NUMBER) {
+            uint32_t go_rice = 0;          /* reset per group, per spec */
+            int base_level = 3;
+            uint32_t threshold = COEF_REMAIN_BIN_REDUCTION;
+            int idx = first_c2_idx;
+            do {
+                if (idx >= C1FLAG_NUMBER) base_level = 1;
+                if ((uint32_t)abs_coeff[idx] >= (uint32_t)base_level) {
+                    write_coef_remain_exp_golomb(cb, (uint32_t)(abs_coeff[idx] - base_level), go_rice);
+                    int adjust = (abs_coeff[idx] > (int)threshold) && (go_rice <= 3);
+                    if (adjust) { go_rice++; threshold += threshold; }
+                }
+                base_level = 2;
+                idx++;
+            } while (idx < num_nonzero);
+        }
+    }
+}
+
+void hevc_cabac_code_split_transform_flag(hevc_cabac_t *cb, int split, int log2_size) {
+    hevc_cabac_encode_bin(cb, HEVC_CTX_TRANS_SUBDIV + (5 - log2_size), (uint32_t)(split ? 1 : 0));
+}
+
+int hevc_chroma_mode_from_idx(int idx, int luma_mode_pu0) {
+    /* Table 8-2's modeIdx -> IntraPredModeC candidate list. */
+    static const int cand[4] = { 0 /*Planar*/, 26 /*Vertical*/, 10 /*Horizontal*/, 1 /*DC*/ };
+    if (idx == 4) return luma_mode_pu0;          /* DM_CHROMA */
+    /* 8.4.3: a candidate that collides with the luma mode would be
+     * redundant (DM_CHROMA already reaches it), so the spec substitutes
+     * mode 34 in that slot. */
+    return (cand[idx] == luma_mode_pu0) ? 34 : cand[idx];
+}
+
+void hevc_cabac_code_intra_chroma_pred_mode_idx(hevc_cabac_t *cb, int idx) {
+    if (idx == 4) {
+        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);   /* DM_CHROMA */
+    } else {
+        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 1);
+        hevc_cabac_encode_bypass_bins(cb, (uint32_t)idx, 2);
     }
 }

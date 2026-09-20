@@ -175,8 +175,17 @@ static size_t write_vps(uint8_t *buf, size_t buf_size) {
     return off + bs_rbsp_to_ebsp(buf + off, buf_size - off, rbsp, bs_bytes_written(&bs));
 }
 
+/* `max_tb_log2` is log2 of the largest transform block the coder will use:
+ * 2 (MaxTb = MinTb = 4) for the CPU path's all-4x4 transform tree, 4
+ * (MaxTb = 16) for the GPU intra path's single 16x16 luma TU. It only
+ * changes log2_diff_max_min_transform_block_size; MinTb stays 4 either way.
+ * max_transform_hierarchy_depth_intra stays 0, which combined with
+ * IntraSplitFlag gives MaxTrafoDepth = IntraSplitFlag - so the CPU path's
+ * NxN CUs still split once to 4x4 and the GPU path's 2Nx2N CU does not
+ * split at all. */
 static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_t coded_h,
-                         uint32_t real_w, uint32_t real_h, int level_idc) {
+                         uint32_t real_w, uint32_t real_h, int level_idc,
+                         int max_tb_log2) {
     uint8_t rbsp[256];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -214,7 +223,7 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write_ue(&bs, 0); /* log2_min_luma_coding_block_size_minus3 -> MinCb = 8 */
     bs_write_ue(&bs, 1); /* log2_diff_max_min_coding_block_size -> Ctb = 16 */
     bs_write_ue(&bs, 0); /* log2_min_luma_transform_block_size_minus2 -> MinTb = 4 */
-    bs_write_ue(&bs, 0); /* log2_diff_max_min_transform_block_size -> MaxTb = MinTb = 4 */
+    bs_write_ue(&bs, (uint32_t)(max_tb_log2 - 2)); /* log2_diff_max_min_transform_block_size */
     bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_inter */
     bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_intra (IntraSplitFlag adds +1 -> MaxTrafoDepth=1) */
 
@@ -372,6 +381,18 @@ struct hevc_encoder {
 
     uint8_t *scratch_out;
     size_t   scratch_out_cap;
+
+    /* GPU intra path (BC250_HEVC_GPU=1), latched once at create time so a
+     * mid-stream getenv() can't change the coding structure between frames -
+     * it selects a DIFFERENT SPS (MaxTb 16 rather than 4), so switching after
+     * the parameter sets are out would desynchronise the decoder.
+     *
+     * The two paths are structurally different coders, not fast/slow variants
+     * of one: the CPU path splits every CTU into four 8x8 NxN-intra CUs of
+     * 4x4 TUs, while the GPU path codes one 16x16 2Nx2N CU with a single
+     * 16x16 luma TU and 8x8 chroma. The GPU path is all-intra only - it has
+     * no inter/merge path at all, so it forces every frame to IDR. */
+    bool use_gpu;
 };
 
 static uint32_t round_up16(uint32_t v) { return (v + 15u) & ~15u; }
@@ -462,6 +483,17 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
         !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs) {
         hevc_encoder_destroy(enc);
         return NULL;
+    }
+
+    /* Latched once - see the use_gpu field comment for why this must not be
+     * re-read per frame. */
+    {
+        const char *g = getenv("BC250_HEVC_GPU");
+        enc->use_gpu = (g && strcmp(g, "1") == 0);
+        if (enc->use_gpu) {
+            fprintf(stderr, "[bc250-hevc] BC250_HEVC_GPU=1: GPU intra path enabled "
+                            "(all-intra, 16x16 CU / 16x16 luma TU)\n");
+        }
     }
 
     return enc;
@@ -1383,7 +1415,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
                             encoder->coded_width, encoder->coded_height,
                             encoder->width, encoder->height,
-                            hevc_pick_level_idc(encoder->coded_width, encoder->coded_height));
+                            hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
+                            2 /* MaxTb = 4: this path's transform tree is all-4x4 */);
         total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
     }
 
@@ -1428,6 +1461,173 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     return (int)total;
 }
 
+/* ============================================================================
+ * GPU intra path (BC250_HEVC_GPU=1)
+ * ==========================================================================*/
+
+/* Entropy-code one frame from hevc_intra_wavefront.comp's output. The shader
+ * has already done mode decision, transform, quantization and reconstruction
+ * for every CTU; nothing here recomputes any of it, and nothing here touches
+ * encoder->src_* / recon_* / luma_mode_map's CPU-path meaning beyond the mode
+ * map, which this path fills from the GPU's decisions so MPM derivation sees
+ * what the decoder will see.
+ *
+ * Coding structure, fixed for every CTU (see the use_gpu field comment):
+ *   split_cu_flag = 0        -> one 16x16 CU (MinCb is 8, so this IS coded)
+ *   part_mode                -> not coded, log2CbSize != MinCbLog2SizeY,
+ *                               so PART_2Nx2N is inferred: one PU
+ *   split_transform_flag     -> not coded, MaxTrafoDepth = 0 + IntraSplitFlag
+ *                               = 0, so a single 16x16 luma TU is inferred
+ *                               (this is what needs SPS MaxTb = 16)
+ *   scanIdx                  -> 0 (diagonal) for every block here. The
+ *                               mode-dependent scan of 7.4.9.11 only applies
+ *                               at log2TrafoSize 2, or 3 for luma; this path
+ *                               has 16x16 luma and 8x8 chroma, neither of
+ *                               which qualifies.
+ *
+ * The PPS this shares with the CPU path already has sign_data_hiding,
+ * transform_skip and cu_qp_delta all disabled, so transform_unit() carries
+ * no syntax beyond the cbf flags and the residuals. */
+static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size,
+                           const int32_t *gmodes, const int32_t *gcoeffs, const uint32_t *gcbf)
+{
+    /* All-intra: this path has no inter prediction, so every frame is an IDR
+     * regardless of gop_size. */
+    encoder->force_idr = false;
+    encoder->poc = 0;
+
+    if (encoder->rc.mode != RC_CQP) {
+        int target_qp = rc_get_frame_qp(&encoder->rc, 0);
+        if (target_qp >= 1 && target_qp <= 51) encoder->qp = target_qp;
+    }
+    encoder->last_frame_sad = 0;
+
+    memset(encoder->luma_mode_map, 0,
+           (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
+
+    bool write_param_sets = true; /* every frame is an IDR here */
+    encoder->pps_init_qp = encoder->qp;
+    int slice_qp_delta = encoder->qp - encoder->pps_init_qp;
+
+    bitstream_t slice_bs;
+    bs_init(&slice_bs, encoder->slice_rbsp, encoder->slice_rbsp_cap);
+
+    bs_write1(&slice_bs, 1); /* first_slice_segment_in_pic_flag */
+    bs_write1(&slice_bs, 1); /* no_output_of_prior_pics_flag (IRAP) */
+    bs_write_ue(&slice_bs, 0); /* slice_pic_parameter_set_id */
+    bs_write_ue(&slice_bs, 2); /* slice_type = I */
+    bs_write_se(&slice_bs, slice_qp_delta);
+    bs_write1(&slice_bs, 1);   /* slice_loop_filter_across_slices_enabled_flag */
+    bs_rbsp_trailing_bits(&slice_bs);
+
+    hevc_cabac_t cab;
+    hevc_cabac_init(&cab, &slice_bs);
+    hevc_cabac_reset_contexts(&cab, encoder->qp, 2);
+    hevc_cabac_start(&cab);
+
+    int16_t cl[256], ccb[64], ccr[64];
+
+    uint32_t total_ctus = encoder->width_ctu * encoder->height_ctu;
+    uint32_t ctu_idx = 0;
+    for (uint32_t row = 0; row < encoder->height_ctu; row++) {
+        for (uint32_t col = 0; col < encoder->width_ctu; col++) {
+            uint32_t ctu = row * encoder->width_ctu + col;
+            int ctu_x = (int)col * HEVC_CTU_SIZE, ctu_y = (int)row * HEVC_CTU_SIZE;
+
+            int mode = gmodes[ctu];
+            uint32_t flags = gcbf[ctu];
+            int cbf_luma = (int)(flags & 1u);
+            int cbf_cb   = (int)((flags >> 1) & 1u);
+            int cbf_cr   = (int)((flags >> 2) & 1u);
+            int chroma_idx = (int)((flags >> 8) & 0xFFu);
+
+            hevc_cabac_code_split_cu_flag(&cab, 0, (col > 0 ? 1 : 0) + (row > 0 ? 1 : 0));
+
+            /* MPM. candIntraPredModeB is unconditionally INTRA_DC here: this
+             * CU starts at a CTU boundary, so yCb-1 always crosses into the
+             * CTU row above, which 8.4.2 forces to DC as a normative rule
+             * rather than an availability test (see the long comment on the
+             * CPU path's equivalent - getting this wrong was a real bug). */
+            int mx = ctu_x / HEVC_PU_SIZE, my = ctu_y / HEVC_PU_SIZE;
+            int left_avail = ctu_x > 0;
+            int left_mode = left_avail ? encoder->luma_mode_map[my * encoder->mode_map_stride + (mx - 1)] : 0;
+            int mpm[3];
+            hevc_derive_mpm(left_mode, left_avail, 0, 0, mpm);
+            int pred_idx = hevc_cabac_code_intra_luma_flag(&cab, mode, mpm);
+            hevc_cabac_code_intra_luma_data(&cab, mode, pred_idx, mpm);
+
+            hevc_cabac_code_intra_chroma_pred_mode_idx(&cab, chroma_idx);
+
+            /* transform_tree at trafoDepth 0: chroma cbf bits, then the
+             * single luma leaf, then the chroma residuals. */
+            hevc_cabac_code_cbf_chroma(&cab, cbf_cb, 0);
+            hevc_cabac_code_cbf_chroma(&cab, cbf_cr, 0);
+            hevc_cabac_code_cbf_luma(&cab, cbf_luma, 0);
+
+            const int32_t *cc = gcoeffs + (size_t)ctu * 384;
+            if (cbf_luma) {
+                for (int i = 0; i < 256; i++) cl[i] = (int16_t)cc[i];
+                hevc_cabac_code_residual(&cab, cl, 4, 1, 0);
+            }
+            if (cbf_cb) {
+                for (int i = 0; i < 64; i++) ccb[i] = (int16_t)cc[256 + i];
+                hevc_cabac_code_residual(&cab, ccb, 3, 0, 0);
+            }
+            if (cbf_cr) {
+                for (int i = 0; i < 64; i++) ccr[i] = (int16_t)cc[320 + i];
+                hevc_cabac_code_residual(&cab, ccr, 3, 0, 0);
+            }
+
+            /* Record the mode across this CU's 4x4 grid for the next CTU's
+             * MPM. Only the rightmost column is ever read back (the row above
+             * is DC-forced), but filling all of it keeps the map's meaning
+             * the same as the CPU path's. */
+            for (int py = 0; py < HEVC_CTU_SIZE / HEVC_PU_SIZE; py++)
+                for (int px = 0; px < HEVC_CTU_SIZE / HEVC_PU_SIZE; px++)
+                    encoder->luma_mode_map[(my + py) * encoder->mode_map_stride + (mx + px)] = (int8_t)mode;
+
+            ctu_idx++;
+            hevc_cabac_encode_terminate(&cab, ctu_idx == total_ctus ? 1 : 0);
+        }
+    }
+
+    hevc_cabac_finish(&cab);
+    bs_rbsp_trailing_bits(&slice_bs);
+
+    size_t total = 0;
+    if (write_param_sets) {
+        total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
+        total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
+                           encoder->coded_width, encoder->coded_height,
+                           encoder->width, encoder->height,
+                           hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
+                           4 /* MaxTb = 16: one 16x16 luma TU per CU */);
+        total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
+    }
+
+    {
+        bitstream_t out_bs;
+        bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
+        bs_write_nal_header_hevc(&out_bs, NAL_UNIT_CODED_SLICE_IDR_W_RADL);
+        size_t off = bs_bytes_written(&out_bs);
+        size_t ebsp = bs_rbsp_to_ebsp(encoder->scratch_out + total + off, encoder->scratch_out_cap - total - off,
+                                      encoder->slice_rbsp, bs_bytes_written(&slice_bs));
+        total += off + ebsp;
+    }
+
+    if (total > output_size) return -1;
+    memcpy(output_buf, encoder->scratch_out, total);
+
+    if (total > 0 && encoder->rc.mode != RC_CQP) rc_update_stats(&encoder->rc, (int)(total * 8));
+
+    /* No reference-frame bookkeeping: this path never emits a P-slice, so
+     * prev_recon_* would never be read. has_ref stays false deliberately -
+     * if a caller ever falls back to the CPU path mid-stream, that forces an
+     * IDR rather than letting it predict from a reference it never built. */
+    encoder->frame_count++;
+    return (int)total;
+}
+
 int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
                               bc250_gpu_context_t *gpu_ctx,
                               gpu_image_t input_surface,
@@ -1437,6 +1637,50 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
     if (!encoder || !output_buf) return -1;
 
     encoder->num_gpu_mvs = 0;
+
+    /* GPU intra path. Everything it needs happens on the GPU, so it skips
+     * the NV12 download the CPU path below depends on entirely. Any failure
+     * - no pipeline, allocation refused, a staging pointer that is still
+     * NULL because this is the first frame - falls through to the CPU path
+     * rather than producing a broken frame. */
+    if (encoder->use_gpu && gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        gpu_compute_begin_picture(gpu_ctx, input_surface);
+        int rc = gpu_compute_hevc_dispatch_intra(gpu_ctx, input_surface,
+                                                 (int)encoder->coded_width, (int)encoder->coded_height,
+                                                 (int)encoder->width, (int)encoder->height,
+                                                 encoder->qp);
+        gpu_compute_end_picture(gpu_ctx);
+        int slot = gpu_compute_submitted_slot(gpu_ctx);
+        gpu_compute_sync_slot(gpu_ctx, slot);
+
+        if (rc == 0) {
+            void *md = NULL, *cd = NULL, *bd = NULL;
+            size_t ms = 0, cs = 0, bs_sz = 0;
+            if (gpu_compute_get_hevc_mode_staging_data_slot(gpu_ctx, slot, &md, &ms) == 0 &&
+                gpu_compute_get_hevc_coeff_staging_data_slot(gpu_ctx, slot, &cd, &cs) == 0 &&
+                gpu_compute_get_hevc_cbf_staging_data_slot(gpu_ctx, slot, &bd, &bs_sz) == 0 &&
+                md && cd && bd) {
+                size_t nctu = (size_t)encoder->width_ctu * encoder->height_ctu;
+                if (ms >= nctu * sizeof(int32_t) &&
+                    cs >= nctu * 384 * sizeof(int32_t) &&
+                    bs_sz >= nctu * sizeof(uint32_t)) {
+                    return encode_core_gpu(encoder, output_buf, output_size,
+                                           (const int32_t *)md, (const int32_t *)cd,
+                                           (const uint32_t *)bd);
+                }
+            }
+        }
+        /* Fall through to the CPU path. The dispatch above already consumed
+         * this frame's begin/end picture pair, so re-running the H.264
+         * dispatch here would be a second submission of the same surface;
+         * instead just download and encode on the CPU. */
+        gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                  encoder->dl_y, (int)encoder->width,
+                                  encoder->dl_uv, (int)encoder->width,
+                                  (int)encoder->width, (int)encoder->height);
+        return encode_core(encoder, output_buf, output_size);
+    }
+
     bool is_idr = (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
 
     /* Preserve the existing driver's Vulkan image-layout-transition and

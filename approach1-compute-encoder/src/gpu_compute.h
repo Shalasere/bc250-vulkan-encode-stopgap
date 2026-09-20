@@ -112,6 +112,29 @@ typedef struct bc250_gpu_context {
     VkPipeline reconstruct_pipeline;
     VkPipeline intra_wavefront_pipeline;
 
+    /* HEVC intra reconstruction (hevc_intra_wavefront.comp).
+     *
+     * This gets its own descriptor set layout, pipeline layout, descriptor
+     * set and buffers rather than sharing H.264's intra_wavefront ones, for
+     * two concrete reasons that are easy to get wrong:
+     *
+     *  - coeff_buffer is created STORAGE-only on this tree (no
+     *    TRANSFER_SRC_BIT) because the compact dc_coeff_buffer replaced the
+     *    full coefficient readback. HEVC genuinely needs all 384 ints per
+     *    CTU on the host to entropy-code, so it needs a buffer that can be
+     *    a copy source - adding the bit to coeff_buffer instead would be
+     *    editing the H.264 path to serve HEVC.
+     *  - quant_levels_buffer is int16_t-typed; HEVC's mode output is int32.
+     *
+     * The cost is one extra descriptor set (pool has room: this takes the
+     * totals to 10 sets / 18 images / 29 buffers against 32 / 64 / 64) and
+     * ~23 MB of staging at 1440p, allocated lazily on the first HEVC frame
+     * so an H.264-only session never pays for it. */
+    VkPipeline hevc_wavefront_pipeline;
+    VkDescriptorSetLayout hevc_wavefront_desc_layout;
+    VkPipelineLayout hevc_wavefront_layout;
+    VkDescriptorSet hevc_wavefront_desc_set;
+
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
     VkDescriptorSet predict_desc_set;
@@ -222,6 +245,41 @@ typedef struct bc250_gpu_context {
     VkDeviceMemory nz_staging_memories[2];
     void *nz_staging_mapped[2];
     VkDeviceSize nz_staging_size;
+
+    /* HEVC intra path's own device buffers + host readback. See the
+     * hevc_wavefront_pipeline comment above for why these are separate from
+     * the H.264 ones rather than shared. Allocated lazily by the first
+     * gpu_compute_hevc_dispatch_intra() call, and reallocated when the coded
+     * dimensions change; hevc_alloc_width/height record what they were sized
+     * for. Same double-buffer contract as every staging pair above: index
+     * with the slot gpu_compute_submitted_slot() reports, not current_buf.
+     *
+     * Sizes, per 16x16 CTU: mode = 1 int32, coeff = 384 int32 (256 luma +
+     * 64 Cb + 64 Cr), cbf = 1 uint32. */
+    VkBuffer hevc_mode_buffer;
+    VkDeviceMemory hevc_mode_memory;
+    VkBuffer hevc_coeff_buffer;
+    VkDeviceMemory hevc_coeff_memory;
+    VkBuffer hevc_cbf_buffer;
+    VkDeviceMemory hevc_cbf_memory;
+
+    VkBuffer hevc_mode_staging_buffers[2];
+    VkDeviceMemory hevc_mode_staging_memories[2];
+    void *hevc_mode_staging_mapped[2];
+    VkDeviceSize hevc_mode_staging_size;
+
+    VkBuffer hevc_coeff_staging_buffers[2];
+    VkDeviceMemory hevc_coeff_staging_memories[2];
+    void *hevc_coeff_staging_mapped[2];
+    VkDeviceSize hevc_coeff_staging_size;
+
+    VkBuffer hevc_cbf_staging_buffers[2];
+    VkDeviceMemory hevc_cbf_staging_memories[2];
+    void *hevc_cbf_staging_mapped[2];
+    VkDeviceSize hevc_cbf_staging_size;
+
+    uint32_t hevc_alloc_width;
+    uint32_t hevc_alloc_height;
 
     /* Reconstructed frame for DPB */
     gpu_image_t recon_image;
@@ -410,6 +468,40 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
  * Must match the num_slices the caller will actually partition the CAVLC
  * bitstream into (encoder_h264.c's BC250_SLICES_PER_FRAME). */
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
+
+/* HEVC all-intra mode decision + reconstruction, recorded into the current
+ * command buffer (the caller still drives gpu_compute_end_picture() and the
+ * sync). One dispatch per wavefront step, with a compute->compute barrier
+ * between them: CTU (x,y) is issued on step s = 2*y + x, which is the
+ * dependence-correct order for HEVC intra since a CTU needs its left, above
+ * and above-right neighbours reconstructed. Note the 2:1 slope - this is NOT
+ * the anti-diagonal (x+y) H.264's intra_wavefront.comp uses, because the
+ * above-right dependency needs the row above to be two CTUs ahead, not one.
+ *
+ * `width`/`height` are the CODED dimensions (a whole number of 16x16 CTUs);
+ * `src_width`/`src_height` are the real source dimensions, which may be
+ * smaller (1080 is not a multiple of 16) and which source reads clamp to so
+ * the bottom row replicates the edge instead of reading zeros.
+ *
+ * Results land in the HEVC staging buffers, readable via the
+ * gpu_compute_get_hevc_*_slot() getters after a sync. Returns 0 on success,
+ * -1 if the HEVC pipeline is unavailable (shader missing, allocation failed)
+ * - in which case the caller must fall back to the CPU path, as
+ * encoder_h265.c does. */
+int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
+                                    int width, int height,
+                                    int src_width, int src_height, int qp);
+
+/* HEVC readback, same slot contract as the gpu_compute_get_*_staging_data_slot
+ * family below. mode = one int32 per CTU (the chosen luma intra mode), coeff =
+ * 384 int32 per CTU (256 luma, then 64 Cb, then 64 Cr), cbf = one uint32 per
+ * CTU packing four fields: bit 0 = cbf_luma, bit 1 = cbf_cb, bit 2 = cbf_cr,
+ * and bits 8+ = the chosen intra_chroma_pred_mode INDEX (0..4), which the
+ * shader decides and the CPU only entropy-codes. */
+int gpu_compute_get_hevc_mode_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_hevc_coeff_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+int gpu_compute_get_hevc_cbf_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
 
