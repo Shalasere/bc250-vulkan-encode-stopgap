@@ -84,9 +84,29 @@ jobs:
           exit 1
         fi
         
+        # Require SILENCE, not just exit 0.
+        #
+        # ffmpeg's decoders conceal errors and keep going: a stream that makes
+        # it print "error while decoding MB 1 0" still exits 0. This step used
+        # to be a bare `ffmpeg ... -f null -` followed by an unconditional
+        # "ZERO errors!" echo, so it reported success while the log directly
+        # above it showed decode errors - and it stayed green for as long as
+        # the H.264 raw path was emitting an undecodable bitstream. Capture
+        # stderr and fail on any output.
+        assert_decodes_silently() {
+          local label="$1" path="$2"
+          local err
+          err="$(ffmpeg -v error -i "$path" -f null - 2>&1 >/dev/null)"
+          if [ -n "$err" ]; then
+            echo "ERROR: $label decoder reported errors (ffmpeg still exits 0 for these):"
+            echo "$err" | sed 's/^/    /'
+            return 1
+          fi
+          echo "✓ SUCCESS: $label decoded with ZERO errors (stderr empty, not just exit 0)"
+        }
+
         echo "Found test stream at $STREAM_PATH ($(wc -c < "$STREAM_PATH") bytes)"
-        ffmpeg -v error -i "$STREAM_PATH" -f null -
-        echo "✓ SUCCESS: FFmpeg verified and decoded all frames with ZERO errors!"
+        assert_decodes_silently "H.264" "$STREAM_PATH"
 
         # Content Assertion: Decode stream to raw YUV and verify exact frame count & byte size
         echo "Running Content Assertion: decoding stream to raw YUV420p..."
@@ -101,7 +121,7 @@ jobs:
           exit 1
         fi
         rm -f decoded.yuv
-        echo "✓ CONTENT ASSERTION PASSED: All $FRAME_COUNT frames decoded and verified with zero errors!"
+        echo "✓ CONTENT ASSERTION PASSED: $FRAME_COUNT frames, $DECODED_SIZE bytes of raw YUV (size check only; the zero-errors check is the silent-decode assert above)"
 
         # Validate generated H.265/HEVC stream with FFmpeg reference decoder
         echo "Validating generated H.265/HEVC stream with FFmpeg reference decoder..."
@@ -117,8 +137,7 @@ jobs:
 
         if [ -f "$HEVC_STREAM_PATH" ]; then
           echo "Found HEVC test stream at $HEVC_STREAM_PATH ($(wc -c < "$HEVC_STREAM_PATH") bytes)"
-          ffmpeg -v error -i "$HEVC_STREAM_PATH" -f null -
-          echo "✓ SUCCESS: FFmpeg verified and decoded all H.265/HEVC frames with ZERO errors!"
+          assert_decodes_silently "H.265/HEVC" "$HEVC_STREAM_PATH"
 
           echo "Running HEVC Content Assertion: decoding stream to raw YUV420p..."
           ffmpeg -v error -y -vsync 0 -i "$HEVC_STREAM_PATH" -f rawvideo -pix_fmt yuv420p decoded_hevc.yuv
@@ -131,7 +150,7 @@ jobs:
             exit 1
           fi
           rm -f decoded_hevc.yuv
-          echo "✓ HEVC CONTENT ASSERTION PASSED: All $HEVC_FRAME_COUNT frames decoded and verified with zero errors!"
+          echo "✓ HEVC CONTENT ASSERTION PASSED: $HEVC_FRAME_COUNT frames, $HEVC_DECODED_SIZE bytes of raw YUV (size check only; the zero-errors check is the silent-decode assert above)"
         else
           echo "WARNING: bc250_test_stream.hevc was not produced."
         fi
