@@ -11,8 +11,10 @@
  * fps for 1080p on the BC-250 against H.264's 82, because H.264 does
  * prediction and transform on the GPU and HEVC did not. Profiling put
  * ~94% of the HEVC frame in per-block arithmetic - prediction,
- * transform, quantization, reconstruction - and only ~0.7% in CABAC,
- * which is the one part that must stay serial on the CPU.
+ * transform, quantization, reconstruction - leaving CABAC, the one part
+ * that must stay serial on the CPU. (CABAC's share scales with BITRATE,
+ * not with pixels: ~1 ms on a 3 KB desktop frame but ~18 ms on a 79 KB
+ * one, so the CPU remainder is content-dependent.)
  *
  * So the reconstruction loop moves here; the CPU reads back the modes
  * and coefficients this shader decides and does entropy coding only.
@@ -65,10 +67,26 @@
  * SCOPE
  * =====================================================================
  * Every CTU is one undivided 16x16 CU: one intra mode, one 16x16 luma
- * transform. That is a legal configuration the CPU encoder already
- * emits for flat CTUs, so this can be validated bit-exactly against the
- * CPU path forced to the same structure before split cases are added.
- * Chroma is still done on the CPU in this version.
+ * transform, one 8x8 Cb and Cr. That is a legal configuration the CPU
+ * encoder already emits for flat CTUs, and both luma and chroma are
+ * verified bit-exact against the CPU. Split CUs, mode refinement and
+ * the MPM rate term are not implemented here yet.
+ *
+ * =====================================================================
+ * THREADING: ONE THREAD PER COEFFICIENT, NOT PER LINE
+ * =====================================================================
+ * Measured, this shader is workgroup-LATENCY bound, not throughput
+ * bound: per-step time was ~54 us at both 720p and 1080p even though
+ * the two have very different numbers of workgroups per step. So what
+ * matters is the critical path through one workgroup, and leaving 240
+ * of 256 threads idle is the thing to avoid.
+ *
+ * That inverts the CPU's tradeoff. The CPU transforms with a partial
+ * butterfly because it has one thread and wants fewer multiplies; a
+ * butterfly is inherently per-LINE, so here it could only occupy 16
+ * threads at ~85 multiplies each. The plain matrix product spreads
+ * across all 256 at 16 multiplies each, and is bit-identical - the same
+ * integer sums in a different association order.
  */
 
 #define N      16
@@ -150,6 +168,13 @@ int tmat(int log2n, int i, int j) {
     int v = DCT32[row][nn - 1 - j];
     return ((row & 1) != 0) ? -v : v;
 }
+
+/* Branch-free accessors for the two sizes this shader transforms. Both
+ * have N <= 16, so the column index never reaches the mirrored half of
+ * the table and the general form's test is dead weight in the innermost
+ * loop of the whole shader. */
+int m16(int i, int j) { return DCT32[i << 1][j]; }
+int m8 (int i, int j) { return DCT32[i << 2][j]; }
 
 const int ANGLE[35] = int[35](
       0,   0,  32,  26,  21,  17,  13,   9,   5,   2,   0,  -2,
@@ -250,7 +275,12 @@ void gather(int bx, int by) {
         s_left[t] = s_scan[SIDE - 1 - int(t)];
         s_top[t]  = s_scan[SIDE + 1 + int(t)];
     }
-    if (t == 0u) s_corner = s_scan[SIDE];
+    if (t == 0u) {
+        s_corner = s_scan[SIDE];
+        int sum = N;
+        for (int i = 0; i < N; i++) sum += s_scan[SIDE - 1 - i] + s_scan[SIDE + 1 + i];
+        s_dc = sum >> (LOG2N + 1);
+    }
     barrier();
 }
 
@@ -278,12 +308,12 @@ void smooth_for(int mode) {
             s_ft[i] = (s_top[i - 1]  + 2 * s_top[i]  + s_top[i + 1]  + 2) >> 2;
         }
     }
-    if (t == 0u) {
+    /* s_dc is NOT recomputed here: DC is never filtered, so its value
+     * depends only on the unsmoothed references and is set once after
+     * the gather. Recomputing it per candidate had one thread looping
+     * 2*N times inside the mode search. */
+    if (t == 0u)
         s_fc = filt ? ((s_left[0] + 2 * s_corner + s_top[0] + 2) >> 2) : s_corner;
-        int sum = N;
-        for (int i = 0; i < N; i++) sum += s_left[i] + s_top[i];
-        s_dc = sum >> (LOG2N + 1);
-    }
 }
 
 /* One predicted sample. Reads only shared references. */
@@ -419,61 +449,7 @@ int predict_c(int plane, int mode, int x, int y) {
     return (fact != 0) ? (((32 - fact) * r0 + fact * r1 + 16) >> 5) : r0;
 }
 
-/* 1-D partial butterfly forward transform of 8 samples, in place. */
-void fwd8(inout int v[NC]) {
-    int e4[4], o4[4], e2[2], o2[2], out_[NC];
-    for (int k = 0; k < 4; k++) { e4[k] = v[k] + v[7 - k]; o4[k] = v[k] - v[7 - k]; }
-    for (int k = 0; k < 2; k++) { e2[k] = e4[k] + e4[3 - k]; o2[k] = e4[k] - e4[3 - k]; }
-    for (int k = 0; k < 4; k++) {
-        int acc = 0;
-        for (int jj = 0; jj < 4; jj++) acc += tmat(3, 2 * k + 1, jj) * o4[jj];
-        out_[2 * k + 1] = acc;
-    }
-    for (int k = 0; k < 2; k++) {
-        int acc = 0;
-        for (int jj = 0; jj < 2; jj++) acc += tmat(2, 2 * k + 1, jj) * o2[jj];
-        out_[(2 * k + 1) * 2] = acc;
-    }
-    out_[0] = 64 * (e2[0] + e2[1]);
-    out_[4] = 64 * (e2[0] - e2[1]);
-    for (int k = 0; k < NC; k++) v[k] = out_[k];
-}
 
-/* 1-D partial butterfly forward transform of 16 samples, in place.
- * Same decomposition as the CPU reference: even outputs are the
- * half-size transform of the sums, odd outputs the direct product with
- * the differences. Unrolled by size rather than recursive - GLSL has no
- * recursion, and fixed extents keep this off scratch memory. */
-void fwd16(inout int v[N]) {
-    int e8[8], o8[8], e4[4], o4[4], e2[2], o2[2];
-    for (int k = 0; k < 8; k++) { e8[k] = v[k] + v[15 - k]; o8[k] = v[k] - v[15 - k]; }
-    for (int k = 0; k < 4; k++) { e4[k] = e8[k] + e8[7 - k]; o4[k] = e8[k] - e8[7 - k]; }
-    for (int k = 0; k < 2; k++) { e2[k] = e4[k] + e4[3 - k]; o2[k] = e4[k] - e4[3 - k]; }
-
-    int out_[N];
-    /* odd outputs of the 16-point stage */
-    for (int k = 0; k < 8; k++) {
-        int acc = 0;
-        for (int jj = 0; jj < 8; jj++) acc += tmat(4, 2 * k + 1, jj) * o8[jj];
-        out_[2 * k + 1] = acc;
-    }
-    /* odd outputs of the 8-point stage land on multiples of 2 */
-    for (int k = 0; k < 4; k++) {
-        int acc = 0;
-        for (int jj = 0; jj < 4; jj++) acc += tmat(3, 2 * k + 1, jj) * o4[jj];
-        out_[(2 * k + 1) * 2] = acc;
-    }
-    /* odd outputs of the 4-point stage land on multiples of 4 */
-    for (int k = 0; k < 2; k++) {
-        int acc = 0;
-        for (int jj = 0; jj < 2; jj++) acc += tmat(2, 2 * k + 1, jj) * o2[jj];
-        out_[(2 * k + 1) * 4] = acc;
-    }
-    /* the 2-point base: rows 0 and 1 of M2 == M32 rows 0 and 16 */
-    out_[0] = 64 * (e2[0] + e2[1]);
-    out_[8] = 64 * (e2[0] - e2[1]);
-    for (int k = 0; k < N; k++) v[k] = out_[k];
-}
 
 void main() {
     uint t = gl_LocalInvocationID.x;
@@ -526,20 +502,31 @@ void main() {
     s_blk[t] = src - s_pred[t];
     barrier();
 
-    /* ---- forward transform, columns then rows ---- */
+    /* ---- forward transform, columns then rows ----
+     *
+     * One thread per COEFFICIENT, not per line. The CPU uses a partial
+     * butterfly because it has one thread and wants fewer multiplies;
+     * here the constraint is the opposite. A butterfly is inherently
+     * per-line, so it can only occupy 16 of the 256 threads and each of
+     * those does ~85 multiplies; the plain matrix product spreads over
+     * all 256 with 16 multiplies each. Same integer sums in a different
+     * association order, so bit-identical - verified against the CPU. */
     int shift1 = LOG2N + 8 - 9, shift2 = LOG2N + 6;
-    if (t < uint(N)) {
-        int line[N];
-        for (int r = 0; r < N; r++) line[r] = s_blk[r * N + int(t)];
-        fwd16(line);
-        for (int r = 0; r < N; r++) s_tmp[r * N + int(t)] = (line[r] + (1 << (shift1 - 1))) >> shift1;
+    int trow = int(t) >> LOG2N, tcol = int(t) & (N - 1);
+    {
+        int acc = 0;
+        for (int r = 0; r < N; r++) acc += m16(trow, r) * s_blk[r * N + tcol];
+        int v = (acc + (1 << (shift1 - 1))) >> shift1;
+        barrier();
+        s_tmp[trow * N + tcol] = v;
     }
     barrier();
-    if (t < uint(N)) {
-        int line[N];
-        for (int c = 0; c < N; c++) line[c] = s_tmp[int(t) * N + c];
-        fwd16(line);
-        for (int c = 0; c < N; c++) s_blk[int(t) * N + c] = (line[c] + (1 << (shift2 - 1))) >> shift2;
+    {
+        int acc = 0;
+        for (int c = 0; c < N; c++) acc += m16(tcol, c) * s_tmp[trow * N + c];
+        int v = (acc + (1 << (shift2 - 1))) >> shift2;
+        barrier();
+        s_blk[trow * N + tcol] = v;
     }
     barrier();
 
@@ -570,24 +557,20 @@ void main() {
     s_tmp[t] = clamp((dq + (1 << (bdshift - 1))) >> bdshift, -32768, 32767);
     barrier();
 
-    if (t < uint(N)) {                                   /* inverse, columns */
-        int line[N];
-        for (int r = 0; r < N; r++) {
-            int acc = 0;
-            for (int k = 0; k < N; k++) acc += tmat(LOG2N, k, r) * s_tmp[k * N + int(t)];
-            line[r] = clamp((acc + 64) >> 7, -32768, 32767);
-        }
-        for (int r = 0; r < N; r++) s_blk[r * N + int(t)] = line[r];
+    {                                                    /* inverse, columns */
+        int acc = 0;
+        for (int k = 0; k < N; k++) acc += m16(k, trow) * s_tmp[k * N + tcol];
+        int v = clamp((acc + 64) >> 7, -32768, 32767);
+        barrier();
+        s_blk[trow * N + tcol] = v;
     }
     barrier();
-    if (t < uint(N)) {                                   /* inverse, rows */
-        int line[N];
-        for (int c = 0; c < N; c++) {
-            int acc = 0;
-            for (int k = 0; k < N; k++) acc += tmat(LOG2N, k, c) * s_blk[int(t) * N + k];
-            line[c] = clamp((acc + 2048) >> 12, -32768, 32767);
-        }
-        for (int c = 0; c < N; c++) s_tmp[int(t) * N + c] = line[c];
+    {                                                    /* inverse, rows */
+        int acc = 0;
+        for (int k = 0; k < N; k++) acc += m16(k, tcol) * s_blk[trow * N + k];
+        int v = clamp((acc + 2048) >> 12, -32768, 32767);
+        barrier();
+        s_tmp[trow * N + tcol] = v;
     }
     barrier();
 
@@ -645,26 +628,30 @@ void main() {
     int cbdshift = 8 + LOG2NC - 5;
     int cdenom = (LEVELSCALE[rem] * 16) << per;
 
-    /* Threads 0..7 do Cb columns, 8..15 do Cr columns, and so on - each
-     * plane gets NC lines per pass. */
-    for (int pl = 0; pl < 2; pl++) {
-        if (t < uint(NC)) {
-            int line[NC];
-            for (int r = 0; r < NC; r++) line[r] = s_cblk[pl][r * NC + int(t)];
-            fwd8(line);
-            for (int r = 0; r < NC; r++)
-                s_ctmp[pl][r * NC + int(t)] = (line[r] + (1 << (cshift1 - 1))) >> cshift1;
-        }
+    /* One thread per chroma coefficient, both planes at once: threads
+     * 0..63 are Cb, 64..127 are Cr. Same reasoning as luma - the plain
+     * product spreads across 128 threads where a per-line butterfly
+     * would occupy 8. */
+    int cpl  = int(t) >> 6;                 /* 0 = Cb, 1 = Cr */
+    int cidxn = int(t) & 63;
+    int crow = cidxn >> LOG2NC, ccol = cidxn & (NC - 1);
+    bool c2thread = (t < uint(2 * NC * NC));
+    {
+        int acc = 0;
+        if (c2thread) for (int r = 0; r < NC; r++) acc += m8(crow, r) * s_cblk[cpl][r * NC + ccol];
+        int v = (acc + (1 << (cshift1 - 1))) >> cshift1;
         barrier();
-        if (t < uint(NC)) {
-            int line[NC];
-            for (int c = 0; c < NC; c++) line[c] = s_ctmp[pl][int(t) * NC + c];
-            fwd8(line);
-            for (int c = 0; c < NC; c++)
-                s_cblk[pl][int(t) * NC + c] = (line[c] + (1 << (cshift2 - 1))) >> cshift2;
-        }
-        barrier();
+        if (c2thread) s_ctmp[cpl][crow * NC + ccol] = v;
     }
+    barrier();
+    {
+        int acc = 0;
+        if (c2thread) for (int c = 0; c < NC; c++) acc += m8(ccol, c) * s_ctmp[cpl][crow * NC + c];
+        int v = (acc + (1 << (cshift2 - 1))) >> cshift2;
+        barrier();
+        if (c2thread) s_cblk[cpl][crow * NC + ccol] = v;
+    }
+    barrier();
 
     if (cthread) {
         for (int pl = 0; pl < 2; pl++) {
@@ -701,28 +688,22 @@ void main() {
         }
     }
     barrier();
-    for (int pl = 0; pl < 2; pl++) {
-        if (t < uint(NC)) {
-            int line[NC];
-            for (int r = 0; r < NC; r++) {
-                int acc = 0;
-                for (int k = 0; k < NC; k++) acc += tmat(LOG2NC, k, r) * s_ctmp[pl][k * NC + int(t)];
-                line[r] = clamp((acc + 64) >> 7, -32768, 32767);
-            }
-            for (int r = 0; r < NC; r++) s_cblk[pl][r * NC + int(t)] = line[r];
-        }
+    {
+        int acc = 0;
+        if (c2thread) for (int k = 0; k < NC; k++) acc += m8(k, crow) * s_ctmp[cpl][k * NC + ccol];
+        int v = clamp((acc + 64) >> 7, -32768, 32767);
         barrier();
-        if (t < uint(NC)) {
-            int line[NC];
-            for (int c = 0; c < NC; c++) {
-                int acc = 0;
-                for (int k = 0; k < NC; k++) acc += tmat(LOG2NC, k, c) * s_cblk[pl][int(t) * NC + k];
-                line[c] = clamp((acc + 2048) >> 12, -32768, 32767);
-            }
-            for (int c = 0; c < NC; c++) s_ctmp[pl][int(t) * NC + c] = line[c];
-        }
-        barrier();
+        if (c2thread) s_cblk[cpl][crow * NC + ccol] = v;
     }
+    barrier();
+    {
+        int acc = 0;
+        if (c2thread) for (int k = 0; k < NC; k++) acc += m8(k, ccol) * s_cblk[cpl][crow * NC + k];
+        int v = clamp((acc + 2048) >> 12, -32768, 32767);
+        barrier();
+        if (c2thread) s_ctmp[cpl][crow * NC + ccol] = v;
+    }
+    barrier();
 
     /* ONE thread writes both components of the packed rg8 texel. Split
      * across two threads this would be a read-modify-write race on the
