@@ -1724,6 +1724,32 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
         insert_compute_barrier(cmd_buf);
     }
 
+    /* Hand the decisions back. Without this the shader's output never
+     * leaves device memory and the CPU has nothing to entropy-code.
+     * The barrier is the write-then-copy dependency the copies need -
+     * the compute barriers above only order compute against compute. */
+    insert_compute_to_transfer_barrier(cmd_buf);
+    {
+        uint32_t nctu = wc * hc;
+        VkDeviceSize mode_sz  = (VkDeviceSize)nctu * sizeof(int32_t);
+        VkDeviceSize coeff_sz = (VkDeviceSize)nctu * 256u * sizeof(int32_t);
+        VkDeviceSize cbf_sz   = (VkDeviceSize)nctu * sizeof(uint32_t);
+        if (mode_sz  > ctx->quant_staging_size)     mode_sz  = ctx->quant_staging_size;
+        if (coeff_sz > ctx->coeff_staging_size)     coeff_sz = ctx->coeff_staging_size;
+        if (cbf_sz   > ctx->pred_mode_staging_size) cbf_sz   = ctx->pred_mode_staging_size;
+
+        VkBufferCopy r;
+        r = (VkBufferCopy){ .srcOffset = 0, .dstOffset = 0, .size = mode_sz };
+        vkCmdCopyBuffer(cmd_buf, ctx->quant_levels_buffer,
+                         ctx->quant_staging_buffers[ctx->current_buf], 1, &r);
+        r = (VkBufferCopy){ .srcOffset = 0, .dstOffset = 0, .size = coeff_sz };
+        vkCmdCopyBuffer(cmd_buf, ctx->coeff_buffer,
+                         ctx->coeff_staging_buffers[ctx->current_buf], 1, &r);
+        r = (VkBufferCopy){ .srcOffset = 0, .dstOffset = 0, .size = cbf_sz };
+        vkCmdCopyBuffer(cmd_buf, ctx->pred_mode_buffer,
+                         ctx->pred_mode_staging_buffers[ctx->current_buf], 1, &r);
+    }
+
     ctx->has_recon_frame = true;
     return 0;
 }
