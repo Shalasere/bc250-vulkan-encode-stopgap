@@ -193,6 +193,17 @@ GitHub Actions will automatically build the driver, run the test suite, package 
 
 ---
 
+## 🎞️ H.265 / HEVC
+
+There is a real intra-only HEVC encoder here, with both a CPU and a GPU
+reconstruction path. It is **not advertised through VA-API by default**:
+Sunshine probes HEVC before H.264 and would negotiate the slower
+encoder, so it is opt-in with `BC250_ENABLE_HEVC=1`.
+
+👉 **[HEVC encoder: usage, architecture, measurements and measured dead ends (docs/hevc-encoder.md)](docs/hevc-encoder.md)**
+
+---
+
 ## ❓ Troubleshooting & FAQs
 
 Have an issue? We've written a dedicated, comprehensive guide:
