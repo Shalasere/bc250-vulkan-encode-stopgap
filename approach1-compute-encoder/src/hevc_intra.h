@@ -77,16 +77,30 @@ extern "C" {
  * predicting a block it has just searched, should gather ONCE and reuse.
  * hevc_predict_4x4() is the convenience wrapper that gathers per call. */
 typedef struct {
-    uint8_t left[8];
-    uint8_t top[8];
+    uint8_t left[2 * 32];   /* p[-1][0 .. 2*nTbS-1] */
+    uint8_t top[2 * 32];    /* p[0 .. 2*nTbS-1][-1] */
     uint8_t corner;
 } hevc_refs_t;
 
+void hevc_gather_refs_sz(const uint8_t *recon_plane, int stride, int width, int height,
+                          int x0, int y0, int log2_size, int is_luma, hevc_refs_t *refs_out);
+
+/* nTbS == 4 shorthand. */
 void hevc_gather_refs(const uint8_t *recon_plane, int stride, int width, int height,
                        int x0, int y0, int is_luma, hevc_refs_t *refs_out);
 
-/* Predict one 4x4 block from already-gathered references. `mode` may be
- * any of 0..34. Writes 16 samples, row-major (pred[y*4+x]). */
+/* Predict one nTbS x nTbS block from already-gathered references. `mode`
+ * may be any of 0..34. Writes nTbS*nTbS samples, row-major.
+ *
+ * Applies 8.4.4.2.3's reference smoothing internally where the spec calls
+ * for it (luma, nTbS >= 8, mode-dependent) - which is why the references
+ * are passed unfiltered and each mode filters its own copy: one gathered
+ * set is shared across a whole mode search, and different candidates
+ * disagree about whether they are filtered. */
+void hevc_predict_refs(const hevc_refs_t *refs, int log2_size, int mode, int is_luma,
+                        uint8_t *pred_out);
+
+/* nTbS == 4 shorthand. */
 void hevc_predict_4x4_refs(const hevc_refs_t *refs, int mode, int is_luma,
                             uint8_t pred_out[16]);
 
@@ -117,6 +131,12 @@ int hevc_scan_idx_for_mode(int mode);
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0,
                            const int mpm[3], int qp);
+
+/* Mode decision for a block of any size, against already-gathered
+ * references. Same coarse-then-refine candidate set and same
+ * SAD + lambda*bits criterion as the 4x4 form. */
+int hevc_choose_mode_sz(const hevc_refs_t *refs, const uint8_t *src, int stride,
+                         int x0, int y0, int log2_size, const int mpm[3], int qp);
 
 /* Same decision, but against references the caller has already gathered -
  * so a caller that will go on to predict the winning mode does not pay

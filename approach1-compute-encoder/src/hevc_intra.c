@@ -141,6 +141,63 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma, 
  * the CTU size, so each 4-sample run lies wholly inside one block AND is
  * wholly in or wholly out of the picture. A run that could straddle either
  * boundary would need the per-sample form. */
+void hevc_gather_refs_sz(const uint8_t *plane, int stride, int width, int height,
+                          int x0, int y0, int log2_size, int is_luma, hevc_refs_t *r) {
+    int n = 1 << log2_size;
+    int side = 2 * n;                    /* samples along each edge */
+    int total = 2 * side + 1;
+    long long cur_rank = zorder_rank(x0, y0, width, is_luma);
+
+    /* Availability is resolved once per 4-sample run rather than per
+     * sample: each run lies wholly inside one 4x4 coding block and is
+     * wholly in or out of the picture, because (x0,y0) is 4-aligned in
+     * its own plane and the coded dimensions are a CTU multiple. That
+     * keeps this at n+1 rank comparisons - 5 for a 4x4 block, exactly
+     * what the 4x4-only version cost. */
+    uint8_t sv[4 * HEVC_MAX_TB_SIZE + 1], sa[4 * HEVC_MAX_TB_SIZE + 1];
+
+    /* Spec substitution order: p[-1][2n-1] up the left edge, the corner,
+     * then along the top to p[2n-1][-1]. */
+    for (int i = 0; i < side; i++) {
+        int y = side - 1 - i;
+        int avail = (i & 3) ? sa[i - 1]
+                            : (uint8_t)zorder_available(x0 - 1, y0 + (y & ~3), width, height,
+                                                         is_luma, cur_rank);
+        sa[i] = (uint8_t)avail;
+        sv[i] = avail ? plane[(size_t)(y0 + y) * stride + (x0 - 1)] : 0;
+    }
+    sa[side] = (uint8_t)zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
+    sv[side] = sa[side] ? plane[(size_t)(y0 - 1) * stride + (x0 - 1)] : 0;
+    for (int x = 0; x < side; x++) {
+        int i = side + 1 + x;
+        int avail = (x & 3) ? sa[i - 1]
+                            : (uint8_t)zorder_available(x0 + x, y0 - 1, width, height,
+                                                         is_luma, cur_rank);
+        sa[i] = (uint8_t)avail;
+        sv[i] = avail ? plane[(size_t)(y0 - 1) * stride + (x0 + x)] : 0;
+    }
+
+    int first = -1;
+    for (int i = 0; i < total; i++) { if (sa[i]) { first = i; break; } }
+
+    if (first < 0) {
+        for (int i = 0; i < total; i++) sv[i] = 128;
+    } else {
+        for (int i = 0; i < first; i++) sv[i] = sv[first];
+        for (int i = first + 1; i < total; i++) if (!sa[i]) sv[i] = sv[i - 1];
+    }
+
+    for (int y = 0; y < side; y++) r->left[y] = sv[side - 1 - y];
+    r->corner = sv[side];
+    for (int x = 0; x < side; x++) r->top[x] = sv[side + 1 + x];
+}
+
+/* Fixed-extent nTbS == 4 gather. Identical in effect to
+ * hevc_gather_refs_sz(..., 2, ...) - tests/test_hevc_encode.c asserts
+ * that on every block of a synthetic picture - but written with constant
+ * bounds, because 4x4 is by far the most common size and the generic
+ * loops cannot be unrolled. Routing 4x4 through the generic form cost
+ * ~25% of the frame. */
 void hevc_gather_refs(const uint8_t *plane, int stride, int width, int height,
                        int x0, int y0, int is_luma, hevc_refs_t *r) {
     long long cur_rank = zorder_rank(x0, y0, width, is_luma);
@@ -151,8 +208,6 @@ void hevc_gather_refs(const uint8_t *plane, int stride, int width, int height,
     int av_a  = zorder_available(x0,     y0 - 1, width, height, is_luma, cur_rank);
     int av_ar = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, cur_rank);
 
-    /* Filled in the spec's own substitution order: p[-1][7] up the left
-     * edge, the corner, then along the top to p[7][-1]. */
     uint8_t sv[17], sa[17];
     for (int i = 0; i < 8; i++) {
         int y = 7 - i;
@@ -168,7 +223,6 @@ void hevc_gather_refs(const uint8_t *plane, int stride, int width, int height,
 
     int first = -1;
     for (int i = 0; i < 17; i++) { if (sa[i]) { first = i; break; } }
-
     if (first < 0) {
         for (int i = 0; i < 17; i++) sv[i] = 128;
     } else {
@@ -199,22 +253,57 @@ static const int16_t inv_angle[15] = {
      -630,  -910, -1638, -4096
 };
 
-/* Rec. ITU-T H.265 8.4.4.2.6, specialized to nTbS == 4.
+/* Rec. ITU-T H.265 8.4.4.2.3 reference sample smoothing.
  *
- * Note what is deliberately NOT here: 8.4.4.2.3's reference-sample
- * smoothing filter. That clause sets filterFlag = 0 unconditionally when
- * nTbS is equal to 4, and every transform block in this encoder is 4x4
- * (see encoder_h265.c's picture structure), so the filtered reference
- * array pF[][] never applies. Applying it anyway would put this encoder's
- * reconstruction out of step with every conforming decoder. */
-static void predict_angular(const hevc_refs_t *r, int mode, int is_luma, uint8_t out[16]) {
-    const int nTbS = 4;
+ * filterFlag is 0 whenever nTbS is 4 or the mode is DC, which is why the
+ * 4x4-only encoder could ignore this clause entirely. It is NOT optional
+ * at larger sizes: skipping it puts the encoder's reconstruction out of
+ * step with every conforming decoder. Luma only - 8.4.4.2.1 invokes this
+ * process only when cIdx is 0.
+ *
+ * The strong (bilinear) 32x32 variant is not implemented and must not
+ * fire: it is gated on sps_strong_intra_smoothing_enable_flag, which
+ * encoder_h265.c writes as 0. */
+static const uint8_t intra_hor_ver_dist_thres[6] = { 0, 0, 0, 7, 1, 0 }; /* by log2_size */
+
+static void smooth_refs(hevc_refs_t *r, int log2_size, int mode, int is_luma) {
+    int n = 1 << log2_size;
+    if (!is_luma || log2_size < 3 || mode == HEVC_MODE_DC) return;
+    if (mode != HEVC_MODE_PLANAR) {
+        int d1 = mode - 26, d2 = mode - 10;
+        if (d1 < 0) d1 = -d1;
+        if (d2 < 0) d2 = -d2;
+        int min_dist = d1 < d2 ? d1 : d2;
+        if (min_dist <= intra_hor_ver_dist_thres[log2_size]) return;
+    }
+
+    int side = 2 * n;
+    uint8_t fl[2 * HEVC_MAX_TB_SIZE], ft[2 * HEVC_MAX_TB_SIZE];
+    uint8_t fc = (uint8_t)((r->left[0] + 2 * r->corner + r->top[0] + 2) >> 2);
+
+    fl[0] = (uint8_t)((r->corner + 2 * r->left[0] + r->left[1] + 2) >> 2);
+    for (int y = 1; y < side - 1; y++)
+        fl[y] = (uint8_t)((r->left[y - 1] + 2 * r->left[y] + r->left[y + 1] + 2) >> 2);
+    fl[side - 1] = r->left[side - 1];
+
+    ft[0] = (uint8_t)((r->corner + 2 * r->top[0] + r->top[1] + 2) >> 2);
+    for (int x = 1; x < side - 1; x++)
+        ft[x] = (uint8_t)((r->top[x - 1] + 2 * r->top[x] + r->top[x + 1] + 2) >> 2);
+    ft[side - 1] = r->top[side - 1];
+
+    r->corner = fc;
+    for (int i = 0; i < side; i++) { r->left[i] = fl[i]; r->top[i] = ft[i]; }
+}
+
+/* Rec. ITU-T H.265 8.4.4.2.6, for any nTbS. */
+static void predict_angular(const hevc_refs_t *r, int log2_size, int mode, int is_luma,
+                             uint8_t *out) {
+    int n = 1 << log2_size;
     int angle = intra_pred_angle[mode];
 
-    /* ref[] is indexed from -nTbS to 2*nTbS+1 in the spec's terms; store it
-     * offset so index 0 of the array is spec index -nTbS. */
-    int ref[4 + 8 + 2];
-#define REF(i) ref[(i) + 4]
+    /* ref[] spans spec indices -nTbS .. 2*nTbS+1; stored offset by nTbS. */
+    int ref[3 * HEVC_MAX_TB_SIZE + 2];
+#define REF(i) ref[(i) + n]
 
     /* For the near-vertical modes (>= 18) the reference array runs along
      * the top row and the projection walks it per output row; for the
@@ -223,51 +312,98 @@ static void predict_angular(const hevc_refs_t *r, int mode, int is_luma, uint8_t
     const uint8_t *side_edge = (mode >= 18) ? r->left : r->top;
 
     REF(0) = r->corner;
-    for (int i = 1; i <= nTbS; i++) REF(i) = main_edge[i - 1];
+    for (int i = 1; i <= n; i++) REF(i) = main_edge[i - 1];
 
     if (angle < 0) {
-        int lim = (nTbS * angle) >> 5;
+        int lim = (n * angle) >> 5;
         if (lim < -1) {
             int inv = inv_angle[mode - 11];
             for (int i = -1; i >= lim; i--) {
                 int k = -1 + ((i * inv + 128) >> 8);
                 if (k < 0) REF(i) = r->corner;
-                else       REF(i) = side_edge[k > 7 ? 7 : k];
+                else       REF(i) = side_edge[k > 2 * n - 1 ? 2 * n - 1 : k];
             }
         }
     } else {
-        for (int i = nTbS + 1; i <= 2 * nTbS; i++) REF(i) = main_edge[i - 1];
+        for (int i = n + 1; i <= 2 * n; i++) REF(i) = main_edge[i - 1];
     }
 
-    for (int j = 0; j < nTbS; j++) {
+    for (int j = 0; j < n; j++) {
         int idx  = ((j + 1) * angle) >> 5;
         int fact = ((j + 1) * angle) & 31;
-        for (int i = 0; i < nTbS; i++) {
+        for (int i = 0; i < n; i++) {
             int v = fact ? (((32 - fact) * REF(i + idx + 1) + fact * REF(i + idx + 2) + 16) >> 5)
                          : REF(i + idx + 1);
             /* j is y (row) for the vertical family and x (column) for the
              * horizontal one - the whole prediction is transposed between
              * the two branches, which is exactly how the spec writes it. */
-            if (mode >= 18) out[j * 4 + i] = (uint8_t)v;
-            else            out[i * 4 + j] = (uint8_t)v;
+            if (mode >= 18) out[j * n + i] = (uint8_t)v;
+            else            out[i * n + j] = (uint8_t)v;
         }
     }
 #undef REF
 
     /* The exactly-vertical and exactly-horizontal modes get one edge
-     * column/row gradient-filtered, luma only, for nTbS < 32 (always true
-     * here). */
-    if (is_luma && mode == 26)
-        for (int y = 0; y < 4; y++)
-            out[y * 4] = clip8(r->top[0] + ((r->left[y] - r->corner) >> 1));
-    else if (is_luma && mode == 10)
-        for (int x = 0; x < 4; x++)
-            out[x] = clip8(r->left[0] + ((r->top[x] - r->corner) >> 1));
+     * column/row gradient-filtered - luma only, and only below 32x32. */
+    if (is_luma && n < 32) {
+        if (mode == 26)
+            for (int y = 0; y < n; y++)
+                out[y * n] = clip8(r->top[0] + ((r->left[y] - r->corner) >> 1));
+        else if (mode == 10)
+            for (int x = 0; x < n; x++)
+                out[x] = clip8(r->left[0] + ((r->top[x] - r->corner) >> 1));
+    }
 }
 
+void hevc_predict_refs(const hevc_refs_t *refs, int log2_size, int mode, int is_luma,
+                        uint8_t *pred_out) {
+    int n = 1 << log2_size;
+
+    /* Smoothing mutates the reference set, so work on a copy - callers
+     * share one gathered set across many candidate modes and each mode
+     * decides independently whether it is filtered. */
+    hevc_refs_t local;
+    const hevc_refs_t *r = refs;
+    if (is_luma && log2_size >= 3) {
+        local = *refs;
+        smooth_refs(&local, log2_size, mode, is_luma);
+        r = &local;
+    }
+
+    if (mode == HEVC_MODE_PLANAR) {
+        /* 8.4.4.2.5: p[nTbS][-1] is top[n] and p[-1][nTbS] is left[n]. */
+        int shift = log2_size + 1;
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++) {
+                int v = (n - 1 - x) * r->left[y] + (x + 1) * r->top[n] +
+                        (n - 1 - y) * r->top[x]  + (y + 1) * r->left[n] + n;
+                pred_out[y * n + x] = (uint8_t)(v >> shift);
+            }
+    } else if (mode == HEVC_MODE_DC) {
+        /* 8.4.4.2.4. */
+        int sum = n;
+        for (int i = 0; i < n; i++) sum += r->left[i] + r->top[i];
+        int dc = sum >> (log2_size + 1);
+        for (int i = 0; i < n * n; i++) pred_out[i] = (uint8_t)dc;
+        if (is_luma && n < 32) {
+            pred_out[0] = (uint8_t)((r->left[0] + 2 * dc + r->top[0] + 2) >> 2);
+            for (int x = 1; x < n; x++) pred_out[x] = (uint8_t)((r->top[x] + 3 * dc + 2) >> 2);
+            for (int y = 1; y < n; y++) pred_out[y * n] = (uint8_t)((r->left[y] + 3 * dc + 2) >> 2);
+        }
+    } else if (mode >= 2 && mode <= 34) {
+        predict_angular(r, log2_size, mode, is_luma, pred_out);
+    } else {
+        for (int i = 0; i < n * n; i++) pred_out[i] = 128;
+    }
+}
+
+/* Fixed-extent nTbS == 4 prediction. Asserted equivalent to
+ * hevc_predict_refs(r, 2, ...) for every mode in the tests; written
+ * separately for the same unrolling reason as the gather above. No
+ * reference smoothing appears here because 8.4.4.2.3 sets filterFlag = 0
+ * unconditionally at nTbS == 4. */
 void hevc_predict_4x4_refs(const hevc_refs_t *r, int mode, int is_luma, uint8_t pred_out[16]) {
     if (mode == HEVC_MODE_PLANAR) {
-        /* 8.4.4.2.5. p[nTbS][-1] is top[4] and p[-1][nTbS] is left[4]. */
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++) {
                 int v = (3 - x) * r->left[y] + (x + 1) * r->top[4] +
@@ -275,7 +411,6 @@ void hevc_predict_4x4_refs(const hevc_refs_t *r, int mode, int is_luma, uint8_t 
                 pred_out[y * 4 + x] = (uint8_t)(v >> 3);
             }
     } else if (mode == HEVC_MODE_DC) {
-        /* 8.4.4.2.4. */
         int dc = (r->left[0] + r->left[1] + r->left[2] + r->left[3] +
                   r->top[0]  + r->top[1]  + r->top[2]  + r->top[3] + 4) >> 3;
         for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
@@ -285,7 +420,43 @@ void hevc_predict_4x4_refs(const hevc_refs_t *r, int mode, int is_luma, uint8_t 
             for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((r->left[y] + 3 * dc + 2) >> 2);
         }
     } else if (mode >= 2 && mode <= 34) {
-        predict_angular(r, mode, is_luma, pred_out);
+        int angle = intra_pred_angle[mode];
+        int ref[4 + 8 + 2];
+#define REF4(i) ref[(i) + 4]
+        const uint8_t *main_edge = (mode >= 18) ? r->top  : r->left;
+        const uint8_t *side_edge = (mode >= 18) ? r->left : r->top;
+
+        REF4(0) = r->corner;
+        for (int i = 1; i <= 4; i++) REF4(i) = main_edge[i - 1];
+        if (angle < 0) {
+            int lim = (4 * angle) >> 5;
+            if (lim < -1) {
+                int inv = inv_angle[mode - 11];
+                for (int i = -1; i >= lim; i--) {
+                    int k = -1 + ((i * inv + 128) >> 8);
+                    REF4(i) = (k < 0) ? r->corner : side_edge[k > 7 ? 7 : k];
+                }
+            }
+        } else {
+            for (int i = 5; i <= 8; i++) REF4(i) = main_edge[i - 1];
+        }
+        for (int j = 0; j < 4; j++) {
+            int idx  = ((j + 1) * angle) >> 5;
+            int fact = ((j + 1) * angle) & 31;
+            for (int i = 0; i < 4; i++) {
+                int v = fact ? (((32 - fact) * REF4(i + idx + 1) + fact * REF4(i + idx + 2) + 16) >> 5)
+                             : REF4(i + idx + 1);
+                if (mode >= 18) pred_out[j * 4 + i] = (uint8_t)v;
+                else            pred_out[i * 4 + j] = (uint8_t)v;
+            }
+        }
+#undef REF4
+        if (is_luma && mode == 26)
+            for (int y = 0; y < 4; y++)
+                pred_out[y * 4] = clip8(r->top[0] + ((r->left[y] - r->corner) >> 1));
+        else if (is_luma && mode == 10)
+            for (int x = 0; x < 4; x++)
+                pred_out[x] = clip8(r->left[0] + ((r->top[x] - r->corner) >> 1));
     } else {
         for (int i = 0; i < 16; i++) pred_out[i] = 128;
     }
@@ -463,6 +634,57 @@ int hevc_choose_among(const hevc_refs_t *refs, const uint8_t *src_y, int stride,
         long cost = block_sad(src_y, stride, x0, y0, pred) +
                     ((lambda * hevc_mode_signal_bits(m, mpm)) >> 8);
         if (best_cost < 0 || cost < best_cost) { best_cost = cost; best_mode = m; }
+    }
+    return best_mode;
+}
+
+int hevc_choose_mode_sz(const hevc_refs_t *refs, const uint8_t *src, int stride,
+                         int x0, int y0, int log2_size, const int mpm[3], int qp) {
+    int n = 1 << log2_size;
+    long lambda = mpm ? hevc_lambda_sad_q8(qp) : 0;
+    uint8_t tried[HEVC_MODE_COUNT];
+    memset(tried, 0, sizeof(tried));
+
+    int best_mode = HEVC_MODE_DC;
+    long best_cost = -1;
+    int best_angular = -1;
+    long best_angular_cost = -1;
+
+    int cands[18];
+    int ncand = 0;
+    cands[ncand++] = HEVC_MODE_PLANAR;
+    cands[ncand++] = HEVC_MODE_DC;
+    for (int m = 2; m <= 34; m += 4) cands[ncand++] = m;
+    if (mpm) for (int i = 0; i < 3; i++) cands[ncand++] = mpm[i];
+
+    uint8_t pred[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+    for (int pass = 0; pass < 2; pass++) {
+        for (int c = 0; c < ncand; c++) {
+            int m = cands[c];
+            if (m < 0 || m >= HEVC_MODE_COUNT || tried[m]) continue;
+            tried[m] = 1;
+
+            hevc_predict_refs(refs, log2_size, m, 1, pred);
+            long sad = 0;
+            for (int y = 0; y < n; y++)
+                for (int x = 0; x < n; x++) {
+                    int d = src[(size_t)(y0 + y) * stride + x0 + x] - pred[y * n + x];
+                    sad += d < 0 ? -d : d;
+                }
+            long cost = sad + ((lambda * hevc_mode_signal_bits(m, mpm)) >> 8);
+
+            if (best_cost < 0 || cost < best_cost) { best_cost = cost; best_mode = m; }
+            if (m >= 2 && (best_angular_cost < 0 || cost < best_angular_cost)) {
+                best_angular_cost = cost; best_angular = m;
+            }
+        }
+        if (pass == 1 || best_angular < 0) break;
+        ncand = 0;
+        for (int d = -2; d <= 2; d++) {
+            if (!d) continue;
+            int m = best_angular + d;
+            if (m >= 2 && m <= 34) cands[ncand++] = m;
+        }
     }
     return best_mode;
 }

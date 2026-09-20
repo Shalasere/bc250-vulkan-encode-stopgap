@@ -170,7 +170,7 @@ static size_t write_vps(uint8_t *buf, size_t buf_size) {
 }
 
 static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_t coded_h,
-                         uint32_t real_w, uint32_t real_h, int level_idc) {
+                         uint32_t real_w, uint32_t real_h, int level_idc, int max_tb_log2) {
     uint8_t rbsp[256];
     bitstream_t bs;
     bs_init(&bs, rbsp, sizeof(rbsp));
@@ -208,9 +208,16 @@ static size_t write_sps(uint8_t *buf, size_t buf_size, uint32_t coded_w, uint32_
     bs_write_ue(&bs, 0); /* log2_min_luma_coding_block_size_minus3 -> MinCb = 8 */
     bs_write_ue(&bs, 1); /* log2_diff_max_min_coding_block_size -> Ctb = 16 */
     bs_write_ue(&bs, 0); /* log2_min_luma_transform_block_size_minus2 -> MinTb = 4 */
-    bs_write_ue(&bs, 0); /* log2_diff_max_min_transform_block_size -> MaxTb = MinTb = 4 */
-    bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_inter (unused, no inter) */
-    bs_write_ue(&bs, 0); /* max_transform_hierarchy_depth_intra (IntraSplitFlag adds +1 -> MaxTrafoDepth=1) */
+    /* MaxTb. At 4 (the old fixed value) log2TrafoSize always exceeded it
+     * at an 8x8 CU, so 7.4.9.8 INFERRED split_transform_flag = 1 and the
+     * transform tree had no choices at all. Raising it to 8 is what makes
+     * the flag codable, i.e. what lets a CU use one 8x8 transform instead
+     * of four 4x4 ones. max_transform_hierarchy_depth_intra must rise to
+     * 1 to match, or the flag is still not coded (7.3.8.8 requires
+     * trafoDepth < MaxTrafoDepth). */
+    bs_write_ue(&bs, (uint32_t)(max_tb_log2 - 2)); /* log2_diff_max_min_transform_block_size */
+    bs_write_ue(&bs, 0);                            /* max_transform_hierarchy_depth_inter */
+    bs_write_ue(&bs, (uint32_t)(max_tb_log2 - 2)); /* max_transform_hierarchy_depth_intra */
 
     bs_write1(&bs, 0); /* scaling_list_enabled_flag */
     bs_write1(&bs, 0); /* amp_enabled_flag */
@@ -323,6 +330,21 @@ struct hevc_encoder {
     int use_split_rmd;
     int shortlist_n;   /* how many of the 35 survive to the exact decision */
 
+    /* MaxTbLog2SizeY. 4 allows an undivided 16x16 CU with one 16x16
+     * transform; 2 restores the original spec-minimum behaviour. */
+    int max_tb_log2;
+
+    /* CtDepth per 4x4 unit - 0 for an undivided 16x16 CU, 1 for an 8x8
+     * one. split_cu_flag's context is derived from the left and above
+     * neighbours' depths (9.3.4.2.2), which was a constant while every
+     * CTU split unconditionally and is not any more. */
+    uint8_t *cu_depth_map;
+
+    /* Flatness threshold for the CU-size decision, as a fraction
+     * flat_num/flat_den of the quantizer step. Tunable so the tradeoff
+     * can be swept rather than guessed. */
+    int flat_num, flat_den;
+
     /* Raw NV12 download scratch, real width x height. */
     uint8_t *dl_y;
     uint8_t *dl_uv;
@@ -374,6 +396,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
 
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
+    enc->cu_depth_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
 
     /* Split (offloadable) mode decision. Opt-in for now: it trades a
      * small amount of decision accuracy - modes are scored against source
@@ -383,6 +406,33 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
         const char *e = getenv("BC250_HEVC_SPLIT_RMD");
         enc->use_split_rmd = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
     }
+    enc->max_tb_log2 = 4;
+    {
+        const char *e = getenv("BC250_HEVC_MAX_TB");
+        if (e) {
+            int v = atoi(e);
+            if (v == 4) enc->max_tb_log2 = 2;
+            else if (v == 8) enc->max_tb_log2 = 3;
+            else if (v == 16) enc->max_tb_log2 = 4;
+        }
+    }
+    /* Merge threshold as a fraction of the quantizer step, in eighths.
+     * 32 means "merge when the block's mean absolute deviation is within
+     * four quantizer steps", which is far more permissive than the naive
+     * RD arithmetic suggests and is what measured best: sweeping 1x, 2x,
+     * 4x and 8x gave -28.6%, -32.7%, -34.8% and -34.3% BD-rate. Being
+     * stricter is actively harmful - at 1/8x the mean fell to -16.1% and
+     * synthetic content regressed by +26%, because every CU that does
+     * NOT merge still pays the split_transform_flag bin that raising
+     * MaxTbLog2SizeY makes codable, so a merge that does not happen is a
+     * bin spent for nothing. */
+    enc->flat_num = 32;
+    enc->flat_den = 8;
+    {
+        const char *e = getenv("BC250_HEVC_FLAT");
+        if (e) { int v = atoi(e); if (v > 0 && v <= 512) enc->flat_num = v; }
+    }
+
     enc->shortlist_n = 4;
     {
         const char *e = getenv("BC250_HEVC_SHORTLIST");
@@ -404,7 +454,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->scratch_out = malloc(enc->scratch_out_cap);
 
     if (!enc->src_y || !enc->src_cb || !enc->src_cr || !enc->recon_y || !enc->recon_cb ||
-        !enc->recon_cr || !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
+        !enc->recon_cr || !enc->luma_mode_map || !enc->cu_depth_map || !enc->dl_y || !enc->dl_uv ||
         !enc->slice_rbsp || !enc->scratch_out) {
         hevc_encoder_destroy(enc);
         return NULL;
@@ -419,6 +469,7 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->src_y); free(encoder->src_cb); free(encoder->src_cr);
     free(encoder->recon_y); free(encoder->recon_cb); free(encoder->recon_cr);
     free(encoder->luma_mode_map);
+    free(encoder->cu_depth_map);
     free(encoder->mode_shortlist);
     free(encoder->dl_y); free(encoder->dl_uv);
     free(encoder->slice_rbsp);
@@ -505,6 +556,7 @@ static void restore_cu_luma(hevc_encoder_t *enc, int cu_x, int cu_y, const uint8
         memcpy(enc->recon_y + (size_t)(cu_y + y) * cw + cu_x, in + y * 8, 8);
 }
 
+
 /* forced_mode < 0 searches per block (the PART_NxN shape); forced_mode >= 0
  * applies that one mode to all four blocks (the PART_2Nx2N shape, where
  * only one mode is signalled but prediction and reconstruction are still
@@ -582,16 +634,70 @@ static void run_luma_pass(hevc_encoder_t *enc, int cu_x, int cu_y, int forced_mo
         memcpy(p->coeff[pu], coeff, sizeof(coeff));
         p->cbf[pu] = any_nonzero16(coeff);
 
-        int16_t recon_residual[16];
-        hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                enc->recon_y[(py + y) * cw + (px + x)] = clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
+        if (p->cbf[pu]) {
+            int16_t recon_residual[16];
+            hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++)
+                    enc->recon_y[(py + y) * cw + (px + x)] =
+                        clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
+        } else {
+            /* All coefficients zero - reconstruction is the prediction. */
+            for (int y = 0; y < 4; y++)
+                memcpy(&enc->recon_y[(py + y) * cw + px], &pred[y * 4], 4);
+        }
 
         enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = (int8_t)mode;
     }
 
     save_cu_luma(enc, cu_x, cu_y, p->recon);
+}
+
+/* Predict, transform, quantize and reconstruct one square block of a
+ * plane, in place. Returns cbf. Shared by every luma and chroma TU at
+ * every size - the only size-dependent choices are DST (4x4 luma intra
+ * only, 8.6.4.1) and the reference gathering, both handled here. */
+static int code_tu(hevc_encoder_t *enc, uint8_t *src, uint8_t *recon, int stride,
+                    int pw, int ph, int x0, int y0, int log2, int mode, int is_luma,
+                    int16_t *coeff_out) {
+    int n = 1 << log2;
+    int qp = enc->qp;
+
+    hevc_refs_t refs;
+    hevc_gather_refs_sz(recon, stride, pw, ph, x0, y0, log2, is_luma, &refs);
+
+    uint8_t pred[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+    hevc_predict_refs(&refs, log2, mode, is_luma, pred);
+
+    int16_t res[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            res[y * n + x] = (int16_t)(src[(size_t)(y0 + y) * stride + x0 + x] - pred[y * n + x]);
+
+    int use_dst = (is_luma && log2 == 2);
+    hevc_transform_quant(res, log2, qp, use_dst, coeff_out);
+
+    int cbf = 0;
+    for (int i = 0; i < n * n; i++) if (coeff_out[i]) { cbf = 1; break; }
+
+    if (!cbf) {
+        /* Every coefficient quantized to zero, so the inverse transform
+         * would return all zeros and the reconstruction is exactly the
+         * prediction. Worth special-casing rather than computing: on the
+         * flat content that now gets large CUs this is the common case,
+         * and an inverse transform is O(n^3). */
+        for (int y = 0; y < n; y++)
+            memcpy(&recon[(size_t)(y0 + y) * stride + x0], &pred[y * n], (size_t)n);
+        return 0;
+    }
+
+    int16_t rres[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+    hevc_dequant_itransform(coeff_out, log2, qp, use_dst, rres);
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            recon[(size_t)(y0 + y) * stride + x0 + x] =
+                clip8i(pred[y * n + x] + rres[y * n + x]);
+    return cbf;
 }
 
 static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y) {
@@ -611,15 +717,11 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
      * worth of intra_luma_pred_mode at ~1.9 bits each. Signalling one mode
      * per CU instead of four removes up to three quarters of that.
      *
-     * Crucially the two shapes produce the SAME transform tree here, so
-     * nothing else in this encoder has to change: the CU is 8x8 and
-     * MaxTbLog2SizeY is 2, so log2TrafoSize (3) > MaxTbLog2SizeY at
-     * trafoDepth 0 and ITU-T H.265 7.4.9.8 INFERS split_transform_flag = 1
-     * with no bit spent - the same four 4x4 luma TUs and the same single
-     * 4x4 chroma pair that IntraSplitFlag used to force under NxN. The
-     * only syntax difference between the two is the part_mode bin's value
-     * and how many intra_luma_pred_modes follow it. (PART_NxN remains
-     * legal only because 8x8 is MinCbSizeY.)
+     * PART_NxN forces IntraSplitFlag = 1, so its transform tree always
+     * splits into four 4x4 luma TUs. PART_2Nx2N does not, so with
+     * MaxTbLog2SizeY raised to 3 it gets a real third option: one 8x8
+     * transform for the whole CU, chosen below. (PART_NxN remains legal
+     * only because 8x8 is MinCbSizeY.)
      * ------------------------------------------------------------------ */
     uint8_t entry_recon[64];
     save_cu_luma(enc, cu_x, cu_y, entry_recon);
@@ -679,6 +781,14 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         }
     }
 
+    /* A single 8x8 transform for a PART_2Nx2N CU, instead of four 4x4
+     * ones, was built and MEASURED: +0.4% BD-rate and 0.60x speed,
+     * because trialling it costs a whole extra prediction and transform
+     * per CU while the four 4x4 TUs' per-block reconstruction chaining is
+     * worth about as much as the larger transform's energy compaction at
+     * this size. Not kept. The transform-size lever pays off by making
+     * CUs bigger (fewer of them), not by making the transform inside an
+     * 8x8 CU bigger - see encode_ctu(). */
     hevc_cabac_code_part_mode_intra(cab, part_2nx2n);
 
     int *pu_modes = chosen->mode;
@@ -786,7 +896,16 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
      * recursion produces for a CU whose chroma has already hit the 4x4
      * floor - see this file's top comment and x265's own
      * Entropy::encodeTransform(), which this encoder's fixed two-level
-     * structure is a manually-unrolled special case of). */
+     * structure is a manually-unrolled special case of).
+     *
+     * split_transform_flag comes FIRST, before the chroma cbfs, and only
+     * when the tree actually has a choice (7.3.8.8): PART_NxN sets
+     * IntraSplitFlag, which both forces the split and suppresses the
+     * flag, so it is coded only for PART_2Nx2N and only when
+     * MaxTbLog2SizeY allows an 8x8 transform at all. */
+    if (part_2nx2n && enc->max_tb_log2 > 3)
+        hevc_cabac_code_split_transform_flag(cab, 1, 3);
+
     hevc_cabac_code_cbf_chroma(cab, cbf_cb, 0);
     hevc_cabac_code_cbf_chroma(cab, cbf_cr, 0);
 
@@ -810,11 +929,158 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     if (cbf_cr) hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, chroma_scan);
 }
 
+/* One undivided 16x16 CU: a single intra mode, a single 16x16 luma
+ * transform and a single 8x8 chroma pair for the whole CTU.
+ *
+ * This is the lever the transform work exists for. Measured at MaxTb 4,
+ * a 1080p desktop frame cost 9223 bytes at QP 18 and 8633 at QP 38 - a
+ * 13% swing across a 20-QP range, i.e. residual was almost irrelevant
+ * and the entire frame was per-CU syntax at ~2.2 bits each. Coding a
+ * flat CTU as one CU instead of four (each of which may further split
+ * into four PUs) removes three quarters to fifteen sixteenths of that.
+ *
+ * No part_mode is coded: 7.3.8.5 codes it only at MinCbLog2SizeY, so a
+ * 16x16 CU is implicitly PART_2Nx2N. IntraSplitFlag is therefore 0, and
+ * with MaxTbLog2SizeY == 4 the transform tree has a real choice at depth
+ * 0, which is coded as "do not split". */
+static void encode_cu16(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y) {
+    uint32_t cw = enc->coded_width, ch = enc->coded_height;
+    uint32_t ccw = cw / 2, cch = ch / 2;
+    int qp = enc->qp;
+
+    int mpm[3];
+    derive_pu_mpm(enc, cu_x, cu_y, mpm);
+
+    hevc_refs_t refs;
+    hevc_gather_refs_sz(enc->recon_y, (int)cw, (int)cw, (int)ch, cu_x, cu_y, 4, 1, &refs);
+    int mode = hevc_choose_mode_sz(&refs, enc->src_y, (int)cw, cu_x, cu_y, 4, mpm, qp);
+
+    int16_t luma_coeff[256];
+    int cbf_luma = code_tu(enc, enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch,
+                            cu_x, cu_y, 4, mode, 1, luma_coeff);
+
+    for (int by = 0; by < 4; by++)
+        for (int bx = 0; bx < 4; bx++)
+            enc->luma_mode_map[(cu_y / 4 + by) * enc->mode_map_stride + (cu_x / 4 + bx)] = (int8_t)mode;
+
+    /* Chroma is 8x8 here. Its five candidate indices are scored the same
+     * way as at 4x4, on the summed Cb+Cr prediction error. */
+    int cx = cu_x / 2, cy = cu_y / 2;
+    int chroma_idx = 4, chroma_mode = mode;
+    {
+        hevc_refs_t rcb, rcr;
+        hevc_gather_refs_sz(enc->recon_cb, (int)ccw, (int)ccw, (int)cch, cx, cy, 3, 0, &rcb);
+        hevc_gather_refs_sz(enc->recon_cr, (int)ccw, (int)ccw, (int)cch, cx, cy, 3, 0, &rcr);
+        long lambda = hevc_lambda_sad_q8(qp);
+        long best = -1;
+        uint8_t pb[64], pr[64];
+        for (int idx = 0; idx <= 4; idx++) {
+            int m = hevc_chroma_mode_from_idx(idx, mode);
+            hevc_predict_refs(&rcb, 3, m, 0, pb);
+            hevc_predict_refs(&rcr, 3, m, 0, pr);
+            long sad = 0;
+            for (int y = 0; y < 8; y++)
+                for (int x = 0; x < 8; x++) {
+                    int db = enc->src_cb[(cy + y) * ccw + cx + x] - pb[y * 8 + x];
+                    int dr = enc->src_cr[(cy + y) * ccw + cx + x] - pr[y * 8 + x];
+                    sad += (db < 0 ? -db : db) + (dr < 0 ? -dr : dr);
+                }
+            long cost = sad + ((lambda * (idx == 4 ? 1 : 3)) >> 8);
+            if (best < 0 || cost < best) { best = cost; chroma_idx = idx; chroma_mode = m; }
+        }
+    }
+
+    int16_t coeff_cb[64], coeff_cr[64];
+    int cbf_cb = code_tu(enc, enc->src_cb, enc->recon_cb, (int)ccw, (int)ccw, (int)cch,
+                          cx, cy, 3, chroma_mode, 0, coeff_cb);
+    int cbf_cr = code_tu(enc, enc->src_cr, enc->recon_cr, (int)ccw, (int)ccw, (int)cch,
+                          cx, cy, 3, chroma_mode, 0, coeff_cr);
+
+    /* ---- syntax ---- */
+    int pred_idx = hevc_cabac_code_intra_luma_flag(cab, mode, mpm);
+    hevc_cabac_code_intra_luma_data(cab, mode, pred_idx, mpm);
+    hevc_cabac_code_intra_chroma_pred_mode(cab, chroma_idx);
+
+    hevc_cabac_code_split_transform_flag(cab, 0, 4);
+    hevc_cabac_code_cbf_chroma(cab, cbf_cb, 0);
+    hevc_cabac_code_cbf_chroma(cab, cbf_cr, 0);
+
+    hevc_cabac_code_cbf_luma(cab, cbf_luma, 0);
+    /* 7.4.9.11 derives a mode-dependent scan only at log2TrafoSize 2, or
+     * 3 for luma. A 16x16 luma TU and an 8x8 chroma TU are both outside
+     * that, so both scan diagonally. */
+    if (cbf_luma) hevc_cabac_code_residual(cab, luma_coeff, 4, 1, 0);
+    if (cbf_cb) hevc_cabac_code_residual(cab, coeff_cb, 3, 0, 0);
+    if (cbf_cr) hevc_cabac_code_residual(cab, coeff_cr, 3, 0, 0);
+}
+
+/* Is this block flat enough that one big prediction will do?
+ *
+ * Merging four CUs into one saves roughly three CUs' worth of syntax -
+ * measured at ~2.2 bits each - so the RD-justified distortion budget is
+ * lambda_sse * ~6.6 bits, which at QP 27 is well under one grey level of
+ * RMS error per pixel. In other words a merge only pays on content that
+ * is genuinely flat, and the test is whether the block's deviation from
+ * its own mean is small next to the quantizer step - if it is, the
+ * residual quantizes to nothing either way and the big CU is free.
+ *
+ * This is a structure decision taken from the source picture, which is
+ * safe in a way the equivalent MODE decision is not: getting it wrong
+ * costs bits and a little distortion, whereas choosing a prediction mode
+ * against source neighbours desynchronizes the encoder from the decoder
+ * outright (measured at +48% BD-rate, see hevc_intra.h). */
+static int block_is_flat(const hevc_encoder_t *enc, int x0, int y0, int n) {
+    uint32_t cw = enc->coded_width;
+    long sum = 0;
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            sum += enc->src_y[(size_t)(y0 + y) * cw + x0 + x];
+    long mean = sum / (n * n);
+
+    long mad = 0;
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+            long d = (long)enc->src_y[(size_t)(y0 + y) * cw + x0 + x] - mean;
+            mad += d < 0 ? -d : d;
+        }
+    mad = mad / (n * n);
+
+    /* Quantizer step, roughly 2^((qp-4)/6), in 1/16ths to keep it in
+     * integers at low QP. */
+    int qp = enc->qp;
+    long qstep16 = (16L << (qp / 6)) >> 1;
+    if (qp % 6) qstep16 = (qstep16 * (100 + 12 * (qp % 6))) / 100;
+
+    return (mad * 16 * enc->flat_num) <= (qstep16 * enc->flat_den);
+}
+
 static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row) {
     int ctu_x = ctu_col * HEVC_CTU_SIZE, ctu_y = ctu_row * HEVC_CTU_SIZE;
     int cond_l = ctu_col > 0 ? 1 : 0;
     int cond_a = ctu_row > 0 ? 1 : 0;
-    hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
+
+    int split = 1;
+    if (enc->max_tb_log2 >= 4 && block_is_flat(enc, ctu_x, ctu_y, HEVC_CTU_SIZE))
+        split = 0;
+
+    /* 9.3.4.2.2: ctxInc counts neighbours coded at a GREATER depth than
+     * this node. At the CTU root cqtDepth is 0, so that means neighbours
+     * that were themselves split. This was a constant while every CTU
+     * split unconditionally; now it has to read the real depth map. */
+    int mx = ctu_x / 4, my = ctu_y / 4;
+    int cl = cond_l && enc->cu_depth_map[my * enc->mode_map_stride + mx - 1] > 0;
+    int ca = cond_a && enc->cu_depth_map[(my - 1) * enc->mode_map_stride + mx] > 0;
+    hevc_cabac_code_split_cu_flag(cab, split, cl + ca);
+
+    /* Record this CTU's depth for the neighbours that will read it. */
+    for (int by = 0; by < HEVC_CTU_SIZE / 4; by++)
+        memset(&enc->cu_depth_map[(my + by) * enc->mode_map_stride + mx],
+               (uint8_t)split, HEVC_CTU_SIZE / 4);
+
+    if (!split) {
+        encode_cu16(enc, cab, ctu_x, ctu_y);
+        return;
+    }
 
     static const int cu_off_x[4] = { 0, 8, 0, 8 };
     static const int cu_off_y[4] = { 0, 0, 8, 8 };
@@ -962,7 +1228,8 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
                         encoder->coded_width, encoder->coded_height,
                         encoder->width, encoder->height,
-                        hevc_pick_level_idc(encoder->coded_width, encoder->coded_height));
+                        hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
+                        encoder->max_tb_log2);
     total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
 
     {

@@ -154,6 +154,46 @@ static void test_angular_prediction(void) {
     printf("[test_hevc_encode] Angular intra prediction OK (all 33 angular modes).\n");
 }
 
+/*
+ * 4x4 has hand-unrolled gather and prediction paths alongside the generic
+ * any-size ones, because the generic loops have runtime extents the
+ * compiler cannot unroll and 4x4 is the common size (routing it through
+ * the generic form cost ~25% of the frame). Two implementations of the
+ * same thing is exactly how a subtle divergence gets in, so assert they
+ * agree - on every block of a picture, for every mode, both planes.
+ */
+static void test_fast_and_generic_agree(void) {
+    printf("[test_hevc_encode] 4x4 fast path vs generic path...\n");
+    enum { S = 64 };
+    static uint8_t plane[S * S];
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++)
+            plane[y * S + x] = (uint8_t)((x * 11 + y * 7 + ((x ^ y) * 3)) & 0xff);
+
+    for (int is_luma = 0; is_luma <= 1; is_luma++) {
+        for (int y0 = 0; y0 < S; y0 += 4) {
+            for (int x0 = 0; x0 < S; x0 += 4) {
+                hevc_refs_t fast, gen;
+                hevc_gather_refs(plane, S, S, S, x0, y0, is_luma, &fast);
+                hevc_gather_refs_sz(plane, S, S, S, x0, y0, 2, is_luma, &gen);
+                assert(fast.corner == gen.corner && "4x4 gather corner differs");
+                for (int i = 0; i < 8; i++) {
+                    assert(fast.left[i] == gen.left[i] && "4x4 gather left differs");
+                    assert(fast.top[i] == gen.top[i] && "4x4 gather top differs");
+                }
+                for (int mode = 0; mode < HEVC_MODE_COUNT; mode++) {
+                    uint8_t pf[16], pg[16];
+                    hevc_predict_4x4_refs(&fast, mode, is_luma, pf);
+                    hevc_predict_refs(&gen, 2, mode, is_luma, pg);
+                    for (int i = 0; i < 16; i++)
+                        assert(pf[i] == pg[i] && "4x4 fast prediction differs from generic");
+                }
+            }
+        }
+    }
+    printf("[test_hevc_encode] Fast/generic 4x4 paths agree.\n");
+}
+
 /* The mode decision must only ever return a mode this encoder can actually
  * signal and a decoder can actually reproduce (0..34). */
 static void test_mode_decision_range(void) {
@@ -361,6 +401,7 @@ int main(void) {
     test_transform_round_trip_all_sizes();
     test_mpm_derivation();
     test_angular_prediction();
+    test_fast_and_generic_agree();
     test_mode_decision_range();
 
     printf("[test_hevc_encode] Starting H.265 end-to-end bitstream encoding test (GPU-free)...\n");
