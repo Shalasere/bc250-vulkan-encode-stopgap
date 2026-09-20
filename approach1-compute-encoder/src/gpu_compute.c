@@ -1674,7 +1674,8 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
  * co-resident and deadlocks once the dependency graph exceeds
  * occupancy. */
 int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
-                                     int width, int height, int qp) {
+                                     int width, int height,
+                                     int src_width, int src_height, int qp) {
     if (!ctx || !ctx->hevc_wavefront_pipeline) return -1;
     if (src.y_view == VK_NULL_HANDLE) return -1;
 
@@ -1717,7 +1718,8 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
         if (y_hi < y_lo) continue;
         uint32_t count = (uint32_t)(y_hi - y_lo + 1);
 
-        uint32_t pcw[6] = { (uint32_t)width, (uint32_t)height, wc, hc, (uint32_t)qp, s };
+        uint32_t pcw[8] = { (uint32_t)width, (uint32_t)height, wc, hc, (uint32_t)qp, s,
+                             (uint32_t)src_width, (uint32_t)src_height };
         vkCmdPushConstants(cmd_buf, ctx->intra_wavefront_layout,
                             VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcw), pcw);
         vkCmdDispatch(cmd_buf, count, 1, 1);

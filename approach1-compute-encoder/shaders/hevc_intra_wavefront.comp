@@ -78,12 +78,21 @@
 layout(local_size_x = 256) in;
 
 layout(push_constant) uniform PC {
+    /* CODED dimensions - they drive the CTU grid and the extent of the
+     * reconstruction, and are a whole number of CTUs. */
     uint width;
     uint height;
     uint width_ctu;
     uint height_ctu;
     uint qp;
     uint step;
+    /* The SOURCE image's real dimensions, which may be smaller (1080 is
+     * not a multiple of 16). Source reads clamp to these, replicating
+     * the edge exactly as the CPU's pad_replicate() does - an unclamped
+     * imageLoad past the edge returns 0, not the edge pixel, which would
+     * feed a black border into the bottom row's residual. */
+    uint src_width;
+    uint src_height;
 } pc;
 
 layout(set = 0, binding = 0, r8)  uniform readonly image2D srcY;
@@ -192,7 +201,10 @@ shared int  s_cidx, s_cmode;
 shared uint s_nzl;          /* luma cbf, held until the chroma flags join it */
 
 int clip8(int v) { return clamp(v, 0, 255); }
-int srcLuma(int x, int y) { return int(imageLoad(srcY,   ivec2(x, y)).r * 255.0 + 0.5); }
+int srcLuma(int x, int y) {
+    ivec2 p = ivec2(min(x, int(pc.src_width) - 1), min(y, int(pc.src_height) - 1));
+    return int(imageLoad(srcY, p).r * 255.0 + 0.5);
+}
 int recLuma(int x, int y) { return int(imageLoad(reconY, ivec2(x, y)).r * 255.0 + 0.5); }
 
 /* ---- 8.4.4.2.2 gather + substitution ----
@@ -593,7 +605,9 @@ void main() {
 
     int csrc0 = 0, csrc1 = 0;
     if (cthread) {
-        vec2 uv = imageLoad(srcUV, ivec2(cx + cpx, cy + cpy)).rg;
+        ivec2 sp = ivec2(min(cx + cpx, int(pc.src_width) / 2 - 1),
+                         min(cy + cpy, int(pc.src_height) / 2 - 1));
+        vec2 uv = imageLoad(srcUV, sp).rg;
         csrc0 = int(uv.r * 255.0 + 0.5);
         csrc1 = int(uv.g * 255.0 + 0.5);
     }

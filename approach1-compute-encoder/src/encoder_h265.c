@@ -334,6 +334,11 @@ struct hevc_encoder {
      * transform; 2 restores the original spec-minimum behaviour. */
     int max_tb_log2;
 
+    /* Run reconstruction on the GPU (hevc_intra_wavefront.comp) and keep
+     * only CABAC on the CPU. Opt-in: bit-exact for the structure it
+     * supports, but it codes every CTU as one 16x16 CU with no splits. */
+    int use_gpu;
+
     /* CtDepth per 4x4 unit - 0 for an undivided 16x16 CU, 1 for an 8x8
      * one. split_cu_flag's context is derived from the left and above
      * neighbours' depths (9.3.4.2.2), which was a constant while every
@@ -405,6 +410,10 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     {
         const char *e = getenv("BC250_HEVC_SPLIT_RMD");
         enc->use_split_rmd = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
+    }
+    {
+        const char *e = getenv("BC250_HEVC_GPU");
+        enc->use_gpu = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
     }
     enc->max_tb_log2 = 4;
     {
@@ -1089,6 +1098,138 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
 }
 
 /* ============================================================================
+ * GPU path: entropy-code decisions the shader already made
+ *
+ * hevc_intra_wavefront.comp does prediction, transform, quantization and
+ * reconstruction for every CTU and hands back, per CTU: the luma mode,
+ * 384 coefficients (256 luma, 64 Cb, 64 Cr) and a flags word packing
+ * cbf_luma / cbf_cb / cbf_cr and the chroma mode index. All that is left
+ * is the one part that cannot be parallelized - CABAC - which measured
+ * at ~0.7% of the CPU frame.
+ *
+ * The syntax emitted here is exactly encode_cu16()'s, so the two paths
+ * produce the same bitstream shape: every CTU is one undivided 16x16 CU,
+ * which is why split_cu_flag is 0, part_mode is absent (7.3.8.5 codes it
+ * only at MinCbLog2SizeY) and split_transform_flag is 0.
+ * ==========================================================================*/
+static int encode_core_gpu(hevc_encoder_t *enc,
+                            const int32_t *gmodes, const int32_t *gcoeffs,
+                            const uint32_t *gflags,
+                            uint8_t *output_buf, size_t output_size)
+{
+    uint32_t wc = enc->width_ctu, hc = enc->height_ctu;
+
+    memset(enc->luma_mode_map, 0,
+           (size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
+    memset(enc->cu_depth_map, 0,
+           (size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
+
+    bitstream_t slice_bs;
+    bs_init(&slice_bs, enc->slice_rbsp, enc->slice_rbsp_cap);
+    bs_write1(&slice_bs, 1);            /* first_slice_segment_in_pic_flag */
+    bs_write1(&slice_bs, 1);            /* no_output_of_prior_pics_flag */
+    bs_write_ue(&slice_bs, 0);          /* slice_pic_parameter_set_id */
+    bs_write_ue(&slice_bs, 2);          /* slice_type = I */
+    bs_write_se(&slice_bs, 0);          /* slice_qp_delta */
+    bs_write1(&slice_bs, 1);            /* slice_loop_filter_across_slices_enabled_flag */
+    bs_rbsp_trailing_bits(&slice_bs);   /* byte_alignment() - see encode_core */
+
+    hevc_cabac_t cab;
+    hevc_cabac_init(&cab, &slice_bs);
+    hevc_cabac_reset_contexts(&cab, enc->qp);
+    hevc_cabac_start(&cab);
+
+    int16_t coef[256];
+    uint32_t total_ctus = wc * hc;
+    uint32_t idx = 0;
+
+    for (uint32_t row = 0; row < hc; row++) {
+        for (uint32_t col = 0; col < wc; col++) {
+            uint32_t ci = row * wc + col;
+            int cu_x = (int)col * HEVC_CTU_SIZE, cu_y = (int)row * HEVC_CTU_SIZE;
+            int mode = gmodes[ci];
+            if (mode < 0 || mode >= HEVC_MODE_COUNT) mode = HEVC_MODE_DC;
+            uint32_t flags = gflags[ci];
+            int cbf_luma = (int)(flags & 1u);
+            int cbf_cb   = (int)((flags >> 1) & 1u);
+            int cbf_cr   = (int)((flags >> 2) & 1u);
+            int chroma_idx = (int)((flags >> 8) & 0xffu);
+            if (chroma_idx > 4) chroma_idx = 4;
+            int chroma_mode = hevc_chroma_mode_from_idx(chroma_idx, mode);
+
+            /* Every CTU is one 16x16 CU, so depth 0 everywhere and the
+             * split_cu_flag context is always 0 + 0. */
+            hevc_cabac_code_split_cu_flag(&cab, 0, 0);
+
+            int mpm[3];
+            derive_pu_mpm(enc, cu_x, cu_y, mpm);
+            int pred_idx = hevc_cabac_code_intra_luma_flag(&cab, mode, mpm);
+            hevc_cabac_code_intra_luma_data(&cab, mode, pred_idx, mpm);
+            hevc_cabac_code_intra_chroma_pred_mode(&cab, chroma_idx);
+
+            /* The mode map has to be updated as we go: the next CTU's MPM
+             * list reads it. */
+            for (int by = 0; by < HEVC_CTU_SIZE / 4; by++)
+                for (int bx = 0; bx < HEVC_CTU_SIZE / 4; bx++)
+                    enc->luma_mode_map[(cu_y / 4 + by) * enc->mode_map_stride + (cu_x / 4 + bx)] =
+                        (int8_t)mode;
+
+            hevc_cabac_code_split_transform_flag(&cab, 0, 4);
+            hevc_cabac_code_cbf_chroma(&cab, cbf_cb, 0);
+            hevc_cabac_code_cbf_chroma(&cab, cbf_cr, 0);
+            hevc_cabac_code_cbf_luma(&cab, cbf_luma, 0);
+
+            const int32_t *src = &gcoeffs[(size_t)ci * 384];
+            /* 16x16 luma and 8x8 chroma are both outside the sizes
+             * 7.4.9.11 gives a mode-dependent scan, so all three are
+             * diagonal. */
+            if (cbf_luma) {
+                for (int i = 0; i < 256; i++) coef[i] = (int16_t)src[i];
+                hevc_cabac_code_residual(&cab, coef, 4, 1, 0);
+            }
+            if (cbf_cb) {
+                for (int i = 0; i < 64; i++) coef[i] = (int16_t)src[256 + i];
+                hevc_cabac_code_residual(&cab, coef, 3, 0, 0);
+            }
+            if (cbf_cr) {
+                for (int i = 0; i < 64; i++) coef[i] = (int16_t)src[320 + i];
+                hevc_cabac_code_residual(&cab, coef, 3, 0, 0);
+            }
+            (void)chroma_mode;
+
+            idx++;
+            hevc_cabac_encode_terminate(&cab, idx == total_ctus ? 1 : 0);
+        }
+    }
+
+    hevc_cabac_finish(&cab);
+    bs_rbsp_trailing_bits(&slice_bs);
+
+    size_t total = 0;
+    total += write_vps(enc->scratch_out + total, enc->scratch_out_cap - total);
+    total += write_sps(enc->scratch_out + total, enc->scratch_out_cap - total,
+                        enc->coded_width, enc->coded_height, enc->width, enc->height,
+                        hevc_pick_level_idc(enc->coded_width, enc->coded_height),
+                        enc->max_tb_log2);
+    total += write_pps(enc->scratch_out + total, enc->scratch_out_cap - total, enc->qp);
+    {
+        bitstream_t out_bs;
+        bs_init(&out_bs, enc->scratch_out + total, enc->scratch_out_cap - total);
+        bs_write_nal_header_hevc(&out_bs, NAL_UNIT_CODED_SLICE_IDR_W_RADL);
+        size_t off = bs_bytes_written(&out_bs);
+        size_t ebsp = bs_rbsp_to_ebsp(enc->scratch_out + total + off,
+                                       enc->scratch_out_cap - total - off,
+                                       enc->slice_rbsp, bs_bytes_written(&slice_bs));
+        total += off + ebsp;
+    }
+
+    if (total > output_size) return -1;
+    memcpy(output_buf, enc->scratch_out, total);
+    enc->frame_count++;
+    return (int)total;
+}
+
+/* ============================================================================
  * Frame entry point
  * ==========================================================================*/
 
@@ -1287,6 +1428,35 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
      * its coefficient/motion output entirely - HEVC's own transform/quant
      * math is done independently in encode_core() above, see this file's
      * top comment). */
+    /* GPU reconstruction path. Opt-in for now: it is bit-exact against
+     * the CPU for the structure it supports (one undivided 16x16 CU per
+     * CTU) but does not yet implement the split cases, so it trades some
+     * compression for a large amount of speed. */
+    if (encoder->use_gpu && gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        if (gpu_compute_begin_picture(gpu_ctx, input_surface) == 0 &&
+            gpu_compute_hevc_dispatch_intra(gpu_ctx, input_surface,
+                                             (int)encoder->coded_width, (int)encoder->coded_height,
+                                             (int)encoder->width, (int)encoder->height,
+                                             encoder->qp) == 0) {
+            gpu_compute_end_picture(gpu_ctx);
+            gpu_compute_sync(gpu_ctx);
+
+            void *mp = NULL, *cp = NULL, *fp = NULL;
+            size_t mn = 0, cn = 0, fn = 0;
+            if (gpu_compute_get_quant_staging_data(gpu_ctx, &mp, &mn) == 0 &&
+                gpu_compute_get_coeff_staging_data(gpu_ctx, &cp, &cn) == 0 &&
+                gpu_compute_get_pred_mode_staging_data(gpu_ctx, &fp, &fn) == 0) {
+                return encode_core_gpu(encoder, (const int32_t *)mp, (const int32_t *)cp,
+                                        (const uint32_t *)fp, output_buf, output_size);
+            }
+            fprintf(stderr, "[bc250-h265] GPU readback failed, falling back to CPU\n");
+        } else {
+            fprintf(stderr, "[bc250-h265] GPU dispatch unavailable, falling back to CPU\n");
+        }
+        /* Fall through to the CPU path below rather than failing the
+         * frame - a missing shader must not take the encoder down. */
+    }
+
     if (gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
         gpu_compute_begin_picture(gpu_ctx, input_surface);
         gpu_compute_dispatch_encode(gpu_ctx, input_surface, encoder->width, encoder->height,

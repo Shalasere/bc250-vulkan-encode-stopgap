@@ -355,9 +355,20 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
  * flags into the same device buffers the H.264 path uses (read back with
  * gpu_compute_get_quant_staging_data() / _coeff_ / _pred_mode_), and the
  * reconstruction into ctx->recon_image. Returns -1 if the pipeline is
- * unavailable, in which case the caller should stay on the CPU path. */
+ * unavailable, in which case the caller should stay on the CPU path.
+ *
+ * `width`/`height` are the CODED dimensions (a whole number of CTUs) and
+ * set both the CTU grid and the size of the reconstruction image.
+ * `src_width`/`src_height` are the real source image's, which may be
+ * smaller - source reads clamp to them, replicating the edge the way the
+ * CPU's pad_replicate() does. Allocating the reconstruction at the coded
+ * size matters: at surface height the bottom CTU row's rows past the
+ * picture would be dropped by out-of-range imageStore, and the CTU to
+ * its right would then read zeros as left references for its VISIBLE
+ * rows. */
 int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
-                                     int width, int height, int qp);
+                                     int width, int height,
+                                     int src_width, int src_height, int qp);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);
