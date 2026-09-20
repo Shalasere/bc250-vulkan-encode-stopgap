@@ -525,16 +525,11 @@ int hevc_choose_luma_mode_refs(const hevc_refs_t *refs, const uint8_t *src_y, in
 
 /* ===================== transform (8.6.4) ===================== */
 
-/* Public/standard 4x4 integer DCT-II matrix (ITU-T H.265 8.6.4.1's
- * transMatrix for nTbS=4; identical to H.264's and every other MPEG-family
- * codec's 4-point integer DCT approximation). Cross-checked against
- * x265's source/common/constants.cpp g_t4[][] - same standard values. */
-static const int16_t DCT4[4][4] = {
-    { 64,  64,  64,  64 },
-    { 83,  36, -36, -83 },
-    { 64, -64, -64,  64 },
-    { 36, -83,  83, -36 }
-};
+/* The 4x4 DCT-II matrix is no longer written out here - it is derived
+ * from DCT32_HALF below, because HEVC's matrices nest exactly. The
+ * familiar {64,64,64,64},{83,36,-36,-83},... values are asserted against
+ * that derivation in tests/test_hevc_encode.c, where they are an
+ * independent restatement rather than this file checking itself. */
 
 /* Public/standard 4x4 DST-VII "alternative transform" matrix, used ONLY
  * for 4x4 luma intra residuals (ITU-T H.265 8.6.4.1: "if cIdx is equal to
@@ -551,69 +546,74 @@ static const int16_t DST4[4][4] = {
     { 55, -84,  74, -29 }
 };
 
+/* ---------------------------------------------------------------------
+ * Rec. ITU-T H.265 8.6.4.2 transMatrix, for nTbS = 32.
+ *
+ * Only the left half of each row is stored. The DCT-II basis satisfies
+ * M[i][N-1-j] = (-1)^i * M[i][j], so even rows mirror and odd rows mirror
+ * negated - 512 entries instead of 1024, and the symmetry is a property
+ * of the transform rather than a coincidence of the table.
+ *
+ * Every smaller size comes from this one table rather than being
+ * transcribed separately, because HEVC's matrices nest exactly:
+ * M_{N/2}[i][j] == M_N[2i][j], hence M_N[i][j] == M32[i * (32/N)][j].
+ * That is load-bearing for correctness here, not just compactness - it
+ * means the 4x4 matrix derived from this table must come out identical
+ * to the DCT4 table below, which has already been validated end to end
+ * against a real decoder. tests/test_hevc_encode.c asserts exactly that,
+ * along with orthogonality and the mirror symmetry, which between them
+ * catch any single transcription slip. The values cannot be generated
+ * from cos() - the low-frequency entries (83, 36) inherit H.264's
+ * deliberate deviations from the exact basis.
+ * ------------------------------------------------------------------- */
+static const int8_t DCT32_HALF[32][16] = {
+    { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64 },
+    { 90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13,  4 },
+    { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90 },
+    { 90, 82, 67, 46, 22, -4,-31,-54,-73,-85,-90,-88,-78,-61,-38,-13 },
+    { 89, 75, 50, 18,-18,-50,-75,-89,-89,-75,-50,-18, 18, 50, 75, 89 },
+    { 88, 67, 31,-13,-54,-82,-90,-78,-46, -4, 38, 73, 90, 85, 61, 22 },
+    { 87, 57,  9,-43,-80,-90,-70,-25, 25, 70, 90, 80, 43, -9,-57,-87 },
+    { 85, 46,-13,-67,-90,-73,-22, 38, 82, 88, 54, -4,-61,-90,-78,-31 },
+    { 83, 36,-36,-83,-83,-36, 36, 83, 83, 36,-36,-83,-83,-36, 36, 83 },
+    { 82, 22,-54,-90,-61, 13, 78, 85, 31,-46,-90,-67,  4, 73, 88, 38 },
+    { 80,  9,-70,-87,-25, 57, 90, 43,-43,-90,-57, 25, 87, 70, -9,-80 },
+    { 78, -4,-82,-73, 13, 85, 67,-22,-88,-61, 31, 90, 54,-38,-90,-46 },
+    { 75,-18,-89,-50, 50, 89, 18,-75,-75, 18, 89, 50,-50,-89,-18, 75 },
+    { 73,-31,-90,-22, 78, 67,-38,-90,-13, 82, 61,-46,-88, -4, 85, 54 },
+    { 70,-43,-87,  9, 90, 25,-80,-57, 57, 80,-25,-90, -9, 87, 43,-70 },
+    { 67,-54,-78, 38, 85,-22,-90,  4, 90, 13,-88,-31, 82, 46,-73,-61 },
+    { 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64 },
+    { 61,-73,-46, 82, 31,-88,-13, 90, -4,-90, 22, 85,-38,-78, 54, 67 },
+    { 57,-80,-25, 90, -9,-87, 43, 70,-70,-43, 87,  9,-90, 25, 80,-57 },
+    { 54,-85, -4, 88,-46,-61, 82, 13,-90, 38, 67,-78,-22, 90,-31,-73 },
+    { 50,-89, 18, 75,-75,-18, 89,-50,-50, 89,-18,-75, 75, 18,-89, 50 },
+    { 46,-90, 38, 54,-90, 31, 61,-88, 22, 67,-85, 13, 73,-82,  4, 78 },
+    { 43,-90, 57, 25,-87, 70,  9,-80, 80, -9,-70, 87,-25,-57, 90,-43 },
+    { 38,-88, 73, -4,-67, 90,-46,-31, 85,-78, 13, 61,-90, 54, 22,-82 },
+    { 36,-83, 83,-36,-36, 83,-83, 36, 36,-83, 83,-36,-36, 83,-83, 36 },
+    { 31,-78, 90,-61,  4, 54,-88, 82,-38,-22, 73,-90, 67,-13,-46, 85 },
+    { 25,-70, 90,-80, 43,  9,-57, 87,-87, 57, -9,-43, 80,-90, 70,-25 },
+    { 22,-61, 85,-90, 73,-38, -4, 46,-78, 90,-82, 54,-13,-31, 67,-88 },
+    { 18,-50, 75,-89, 89,-75, 50,-18,-18, 50,-75, 89,-89, 75,-50, 18 },
+    { 13,-38, 61,-78, 88,-90, 85,-73, 54,-31,  4, 22,-46, 67,-82, 90 },
+    {  9,-25, 43,-57, 70,-80, 87,-90, 90,-87, 80,-70, 57,-43, 25, -9 },
+    {  4,-13, 22,-31, 38,-46, 54,-61, 67,-73, 78,-82, 85,-88, 90,-90 }
+};
+
+/* transMatrix entry for an nTbS = (1<<log2n) transform, row i, column j. */
+int hevc_transform_matrix(int log2n, int i, int j) {
+    int row = i << (5 - log2n);           /* M_N[i][j] == M32[i * 32/N][j] */
+    return (j < 16) ? DCT32_HALF[row][j]
+                    : ((row & 1) ? -DCT32_HALF[row][31 - j] : DCT32_HALF[row][31 - j]);
+}
+
 static inline int32_t clip_coeff(int32_t v) {
     if (v > 32767) return 32767;
     if (v < -32768) return -32768;
     return v;
 }
 
-/* Forward 2D separable transform, matrix M applied directly (not
- * transposed) along both axes. Shift split (1, 8) - chosen so that, paired
- * with the spec-mandated inverse shifts below (7, 12 for 8-bit), a
- * forward-then-inverse round trip with no quantization in between
- * reproduces the original residual exactly for a constant (DC-only) input:
- * forward stage1 shift=1 add=1, stage2 shift=8 add=128 -> for a constant
- * input v, coeff[0][0] = 128*v (verified by hand: row0 of M is {64,64,64,64}
- * so a per-axis DC gain of 4*64=256=2^8; after forward's own /2^1 then
- * /2^8 net divide of 2^9, combined per-axis, the DC coefficient comes out
- * to 128*v); the inverse below then recovers exactly v from that (see its
- * own comment). Non-DC content is NOT expected to be bit-exact through
- * this round trip (that's inherent to any integer DCT/DST approximation,
- * including the real x265/HM ones - see this file's header comment), only
- * well-scaled - forward quantization error is what's supposed to make the
- * picture lossy, not a transform bug. */
-static void forward_transform_4x4(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
-    int32_t tmp[4][4];
-    for (int c = 0; c < 4; c++) {
-        for (int i = 0; i < 4; i++) {
-            int32_t sum = 0;
-            for (int r = 0; r < 4; r++) sum += (int32_t)M[i][r] * residual[r * 4 + c];
-            tmp[i][c] = (sum + 1) >> 1;
-        }
-    }
-    for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
-            int32_t sum = 0;
-            for (int c = 0; c < 4; c++) sum += (int32_t)M[j][c] * tmp[i][c];
-            out[i * 4 + j] = (sum + 128) >> 8;
-        }
-    }
-}
-
-/* Inverse 2D separable transform, matrix M applied in TRANSPOSED form
- * (M[k][idx], k summed) along both axes, with the spec-mandated shifts for
- * 8-bit content (ITU-T H.265 8.6.4.2): stage1 shift=7/add=64 (fixed,
- * independent of bit depth), stage2 shift = 20-BitDepth = 12/add=2048.
- * This exact process is what a real HEVC decoder performs, and this
- * encoder uses the SAME code for its own reconstruction chaining, so the
- * two are trivially identical by construction. */
-static void inverse_transform_4x4(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
-    int32_t tmp[4][4];
-    for (int c = 0; c < 4; c++) {
-        for (int r = 0; r < 4; r++) {
-            int32_t sum = 0;
-            for (int k = 0; k < 4; k++) sum += (int32_t)M[k][r] * coeff[k * 4 + c];
-            tmp[r][c] = clip_coeff((sum + 64) >> 7);
-        }
-    }
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 4; c++) {
-            int32_t sum = 0;
-            for (int k = 0; k < 4; k++) sum += (int32_t)M[k][c] * tmp[r][k];
-            out[r * 4 + c] = (int16_t)clip_coeff((sum + 2048) >> 12);
-        }
-    }
-}
 
 /* ===================== quantization (8.6.3) ===================== */
 
@@ -631,39 +631,211 @@ static const int levelScale[6] = { 40, 45, 51, 57, 64, 72 };
 #define HEVC_BDSHIFT 5
 #define HEVC_FLAT_M  16
 
-static int32_t dequant_level(int32_t level, int qp) {
+/* bdShift grows with the transform size - ITU-T H.265 8.6.3 defines it as
+ * BitDepth + Log2(nTbS) - 5, which is the 5 above only for nTbS == 4.
+ * Using the 4x4 value at every size would decode to a real picture at
+ * systematically the wrong amplitude per size, which is exactly the
+ * "syntactically valid, content garbage" failure this module's header
+ * warns about. */
+static inline int bdshift_for(int log2_size) { return 8 + log2_size - 5; }
+
+static int32_t dequant_level_sz(int32_t level, int qp, int log2_size) {
     int per = qp / 6, rem = qp % 6;
+    int bdshift = bdshift_for(log2_size);
     int64_t val = (int64_t)level * HEVC_FLAT_M * levelScale[rem];
     val <<= per;
-    val = (val + (1 << (HEVC_BDSHIFT - 1))) >> HEVC_BDSHIFT;
+    val = (val + ((int64_t)1 << (bdshift - 1))) >> bdshift;
     return clip_coeff((int32_t)val);
 }
 
-static int32_t quantize_coeff(int32_t coeff_raw, int qp) {
+static int32_t quantize_coeff_sz(int32_t coeff_raw, int qp, int log2_size) {
     int per = qp / 6, rem = qp % 6;
+    int bdshift = bdshift_for(log2_size);
     int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
     int sign = coeff_raw < 0 ? -1 : 1;
     int64_t mag = coeff_raw < 0 ? -(int64_t)coeff_raw : (int64_t)coeff_raw;
-    int64_t num = mag << HEVC_BDSHIFT;
+    int64_t num = mag << bdshift;
     int64_t level = (num + denom / 2) / denom;
     return (int32_t)(sign * level);
 }
 
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]) {
-    int32_t raw[16];
-    forward_transform_4x4(residual, use_dst ? DST4 : DCT4, raw);
-    for (int i = 0; i < 16; i++) {
-        int32_t level = quantize_coeff(raw[i], qp);
+    hevc_transform_quant(residual, 2, qp, use_dst, coeff_out);
+}
+
+void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
+                                  int16_t residual_out[16]) {
+    hevc_dequant_itransform(coeff, 2, qp, use_dst, residual_out);
+}
+
+/* ===================== generalized transform (any nTbS) ===================== */
+
+/* Materialize this size's transMatrix. Cheap next to the transform
+ * itself (1024 writes against 65536 multiply-accumulates at 32x32) and
+ * avoids both a lazily-initialized shared table - this driver has no
+ * locking anywhere - and a branch in the inner loop. */
+static void build_matrix(int log2n, int use_dst, int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE]) {
+    int n = 1 << log2n;
+    if (use_dst && log2n == 2) {
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++) M[i][j] = DST4[i][j];
+        return;
+    }
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            M[i][j] = (int16_t)hevc_transform_matrix(log2n, i, j);
+}
+
+/* Forward 2D separable transform. The shifts are size-dependent:
+ * (log2n + BitDepth - 9, log2n + 6), which for log2n == 2 is the (1, 8)
+ * the 4x4-only code used, so this is a strict generalization of a path
+ * already validated against a real decoder. The pair is what makes a
+ * forward-then-inverse round trip of a DC-only block reproduce its input
+ * for EVERY size: per axis the DC gain is 64*n, so 2D it is 4096*n^2,
+ * and dividing by 2^(log2n+BitDepth-9) * 2^(log2n+6) = 32*n^2 leaves
+ * 128*v - exactly what the normative inverse's fixed (7, 20-BitDepth)
+ * shifts turn back into v. */
+static void forward_transform(const int16_t *residual, int log2n,
+                               const int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE], int32_t *out) {
+    int n = 1 << log2n;
+    int shift1 = log2n + 8 - 9;
+    int shift2 = log2n + 6;
+    int32_t add1 = 1 << (shift1 - 1);
+    int32_t add2 = 1 << (shift2 - 1);
+    /* Stack, deliberately not static: this driver has no locking anywhere
+     * and ffmpeg calls into it from more than one thread, so shared
+     * mutable scratch would be a real race. 4 KB at the largest size. */
+    int32_t tmp[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+
+    for (int c = 0; c < n; c++)
+        for (int i = 0; i < n; i++) {
+            int32_t sum = 0;
+            for (int r = 0; r < n; r++) sum += (int32_t)M[i][r] * residual[r * n + c];
+            tmp[i * n + c] = (sum + add1) >> shift1;
+        }
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            int32_t sum = 0;
+            for (int c = 0; c < n; c++) sum += (int32_t)M[j][c] * tmp[i * n + c];
+            out[i * n + j] = (sum + add2) >> shift2;
+        }
+}
+
+/* Inverse 2D separable transform, matrix applied transposed, with the
+ * spec-mandated shifts of 8.6.4.2: stage 1 is 7 regardless of size or
+ * bit depth, stage 2 is 20 - BitDepth. This is bit-exactly what a
+ * decoder performs, and the encoder reconstructs with the same code. */
+static void inverse_transform(const int16_t *coeff, int log2n,
+                               const int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE], int16_t *out) {
+    int n = 1 << log2n;
+    int32_t tmp[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+
+    for (int c = 0; c < n; c++)
+        for (int r = 0; r < n; r++) {
+            int32_t sum = 0;
+            for (int k = 0; k < n; k++) sum += (int32_t)M[k][r] * coeff[k * n + c];
+            tmp[r * n + c] = clip_coeff((sum + 64) >> 7);
+        }
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++) {
+            int32_t sum = 0;
+            for (int k = 0; k < n; k++) sum += (int32_t)M[k][c] * tmp[r * n + k];
+            out[r * n + c] = (int16_t)clip_coeff((sum + 2048) >> 12);
+        }
+}
+
+/* The nTbS == 4 matrix, written out rather than derived. It is the
+ * overwhelmingly common size and the generalized loops below cannot be
+ * unrolled by the compiler because their extent is a runtime value -
+ * routing 4x4 through them cost ~60% more transform time. Correctness is
+ * not taken on trust: tests/test_hevc_encode.c asserts this equals
+ * hevc_transform_matrix(2, i, j), the canonical derivation from
+ * DCT32_HALF, so the two cannot drift apart. */
+static const int16_t DCT4_FAST[4][4] = {
+    { 64,  64,  64,  64 },
+    { 83,  36, -36, -83 },
+    { 64, -64, -64,  64 },
+    { 36, -83,  83, -36 }
+};
+
+const int16_t *hevc_transform_matrix4(int use_dst) {
+    return use_dst ? &DST4[0][0] : &DCT4_FAST[0][0];
+}
+
+/* Fixed-extent 4x4 forward/inverse. Same arithmetic as the general path
+ * at log2n == 2: shifts (1, 8) forward and the normative (7, 12)
+ * inverse. */
+static void forward_transform_4(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
+    int32_t tmp[16];
+    for (int c = 0; c < 4; c++)
+        for (int i = 0; i < 4; i++) {
+            int32_t sum = 0;
+            for (int r = 0; r < 4; r++) sum += (int32_t)M[i][r] * residual[r * 4 + c];
+            tmp[i * 4 + c] = (sum + 1) >> 1;
+        }
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) {
+            int32_t sum = 0;
+            for (int c = 0; c < 4; c++) sum += (int32_t)M[j][c] * tmp[i * 4 + c];
+            out[i * 4 + j] = (sum + 128) >> 8;
+        }
+}
+
+static void inverse_transform_4(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
+    int32_t tmp[16];
+    for (int c = 0; c < 4; c++)
+        for (int r = 0; r < 4; r++) {
+            int32_t sum = 0;
+            for (int k = 0; k < 4; k++) sum += (int32_t)M[k][r] * coeff[k * 4 + c];
+            tmp[r * 4 + c] = clip_coeff((sum + 64) >> 7);
+        }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            int32_t sum = 0;
+            for (int k = 0; k < 4; k++) sum += (int32_t)M[k][c] * tmp[r * 4 + k];
+            out[r * 4 + c] = (int16_t)clip_coeff((sum + 2048) >> 12);
+        }
+}
+
+void hevc_transform_quant(const int16_t *residual, int log2_size, int qp, int use_dst,
+                           int16_t *coeff_out) {
+    if (log2_size == 2) {
+        int32_t raw4[16];
+        forward_transform_4(residual, use_dst ? DST4 : DCT4_FAST, raw4);
+        for (int i = 0; i < 16; i++) {
+            int32_t level = quantize_coeff_sz(raw4[i], qp, 2);
+            if (level > 32767) level = 32767;
+            if (level < -32768) level = -32768;
+            coeff_out[i] = (int16_t)level;
+        }
+        return;
+    }
+    int n = 1 << log2_size;
+    int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE];
+    int32_t raw[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+    build_matrix(log2_size, use_dst, M);
+    forward_transform(residual, log2_size, M, raw);
+    for (int i = 0; i < n * n; i++) {
+        int32_t level = quantize_coeff_sz(raw[i], qp, log2_size);
         if (level > 32767) level = 32767;
         if (level < -32768) level = -32768;
         coeff_out[i] = (int16_t)level;
     }
 }
 
-void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
-                                  int16_t residual_out[16]) {
-    int16_t dq[16];
-    for (int i = 0; i < 16; i++) dq[i] = (int16_t)dequant_level(coeff[i], qp);
-    inverse_transform_4x4(dq, use_dst ? DST4 : DCT4, residual_out);
+void hevc_dequant_itransform(const int16_t *coeff, int log2_size, int qp, int use_dst,
+                              int16_t *residual_out) {
+    if (log2_size == 2) {
+        int16_t dq4[16];
+        for (int i = 0; i < 16; i++) dq4[i] = (int16_t)dequant_level_sz(coeff[i], qp, 2);
+        inverse_transform_4(dq4, use_dst ? DST4 : DCT4_FAST, residual_out);
+        return;
+    }
+    int n = 1 << log2_size;
+    int16_t M[HEVC_MAX_TB_SIZE][HEVC_MAX_TB_SIZE];
+    int16_t dq[HEVC_MAX_TB_SIZE * HEVC_MAX_TB_SIZE];
+    build_matrix(log2_size, use_dst, M);
+    for (int i = 0; i < n * n; i++) dq[i] = (int16_t)dequant_level_sz(coeff[i], qp, log2_size);
+    inverse_transform(dq, log2_size, M, residual_out);
 }

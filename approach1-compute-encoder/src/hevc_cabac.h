@@ -83,7 +83,9 @@ extern "C" {
 #define HEVC_CTX_LAST_Y      74   /* 18 contexts */
 #define HEVC_CTX_ONE_FLAG    92   /* 24 contexts: 0-15 luma, 16-23 chroma */
 #define HEVC_CTX_ABS_FLAG   116   /* 6 contexts: 0-3 luma, 4-5 chroma */
-#define HEVC_NUM_CTX        122
+#define HEVC_CTX_SIG_CG     122   /* 4 contexts: 0-1 luma, 2-3 chroma (coded_sub_block_flag) */
+#define HEVC_CTX_TRANS_SUBDIV 126 /* 3 contexts: split_transform_flag, by 5-log2TrafoSize */
+#define HEVC_NUM_CTX        129
 
 typedef struct {
     /* Output sink: a plain bit-level bitstream_t (bitstream.h/.c, the same
@@ -195,6 +197,26 @@ void hevc_cabac_code_cbf_chroma(hevc_cabac_t *cb, int cbf, int trafo_depth);
  * hevc_scan_idx_for_mode()). */
 void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
                                    int is_luma, int scan_idx);
+
+/* residual_coding() for a transform block of any HEVC size: log2_size in
+ * 2..5, coefficients row-major with stride (1<<log2_size), known to have
+ * at least one nonzero (the caller checks cbf and skips otherwise).
+ *
+ * Above 4x4 a transform block is several 4x4 coefficient groups, which
+ * brings in everything the 4x4-only coder could skip: coded_sub_block_
+ * flag with its neighbour-derived context, the last-position prefix's
+ * size-dependent context offset/shift plus a bypass suffix, the
+ * neighbouring-group pattern that drives sig_coeff_flag contexts, a
+ * ctxSet that carries greater1 state across groups, and the DC-
+ * coefficient inference for groups whose flag was explicitly coded. */
+void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_size,
+                               int is_luma, int scan_idx);
+
+/* split_transform_flag. Only coded when the transform tree has a real
+ * choice: log2TrafoSize <= MaxTbLog2SizeY, > MinTbLog2SizeY, trafoDepth
+ * < MaxTrafoDepth, and not already forced by IntraSplitFlag at depth 0
+ * (7.3.8.8). ctxInc is 5 - log2TrafoSize. */
+void hevc_cabac_code_split_transform_flag(hevc_cabac_t *cb, int split, int log2_size);
 
 #ifdef __cplusplus
 }

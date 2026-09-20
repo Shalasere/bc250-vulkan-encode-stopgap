@@ -177,6 +177,140 @@ static void test_mode_decision_range(void) {
     printf("[test_hevc_encode] Mode decision range OK.\n");
 }
 
+/*
+ * The 32x32 transMatrix is 512 hand-written numbers, and a single wrong
+ * digit would produce a bitstream that decodes to a real-looking picture
+ * with subtly wrong content - the failure mode this codebase keeps
+ * hitting. These four properties between them pin the whole table down
+ * without needing to restate it.
+ */
+static void test_transform_matrix(void) {
+    printf("[test_hevc_encode] Transform matrix (nesting, 4x4 anchor, symmetry, orthogonality)...\n");
+
+    /* 1. The 4x4 anchor, restated independently of hevc_intra.c. These
+     *    exact values have been validated end-to-end against ffmpeg, and
+     *    every larger matrix is built from the same table, so if the
+     *    derivation reproduces them the low-frequency structure is right. */
+    static const int dct4[4][4] = {
+        { 64,  64,  64,  64 },
+        { 83,  36, -36, -83 },
+        { 64, -64, -64,  64 },
+        { 36, -83,  83, -36 }
+    };
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            assert(hevc_transform_matrix(2, i, j) == dct4[i][j] &&
+                   "derived 4x4 matrix does not match the decoder-validated one");
+
+    /* 1b. The fast path uses a written-out 4x4 matrix instead of the
+     *     derivation, for speed. It must be the same numbers. */
+    const int16_t *fast4 = hevc_transform_matrix4(0);
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            assert(fast4[i * 4 + j] == hevc_transform_matrix(2, i, j) &&
+                   "the fast 4x4 matrix has drifted from the canonical derivation");
+
+    /* 2. The 8x8 matrix, also independently restated - it is the size
+     *    that introduces the odd rows the 4x4 subsampling skips. */
+    static const int dct8[8][8] = {
+        { 64, 64, 64, 64, 64, 64, 64, 64 },
+        { 89, 75, 50, 18,-18,-50,-75,-89 },
+        { 83, 36,-36,-83,-83,-36, 36, 83 },
+        { 75,-18,-89,-50, 50, 89, 18,-75 },
+        { 64,-64,-64, 64, 64,-64,-64, 64 },
+        { 50,-89, 18, 75,-75,-18, 89,-50 },
+        { 36,-83, 83,-36,-36, 83,-83, 36 },
+        { 18,-50, 75,-89, 89,-75, 50,-18 }
+    };
+    for (int i = 0; i < 8; i++)
+        for (int j = 0; j < 8; j++)
+            assert(hevc_transform_matrix(3, i, j) == dct8[i][j] && "derived 8x8 matrix wrong");
+
+    /* 3. Nesting: HEVC's matrices satisfy M_{N/2}[i][j] == M_N[2i][j].
+     *    This chains 32 -> 16 -> 8 -> 4, so the anchors above constrain
+     *    the even rows of every larger size. */
+    for (int log2n = 3; log2n <= 5; log2n++) {
+        int half = 1 << (log2n - 1);
+        for (int i = 0; i < half; i++)
+            for (int j = 0; j < half; j++)
+                assert(hevc_transform_matrix(log2n - 1, i, j) == hevc_transform_matrix(log2n, 2 * i, j) &&
+                       "transform matrices do not nest");
+    }
+
+    /* 4. Mirror symmetry: M[i][N-1-j] == (-1)^i * M[i][j]. This pins the
+     *    right half of every row against the left half that the table
+     *    actually stores. */
+    for (int log2n = 2; log2n <= 5; log2n++) {
+        int n = 1 << log2n;
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) {
+                int mirrored = hevc_transform_matrix(log2n, i, n - 1 - j);
+                int expect = (i & 1) ? -hevc_transform_matrix(log2n, i, j)
+                                     :  hevc_transform_matrix(log2n, i, j);
+                assert(mirrored == expect && "transform matrix mirror symmetry broken");
+            }
+    }
+
+    /* 5. Near-orthogonality: distinct rows have a small inner product and
+     *    every row has the same norm. A single mistyped entry destroys
+     *    both. The integer approximation means these are not exactly 0
+     *    and not exactly equal, hence the tolerances - but a typo moves
+     *    them by orders of magnitude more than the approximation does. */
+    for (int log2n = 2; log2n <= 5; log2n++) {
+        int n = 1 << log2n;
+        long norm0 = 0;
+        for (int j = 0; j < n; j++) {
+            long v = hevc_transform_matrix(log2n, 0, j);
+            norm0 += v * v;
+        }
+        for (int a = 0; a < n; a++) {
+            long norm = 0, cross = 0;
+            for (int j = 0; j < n; j++) {
+                long va = hevc_transform_matrix(log2n, a, j);
+                norm += va * va;
+                if (a > 0) cross += va * hevc_transform_matrix(log2n, a - 1, j);
+            }
+            long dn = norm - norm0;
+            if (dn < 0) dn = -dn;
+            assert(dn * 100 <= norm0 && "transform matrix row norm off by >1% - likely a typo");
+            if (cross < 0) cross = -cross;
+            assert(cross * 100 <= norm0 && "adjacent transform matrix rows not orthogonal - likely a typo");
+        }
+    }
+
+    printf("[test_hevc_encode] Transform matrix OK (4..32).\n");
+}
+
+/* The forward/inverse pair must round-trip a DC-only block at EVERY size,
+ * which is what proves the size-dependent shifts and the size-dependent
+ * quantizer bdShift are paired correctly. Getting bdShift wrong (e.g.
+ * leaving it at the 4x4 value of 5) decodes to a real picture at the
+ * wrong amplitude, so this is the check that catches it. */
+static void test_transform_round_trip_all_sizes(void) {
+    printf("[test_hevc_encode] Transform round-trip at 4/8/16/32, QP 4...\n");
+    for (int log2n = 2; log2n <= 5; log2n++) {
+        int n = 1 << log2n;
+        int16_t residual[32 * 32], coeff[32 * 32], recon[32 * 32];
+        for (int i = 0; i < n * n; i++) residual[i] = 20;
+
+        hevc_transform_quant(residual, log2n, 4, 0, coeff);
+        hevc_dequant_itransform(coeff, log2n, 4, 0, recon);
+
+        for (int i = 0; i < n * n; i++) {
+            int diff = recon[i] - 20;
+            if (diff < 0) diff = -diff;
+            assert(diff <= 3 && "size-dependent transform/quant shifts do not cancel");
+        }
+
+        /* A DC-only constant must also concentrate essentially all its
+         * energy in coefficient 0 - if the matrix rows were scrambled it
+         * would not. */
+        for (int i = 1; i < n * n; i++)
+            assert(coeff[i] == 0 && "constant block produced non-DC coefficients");
+    }
+    printf("[test_hevc_encode] Multi-size round-trip OK.\n");
+}
+
 static void test_mpm_derivation(void) {
     printf("[test_hevc_encode] MPM derivation sanity...\n");
     int mpm[3];
@@ -223,6 +357,8 @@ static int check_nal_sequence(const uint8_t *buf, size_t len, const int *expecte
 
 int main(void) {
     test_transform_round_trip();
+    test_transform_matrix();
+    test_transform_round_trip_all_sizes();
     test_mpm_derivation();
     test_angular_prediction();
     test_mode_decision_range();

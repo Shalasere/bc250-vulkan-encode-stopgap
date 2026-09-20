@@ -208,6 +208,41 @@ void hevc_derive_mpm(int left_mode, int left_avail, int above_mode, int above_av
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
                       int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]);
 
+/* Largest transform block this module supports, and the log2 range of
+ * nTbS: 2 (4x4) through 5 (32x32), which is the whole range HEVC allows. */
+#define HEVC_MAX_TB_SIZE  32
+#define HEVC_MIN_LOG2_TB   2
+#define HEVC_MAX_LOG2_TB   5
+
+/* Forward transform + real HEVC quantization (8.6.3) of an nTbS x nTbS
+ * pixel-domain residual, and its exact inverse, for any nTbS in 4..32.
+ *
+ * `use_dst` selects the alternative DST-VII transform, which HEVC permits
+ * for exactly one case (8.6.4.1): 4x4 luma intra. It is ignored - and
+ * must be - for every other size, where DCT-II is mandatory.
+ *
+ * Both the transform shifts and the quantizer scale are size-dependent,
+ * which is why these cannot just be the 4x4 routines run over a bigger
+ * block: the forward shifts are (log2n + BitDepth - 9, log2n + 6) and the
+ * quantizer's bdShift is BitDepth + log2n - 5. Getting either wrong
+ * produces a picture that decodes cleanly at the wrong amplitude.
+ *
+ * Buffers are row-major, nTbS*nTbS entries. */
+/* transMatrix entry for an nTbS = (1<<log2n) transform, row i, column j
+ * (8.6.4.2). Exposed so the table's structural properties can be asserted
+ * in tests rather than only exercised end to end. */
+int hevc_transform_matrix(int log2n, int i, int j);
+
+/* The written-out 4x4 matrix the fast path actually uses (row-major, 16
+ * entries). Exposed so a test can assert it against the derivation above
+ * rather than the two silently diverging. */
+const int16_t *hevc_transform_matrix4(int use_dst);
+
+void hevc_transform_quant(const int16_t *residual, int log2_size, int qp, int use_dst,
+                           int16_t *coeff_out);
+void hevc_dequant_itransform(const int16_t *coeff, int log2_size, int qp, int use_dst,
+                              int16_t *residual_out);
+
 /* Forward transform (DST-VII if use_dst, else DCT-II) + real HEVC
  * quantization (8.6.3) of a 4x4 pixel-domain residual (row-major,
  * residual[y*4+x] = source-prediction, may be negative). Writes 16
