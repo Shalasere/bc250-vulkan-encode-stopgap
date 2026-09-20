@@ -227,6 +227,8 @@ shared int  s_ctmp[2][NC * NC];
 shared uint s_csad[5];
 shared int  s_cidx, s_cmode;
 shared uint s_nzl;          /* luma cbf, held until the chroma flags join it */
+shared uint s_nzcb, s_nzcr;
+shared int  s_firstidx;     /* first available reference in scan order */
 
 int clip8(int v) { return clamp(v, 0, 255); }
 int srcLuma(int x, int y) {
@@ -258,20 +260,32 @@ void gather(int bx, int by) {
         }
         s_scan[i] = v;
     }
+    if (t == 0u) s_firstidx = 1 << 20;
+    barrier();
+    if (t < uint(total) && s_scan[int(t)] >= 0) atomicMin(s_firstidx, int(t));
     barrier();
 
-    /* The substitution fill is a sequential scan by definition; 65 steps
-     * on one thread is nothing next to the prediction that follows. */
-    if (t == 0u) {
-        int first = -1;
-        for (int i = 0; i < total; i++) { if (s_scan[i] >= 0) { first = i; break; } }
-        if (first < 0) {
-            for (int i = 0; i < total; i++) s_scan[i] = 128;
+    /* 8.4.4.2.2's fill is defined as a sequential scan, but it does not
+     * have to be executed as one: the value at position i is simply the
+     * nearest available entry at or before i, or - if there is none -
+     * the first available entry anywhere. Each thread resolves its own
+     * position by walking back from it, in parallel.
+     *
+     * Done serially on thread 0 this was ~130 dependent shared-memory
+     * accesses per gather, three gathers per CTU, on a shader whose
+     * critical path is one workgroup's latency. */
+    int subst = 128;
+    if (t < uint(total)) {
+        if (s_firstidx > total) {
+            subst = 128;                       /* nothing available at all */
         } else {
-            for (int i = first - 1; i >= 0; i--) s_scan[i] = s_scan[first];
-            for (int i = first + 1; i < total; i++) if (s_scan[i] < 0) s_scan[i] = s_scan[i - 1];
+            int j = int(t);
+            while (j >= 0 && s_scan[j] < 0) j--;
+            subst = (j >= 0) ? s_scan[j] : s_scan[s_firstidx];
         }
     }
+    barrier();
+    if (t < uint(total)) s_scan[int(t)] = subst;
     barrier();
 
     if (t < uint(SIDE)) {
@@ -389,18 +403,20 @@ void gather_chroma(int plane, int cx, int cy, int cw, int chh) {
         if (sx >= 0) v = (plane == 0) ? recCb(sx, sy) : recCr(sx, sy);
         s_scan[i] = v;
     }
+    if (t == 0u) s_firstidx = 1 << 20;
     barrier();
-
-    if (t == 0u) {
-        int first = -1;
-        for (int i = 0; i < total; i++) { if (s_scan[i] >= 0) { first = i; break; } }
-        if (first < 0) {
-            for (int i = 0; i < total; i++) s_scan[i] = 128;
-        } else {
-            for (int i = first - 1; i >= 0; i--) s_scan[i] = s_scan[first];
-            for (int i = first + 1; i < total; i++) if (s_scan[i] < 0) s_scan[i] = s_scan[i - 1];
+    if (t < uint(total) && s_scan[int(t)] >= 0) atomicMin(s_firstidx, int(t));
+    barrier();
+    int subst = 128;
+    if (t < uint(total)) {
+        if (s_firstidx <= total) {
+            int j = int(t);
+            while (j >= 0 && s_scan[j] < 0) j--;
+            subst = (j >= 0) ? s_scan[j] : s_scan[s_firstidx];
         }
     }
+    barrier();
+    if (t < uint(total)) s_scan[int(t)] = subst;
     barrier();
 
     if (t < uint(SIDE_C)) {
@@ -544,12 +560,12 @@ void main() {
      * unit (24 blocks x 16), so nothing had to be resized. */
     uint ctu = uint(s_ctby * int(pc.width_ctu) + s_ctbx);
     coeffs[ctu * 384u + t] = s_blk[t];
-    if (t == 0u) {
-        modes[ctu] = mode;
-        uint nz = 0u;
-        for (int i = 0; i < N * N; i++) { if (s_blk[i] != 0) { nz = 1u; break; } }
-        s_nzl = nz;    /* written to cbf[] with the chroma flags below */
-    }
+    if (t == 0u) { modes[ctu] = mode; s_nzl = 0u; }
+    barrier();
+    /* cbf by atomicOr across all 256 threads rather than one thread
+     * scanning 256 entries - it is one shared op per thread against a
+     * serial chain the length of the block. */
+    if (s_blk[t] != 0) atomicOr(s_nzl, 1u);
 
     /* ---- dequantize + inverse transform + reconstruct ---- */
     int dq = (s_blk[t] * 16 * LEVELSCALE[rem]) << per;
@@ -667,16 +683,17 @@ void main() {
     }
 
     /* cbf MUST be read off s_cblk here, before the inverse transform
-     * below reuses it as scratch. */
-    if (t == 0u) {
-        uint nzb = 0u, nzr = 0u;
-        for (int i = 0; i < NC * NC; i++) {
-            if (s_cblk[0][i] != 0) nzb = 1u;
-            if (s_cblk[1][i] != 0) nzr = 1u;
-        }
-        /* cbf_luma | cbf_cb<<1 | cbf_cr<<2 | chroma_idx<<8 */
-        cbf[ctu] = s_nzl | (nzb << 1) | (nzr << 2) | (uint(s_cidx) << 8);
+     * below reuses it as scratch. Again by atomicOr rather than a
+     * serial scan on one thread. */
+    if (t == 0u) { s_nzcb = 0u; s_nzcr = 0u; }
+    barrier();
+    if (cthread) {
+        if (s_cblk[0][t] != 0) atomicOr(s_nzcb, 1u);
+        if (s_cblk[1][t] != 0) atomicOr(s_nzcr, 1u);
     }
+    barrier();
+    if (t == 0u)   /* cbf_luma | cbf_cb<<1 | cbf_cr<<2 | chroma_idx<<8 */
+        cbf[ctu] = s_nzl | (s_nzcb << 1) | (s_nzcr << 2) | (uint(s_cidx) << 8);
     barrier();
 
     /* dequantize + inverse transform, per plane */
