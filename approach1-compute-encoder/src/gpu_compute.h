@@ -110,6 +110,11 @@ typedef struct bc250_gpu_context {
     VkPipeline color_convert_pipeline;
     VkPipeline reconstruct_pipeline;
     VkPipeline intra_wavefront_pipeline;
+    /* HEVC intra reconstruction (hevc_intra_wavefront.comp). Shares
+     * intra_wavefront's descriptor set layout, pipeline layout and
+     * descriptor set - same binding shape, and its push-constant range
+     * is large enough - so only the pipeline is separate. */
+    VkPipeline hevc_wavefront_pipeline;
 
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
@@ -338,6 +343,21 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target);
  * Must match the num_slices the caller will actually partition the CAVLC
  * bitstream into (encoder_h264.c's BC250_SLICES_PER_FRAME). */
 int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, int width, int height, int qp, int is_intra, int num_slices);
+
+/* HEVC intra reconstruction for one frame, recorded between
+ * gpu_compute_begin_picture() and gpu_compute_end_picture(). Uses the
+ * 2:1 wavefront (s = 2*ctby + ctbx) that HEVC's reference construction
+ * requires - see the implementation's comment and
+ * hevc_intra_wavefront.comp's header for why the H.264 anti-diagonal
+ * would silently read undecoded pixels here.
+ *
+ * Writes the chosen mode per CTU, the quantized coefficients and the cbf
+ * flags into the same device buffers the H.264 path uses (read back with
+ * gpu_compute_get_quant_staging_data() / _coeff_ / _pred_mode_), and the
+ * reconstruction into ctx->recon_image. Returns -1 if the pipeline is
+ * unavailable, in which case the caller should stay on the CPU path. */
+int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
+                                     int width, int height, int qp);
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);
 int gpu_compute_get_staging_data(gpu_context_t *ctx, void **data, size_t *size);

@@ -996,6 +996,21 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     } else {
         fprintf(stderr, "[bc250-gpu] FAILED to load intra_wavefront.comp.spv shader module\n");
     }
+    /* HEVC intra reconstruction. Reuses intra_wavefront's descriptor set
+     * layout and pipeline layout verbatim - the binding shape is the same
+     * (source Y/UV, recon Y/UV, three storage buffers) and its 40-byte
+     * push-constant range comfortably covers this shader's 24. Only the
+     * pipeline differs, so there is nothing to keep in sync.
+     *
+     * Absent is not fatal: the CPU HEVC path stays available and this is
+     * opt-in per encoder. */
+    VkShaderModule hevc_wf_shader = load_spirv_shader(ctx->device, "hevc_intra_wavefront.comp.spv");
+    if (hevc_wf_shader) {
+        ctx->hevc_wavefront_pipeline = create_compute_pipeline(ctx->device, hevc_wf_shader, ctx->intra_wavefront_layout);
+        vkDestroyShaderModule(ctx->device, hevc_wf_shader, NULL);
+        if (!ctx->hevc_wavefront_pipeline)
+            fprintf(stderr, "[bc250-gpu] FAILED to create hevc_wavefront_pipeline\n");
+    }
 
     /* Allocate device buffers for 4K maximum resolution */
     allocate_encoding_buffers(ctx, 3840, 2160);
@@ -1017,6 +1032,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->color_convert_pipeline) vkDestroyPipeline(ctx->device, ctx->color_convert_pipeline, NULL);
     if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
     if (ctx->intra_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->intra_wavefront_pipeline, NULL);
+    if (ctx->hevc_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_wavefront_pipeline, NULL);
 
     if (ctx->motion_est_layout) vkDestroyPipelineLayout(ctx->device, ctx->motion_est_layout, NULL);
     if (ctx->predict_layout) vkDestroyPipelineLayout(ctx->device, ctx->predict_layout, NULL);
@@ -1633,6 +1649,82 @@ int gpu_compute_begin_picture(gpu_context_t *ctx, gpu_image_t render_target) {
     };
     vkBeginCommandBuffer(ctx->cmd_bufs[ctx->current_buf], &begin_info);
 
+    return 0;
+}
+
+/* Record one frame of HEVC intra reconstruction. Call between
+ * gpu_compute_begin_picture() and gpu_compute_end_picture(), exactly
+ * like gpu_compute_dispatch_encode().
+ *
+ * The schedule is the 2:1 slope s = 2*ctby + ctbx, NOT the anti-diagonal
+ * the H.264 path uses. HEVC reference construction reads up to 2*nTbS
+ * samples along each edge (8.4.4.2.2) and so needs the above-right CTU,
+ * which on an anti-diagonal (x+1)+(y-1) == x+y would be co-scheduled and
+ * not yet reconstructed. See hevc_intra_wavefront.comp's header.
+ *
+ * For a given step, ctby runs over the rows where ctbx = s - 2*ctby is
+ * inside the picture, i.e. ctby from ceil((s-Wc+1)/2) to floor(s/2). The
+ * shader recomputes the same mapping from gl_WorkGroupID.x, so only the
+ * step index is pushed - no index list crosses the bus.
+ *
+ * Like the H.264 path this records one dispatch and one barrier per
+ * step into a single command buffer, submitted once. The barriers are
+ * GPU pipeline drains, not CPU round-trips. Deliberately not an
+ * in-shader spin on an atomic: that assumes all workgroups are
+ * co-resident and deadlocks once the dependency graph exceeds
+ * occupancy. */
+int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
+                                     int width, int height, int qp) {
+    if (!ctx || !ctx->hevc_wavefront_pipeline) return -1;
+    if (src.y_view == VK_NULL_HANDLE) return -1;
+
+    if (ctx->staging_buffers[0] == VK_NULL_HANDLE ||
+        ctx->frame_width != (uint32_t)width || ctx->frame_height != (uint32_t)height) {
+        allocate_encoding_buffers(ctx, (uint32_t)width, (uint32_t)height);
+    }
+    if (ctx->recon_image.y_plane == VK_NULL_HANDLE ||
+        ctx->recon_image.width != (uint32_t)width || ctx->recon_image.height != (uint32_t)height) {
+        if (ctx->recon_image.y_plane != VK_NULL_HANDLE)
+            gpu_compute_destroy_image(ctx, ctx->recon_image, ctx->recon_memory);
+        gpu_compute_create_image(ctx, width, height, 0, &ctx->recon_image, &ctx->recon_memory);
+        ctx->has_recon_frame = false;
+    }
+    if (ctx->recon_image.y_view == VK_NULL_HANDLE) return -1;
+
+    VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
+
+    update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 0, src.y_view);
+    update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 1,
+                                     src.uv_view ? src.uv_view : src.y_view);
+    update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 2, ctx->recon_image.y_view);
+    update_storage_image_descriptor(ctx->device, ctx->intra_wavefront_desc_set, 3,
+                                     ctx->recon_image.uv_view ? ctx->recon_image.uv_view : ctx->recon_image.y_view);
+
+    vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hevc_wavefront_pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                             ctx->intra_wavefront_layout, 0, 1, &ctx->intra_wavefront_desc_set, 0, NULL);
+
+    uint32_t wc = ((uint32_t)width  + 15u) / 16u;
+    uint32_t hc = ((uint32_t)height + 15u) / 16u;
+    uint32_t nsteps = 2u * (hc - 1u) + wc;      /* max s is 2*(hc-1) + (wc-1) */
+
+    for (uint32_t s = 0; s < nsteps; s++) {
+        /* rows carrying a CTU on this step */
+        int y_lo = 0;
+        if ((int)s - (int)wc + 1 > 0) y_lo = ((int)s - (int)wc + 2) / 2;
+        int y_hi = (int)s / 2;
+        if (y_hi > (int)hc - 1) y_hi = (int)hc - 1;
+        if (y_hi < y_lo) continue;
+        uint32_t count = (uint32_t)(y_hi - y_lo + 1);
+
+        uint32_t pcw[6] = { (uint32_t)width, (uint32_t)height, wc, hc, (uint32_t)qp, s };
+        vkCmdPushConstants(cmd_buf, ctx->intra_wavefront_layout,
+                            VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pcw), pcw);
+        vkCmdDispatch(cmd_buf, count, 1, 1);
+        insert_compute_barrier(cmd_buf);
+    }
+
+    ctx->has_recon_frame = true;
     return 0;
 }
 
