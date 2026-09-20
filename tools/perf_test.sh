@@ -4,7 +4,24 @@
 # perf_test.sh - Honest wall-clock throughput + per-stage GPU/CPU timing
 # harness for the BC-250 Vulkan-compute VA-API H.264 encoder.
 #
-# WHY THIS EXISTS
+# ===========================================================================
+# SUPERSEDED - this is NOT the canonical performance tool any more.
+#
+# Use `tools/lab` instead; see docs/performance-measurement.md. `lab bench`
+# captures the same BC250_PERF_STATS per-stage breakdown this script does,
+# and adds what this script has no answer for: a measured noise floor, so a
+# delta can be called significant or not; significance-tested A/B
+# (`lab compare`); load conditions (`--load=gpu|cpu|both`), without which a
+# throughput figure only describes an idle machine; and `lab scoreboard`,
+# which compares against libx264 - the actual bar.
+#
+# Kept, not deleted, because it is cited as the provenance of already-
+# published numbers in docs/DEVLOG.md, docs/hevc_scope_note.md and a
+# CMakeLists.txt comment. Removing it would orphan those citations. Do not
+# use it for new measurements.
+# ===========================================================================
+#
+# WHY THIS EXISTS (historical)
 # ----------------
 # tools/quality_test.sh proves the encoder is *correct* (PSNR/SSIM against a
 # ground-truth reference); it says nothing about *speed*, and its own ffmpeg

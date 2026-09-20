@@ -8,13 +8,33 @@
 # inline pipes/quotes/$vars before wsl ever sees them, so commands must travel
 # as a FILE, never as an inline string.
 #
+# This is the canonical way to measure this encoder - see
+# docs/performance-measurement.md. Do not hand-roll a fresh ffmpeg script;
+# the validity rules that live in this harness were all learned by getting
+# them wrong first.
+#
 # USAGE
-#   tools/lab setup
-#   tools/lab build work
-#   tools/lab bench <key> --load=gpu --repeat=3
-#   tools/lab compare <keyA> <keyB> --repeat=3
-#   tools/lab gate <key> <baselineKey>
-#   tools/lab deploy <key>
+#   tools/lab setup                          one-time board setup
+#   tools/lab build work|local:<ref>|<ref>   build -> prints a <key>
+#
+#   tools/lab noise <key> --repeat=5         the floor; run this FIRST
+#   tools/lab bench <key> [opts]             one measurement, TSV
+#   tools/lab compare <keyA> <keyB>          A/B, significance-tested
+#   tools/lab scoreboard <key> [--quality]   vs libx264, per load condition
+#
+#   tools/lab quality <key>                  PSNR/SSIM
+#   tools/lab qsweep <key>                   PSNR/SSIM across bitrates
+#   tools/lab exact <keyA> <keyB>            byte-exactness (deterministic only)
+#   tools/lab audit <key>                    nonzero-mask exactness audit
+#   tools/lab units <key>                    unit tests
+#   tools/lab gate <key> [<baseKey>]         audit + units + quality + exact
+#
+#   tools/lab health                         is the live Sunshine healthy?
+#   tools/lab deploy <key>                   install, health-check, auto-rollback
+#   tools/lab rollback                       restore the previous driver
+#
+# `tools/lab help` prints the harness's own full help, including every
+# bench/noise option. That one needs the board; the summary above does not.
 #
 # ENVIRONMENT
 #   BC250_HOST   default user@10.0.0.104
@@ -22,6 +42,16 @@
 #   BC250_SSH    override the whole ssh command
 #
 set -uo pipefail
+
+# Answer -h/--help locally. Previously any help request still shipped the
+# harness to the board and asked it, so you could not even see the command
+# list with the board powered down or mid-reflash.
+case "${1:-}" in
+    -h|--help|"")
+        awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "${BASH_SOURCE[0]}"
+        exit 0
+        ;;
+esac
 
 HOST="${BC250_HOST:-user@10.0.0.104}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

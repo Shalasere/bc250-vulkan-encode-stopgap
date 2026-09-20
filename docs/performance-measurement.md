@@ -1,0 +1,128 @@
+# Measuring performance
+
+**`tools/lab` is the canonical way to measure this encoder.** If you are
+about to write an `ffmpeg` command to find out whether something got
+faster, stop and use the harness instead.
+
+That is not a style preference. Roughly a dozen throwaway measurement
+scripts drove the optimisation work in `docs/DEVLOG.md` §19–§21, and the
+code changes mostly held up — it was the *harness* that kept being wrong,
+in ways that each produced a confident, specific, false number. Every
+rule below is one of those, encoded so it cannot recur. The most recent
+example is the smallest: `tools/benchmark.sh`, removed in this repo's
+history, generated its source clip without `-pix_fmt`, wrote a zero-byte
+file, and reported two fast timings for two encodes that never ran.
+
+## The short version
+
+```bash
+tools/lab setup                       # once per board
+tools/lab build work                  # or: build local:<unpushed-ref>  -> prints a <key>
+tools/lab noise <key> --repeat=5      # establish the floor BEFORE measuring
+tools/lab compare <keyA> <keyB>       # significance-tested A/B
+tools/lab scoreboard <key>            # the headline: vs libx264, per load condition
+tools/lab gate <key> [<baseKey>]      # units + mask audit + PSNR + byte-exactness
+tools/lab deploy <key>                # health-checked, auto-rollback
+```
+
+`tools/lab --help` lists every command without touching the board.
+`tools/lab help` asks the harness itself and includes every bench option.
+
+## Why it runs the way it does
+
+`tools/lab` runs on your dev machine; `tools/bc250_lab.sh` is the half
+that runs on the board. `lab` ships the harness every invocation, so the
+board can never run a stale copy.
+
+Two things about it are load-bearing:
+
+**Commands travel as files, never as inline strings.** PowerShell mangles
+inline pipes, quotes and `$vars` before WSL ever sees them, and `ssh -n`
+is mandatory because ssh inside a pipeline otherwise eats stdin and
+swallows the rest of the calling script — while `-n` also nulls stdin, so
+heredocs vanish. Two real bugs came from exactly this.
+
+**`build local:<ref>` ships an unpushed commit.** Without it, measuring a
+commit means pushing it first, which couples "I want a number" to "the
+world sees this". The board content-addresses the tarball, so a given ref
+gets a stable, cached key.
+
+## The rules the harness enforces
+
+These are the expensive ones. They are listed here because knowing *why*
+the harness refuses something is what stops you from working around it.
+
+**No delta under ~2.5% of wall time is a result** from a single run.
+Measure the floor first — at 1440p it is `p_wall` sd 1.2%, `cavlc` 1.6%,
+`shadow` 3.1%, `gpu_total` 0.09%. `lab compare` marks anything inside the
+floor as not significant rather than reporting it as a win.
+
+**Byte-exactness is a valid oracle only on `testsrc`, and only all-intra
+(`-g 1`).** This encoder is not bit-reproducible on moving content —
+three runs of one config give three different valid bitstreams. Using
+md5 on `testsrc2` once made a *correct* change look broken and nearly got
+it reverted (§19.6). The GPU motion-estimation non-determinism reaches
+plain `testsrc` too as soon as P-frames exist, confirmed by running one
+unmodified binary against itself and getting four different md5s (§26.5).
+`lab exact` keys this to a per-content determinism registry and refuses
+invalid comparisons instead of trusting you to remember.
+
+**Name the load condition, every time.** Every throughput figure
+published before the harness existed was taken on an idle GPU. Under
+`--load=gpu` (ffmpeg `nlmeans_vulkan`) 1440p goes **66.2 → 1.48 fps** —
+but that generator is a pathologically heavy compute filter, so it is a
+synthetic worst case, not "what a game does". There is **no trustworthy
+real-game figure**; the often-repeated "a game took 1440p from 60 to 11
+fps" is unsourced and collides with a number §12.4 retracted as a
+debug-I/O artifact. State the condition *and* what produced it.
+
+**The bar is libx264, not the previous commit.** Software encoding barely
+notices a game, while GPU contention costs this encoder up to ~45×. A
+change that beats last week's build and still loses to x264 under load
+has not achieved anything. `lab scoreboard` is the scoreboard.
+
+**Never gate health on a SEGV count.** Sunshine SEGVs in its own teardown
+path on nearly every stop on this box, so that signal fires identically
+for healthy and broken builds — it once rolled back a working driver
+(§20.5). `lab health` keys on the live pid.
+
+**Never PSNR-compare a raw `.h264` against a fresh `-f lavfi` source.** A
+container-less stream has no reliable timing for `-lavfi psnr`'s frame
+alignment; the drift compounds every frame and is indifferent to IDR
+boundaries, which produced a false "catastrophic 21 dB quality gap"
+(§22). The tell was that a fresh IDR should reset a real quality problem
+and this one didn't. Decode both streams to raw YUV first, with identical
+forced `-f rawvideo -s WxH -r N` framing. `lab qsweep` and `scoreboard
+--quality` already do this correctly.
+
+**Design the audit before depending on a new GPU→CPU data path.** The
+per-block nonzero mask was silently wrong on every I-frame because
+`intra_wavefront.comp` bypasses `quantize.comp`. `BC250_NZ_AUDIT=1`
+recomputes it on the CPU and caught it (§19.4); `lab audit` runs it.
+
+And one that no harness can enforce for you: **an exact oracle is only
+exact about what it compares.** The mask audit reported EXACT across 401
+frames of genuinely corrupt output, because a one-frame slot swap meant
+both buffers were read from the same wrong slot — they matched each other
+perfectly while both being wrong. A performance counter caught it, not a
+correctness check. Ask what a check actually compares, not how strict it
+sounds.
+
+## Tool inventory
+
+| tool | status |
+|---|---|
+| `tools/lab` | **canonical.** Dev-machine entry point. |
+| `tools/bc250_lab.sh` | **canonical.** The on-board half; `lab` ships it. |
+| `tools/bc250_lab_parse.py` | component. All log parsing, so there is one parser rather than twelve. |
+| `tools/quality_test.sh` | component. PSNR/SSIM, invoked by `lab quality`. |
+| `tools/perf_test.sh` | **superseded.** `lab bench` does the same per-stage breakdown and adds a noise floor, load conditions and significance testing. Retained only because DEVLOG, `hevc_scope_note.md` and a CMakeLists comment cite it as the provenance of published numbers. |
+| `tools/bc250_diagnose.sh` | user-facing probe, not a benchmark. This is what the issue and PR templates ask people to run. |
+| `tools/benchmark.sh` | **deleted.** See this repo's history for why; it is the cautionary tale at the top of this page. |
+
+## If the harness is genuinely missing something
+
+Extend `bc250_lab.sh`. A new one-off script starts with none of the rules
+above and, on this project's record, has roughly even odds of producing a
+number that is confidently wrong — which is worse than no number, because
+someone will act on it.

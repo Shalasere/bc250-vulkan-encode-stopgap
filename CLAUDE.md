@@ -57,6 +57,11 @@ It shipped the second time. See §21.
 
 ## Measure with tools/lab, not with a fresh script
 
+**`tools/lab` is the canonical performance tool.
+`docs/performance-measurement.md` is its documentation — read that before
+measuring anything, and extend `tools/bc250_lab.sh` rather than writing a
+new script if something is missing.**
+
 ```bash
 tools/lab setup                       # once
 tools/lab build work                  # or: build local:<unpushed-ref>
@@ -67,9 +72,18 @@ tools/lab gate <key> [<baseKey>]      # units + mask audit + PSNR + byte-exactne
 tools/lab deploy <key>                # health-checked, auto-rollback
 ```
 
+`tools/lab --help` lists every command without needing the board.
+
 The harness encodes validity rules that were learned the hard way. Writing a
 one-off script bypasses them, and about a dozen such scripts are what produced
-the errors below.
+the errors below. The cheapest illustration: `tools/benchmark.sh` (since
+deleted) built its source clip without `-pix_fmt`, so the clip was zero bytes,
+both encodes failed instantly, and `time` reported two fast numbers for work
+that never happened — all three commands ended in `&>/dev/null`.
+
+`tools/perf_test.sh` is **superseded** by `lab bench` and kept only because
+DEVLOG and `hevc_scope_note.md` cite it as the provenance of published
+numbers. Don't measure with it.
 
 ## Hard-won rules
 

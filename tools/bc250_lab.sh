@@ -46,6 +46,10 @@
 #                                            with per-frame QP correlation
 #                                            (--env=K=V, --no-ref, --bitrates)
 #   ./bc250_lab.sh units <key>               unit-test binaries
+#   ./bc250_lab.sh scoreboard <key> [opts]   THE headline number: this encoder
+#                                            vs libx264, per load condition
+#                                            (--content, --res, --frames,
+#                                             --repeat, --quality)
 #   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + exact
 #   ./bc250_lab.sh health                    is the live Sunshine healthy?
 #   ./bc250_lab.sh deploy <key>              install + health-check + rollback
@@ -926,7 +930,14 @@ rollback() {
     health
 }
 
-usage() { sed -n '2,61p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; }
+# Print the whole header comment, however long it grows. This used to be
+# `sed -n '2,61p'`, a hardcoded range that had already drifted: it cut off
+# mid-list, so `--help` never showed --env= or --audit, and the scoreboard
+# command was missing entirely. Terminating on the first non-comment line
+# cannot drift.
+usage() {
+    awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print } else { exit } }' "${BASH_SOURCE[0]}"
+}
 
 cmd="${1:-}"; [ $# -gt 0 ] && shift
 case "$cmd" in

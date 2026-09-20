@@ -232,6 +232,9 @@ Carried over as-is; out of scope for this project's correctness work.
 
 `.github/workflows/build.yml` builds 64-bit and 32-bit drivers, runs all 5 automated test suites (`ctest`), and strictly validates both generated H.264 and H.265/HEVC bitstreams against the external FFmpeg reference decoder oracle.
 
+**Measuring performance: use `tools/lab`** — it is the canonical tool, and
+[docs/performance-measurement.md](docs/performance-measurement.md) explains why hand-rolling an `ffmpeg` command instead reliably produces numbers that are confidently wrong. Every published figure in this README came from that harness.
+
 Troubleshooting: [docs/troubleshooting.md](docs/troubleshooting.md)
 
 ---
