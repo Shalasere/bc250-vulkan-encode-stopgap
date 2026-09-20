@@ -132,43 +132,66 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
     int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
     int avail_top_right = zorder_available(x0 + 4, y0 - 1, width, height, is_luma, cur_rank);
 
-    uint8_t sv[10];
-    uint8_t sa[10];
+    /* p[-1][nTbS] (the "below-left" sample, here p[-1][4]) is a real
+     * neighbour with its own availability, not something that can be
+     * assumed absent: for a 4x4 block on the left edge of a CU it lives in
+     * the CU to the left, which precedes this one in z-scan order and is
+     * therefore already reconstructed. Planar is the only one of this
+     * encoder's modes that reads it (8.4.4.2.5 uses p[-1][nTbS]), and it
+     * used to be hardcoded to left[3]. A conforming decoder derives the
+     * real sample, so every Planar block where the two differed
+     * reconstructed differently in the decoder than in this encoder -
+     * internally consistent here, wrong on the wire. Measured with a
+     * forced-mode sweep at QP 6: Planar came out at 22.7 dB luma while DC
+     * (66.4 dB) and Vertical (70.6 dB), which never touch this sample,
+     * were fine.
+     *
+     * Gather it as the first entry so the 8.4.4.2.2 substitution scan
+     * still runs bottom-left -> up the left edge -> corner -> along the
+     * top, which is the order that process is defined in. */
+    int avail_below_left = zorder_available(x0 - 1, y0 + 4, width, height, is_luma, cur_rank);
 
-    sa[0] = sa[1] = sa[2] = sa[3] = (uint8_t)avail_left;
+    uint8_t sv[11];
+    uint8_t sa[11];
+
+    sa[0] = (uint8_t)avail_below_left;
+    if (avail_below_left) sv[0] = plane[(y0 + 4) * stride + (x0 - 1)];
+
+    sa[1] = sa[2] = sa[3] = sa[4] = (uint8_t)avail_left;
     if (avail_left) {
-        sv[0] = plane[(y0 + 3) * stride + (x0 - 1)];
-        sv[1] = plane[(y0 + 2) * stride + (x0 - 1)];
-        sv[2] = plane[(y0 + 1) * stride + (x0 - 1)];
-        sv[3] = plane[(y0 + 0) * stride + (x0 - 1)];
+        sv[1] = plane[(y0 + 3) * stride + (x0 - 1)];
+        sv[2] = plane[(y0 + 2) * stride + (x0 - 1)];
+        sv[3] = plane[(y0 + 1) * stride + (x0 - 1)];
+        sv[4] = plane[(y0 + 0) * stride + (x0 - 1)];
     }
-    sa[4] = (uint8_t)avail_corner;
-    if (avail_corner) sv[4] = plane[(y0 - 1) * stride + (x0 - 1)];
+    sa[5] = (uint8_t)avail_corner;
+    if (avail_corner) sv[5] = plane[(y0 - 1) * stride + (x0 - 1)];
 
-    sa[5] = sa[6] = sa[7] = sa[8] = (uint8_t)avail_top;
+    sa[6] = sa[7] = sa[8] = sa[9] = (uint8_t)avail_top;
     if (avail_top) {
-        sv[5] = plane[(y0 - 1) * stride + (x0 + 0)];
-        sv[6] = plane[(y0 - 1) * stride + (x0 + 1)];
-        sv[7] = plane[(y0 - 1) * stride + (x0 + 2)];
-        sv[8] = plane[(y0 - 1) * stride + (x0 + 3)];
+        sv[6] = plane[(y0 - 1) * stride + (x0 + 0)];
+        sv[7] = plane[(y0 - 1) * stride + (x0 + 1)];
+        sv[8] = plane[(y0 - 1) * stride + (x0 + 2)];
+        sv[9] = plane[(y0 - 1) * stride + (x0 + 3)];
     }
-    sa[9] = (uint8_t)avail_top_right;
-    if (avail_top_right) sv[9] = plane[(y0 - 1) * stride + (x0 + 4)];
+    sa[10] = (uint8_t)avail_top_right;
+    if (avail_top_right) sv[10] = plane[(y0 - 1) * stride + (x0 + 4)];
 
     int first = -1;
-    for (int i = 0; i < 10; i++) { if (sa[i]) { first = i; break; } }
+    for (int i = 0; i < 11; i++) { if (sa[i]) { first = i; break; } }
 
     if (first < 0) {
-        for (int i = 0; i < 10; i++) sv[i] = 128;
+        for (int i = 0; i < 11; i++) sv[i] = 128;
     } else {
         for (int i = 0; i < first; i++) sv[i] = sv[first];
-        for (int i = first + 1; i < 10; i++) if (!sa[i]) sv[i] = sv[i - 1];
+        for (int i = first + 1; i < 11; i++) if (!sa[i]) sv[i] = sv[i - 1];
     }
 
-    left[3] = sv[0]; left[2] = sv[1]; left[1] = sv[2]; left[0] = sv[3];
-    *corner = sv[4];
-    top[0] = sv[5]; top[1] = sv[6]; top[2] = sv[7]; top[3] = sv[8];
-    top[4] = sv[9];
+    left[4] = sv[0];
+    left[3] = sv[1]; left[2] = sv[2]; left[1] = sv[3]; left[0] = sv[4];
+    *corner = sv[5];
+    top[0] = sv[6]; top[1] = sv[7]; top[2] = sv[8]; top[3] = sv[9];
+    top[4] = sv[10];
     /* p[-1][4] (bottom-left, one below left[3]): always z-scan-unavailable
      * in this encoder's coding order (see zorder_rank()'s comment) -
      * nearest previously-scanned available sample is left[3] itself
@@ -182,7 +205,7 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
      * it used the same garbage value on both the predict and later
      * reconstruct call for a given block, but NOT consistent with a real
      * decoder, which correctly derives left[4]=left[3]) reconstruction. */
-    left[4] = left[3];
+
 }
 
 /* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
