@@ -156,19 +156,27 @@ void hevc_cabac_code_part_mode_intra(hevc_cabac_t *cb, int is_2nx2n);
  *   for each PU: pred_idx[pu] = hevc_cabac_code_intra_luma_flag(...)
  *   for each PU: hevc_cabac_code_intra_luma_data(..., pred_idx[pu], ...)
  *
- * `mode` is the real HEVC intra mode (0=Planar, 1=DC, 10=Horizontal,
- * 26=Vertical - the only four this encoder ever chooses, see hevc_intra.c)
- * and mpm[3] are this PU's three most-probable-mode candidates from its
+ * `mode` is the real HEVC intra mode (0=Planar, 1=DC, 2..34 angular) and
+ * mpm[3] are this PU's three most-probable-mode candidates from its
  * left/above neighbors (8.4.2). hevc_cabac_code_intra_luma_flag() returns
  * the MPM list index (0-2) if `mode` is one of the 3 candidates, else -1 -
  * pass that value back in as `pred_idx` to the second call. */
 int hevc_cabac_code_intra_luma_flag(hevc_cabac_t *cb, int mode, const int mpm[3]);
 void hevc_cabac_code_intra_luma_data(hevc_cabac_t *cb, int mode, int pred_idx, const int mpm[3]);
 
-/* intra_chroma_pred_mode for one CU, given that CU's representative luma
- * mode (IntraPredModeY of PU 0, per 8.4.3) and the always-DC(1) chroma mode
- * this encoder always signals (see hevc_intra.c's chroma path). */
-void hevc_cabac_code_intra_chroma_pred_mode(hevc_cabac_t *cb, int luma_mode_pu0);
+/* intra_chroma_pred_mode for one CU: `idx` is the syntax element's own
+ * value, 0..4, NOT a prediction mode. 4 means DM_CHROMA (use the luma
+ * mode) and codes as a single context bin; 0..3 select the
+ * {Planar, Vertical, Horizontal, DC} candidate list and code as that bin
+ * plus two bypass bins. Use hevc_chroma_mode_from_idx() to get the actual
+ * prediction mode an index resolves to, including 8.4.3's substitution of
+ * mode 34 when a candidate collides with the luma mode. */
+void hevc_cabac_code_intra_chroma_pred_mode(hevc_cabac_t *cb, int idx);
+
+/* Rec. ITU-T H.265 8.4.3 / Table 8-2 and 8-3: resolve an
+ * intra_chroma_pred_mode index (0..4) against the CU's luma mode
+ * (IntraPredModeY of PU 0) into the real chroma prediction mode. */
+int hevc_chroma_mode_from_idx(int idx, int luma_mode_pu0);
 
 /* cbf_luma / cbf_cb / cbf_cr. `trafo_depth` matches the ctx formulas used
  * throughout this file's .c (luma: ctx = (trafo_depth==0) ? 1 : 0; chroma:

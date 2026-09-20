@@ -619,14 +619,39 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     int16_t (*luma_coeff)[16] = chosen->coeff;
     int *cbf_luma = chosen->cbf;
 
-    /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only (matching
-     * this codebase's existing H.264 "chroma directional modes not
-     * implemented" precedent), DCT-II (never DST - DST is luma-4x4-intra
-     * only, per spec). */
+    /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DCT-II (never DST - DST is
+     * luma-4x4-intra only, per spec).
+     *
+     * Cb and Cr share a single signalled intra_chroma_pred_mode, so the
+     * five candidate indices are scored on the summed prediction error of
+     * both planes. DM_CHROMA (index 4) is a single bin against the
+     * others' three, which the same lambda the luma decision uses accounts
+     * for. */
     int cx = cu_x / 2, cy = cu_y / 2;
+    int chroma_idx = 4, chroma_mode = pu_modes[0];
+    {
+        long lambda = hevc_lambda_sad_q8(qp);
+        long best = -1;
+        for (int idx = 0; idx <= 4; idx++) {
+            int m = hevc_chroma_mode_from_idx(idx, pu_modes[0]);
+            uint8_t pb[16], pr[16];
+            hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, m, 0, pb);
+            hevc_predict_4x4(enc->recon_cr, ccw, ccw, cch, cx, cy, m, 0, pr);
+            long sad = 0;
+            for (int y = 0; y < 4; y++)
+                for (int x = 0; x < 4; x++) {
+                    int db = enc->src_cb[(cy + y) * ccw + (cx + x)] - pb[y * 4 + x];
+                    int dr = enc->src_cr[(cy + y) * ccw + (cx + x)] - pr[y * 4 + x];
+                    sad += (db < 0 ? -db : db) + (dr < 0 ? -dr : dr);
+                }
+            long cost = sad + ((lambda * (idx == 4 ? 1 : 3)) >> 8);
+            if (best < 0 || cost < best) { best = cost; chroma_idx = idx; chroma_mode = m; }
+        }
+    }
+
     uint8_t pred_cb[16], pred_cr[16];
-    hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, HEVC_MODE_DC, 0, pred_cb);
-    hevc_predict_4x4(enc->recon_cr, ccw, ccw, cch, cx, cy, HEVC_MODE_DC, 0, pred_cr);
+    hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, chroma_mode, 0, pred_cb);
+    hevc_predict_4x4(enc->recon_cr, ccw, ccw, cch, cx, cy, chroma_mode, 0, pred_cr);
 
     int16_t res_cb[16], res_cr[16];
     for (int y = 0; y < 4; y++)
@@ -677,10 +702,8 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     for (int pu = 0; pu < npu; pu++)
         hevc_cabac_code_intra_luma_data(cab, pu_modes[pu], pred_idx[pu], mpm[pu]);
 
-    /* Step 3: chroma mode (always DC; luma_mode_pu0 decides whether that's
-     * signaled as index-3-of-candidate-list or as the derived/DM mode -
-     * see hevc_cabac_code_intra_chroma_pred_mode()'s comment). */
-    hevc_cabac_code_intra_chroma_pred_mode(cab, pu_modes[0]);
+    /* Step 3: chroma mode, as the index chosen above. */
+    hevc_cabac_code_intra_chroma_pred_mode(cab, chroma_idx);
 
     /* Step 4: transform_tree - chroma cbf BITS first (trafoDepth=0, this
      * CU's root), then the 4 luma leaves' cbf+residual, then finally the
@@ -701,8 +724,17 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             hevc_cabac_code_residual_4x4(cab, luma_coeff[pu], 1, scan_idx);
         }
     }
-    if (cbf_cb) hevc_cabac_code_residual_4x4(cab, coeff_cb, 0, 0 /* chroma always diagonal in 4:2:0 */);
-    if (cbf_cr) hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, 0);
+    /* Mode-dependent coefficient scan applies to CHROMA too at this block
+     * size: ITU-T H.265 7.4.9.11 derives scanIdx from predModeIntra
+     * whenever log2TrafoSize is equal to 2, with no cIdx condition (the
+     * cIdx==0 condition only appears in the separate log2TrafoSize==3
+     * case). Every chroma TU here is 4x4, so the scan follows
+     * IntraPredModeC. This was latent while chroma was hardcoded to DC -
+     * DC derives scanIdx 0, which is what was passed - and would have
+     * become a real wrong-scan bug the moment chroma stopped being DC. */
+    int chroma_scan = hevc_scan_idx_for_mode(chroma_mode);
+    if (cbf_cb) hevc_cabac_code_residual_4x4(cab, coeff_cb, 0, chroma_scan);
+    if (cbf_cr) hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, chroma_scan);
 }
 
 static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row) {

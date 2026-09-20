@@ -313,16 +313,22 @@ void hevc_cabac_code_intra_luma_data(hevc_cabac_t *cb, int mode, int pred_idx, c
     }
 }
 
-void hevc_cabac_code_intra_chroma_pred_mode(hevc_cabac_t *cb, int luma_mode_pu0) {
-    if (luma_mode_pu0 == 1) {
-        /* DM_CHROMA (derived == luma): luma is already DC, so chroma == DC. */
-        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);
+int hevc_chroma_mode_from_idx(int idx, int luma_mode_pu0) {
+    /* Table 8-2's modeIdx -> IntraPredModeC candidate list. */
+    static const int cand[4] = { 0 /*Planar*/, 26 /*Vertical*/, 10 /*Horizontal*/, 1 /*DC*/ };
+    if (idx == 4) return luma_mode_pu0;          /* DM_CHROMA */
+    /* 8.4.3: a candidate that collides with the luma mode would be
+     * redundant (DM_CHROMA already reaches it), so the spec substitutes
+     * mode 34 in that slot. */
+    return (cand[idx] == luma_mode_pu0) ? 34 : cand[idx];
+}
+
+void hevc_cabac_code_intra_chroma_pred_mode(hevc_cabac_t *cb, int idx) {
+    if (idx == 4) {
+        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);   /* DM_CHROMA */
     } else {
-        /* Candidate list {Planar,Vertical,Horizontal,DC} has DC untouched
-         * at index 3 whenever luma mode isn't DC itself, so index 3 always
-         * yields chroma==DC here. */
         hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 1);
-        hevc_cabac_encode_bypass_bins(cb, 3, 2);
+        hevc_cabac_encode_bypass_bins(cb, (uint32_t)idx, 2);
     }
 }
 
