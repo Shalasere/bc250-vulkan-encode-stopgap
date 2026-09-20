@@ -1,7 +1,7 @@
 # 🎮 AMD BC-250 Custom Driver & VA-API Video Encoder
 
 [![Build & Release BC-250 Drivers](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml/badge.svg)](https://github.com/simpmix/bc250-vcn-driver/actions/workflows/build.yml)
-[![License: MIT](https://img.shields.io/badge/Driver%20License-MIT-blue.svg)](LICENSE)
+[![License: GPL-3.0](https://img.shields.io/badge/Driver%20License-GPL--3.0-blue.svg)](LICENSE)
 [![Kernel Module: GPL-2.0](https://img.shields.io/badge/Audio%20Module-GPL--2.0-green.svg)](audio-fix/README.md)
 
 Hardware-accelerated video encoding and DisplayPort/HDMI audio fixes for the **AMD BC-250 ("Cyan Skillfish" / PS5 "Oberon" APU)** on Linux (Bazzite, CachyOS, Fedora, Ubuntu, Arch, ChimeraOS).
@@ -212,7 +212,7 @@ Common quick fixes:
 ---
 
 ## 📜 License
-* Userspace compute driver, shaders, and tools: **MIT**
+* Userspace compute driver, shaders, and tools: **GPL-3.0-only** (relicensed from MIT; the H.264/H.265 CABAC entropy coders adapt code from x264/x265, both GPL-licensed)
 * Audio fix kernel module: **GPL-2.0**
 
 <!-- bc250-vcn-driver v0.2.0 -->
