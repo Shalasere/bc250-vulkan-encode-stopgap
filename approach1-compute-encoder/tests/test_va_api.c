@@ -78,6 +78,19 @@ static void *encoder_worker_thread(void *arg) {
 int main(void) {
     printf("=== Running BC-250 VA-API Driver Tests ===\n");
 
+    /* HEVC is no longer advertised by default - it is opt-in via
+     * BC250_ENABLE_HEVC=1, because Sunshine probes HEVC first and would
+     * otherwise silently negotiate the ~7-9 fps CPU path over the 45-60 fps
+     * H.264 one (see va_backend.c's hevc_advertised()). This test
+     * deliberately exercises the whole HEVC VA-API pipeline below - profile
+     * list, entrypoints, config, context, the parameter buffers - so it opts
+     * in here rather than weakening those assertions to match the default.
+     *
+     * Must be set before the first VA call: hevc_advertised() caches its
+     * answer on first use, precisely so the profile query and the entrypoint
+     * query can never disagree. */
+    setenv("BC250_ENABLE_HEVC", "1", 1);
+
     struct VADriverContext ctx;
     struct VADriverVTable vtable;
     memset(&ctx, 0, sizeof(ctx));

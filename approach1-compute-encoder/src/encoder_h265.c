@@ -1673,11 +1673,14 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         /* Fall through to the CPU path. The dispatch above already consumed
          * this frame's begin/end picture pair, so re-running the H.264
          * dispatch here would be a second submission of the same surface;
-         * instead just download and encode on the CPU. */
+         * instead just download and encode on the CPU. Sync-bracketed for
+         * the same reason as the main path below. */
+        gpu_compute_dmabuf_sync_start(gpu_ctx, input_memory);
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
                                   encoder->dl_y, (int)encoder->width,
                                   encoder->dl_uv, (int)encoder->width,
                                   (int)encoder->width, (int)encoder->height);
+        gpu_compute_dmabuf_sync_end(gpu_ctx, input_memory);
         return encode_core(encoder, output_buf, output_size);
     }
 
@@ -1705,10 +1708,21 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
             }
         }
 
+        /* input_surface/input_memory is the live VA-API surface a real
+         * Sunshine session writes into directly via its own GL blit, into
+         * this surface's exported DMA-BUF - a separate GPU context, API and
+         * process from this driver's Vulkan one, with nothing shared to
+         * order this CPU read against that write. See gpu_compute.h's
+         * gpu_compute_dmabuf_sync_start() doc comment. Without the bracket,
+         * what HEVC actually encodes is subject to the same torn-read race
+         * that BC250_DUMP_REAL_INPUT dumps first exposed - not just a
+         * diagnostic capture of it. */
+        gpu_compute_dmabuf_sync_start(gpu_ctx, input_memory);
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
                                    encoder->dl_y, (int)encoder->width,
                                    encoder->dl_uv, (int)encoder->width,
                                    (int)encoder->width, (int)encoder->height);
+        gpu_compute_dmabuf_sync_end(gpu_ctx, input_memory);
     } else {
         memset(encoder->dl_y, 128, (size_t)encoder->width * encoder->height);
         memset(encoder->dl_uv, 128, (size_t)(encoder->width / 2) * (encoder->height / 2) * 2);

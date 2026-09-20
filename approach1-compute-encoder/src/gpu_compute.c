@@ -17,6 +17,8 @@
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/dma-buf.h>
 #include <limits.h>
 #include <dlfcn.h>
 #include <sys/ioctl.h>
@@ -1687,6 +1689,70 @@ int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int 
     return 0;
 }
 
+/* Shared implementation for gpu_compute_dmabuf_sync_start()/_end() - see
+ * their doc comment in gpu_compute.h. `flags` is one of
+ * DMA_BUF_SYNC_START|DMA_BUF_SYNC_READ or DMA_BUF_SYNC_END|DMA_BUF_SYNC_READ.
+ * Only READ is ever requested here: every current caller is a CPU read of
+ * surface memory, never a CPU write racing a GPU reader.
+ *
+ * This is the CPU-side counterpart to gpu_compute_wait_for_image_ready()
+ * below, and the two are NOT interchangeable. That one imports the
+ * dma-buf's fences as a Vulkan wait semaphore, which orders this driver's
+ * own GPU compute work against an external writer - it does nothing for a
+ * CPU vkMapMemory() read, which is what these two cover. A surface read
+ * back on the CPU needs this; a surface consumed by our shaders needs
+ * that. */
+static int gpu_compute_dmabuf_cpu_sync(gpu_context_t *ctx, gpu_memory_t memory, uint64_t flags) {
+    if (!ctx || !memory.memory) return -1;
+
+    /* Gets its own short-lived fd (vkGetMemoryFdKHR hands back a new one
+     * each call per the Vulkan spec - the same call
+     * gpu_compute_export_nv12_dmabuf() already makes for the real VA-API
+     * export path) purely to issue this one ioctl, and closes it again
+     * below, so these never accumulate fds across frames. It must not be
+     * confused with a longer-lived fd a caller obtained from
+     * gpu_compute_export_nv12_dmabuf() for actual DMA-BUF export. */
+    int fd = -1;
+    if (gpu_compute_export_nv12_dmabuf(ctx, memory, &fd) != 0) return -1;
+
+    struct dma_buf_sync sync = { .flags = flags };
+    int ret = ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
+    if (ret != 0) {
+        /* ENOTTY/EINVAL mean this memory, while a valid VkDeviceMemory, did
+         * not resolve to something the kernel treats as a sync-able dma-buf
+         * (no exporter support, or this allocation was never really shared
+         * externally) - expected on some caller paths, not a bug. Log once
+         * rather than every frame, since this runs per-frame on the encode
+         * input path, but still surface it once so it is visible while
+         * debugging. Any other errno is unexpected and always logged -
+         * still not fatal, because this is a best-effort barrier. */
+        static bool warned_notty = false;
+        if (errno == ENOTTY || errno == EINVAL) {
+            if (!warned_notty) {
+                fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_SYNC not supported for this memory "
+                                "(errno=%d: %s) - proceeding without CPU/GPU dma-buf sync\n",
+                        errno, strerror(errno));
+                warned_notty = true;
+            }
+        } else {
+            fprintf(stderr, "[bc250-gpu] DMA_BUF_IOCTL_SYNC failed (flags=0x%llx): %s\n",
+                    (unsigned long long)flags, strerror(errno));
+        }
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
+int gpu_compute_dmabuf_sync_start(gpu_context_t *ctx, gpu_memory_t memory) {
+    return gpu_compute_dmabuf_cpu_sync(ctx, memory, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+}
+
+int gpu_compute_dmabuf_sync_end(gpu_context_t *ctx, gpu_memory_t memory) {
+    return gpu_compute_dmabuf_cpu_sync(ctx, memory, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+}
+
 /* See gpu_compute.h for the full story on why this exists. Short version:
  * this driver's VA-API render-target surfaces are zero-copy shared with
  * Sunshine's own GL context via the dma-buf bc250_ExportSurfaceHandle()
@@ -2957,8 +3023,19 @@ void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, g
     uint8_t *uv_buf = malloc(uv_size);
     if (!y_buf || !uv_buf) { free(y_buf); free(uv_buf); return; }
 
-    if (gpu_compute_download_nv12(ctx, image, memory,
-                                   y_buf, width, uv_buf, width, width, height) == 0) {
+    /* Reads back the surface exactly as a real Sunshine session leaves it -
+     * written via Sunshine's own GL blit into the exported DMA-BUF, outside
+     * this driver's Vulkan queue entirely. Bracket the CPU read so this
+     * debug dump does not itself race that write: without it, the dumps
+     * could show the very torn-content corruption this instrumentation
+     * exists to diagnose, rather than a race-free capture of what the
+     * encoder is really about to see. */
+    gpu_compute_dmabuf_sync_start(ctx, memory);
+    int download_ok = gpu_compute_download_nv12(ctx, image, memory,
+                                   y_buf, width, uv_buf, width, width, height);
+    gpu_compute_dmabuf_sync_end(ctx, memory);
+
+    if (download_ok == 0) {
         char dump_path[600];
         snprintf(dump_path, sizeof(dump_path), "%s/real_%05d.nv12", dump_dir, dump_frame_index);
         FILE *dumpf = fopen(dump_path, "wb");

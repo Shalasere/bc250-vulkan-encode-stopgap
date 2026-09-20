@@ -404,6 +404,47 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
  * will not close the file descriptor"). Returns 0 on success. */
 int gpu_compute_export_nv12_dmabuf(gpu_context_t *ctx, gpu_memory_t memory, int *out_fd);
 
+/* Best-effort CPU-read/GPU-write synchronization for a surface's dma-buf
+ * memory, via the kernel's DMA_BUF_IOCTL_SYNC.
+ *
+ * A live Sunshine session writes into a surface's exported DMA-BUF directly
+ * via its own OpenGL/EGL blit (see gpu_compute_export_nv12_dmabuf() and
+ * va_backend.c's bc250_ExportSurfaceHandle()) - a separate GPU context, API
+ * and process from this driver's Vulkan one, with no shared semaphore or
+ * fence between them. A CPU-side vkMapMemory() read of that same memory
+ * therefore has nothing stopping it racing Sunshine's still-in-flight
+ * writes: rows the blit already finished read correctly, rows still in
+ * flight read torn/stale data - which is exactly the content-dependent
+ * block corruption (clean in static regions, corrupt in busy ones) that
+ * BC250_DUMP_REAL_INPUT dumps confirmed in the raw captured frame, before
+ * either encoder touched it.
+ *
+ * DMA_BUF_IOCTL_SYNC(START|READ) is the kernel's standard cross-process,
+ * cross-API answer: it needs no cooperation from Sunshine, and for a
+ * DRM/GEM-backed exporter like amdgpu it blocks until GPU work already
+ * recorded against the buffer's reservation object has completed, via the
+ * exporter's begin_cpu_access callback. SYNC_END closes the access session.
+ *
+ * NOT the same thing as gpu_compute_wait_for_image_ready(), and not a
+ * substitute for it. That imports the dma-buf's fences as a Vulkan wait
+ * semaphore, ordering this driver's own GPU compute against the external
+ * writer; it does nothing for a CPU read. These order a CPU read; they do
+ * nothing for our shaders. A path that does both needs both.
+ *
+ * Call sync_start() immediately before and sync_end() immediately after any
+ * CPU read of memory an external GPU API could plausibly have just written.
+ * Do NOT wrap a CPU read of memory only ever written by this driver's own
+ * GPU work (e.g. ctx->recon_memory) - that is already ordered by a real
+ * Vulkan fence via gpu_compute_sync(), and this ioctl is a kernel
+ * round-trip, not a free no-op.
+ *
+ * Best-effort: returns 0 if the ioctl was attempted and succeeded, -1 on any
+ * failure (memory isn't dma-buf-exportable, or the ioctl failed, e.g.
+ * ENOTTY/EINVAL because this allocation isn't really dma-buf-backed).
+ * Callers must treat -1 as "proceed without the barrier", not as fatal. */
+int gpu_compute_dmabuf_sync_start(gpu_context_t *ctx, gpu_memory_t memory);
+int gpu_compute_dmabuf_sync_end(gpu_context_t *ctx, gpu_memory_t memory);
+
 /* Explicit GPU-side wait for whatever wrote into `memory` last, through
  * *any* API/context - not just this driver's own Vulkan submissions.
  *

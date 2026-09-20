@@ -17,11 +17,26 @@ static bc250_driver_data* get_driver_data(VADriverContextP ctx) {
     return (bc250_driver_data*)ctx->pDriverData;
 }
 
+/* Whether to offer HEVC through VA-API at all. Read once and cached, so
+ * the profile query and the entrypoint query can never disagree - a
+ * client that saw HEVC in the profile list and was then refused the
+ * entrypoint would be a confusing failure rather than a clean absence. */
+static int hevc_advertised(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("BC250_ENABLE_HEVC");
+        cached = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T' || e[0] == 'y' || e[0] == 'Y'));
+    }
+    return cached;
+}
+
 VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list, int *num_profiles) {
     if (!ctx || !num_profiles) return VA_STATUS_ERROR_INVALID_PARAMETER;
 
     if (!profile_list) {
-        *num_profiles = 5;
+        /* Must track the flag: libva uses this count to size the array it
+         * then passes back in. */
+        *num_profiles = hevc_advertised() ? 5 : 4;
         return VA_STATUS_SUCCESS;
     }
 
@@ -37,7 +52,30 @@ VAStatus bc250_QueryConfigProfiles(VADriverContextP ctx, VAProfile *profile_list
 #endif
     profile_list[i++] = VAProfileH264Main;
     profile_list[i++] = VAProfileH264High;
-    profile_list[i++] = VAProfileHEVCMain;
+    /* HEVC Main - OFF BY DEFAULT, opt in with BC250_ENABLE_HEVC=1.
+     *
+     * bc250_CreateContext() builds a real HEVC encoder for this profile and
+     * bc250_EndPicture() drives it, and advertising it here is what makes it
+     * reachable at all: ffmpeg's hevc_vaapi builds its candidate list from
+     * vaQueryConfigProfiles(), so without this the open fails with "No usable
+     * encoding profile found".
+     *
+     * It stays off because this is a REAL-TIME streaming driver and the
+     * default HEVC path is not real-time: ~7-9 fps at 1080p against 45-60 for
+     * H.264, because H.264 does prediction and transform on the GPU while the
+     * CPU HEVC path does everything on the CPU. Sunshine probes HEVC FIRST and
+     * only falls back to H.264 when the open fails, so advertising this would
+     * let a Moonlight client that prefers HEVC silently negotiate a far worse
+     * session than the fallback it takes today.
+     *
+     * NOTE: BC250_HEVC_GPU=1 (docs/hevc-gpu-intra.md) runs HEVC intra on the
+     * GPU at ~46 fps, which would clear that bar - but it is all-intra, it has
+     * had no board validation on this tree, and it is a separate opt-in. When
+     * it is validated, revisit whether BC250_ENABLE_HEVC should default on
+     * WITH the GPU path forced; do not default this on by itself, since that
+     * would advertise the 7-9 fps CPU path. */
+    if (hevc_advertised())
+        profile_list[i++] = VAProfileHEVCMain;
 
     *num_profiles = i;
     return VA_STATUS_SUCCESS;
@@ -54,7 +92,7 @@ VAStatus bc250_QueryConfigEntrypoints(VADriverContextP ctx, VAProfile profile, V
                                 profile == VAProfileH264Baseline ||
                                 profile == VAProfileH264Main ||
                                 profile == VAProfileH264High ||
-                                profile == VAProfileHEVCMain);
+                                (profile == VAProfileHEVCMain && hevc_advertised()));
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -1355,10 +1393,19 @@ VAStatus bc250_GetImage(VADriverContextP ctx, VASurfaceID surface, int x, int y,
         if (copy_width > surf->width) copy_width = surf->width;
         if (copy_height > surf->height) copy_height = surf->height;
 
+        /* surf->memory can be the same live surface a real Sunshine session
+         * writes into directly via its own GL blit, into this surface's
+         * exported DMA-BUF - a separate GPU context/API/process from this
+         * driver's Vulkan one, with nothing shared to order this CPU read
+         * against that write (see gpu_compute.h's
+         * gpu_compute_dmabuf_sync_start()). Bracket it so vaGetImage() does
+         * not race that write the way the encode-input read did. */
+        gpu_compute_dmabuf_sync_start(&data->gpu, surf->memory);
         gpu_compute_download_nv12(&data->gpu, &surf->image, surf->memory,
                                   dst_y, y_pitch,
                                   dst_uv, uv_pitch,
                                   copy_width, copy_height);
+        gpu_compute_dmabuf_sync_end(&data->gpu, surf->memory);
     }
     DRIVER_UNLOCK(data);
     return VA_STATUS_SUCCESS;
