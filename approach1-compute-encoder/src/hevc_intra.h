@@ -61,6 +61,35 @@ extern "C" {
 #define HEVC_MODE_VERTICAL   26
 #define HEVC_MODE_COUNT      35
 
+/* The full reference sample set one 4x4 block's prediction can read, after
+ * Rec. ITU-T H.265 8.4.4.2.2's substitution scan has filled in every
+ * unavailable entry. Angular modes project along a slope and can reach
+ * 2*nTbS samples down either edge, so all 4*nTbS+1 = 17 neighbour
+ * positions are carried, not just the 11 Planar/DC/10/26 touch.
+ *
+ *   corner  = p[-1][-1]
+ *   left[y] = p[-1][y],  y = 0..7
+ *   top[x]  = p[x][-1],  x = 0..7
+ *
+ * Gathering these is a material share of encode time (it walks 5 z-scan
+ * rank comparisons and 17 plane reads), so it is exposed rather than kept
+ * internal: a caller evaluating several modes for one block, or
+ * predicting a block it has just searched, should gather ONCE and reuse.
+ * hevc_predict_4x4() is the convenience wrapper that gathers per call. */
+typedef struct {
+    uint8_t left[8];
+    uint8_t top[8];
+    uint8_t corner;
+} hevc_refs_t;
+
+void hevc_gather_refs(const uint8_t *recon_plane, int stride, int width, int height,
+                       int x0, int y0, int is_luma, hevc_refs_t *refs_out);
+
+/* Predict one 4x4 block from already-gathered references. `mode` may be
+ * any of 0..34. Writes 16 samples, row-major (pred[y*4+x]). */
+void hevc_predict_4x4_refs(const hevc_refs_t *refs, int mode, int is_luma,
+                            uint8_t pred_out[16]);
+
 /* Rec. ITU-T H.265 Table 8-10 (scan derivation for intra 4x4/8x8 luma, and
  * 4:4:4 chroma - not applicable to our 4:2:0 chroma, which always scans
  * diagonally): dirMode in [6,14] -> SCAN_VER(2), [22,30] -> SCAN_HOR(1),
@@ -88,6 +117,62 @@ int hevc_scan_idx_for_mode(int mode);
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0,
                            const int mpm[3], int qp);
+
+/* Same decision, but against references the caller has already gathered -
+ * so a caller that will go on to predict the winning mode does not pay
+ * for the 17-sample substitution scan twice. */
+int hevc_choose_luma_mode_refs(const hevc_refs_t *refs, const uint8_t *src_y, int stride,
+                                int x0, int y0, const int mpm[3], int qp);
+
+/* ---- Split mode decision (the form that can be offloaded) ----
+ *
+ * hevc_choose_luma_mode() cannot be parallelized across blocks: it reads
+ * `recon_y`, and a block's reconstruction depends on the mode chosen for
+ * its z-scan predecessors. That serial chain is ~64% of encode time by
+ * profile, all of it in prediction and SAD.
+ *
+ * These two functions break that chain into a parallel half and a serial
+ * half. hevc_block_mode_costs() scores ALL 35 modes for one block against
+ * neighbours taken from `ref_plane` - pass the SOURCE picture and every
+ * block becomes independent, so the whole frame's costs can be computed
+ * at once (on the GPU, or in any order). hevc_pick_mode_from_costs() then
+ * applies the rate term serially, where the true MPM list is known.
+ *
+ * The split keeps the rate-aware decision EXACT: only the distortion term
+ * is approximated, by measuring prediction against source rather than
+ * reconstructed neighbours. At sane QP those differ by the quantization
+ * error alone. It also makes the distortion search exhaustive over all 35
+ * modes instead of hevc_choose_luma_mode()'s coarse-then-refine subset,
+ * because a parallel evaluator has no reason to prune. */
+void hevc_block_mode_costs(const uint8_t *ref_plane, const uint8_t *src_y, int stride,
+                            int width, int height, int x0, int y0,
+                            uint16_t costs_out[HEVC_MODE_COUNT]);
+
+int hevc_pick_mode_from_costs(const uint16_t costs[HEVC_MODE_COUNT],
+                               const int mpm[3], int qp);
+
+/* 🚨 Deciding the mode outright from source-neighbour costs (i.e. using
+ * hevc_pick_mode_from_costs() as the final answer) is MEASURED BAD: it
+ * costs +48% BD-rate, and it loses on BOTH axes at once - more bits AND
+ * 3-12 dB lower PSNR - because the encoder picks whatever predicts the
+ * source best from ideal neighbours, while the decoder must predict from
+ * quantized reconstruction. Flat/gradient content is hit hardest (+59%
+ * desktop, +81% synthetic) and dense detail barely at all (+4.9%). This
+ * is the same trap already recorded for the H.264 I-slice path.
+ *
+ * So the parallel pass is used as a SHORTLIST, not a decision. This
+ * returns the `n` cheapest modes by source cost; the caller then
+ * re-evaluates just those against the real reconstructed neighbours and
+ * picks among them. The shortlist only has to CONTAIN the true winner,
+ * which a source-based score is good at, and the decision itself stays
+ * exact. Writes n modes to out[], returns how many were written. */
+void hevc_rank_modes_by_cost(const uint16_t costs[HEVC_MODE_COUNT], int n, uint8_t *out);
+
+/* Evaluate an explicit candidate list against already-gathered (real)
+ * references and return the best by SAD + lambda*bits. */
+int hevc_choose_among(const hevc_refs_t *refs, const uint8_t *src_y, int stride,
+                       int x0, int y0, const int mpm[3], int qp,
+                       const int *cands, int ncands);
 
 /* The Lagrangian multiplier hevc_choose_luma_mode() weighs signalling bits
  * against SAD with, in 1/256ths. Exposed so callers making higher-level

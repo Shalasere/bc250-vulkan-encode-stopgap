@@ -117,24 +117,11 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma, 
     return zorder_rank(nx, ny, width, is_luma) < cur_rank;
 }
 
-/* The full reference sample set one 4x4 block's prediction can read, after
- * the 8.4.4.2.2 substitution scan has filled in every unavailable entry.
- * Angular modes project along a slope and can reach 2*nTbS samples down
- * the left edge or along the top row (8.4.4.2.6's ref[] construction), so
- * all 4*nTbS+1 = 17 of the spec's neighbour positions are gathered - not
- * just the 11 that Planar/DC/10/26 happen to touch.
+/* hevc_refs_t is declared in hevc_intra.h - the reference set is part of
+ * the public interface now, so callers evaluating several modes for one
+ * block can gather once instead of per mode.
  *
- *   corner  = p[-1][-1]
- *   left[y] = p[-1][y],  y = 0..7
- *   top[x]  = p[x][-1],  x = 0..7
- */
-typedef struct {
-    uint8_t left[8];
-    uint8_t top[8];
-    uint8_t corner;
-} hevc_refs_t;
-
-/* Gathers all 17 neighbour samples and applies Rec. ITU-T H.265
+ * Gathers all 17 neighbour samples and applies Rec. ITU-T H.265
  * 8.4.4.2.2's substitution scan, which runs from p[-1][2*nTbS-1] up the
  * left edge, through the corner p[-1][-1], and along the top to
  * p[2*nTbS-1][-1], each unavailable entry taking the value of the
@@ -154,8 +141,8 @@ typedef struct {
  * the CTU size, so each 4-sample run lies wholly inside one block AND is
  * wholly in or wholly out of the picture. A run that could straddle either
  * boundary would need the per-sample form. */
-static void gather_refs(const uint8_t *plane, int stride, int width, int height,
-                         int x0, int y0, int is_luma, hevc_refs_t *r) {
+void hevc_gather_refs(const uint8_t *plane, int stride, int width, int height,
+                       int x0, int y0, int is_luma, hevc_refs_t *r) {
     long long cur_rank = zorder_rank(x0, y0, width, is_luma);
 
     int av_bl = zorder_available(x0 - 1, y0 + 4, width, height, is_luma, cur_rank);
@@ -278,7 +265,7 @@ static void predict_angular(const hevc_refs_t *r, int mode, int is_luma, uint8_t
             out[x] = clip8(r->left[0] + ((r->top[x] - r->corner) >> 1));
 }
 
-static void predict_from_refs(const hevc_refs_t *r, int mode, int is_luma, uint8_t pred_out[16]) {
+void hevc_predict_4x4_refs(const hevc_refs_t *r, int mode, int is_luma, uint8_t pred_out[16]) {
     if (mode == HEVC_MODE_PLANAR) {
         /* 8.4.4.2.5. p[nTbS][-1] is top[4] and p[-1][nTbS] is left[4]. */
         for (int y = 0; y < 4; y++)
@@ -307,8 +294,8 @@ static void predict_from_refs(const hevc_refs_t *r, int mode, int is_luma, uint8
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
                       int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
     hevc_refs_t refs;
-    gather_refs(recon_plane, stride, width, height, x0, y0, is_luma, &refs);
-    predict_from_refs(&refs, mode, is_luma, pred_out);
+    hevc_gather_refs(recon_plane, stride, width, height, x0, y0, is_luma, &refs);
+    hevc_predict_4x4_refs(&refs, mode, is_luma, pred_out);
 }
 
 /* ===================== mode decision ===================== */
@@ -365,12 +352,131 @@ static long block_sad(const uint8_t *src, int stride, int x0, int y0, const uint
  * way the old code's per-candidate hevc_predict_4x4() call did. That alone
  * more than pays for the extra candidates.
  */
+/* The parallel half of the split decision - see hevc_intra.h. Scores all
+ * 35 modes for one block; no pruning, because the point of this form is
+ * that every block is independent and an evaluator that can run them all
+ * at once gains nothing by searching fewer modes.
+ *
+ * A 4x4 SAD maxes out at 16*255 = 4080, so uint16 is exact here, not a
+ * saturating approximation. */
+void hevc_block_mode_costs(const uint8_t *ref_plane, const uint8_t *src_y, int stride,
+                            int width, int height, int x0, int y0,
+                            uint16_t costs_out[HEVC_MODE_COUNT]) {
+    hevc_refs_t refs;
+    hevc_gather_refs(ref_plane, stride, width, height, x0, y0, 1, &refs);
+    for (int m = 0; m < HEVC_MODE_COUNT; m++) {
+        uint8_t pred[16];
+        hevc_predict_4x4_refs(&refs, m, 1, pred);
+        costs_out[m] = (uint16_t)block_sad(src_y, stride, x0, y0, pred);
+    }
+}
+
+/* The serial half: apply the rate term, which needs this block's real MPM
+ * list and therefore its z-scan predecessors' committed modes.
+ *
+ * This deliberately searches the SAME coarse-then-refine candidate subset
+ * hevc_choose_luma_mode() does, even though every mode's distortion is
+ * already sitting in costs[] and an exhaustive argmin would be free here.
+ * Measured: exhaustive costs +49.4% BD-rate. Not because it picks worse
+ * modes per block - it picks better ones - but because it picks more
+ * VARIED ones, and two things in this encoder reward agreement between
+ * neighbours much more than they reward a slightly lower SAD: a mode
+ * matching the MPM list costs 2 bits instead of 6, and a CU whose four
+ * blocks all want the same mode collapses from PART_NxN to PART_2Nx2N
+ * and signals one mode instead of four. Pruning to the coarse grid keeps
+ * neighbouring blocks landing on the same few modes. The effect is
+ * strongly content-dependent - it cost +59% on a flat desktop frame and
+ * only +4.6% on dense detail, exactly where agreement was plentiful
+ * versus already rare. */
+int hevc_pick_mode_from_costs(const uint16_t costs[HEVC_MODE_COUNT],
+                               const int mpm[3], int qp) {
+    long lambda = mpm ? hevc_lambda_sad_q8(qp) : 0;
+    uint8_t tried[HEVC_MODE_COUNT];
+    memset(tried, 0, sizeof(tried));
+
+    int best_mode = HEVC_MODE_DC;
+    long best_cost = -1;
+    int best_angular = -1;
+    long best_angular_cost = -1;
+
+    int cands[18];
+    int n = 0;
+    cands[n++] = HEVC_MODE_PLANAR;
+    cands[n++] = HEVC_MODE_DC;
+    for (int m = 2; m <= 34; m += 4) cands[n++] = m;
+    if (mpm) for (int i = 0; i < 3; i++) cands[n++] = mpm[i];
+
+    for (int pass = 0; pass < 2; pass++) {
+        for (int c = 0; c < n; c++) {
+            int m = cands[c];
+            if (m < 0 || m >= HEVC_MODE_COUNT || tried[m]) continue;
+            tried[m] = 1;
+            long cost = (long)costs[m] + ((lambda * hevc_mode_signal_bits(m, mpm)) >> 8);
+            if (best_cost < 0 || cost < best_cost) { best_cost = cost; best_mode = m; }
+            if (m >= 2 && (best_angular_cost < 0 || cost < best_angular_cost)) {
+                best_angular_cost = cost; best_angular = m;
+            }
+        }
+        if (pass == 1 || best_angular < 0) break;
+        n = 0;
+        for (int d = -2; d <= 2; d++) {
+            if (!d) continue;
+            int m = best_angular + d;
+            if (m >= 2 && m <= 34) cands[n++] = m;
+        }
+    }
+    return best_mode;
+}
+
+void hevc_rank_modes_by_cost(const uint16_t costs[HEVC_MODE_COUNT], int n, uint8_t *out) {
+    if (n > HEVC_MODE_COUNT) n = HEVC_MODE_COUNT;
+    if (n < 1) n = 1;
+    uint8_t taken[HEVC_MODE_COUNT];
+    memset(taken, 0, sizeof(taken));
+    for (int k = 0; k < n; k++) {
+        int best = -1;
+        for (int m = 0; m < HEVC_MODE_COUNT; m++)
+            if (!taken[m] && (best < 0 || costs[m] < costs[best])) best = m;
+        taken[best] = 1;
+        out[k] = (uint8_t)best;
+    }
+}
+
+int hevc_choose_among(const hevc_refs_t *refs, const uint8_t *src_y, int stride,
+                       int x0, int y0, const int mpm[3], int qp,
+                       const int *cands, int ncands) {
+    long lambda = mpm ? hevc_lambda_sad_q8(qp) : 0;
+    int best_mode = HEVC_MODE_DC;
+    long best_cost = -1;
+    /* Callers concatenate a shortlist with the MPM list, which overlap
+     * often; a duplicate here costs a whole redundant prediction. */
+    uint64_t seen_lo = 0, seen_hi = 0;
+    for (int c = 0; c < ncands; c++) {
+        int m = cands[c];
+        if (m < 0 || m >= HEVC_MODE_COUNT) continue;
+        uint64_t bit = 1ull << (m & 63);
+        uint64_t *seen = (m < 64) ? &seen_lo : &seen_hi;
+        if (*seen & bit) continue;
+        *seen |= bit;
+        uint8_t pred[16];
+        hevc_predict_4x4_refs(refs, m, 1, pred);
+        long cost = block_sad(src_y, stride, x0, y0, pred) +
+                    ((lambda * hevc_mode_signal_bits(m, mpm)) >> 8);
+        if (best_cost < 0 || cost < best_cost) { best_cost = cost; best_mode = m; }
+    }
+    return best_mode;
+}
+
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0,
                            const int mpm[3], int qp) {
     hevc_refs_t refs;
-    gather_refs(recon_y, stride, width, height, x0, y0, 1, &refs);
+    hevc_gather_refs(recon_y, stride, width, height, x0, y0, 1, &refs);
+    return hevc_choose_luma_mode_refs(&refs, src_y, stride, x0, y0, mpm, qp);
+}
 
+int hevc_choose_luma_mode_refs(const hevc_refs_t *refs, const uint8_t *src_y, int stride,
+                                int x0, int y0, const int mpm[3], int qp) {
     int lambda = mpm ? hevc_lambda_sad_q8(qp) : 0;
     uint8_t tried[HEVC_MODE_COUNT];
     memset(tried, 0, sizeof(tried));
@@ -394,7 +500,7 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
             tried[m] = 1;
 
             uint8_t pred[16];
-            predict_from_refs(&refs, m, 1, pred);
+            hevc_predict_4x4_refs(refs, m, 1, pred);
             long cost = block_sad(src_y, stride, x0, y0, pred) +
                         (((long)lambda * hevc_mode_signal_bits(m, mpm)) >> 8);
 

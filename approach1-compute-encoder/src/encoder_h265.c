@@ -64,8 +64,10 @@
  * depends on - see that call site's comment below.
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include "encoder_h265.h"
 #include "bitstream.h"
+#include <time.h>
 #include "hevc_cabac.h"
 #include "hevc_intra.h"
 #include <stdio.h>
@@ -302,6 +304,25 @@ struct hevc_encoder {
     int8_t *luma_mode_map;
     uint32_t mode_map_stride;
 
+    /* Per-4x4-luma-block intra mode SHORTLIST: the `shortlist_n` modes
+     * that best predict the source block from its source neighbours,
+     * produced by one frame-wide pass before any CTU is coded (see
+     * encode_core). Every block in that pass is independent, so it is the
+     * offloadable half of the mode decision.
+     *
+     * Deliberately stores the ranked mode numbers, not the 35 costs: this
+     * is exactly what a GPU pass would hand back, and it matters. Keeping
+     * all 35 costs meant 9 MB of scattered reads per frame plus a 35-entry
+     * selection per block, both of which land in the SERIAL half and ate
+     * most of the benefit (measured: 1.25x projected, against 2.4x for
+     * this compact form). One byte per candidate, ranked, is 1 MB.
+     *
+     * Indexed [((y/4) * mode_map_stride + (x/4)) * shortlist_n].
+     * NULL when the split decision is disabled. */
+    uint8_t *mode_shortlist;
+    int use_split_rmd;
+    int shortlist_n;   /* how many of the 35 survive to the exact decision */
+
     /* Raw NV12 download scratch, real width x height. */
     uint8_t *dl_y;
     uint8_t *dl_uv;
@@ -354,6 +375,25 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->mode_map_stride = enc->coded_width / HEVC_PU_SIZE;
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
 
+    /* Split (offloadable) mode decision. Opt-in for now: it trades a
+     * small amount of decision accuracy - modes are scored against source
+     * rather than reconstructed neighbours - for a search that is
+     * embarrassingly parallel and can therefore move off the CPU. */
+    {
+        const char *e = getenv("BC250_HEVC_SPLIT_RMD");
+        enc->use_split_rmd = (e && (e[0] == '1' || e[0] == 't' || e[0] == 'T'));
+    }
+    enc->shortlist_n = 4;
+    {
+        const char *e = getenv("BC250_HEVC_SHORTLIST");
+        if (e) { int v = atoi(e); if (v >= 1 && v <= HEVC_MODE_COUNT) enc->shortlist_n = v; }
+    }
+    if (enc->use_split_rmd) {
+        size_t blocks = (size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE);
+        enc->mode_shortlist = malloc(blocks * (size_t)enc->shortlist_n);
+        if (!enc->mode_shortlist) { hevc_encoder_destroy(enc); return NULL; }
+    }
+
     enc->dl_y = malloc((size_t)width * height);
     enc->dl_uv = malloc((size_t)(width / 2) * (height / 2) * 2);
 
@@ -379,6 +419,7 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->src_y); free(encoder->src_cb); free(encoder->src_cr);
     free(encoder->recon_y); free(encoder->recon_cb); free(encoder->recon_cr);
     free(encoder->luma_mode_map);
+    free(encoder->mode_shortlist);
     free(encoder->dl_y); free(encoder->dl_uv);
     free(encoder->slice_rbsp);
     free(encoder->scratch_out);
@@ -491,17 +532,42 @@ static void run_luma_pass(hevc_encoder_t *enc, int cu_x, int cu_y, int forced_mo
         int mpm[3];
         derive_pu_mpm(enc, px, py, mpm);
 
-        int mode = (forced_mode >= 0)
-                 ? forced_mode
-                 : hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch,
-                                          px, py, mpm, qp);
+        /* Gather this block's reference samples ONCE and share them
+         * between the mode search and the prediction of the winner. The
+         * substitution scan is ~21% of encode time by profile, and doing
+         * it twice per block bought nothing - the reconstruction cannot
+         * have changed in between. */
+        hevc_refs_t refs;
+        hevc_gather_refs(enc->recon_y, (int)cw, (int)cw, (int)ch, px, py, 1, &refs);
+
+        int mode;
+        if (forced_mode >= 0) {
+            mode = forced_mode;
+        } else if (enc->mode_shortlist) {
+            /* The frame-wide pass narrowed 35 modes to a handful; decide
+             * among those against the REAL reconstructed neighbours.
+             * Taking the pass's answer directly instead is measured at
+             * +48% BD-rate - see hevc_rank_modes_by_cost()'s header note.
+             * The MPMs are appended here rather than ranked there: they
+             * are what the rate term would have promoted, and adding them
+             * needs no knowledge the parallel pass could have had. */
+            const uint8_t *sl = enc->mode_shortlist +
+                ((size_t)(py / 4) * enc->mode_map_stride + (px / 4)) * enc->shortlist_n;
+            int cands[HEVC_MODE_COUNT + 3];
+            int nc = 0;
+            for (int i = 0; i < enc->shortlist_n; i++) cands[nc++] = sl[i];
+            for (int i = 0; i < 3; i++) cands[nc++] = mpm[i];
+            mode = hevc_choose_among(&refs, enc->src_y, (int)cw, px, py, mpm, qp, cands, nc);
+        } else {
+            mode = hevc_choose_luma_mode_refs(&refs, enc->src_y, (int)cw, px, py, mpm, qp);
+        }
         p->mode[pu] = mode;
         /* Only PU 0's signalling cost is real under PART_2Nx2N; the caller
          * accounts for that, this just reports the per-shape total. */
         p->mode_bits += hevc_mode_signal_bits(mode, mpm);
 
         uint8_t pred[16];
-        hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, pred);
+        hevc_predict_4x4_refs(&refs, mode, 1, pred);
 
         int16_t residual[16];
         for (int y = 0; y < 4; y++)
@@ -629,14 +695,21 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
      * for. */
     int cx = cu_x / 2, cy = cu_y / 2;
     int chroma_idx = 4, chroma_mode = pu_modes[0];
+
+    /* Both planes' reference samples are gathered once and reused across
+     * all five candidates and the final prediction - 2 gathers per CU
+     * instead of 12. */
+    hevc_refs_t refs_cb, refs_cr;
+    hevc_gather_refs(enc->recon_cb, (int)ccw, (int)ccw, (int)cch, cx, cy, 0, &refs_cb);
+    hevc_gather_refs(enc->recon_cr, (int)ccw, (int)ccw, (int)cch, cx, cy, 0, &refs_cr);
     {
         long lambda = hevc_lambda_sad_q8(qp);
         long best = -1;
         for (int idx = 0; idx <= 4; idx++) {
             int m = hevc_chroma_mode_from_idx(idx, pu_modes[0]);
             uint8_t pb[16], pr[16];
-            hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, m, 0, pb);
-            hevc_predict_4x4(enc->recon_cr, ccw, ccw, cch, cx, cy, m, 0, pr);
+            hevc_predict_4x4_refs(&refs_cb, m, 0, pb);
+            hevc_predict_4x4_refs(&refs_cr, m, 0, pr);
             long sad = 0;
             for (int y = 0; y < 4; y++)
                 for (int x = 0; x < 4; x++) {
@@ -650,8 +723,8 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     }
 
     uint8_t pred_cb[16], pred_cr[16];
-    hevc_predict_4x4(enc->recon_cb, ccw, ccw, cch, cx, cy, chroma_mode, 0, pred_cb);
-    hevc_predict_4x4(enc->recon_cr, ccw, ccw, cch, cx, cy, chroma_mode, 0, pred_cr);
+    hevc_predict_4x4_refs(&refs_cb, chroma_mode, 0, pred_cb);
+    hevc_predict_4x4_refs(&refs_cr, chroma_mode, 0, pred_cr);
 
     int16_t res_cb[16], res_cr[16];
     for (int y = 0; y < 4; y++)
@@ -761,6 +834,9 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
  * way and then share everything from here on. */
 static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size)
 {
+    struct timespec t_start;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
                   encoder->dl_y, encoder->width, encoder->width, encoder->height);
 
@@ -777,6 +853,53 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
 
     memset(encoder->luma_mode_map, 0, (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
+
+    /* ------------------------------------------------------------------
+     * Frame-wide intra distortion pass.
+     *
+     * THIS LOOP IS THE OFFLOAD TARGET. Every iteration is independent -
+     * it reads only the source picture and writes only its own block's
+     * 35 costs - so it can run in any order, or all at once on the GPU as
+     * one dispatch of (coded_width/4) x (coded_height/4) invocations. It
+     * is written here as a plain CPU loop so the decision it produces can
+     * be validated against the serial encoder before any shader exists.
+     *
+     * By profile this is ~64% of the frame's CPU time (prediction, the
+     * neighbour substitution scan, and SAD), and it is the only large
+     * part of an intra HEVC encode that is not inherently serial: the
+     * reconstruction chain that follows genuinely cannot be parallelized
+     * at 4x4 granularity, so ~2.8x is the honest Amdahl ceiling for this
+     * decomposition, not "make H.265 fast".
+     * ------------------------------------------------------------------ */
+    double rmd_ms = 0.0;
+    if (encoder->mode_shortlist) {
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int cw = (int)encoder->coded_width, chh = (int)encoder->coded_height;
+        int nsl = encoder->shortlist_n;
+        for (int by = 0; by < chh / HEVC_PU_SIZE; by++) {
+            for (int bx = 0; bx < cw / HEVC_PU_SIZE; bx++) {
+                /* The 35 costs live and die inside this iteration - they
+                 * never reach memory, which is the whole point. Only the
+                 * ranked shortlist is written out. */
+                uint16_t costs[HEVC_MODE_COUNT];
+                hevc_block_mode_costs(encoder->src_y, encoder->src_y, cw, cw, chh,
+                                       bx * HEVC_PU_SIZE, by * HEVC_PU_SIZE, costs);
+                uint8_t *sl = encoder->mode_shortlist +
+                    ((size_t)by * encoder->mode_map_stride + bx) * nsl;
+                /* Pure distortion ranking - no rate term, because the MPM
+                 * list a rate term needs depends on neighbouring blocks'
+                 * decisions and would reintroduce exactly the serial
+                 * dependency this pass exists to avoid. The caller adds
+                 * the MPMs to the candidate set itself, which costs
+                 * nothing and covers what the rate term would have
+                 * promoted. */
+                hevc_rank_modes_by_cost(costs, nsl, sl);
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        rmd_ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    }
 
     bitstream_t slice_bs;
     bs_init(&slice_bs, encoder->slice_rbsp, encoder->slice_rbsp_cap);
@@ -864,6 +987,19 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     if (getenv("BC250_HEVC_DEBUG_RECON")) {
         FILE *fy = fopen("bc250_hevc_debug_recon_y.raw", "wb");
         if (fy) { fwrite(encoder->recon_y, 1, (size_t)encoder->coded_width * encoder->coded_height, fy); fclose(fy); }
+    }
+
+    /* Reports how much of the frame is the offloadable distortion pass
+     * versus the serial remainder, which is the only number that says
+     * what moving that pass to the GPU can actually buy. */
+    if (getenv("BC250_HEVC_PROFILE")) {
+        struct timespec tend;
+        clock_gettime(CLOCK_MONOTONIC, &tend);
+        double total_ms = (tend.tv_sec - t_start.tv_sec) * 1e3 +
+                          (tend.tv_nsec - t_start.tv_nsec) / 1e6;
+        fprintf(stderr, "[hevc-profile] total=%.1fms parallel_rmd=%.1fms serial=%.1fms (%.0f%% offloadable)\n",
+                total_ms, rmd_ms, total_ms - rmd_ms,
+                total_ms > 0 ? 100.0 * rmd_ms / total_ms : 0.0);
     }
 
     encoder->frame_count++;
