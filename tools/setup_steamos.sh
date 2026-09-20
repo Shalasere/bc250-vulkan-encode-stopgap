@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap
 #
 # setup_steamos.sh - Automated installer tailored specifically for Valve SteamOS & HoloISO
 #
@@ -95,7 +95,7 @@ else
         else
             echo -e "${RED}Error: 'cmake' not found and pre-built binary was not provided.${NC}"
             echo -e "Please download the pre-compiled release package from:"
-            echo -e "  ${BOLD}https://github.com/Kai/bc250-vcn-driver/releases${NC}"
+            echo -e "  ${BOLD}https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases${NC}"
             exit 1
         fi
     fi

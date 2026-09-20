@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap
 #
 # setup_bazzite.sh - Automated installer tailored specifically for Bazzite / Silverblue / Kinoite (rpm-ostree)
 #
@@ -74,7 +74,7 @@ else
         echo -e "${RED}Error: 'cmake' not found and pre-built binary was not provided.${NC}"
         echo -e "To resolve this:"
         echo -e "  Option A (Recommended): Download the pre-built release package from:"
-        echo -e "    ${BOLD}https://github.com/Kai/bc250-vcn-driver/releases${NC}"
+        echo -e "    ${BOLD}https://github.com/Shalasere/bc250-vulkan-encode-stopgap/releases${NC}"
         echo -e "  Option B: Install development tools on Bazzite via:"
         echo -e "    ${BOLD}ujust dev-tools${NC} (or layered via rpm-ostree install cmake gcc)"
         exit 1

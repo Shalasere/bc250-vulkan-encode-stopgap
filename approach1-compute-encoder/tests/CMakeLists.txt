@@ -1,4 +1,4 @@
-# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap
 cmake_minimum_required(VERSION 3.16)
 
 # All four test binaries below validate exclusively via assert() - there is

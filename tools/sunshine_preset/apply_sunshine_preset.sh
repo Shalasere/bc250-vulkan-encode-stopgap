@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver
+# bc250-vcn-driver v0.2.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap
 #
 # apply_sunshine_preset.sh - Applies the pre-tuned BC-250 streaming configuration to Sunshine
 #

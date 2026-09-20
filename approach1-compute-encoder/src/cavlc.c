@@ -1,4 +1,4 @@
-/* bc250-vcn-driver v0.2.0 - https://github.com/Kai/bc250-vcn-driver */
+/* bc250-vcn-driver v0.2.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap */
 /*
  * Copyright (c) 2026 BC-250 Project
  * SPDX-License-Identifier: GPL-3.0-only
