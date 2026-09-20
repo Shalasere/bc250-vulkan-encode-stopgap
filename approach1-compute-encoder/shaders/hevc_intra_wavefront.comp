@@ -1,0 +1,445 @@
+#version 450
+/* bc250-vcn-driver - HEVC intra reconstruction on the GPU
+ *
+ * Copyright (c) 2026 BC-250 Project Contributors
+ * SPDX-License-Identifier: GPL-3.0-only
+ *
+ * =====================================================================
+ * WHY THIS EXISTS
+ * =====================================================================
+ * The CPU HEVC encoder is correct and compresses well, but runs at ~9
+ * fps for 1080p on the BC-250 against H.264's 82, because H.264 does
+ * prediction and transform on the GPU and HEVC did not. Profiling put
+ * ~94% of the HEVC frame in per-block arithmetic - prediction,
+ * transform, quantization, reconstruction - and only ~0.7% in CABAC,
+ * which is the one part that must stay serial on the CPU.
+ *
+ * So the reconstruction loop moves here; the CPU reads back the modes
+ * and coefficients this shader decides and does entropy coding only.
+ *
+ * =====================================================================
+ * THE SCHEDULE, AND WHY IT IS NOT intra_wavefront.comp's
+ * =====================================================================
+ * The H.264 shader walks anti-diagonals d = mbx+mby, which is sound
+ * there because an Intra16x16 macroblock reads only top[0..15],
+ * left[0..15] and the corner - all on strictly earlier diagonals.
+ *
+ * HEVC cannot use that. Reference construction reads up to 2*nTbS
+ * samples along each edge (8.4.4.2.2), so a CTU also needs its
+ * ABOVE-RIGHT neighbour, and for a CTU at (x,y) that is (x+1,y-1) with
+ * (x+1)+(y-1) == x+y - the SAME anti-diagonal. It would be co-scheduled
+ * and not yet reconstructed, so the H.264 schedule would silently read
+ * undecoded pixels here.
+ *
+ * The fix is the 2:1 slope, which is what HEVC's own Wavefront Parallel
+ * Processing uses:
+ *
+ *     step s = 2*ctby + ctbx
+ *
+ *   left        (x-1,y  ) -> s-1   earlier
+ *   above       (x  ,y-1) -> s-2   earlier
+ *   above-right (x+1,y-1) -> s-1   earlier
+ *   below-left  (x-1,y+1) -> s+1   LATER, and that is fine:
+ *
+ * for a CTU-aligned block the below-left samples lie in the CTU
+ * below-left, which is later in raster order and therefore not z-scan
+ * available anyway (6.4.1). The substitution process fills them, just
+ * as on the CPU.
+ *
+ * One workgroup per CTU. Cross-CTU ordering is the host's pipeline
+ * barrier between dispatches - deliberately NOT an in-shader spin on an
+ * atomic flag, which would assume all workgroups are co-resident and
+ * deadlock once the dependency graph exceeds occupancy.
+ *
+ * =====================================================================
+ * SHARED MEMORY, DELIBERATELY
+ * =====================================================================
+ * Every thread in a workgroup predicts a different sample of the SAME
+ * block from the SAME reference set. Giving each thread its own copy of
+ * that set would be ~512 bytes x 256 threads of scratch per workgroup
+ * and would spill catastrophically, so the references - raw, smoothed,
+ * and the DC value derived from them - all live in shared memory and
+ * are computed once per candidate mode.
+ *
+ * =====================================================================
+ * SCOPE
+ * =====================================================================
+ * Every CTU is one undivided 16x16 CU: one intra mode, one 16x16 luma
+ * transform. That is a legal configuration the CPU encoder already
+ * emits for flat CTUs, so this can be validated bit-exactly against the
+ * CPU path forced to the same structure before split cases are added.
+ * Chroma is still done on the CPU in this version.
+ */
+
+#define N      16
+#define LOG2N   4
+#define SIDE   (2 * N)
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform PC {
+    uint width;
+    uint height;
+    uint width_ctu;
+    uint height_ctu;
+    uint qp;
+    uint step;
+} pc;
+
+layout(set = 0, binding = 0, r8) uniform readonly image2D srcY;
+layout(set = 0, binding = 2, r8) uniform image2D reconY;      /* read AND write */
+layout(std430, set = 0, binding = 4) buffer ModeOut  { int  modes[];  };
+layout(std430, set = 0, binding = 5) buffer CoeffOut { int  coeffs[]; };
+layout(std430, set = 0, binding = 6) buffer CbfOut   { uint cbf[];    };
+
+/* Rec. ITU-T H.265 8.6.4.2 transMatrix, left half of each row; the right
+ * half is the mirror M[i][N-1-j] == (-1)^i * M[i][j] and every smaller
+ * size is M32[i*32/N][j]. Same table and same nesting as the CPU, so the
+ * two cannot drift apart about what the transform is. */
+const int DCT32[32][16] = {
+ { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+ { 90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13,  4},
+ { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90},
+ { 90, 82, 67, 46, 22, -4,-31,-54,-73,-85,-90,-88,-78,-61,-38,-13},
+ { 89, 75, 50, 18,-18,-50,-75,-89,-89,-75,-50,-18, 18, 50, 75, 89},
+ { 88, 67, 31,-13,-54,-82,-90,-78,-46, -4, 38, 73, 90, 85, 61, 22},
+ { 87, 57,  9,-43,-80,-90,-70,-25, 25, 70, 90, 80, 43, -9,-57,-87},
+ { 85, 46,-13,-67,-90,-73,-22, 38, 82, 88, 54, -4,-61,-90,-78,-31},
+ { 83, 36,-36,-83,-83,-36, 36, 83, 83, 36,-36,-83,-83,-36, 36, 83},
+ { 82, 22,-54,-90,-61, 13, 78, 85, 31,-46,-90,-67,  4, 73, 88, 38},
+ { 80,  9,-70,-87,-25, 57, 90, 43,-43,-90,-57, 25, 87, 70, -9,-80},
+ { 78, -4,-82,-73, 13, 85, 67,-22,-88,-61, 31, 90, 54,-38,-90,-46},
+ { 75,-18,-89,-50, 50, 89, 18,-75,-75, 18, 89, 50,-50,-89,-18, 75},
+ { 73,-31,-90,-22, 78, 67,-38,-90,-13, 82, 61,-46,-88, -4, 85, 54},
+ { 70,-43,-87,  9, 90, 25,-80,-57, 57, 80,-25,-90, -9, 87, 43,-70},
+ { 67,-54,-78, 38, 85,-22,-90,  4, 90, 13,-88,-31, 82, 46,-73,-61},
+ { 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64},
+ { 61,-73,-46, 82, 31,-88,-13, 90, -4,-90, 22, 85,-38,-78, 54, 67},
+ { 57,-80,-25, 90, -9,-87, 43, 70,-70,-43, 87,  9,-90, 25, 80,-57},
+ { 54,-85, -4, 88,-46,-61, 82, 13,-90, 38, 67,-78,-22, 90,-31,-73},
+ { 50,-89, 18, 75,-75,-18, 89,-50,-50, 89,-18,-75, 75, 18,-89, 50},
+ { 46,-90, 38, 54,-90, 31, 61,-88, 22, 67,-85, 13, 73,-82,  4, 78},
+ { 43,-90, 57, 25,-87, 70,  9,-80, 80, -9,-70, 87,-25,-57, 90,-43},
+ { 38,-88, 73, -4,-67, 90,-46,-31, 85,-78, 13, 61,-90, 54, 22,-82},
+ { 36,-83, 83,-36,-36, 83,-83, 36, 36,-83, 83,-36,-36, 83,-83, 36},
+ { 31,-78, 90,-61,  4, 54,-88, 82,-38,-22, 73,-90, 67,-13,-46, 85},
+ { 25,-70, 90,-80, 43,  9,-57, 87,-87, 57, -9,-43, 80,-90, 70,-25},
+ { 22,-61, 85,-90, 73,-38, -4, 46,-78, 90,-82, 54,-13,-31, 67,-88},
+ { 18,-50, 75,-89, 89,-75, 50,-18,-18, 50,-75, 89,-89, 75,-50, 18},
+ { 13,-38, 61,-78, 88,-90, 85,-73, 54,-31,  4, 22,-46, 67,-82, 90},
+ {  9,-25, 43,-57, 70,-80, 87,-90, 90,-87, 80,-70, 57,-43, 25, -9},
+ {  4,-13, 22,-31, 38,-46, 54,-61, 67,-73, 78,-82, 85,-88, 90,-90}
+};
+
+/* M_N[i][j] for N == 1<<log2n. */
+int tmat(int log2n, int i, int j) {
+    int row = i << (5 - log2n);
+    int nn = 1 << log2n;
+    if (j < 16) return DCT32[row][j];
+    int v = DCT32[row][nn - 1 - j];
+    return ((row & 1) != 0) ? -v : v;
+}
+
+const int ANGLE[35] = int[35](
+      0,   0,  32,  26,  21,  17,  13,   9,   5,   2,   0,  -2,
+     -5,  -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,  -9,
+     -5,  -2,   0,   2,   5,   9,  13,  17,  21,  26,  32 );
+const int INVANG[15] = int[15](
+    -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
+     -482,  -630, -910, -1638, -4096 );
+const int LEVELSCALE[6] = int[6]( 40, 45, 51, 57, 64, 72 );
+
+/* ---- shared state, one CTU's worth ---- */
+shared int  s_ctbx, s_ctby;
+shared int  s_scan[4 * N + 1];     /* references in 8.4.4.2.2 scan order */
+shared int  s_left[SIDE];          /* p[-1][0..2N-1], substituted        */
+shared int  s_top[SIDE];           /* p[0..2N-1][-1], substituted        */
+shared int  s_corner;
+shared int  s_fl[SIDE], s_ft[SIDE], s_fc;   /* smoothed, current mode     */
+shared int  s_dc;
+shared int  s_pred[N * N];
+shared int  s_blk[N * N];          /* residual, then coefficients, reused */
+shared int  s_tmp[N * N];
+shared uint s_sad[35];
+shared int  s_best_mode;
+
+int clip8(int v) { return clamp(v, 0, 255); }
+int srcLuma(int x, int y) { return int(imageLoad(srcY,   ivec2(x, y)).r * 255.0 + 0.5); }
+int recLuma(int x, int y) { return int(imageLoad(reconY, ivec2(x, y)).r * 255.0 + 0.5); }
+
+/* ---- 8.4.4.2.2 gather + substitution ----
+ * Availability for a CTU-aligned block is just picture edges here: left,
+ * above and above-right are earlier CTUs in raster order and so z-scan
+ * available; below-left is a later CTU and never is. */
+void gather(int bx, int by) {
+    uint t = gl_LocalInvocationID.x;
+    int total = 4 * N + 1;
+
+    if (t < uint(total)) {
+        int i = int(t);
+        int v = -1;
+        if (i < SIDE) {
+            int y = SIDE - 1 - i;
+            if (y < N && bx > 0 && (by + y) < int(pc.height)) v = recLuma(bx - 1, by + y);
+        } else if (i == SIDE) {
+            if (bx > 0 && by > 0) v = recLuma(bx - 1, by - 1);
+        } else {
+            int x = i - SIDE - 1;
+            bool ok = (x < N) ? (by > 0) : (by > 0 && (bx + N) < int(pc.width));
+            if (ok && (bx + x) < int(pc.width)) v = recLuma(bx + x, by - 1);
+        }
+        s_scan[i] = v;
+    }
+    barrier();
+
+    /* The substitution fill is a sequential scan by definition; 65 steps
+     * on one thread is nothing next to the prediction that follows. */
+    if (t == 0u) {
+        int first = -1;
+        for (int i = 0; i < total; i++) { if (s_scan[i] >= 0) { first = i; break; } }
+        if (first < 0) {
+            for (int i = 0; i < total; i++) s_scan[i] = 128;
+        } else {
+            for (int i = first - 1; i >= 0; i--) s_scan[i] = s_scan[first];
+            for (int i = first + 1; i < total; i++) if (s_scan[i] < 0) s_scan[i] = s_scan[i - 1];
+        }
+    }
+    barrier();
+
+    if (t < uint(SIDE)) {
+        s_left[t] = s_scan[SIDE - 1 - int(t)];
+        s_top[t]  = s_scan[SIDE + 1 + int(t)];
+    }
+    if (t == 0u) s_corner = s_scan[SIDE];
+    barrier();
+}
+
+/* ---- 8.4.4.2.3 reference smoothing into s_fl/s_ft/s_fc, plus the DC
+ * value. Luma, nTbS >= 8, not DC; intraHorVerDistThres[16] is 1. Caller
+ * must barrier() after. */
+void smooth_for(int mode) {
+    uint t = gl_LocalInvocationID.x;
+    bool filt = (mode != 1);
+    if (filt && mode != 0) filt = (min(abs(mode - 26), abs(mode - 10)) > 1);
+
+    if (t < uint(SIDE)) {
+        int i = int(t);
+        if (!filt) {
+            s_fl[i] = s_left[i];
+            s_ft[i] = s_top[i];
+        } else if (i == 0) {
+            s_fl[0] = (s_corner + 2 * s_left[0] + s_left[1] + 2) >> 2;
+            s_ft[0] = (s_corner + 2 * s_top[0]  + s_top[1]  + 2) >> 2;
+        } else if (i == SIDE - 1) {
+            s_fl[i] = s_left[i];
+            s_ft[i] = s_top[i];
+        } else {
+            s_fl[i] = (s_left[i - 1] + 2 * s_left[i] + s_left[i + 1] + 2) >> 2;
+            s_ft[i] = (s_top[i - 1]  + 2 * s_top[i]  + s_top[i + 1]  + 2) >> 2;
+        }
+    }
+    if (t == 0u) {
+        s_fc = filt ? ((s_left[0] + 2 * s_corner + s_top[0] + 2) >> 2) : s_corner;
+        int sum = N;
+        for (int i = 0; i < N; i++) sum += s_left[i] + s_top[i];
+        s_dc = sum >> (LOG2N + 1);
+    }
+}
+
+/* One predicted sample. Reads only shared references. */
+int predict(int mode, int x, int y) {
+    if (mode == 0) {                                   /* 8.4.4.2.5 planar */
+        int v = (N - 1 - x) * s_fl[y] + (x + 1) * s_ft[N] +
+                (N - 1 - y) * s_ft[x] + (y + 1) * s_fl[N] + N;
+        return v >> (LOG2N + 1);
+    }
+    if (mode == 1) {                                   /* 8.4.4.2.4 DC */
+        int dc = s_dc;
+        if (x == 0 && y == 0) return (s_fl[0] + 2 * dc + s_ft[0] + 2) >> 2;
+        if (y == 0) return (s_ft[x] + 3 * dc + 2) >> 2;
+        if (x == 0) return (s_fl[y] + 3 * dc + 2) >> 2;
+        return dc;
+    }
+
+    /* 8.4.4.2.6 angular. The two families are transposes; `i` indexes
+     * along the reference array, `j` drives the slope. */
+    int ang  = ANGLE[mode];
+    bool vert = (mode >= 18);
+    int i = vert ? x : y;
+    int j = vert ? y : x;
+    int idx  = ((j + 1) * ang) >> 5;
+    int fact = ((j + 1) * ang) & 31;
+
+    int r0 = 0, r1 = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int k = i + idx + 1 + pass;
+        int v;
+        if (k == 0) v = s_fc;
+        else if (k > 0) v = vert ? s_ft[min(k - 1, SIDE - 1)] : s_fl[min(k - 1, SIDE - 1)];
+        else {
+            int m = -1 + ((k * INVANG[mode - 11] + 128) >> 8);   /* Table 8-6 */
+            if (m < 0) v = s_fc;
+            else v = vert ? s_fl[min(m, SIDE - 1)] : s_ft[min(m, SIDE - 1)];
+        }
+        if (pass == 0) r0 = v; else r1 = v;
+    }
+    int p = (fact != 0) ? (((32 - fact) * r0 + fact * r1 + 16) >> 5) : r0;
+
+    /* exactly-vertical / exactly-horizontal edge filter (luma, N < 32) */
+    if (mode == 26 && x == 0) return clip8(s_ft[0] + ((s_fl[y] - s_fc) >> 1));
+    if (mode == 10 && y == 0) return clip8(s_fl[0] + ((s_ft[x] - s_fc) >> 1));
+    return p;
+}
+
+/* 1-D partial butterfly forward transform of 16 samples, in place.
+ * Same decomposition as the CPU reference: even outputs are the
+ * half-size transform of the sums, odd outputs the direct product with
+ * the differences. Unrolled by size rather than recursive - GLSL has no
+ * recursion, and fixed extents keep this off scratch memory. */
+void fwd16(inout int v[N]) {
+    int e8[8], o8[8], e4[4], o4[4], e2[2], o2[2];
+    for (int k = 0; k < 8; k++) { e8[k] = v[k] + v[15 - k]; o8[k] = v[k] - v[15 - k]; }
+    for (int k = 0; k < 4; k++) { e4[k] = e8[k] + e8[7 - k]; o4[k] = e8[k] - e8[7 - k]; }
+    for (int k = 0; k < 2; k++) { e2[k] = e4[k] + e4[3 - k]; o2[k] = e4[k] - e4[3 - k]; }
+
+    int out_[N];
+    /* odd outputs of the 16-point stage */
+    for (int k = 0; k < 8; k++) {
+        int acc = 0;
+        for (int jj = 0; jj < 8; jj++) acc += tmat(4, 2 * k + 1, jj) * o8[jj];
+        out_[2 * k + 1] = acc;
+    }
+    /* odd outputs of the 8-point stage land on multiples of 2 */
+    for (int k = 0; k < 4; k++) {
+        int acc = 0;
+        for (int jj = 0; jj < 4; jj++) acc += tmat(3, 2 * k + 1, jj) * o4[jj];
+        out_[(2 * k + 1) * 2] = acc;
+    }
+    /* odd outputs of the 4-point stage land on multiples of 4 */
+    for (int k = 0; k < 2; k++) {
+        int acc = 0;
+        for (int jj = 0; jj < 2; jj++) acc += tmat(2, 2 * k + 1, jj) * o2[jj];
+        out_[(2 * k + 1) * 4] = acc;
+    }
+    /* the 2-point base: rows 0 and 1 of M2 == M32 rows 0 and 16 */
+    out_[0] = 64 * (e2[0] + e2[1]);
+    out_[8] = 64 * (e2[0] - e2[1]);
+    for (int k = 0; k < N; k++) v[k] = out_[k];
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+
+    /* which CTU? s = 2*ctby + ctbx, so ctbx = s - 2*ctby */
+    if (t == 0u) {
+        int s  = int(pc.step);
+        int Wc = int(pc.width_ctu), Hc = int(pc.height_ctu);
+        int y_lo = max(0, (s - Wc + 2) / 2);
+        int yy = y_lo + int(gl_WorkGroupID.x);
+        int xx = s - 2 * yy;
+        s_ctby = (yy < Hc && xx >= 0 && xx < Wc) ? yy : -1;
+        s_ctbx = xx;
+    }
+    barrier();
+    if (s_ctby < 0) return;
+
+    int bx = s_ctbx * N, by = s_ctby * N;
+    int px = int(t) & (N - 1), py = int(t) >> LOG2N;
+
+    gather(bx, by);
+
+    int src = srcLuma(bx + px, by + py);
+
+    /* ---- mode search over the coarse grid plus planar/DC ---- */
+    if (t < 35u) s_sad[t] = 0u;
+    barrier();
+    for (int m = 0; m < 35; m++) {
+        if (m >= 2 && ((m - 2) % 4) != 0) continue;     /* coarse grid */
+        smooth_for(m);
+        barrier();
+        atomicAdd(s_sad[m], uint(abs(src - predict(m, px, py))));
+        barrier();
+    }
+    if (t == 0u) {
+        int best = 1; uint bc = 0xffffffffu;
+        for (int m = 0; m < 35; m++) {
+            if (m >= 2 && ((m - 2) % 4) != 0) continue;
+            if (s_sad[m] < bc) { bc = s_sad[m]; best = m; }
+        }
+        s_best_mode = best;
+    }
+    barrier();
+
+    int mode = s_best_mode;
+    smooth_for(mode);
+    barrier();
+    s_pred[t] = predict(mode, px, py);
+    barrier();
+    s_blk[t] = src - s_pred[t];
+    barrier();
+
+    /* ---- forward transform, columns then rows ---- */
+    int shift1 = LOG2N + 8 - 9, shift2 = LOG2N + 6;
+    if (t < uint(N)) {
+        int line[N];
+        for (int r = 0; r < N; r++) line[r] = s_blk[r * N + int(t)];
+        fwd16(line);
+        for (int r = 0; r < N; r++) s_tmp[r * N + int(t)] = (line[r] + (1 << (shift1 - 1))) >> shift1;
+    }
+    barrier();
+    if (t < uint(N)) {
+        int line[N];
+        for (int c = 0; c < N; c++) line[c] = s_tmp[int(t) * N + c];
+        fwd16(line);
+        for (int c = 0; c < N; c++) s_blk[int(t) * N + c] = (line[c] + (1 << (shift2 - 1))) >> shift2;
+    }
+    barrier();
+
+    /* ---- quantize (8.6.3), bdShift = BitDepth + log2n - 5 ---- */
+    int qp = int(pc.qp);
+    int per = qp / 6, rem = qp - per * 6;
+    int bdshift = 8 + LOG2N - 5;
+    int denom = (LEVELSCALE[rem] * 16) << per;
+    int raw = s_blk[t];
+    int lvl = (raw < 0 ? -1 : 1) * (((abs(raw) << bdshift) + denom / 2) / denom);
+    s_blk[t] = clamp(lvl, -32768, 32767);
+    barrier();
+
+    uint ctu = uint(s_ctby * int(pc.width_ctu) + s_ctbx);
+    coeffs[ctu * uint(N * N) + t] = s_blk[t];
+    if (t == 0u) {
+        modes[ctu] = mode;
+        uint nz = 0u;
+        for (int i = 0; i < N * N; i++) { if (s_blk[i] != 0) { nz = 1u; break; } }
+        cbf[ctu] = nz;
+    }
+
+    /* ---- dequantize + inverse transform + reconstruct ---- */
+    int dq = (s_blk[t] * 16 * LEVELSCALE[rem]) << per;
+    s_tmp[t] = clamp((dq + (1 << (bdshift - 1))) >> bdshift, -32768, 32767);
+    barrier();
+
+    if (t < uint(N)) {                                   /* inverse, columns */
+        int line[N];
+        for (int r = 0; r < N; r++) {
+            int acc = 0;
+            for (int k = 0; k < N; k++) acc += tmat(LOG2N, k, r) * s_tmp[k * N + int(t)];
+            line[r] = clamp((acc + 64) >> 7, -32768, 32767);
+        }
+        for (int r = 0; r < N; r++) s_blk[r * N + int(t)] = line[r];
+    }
+    barrier();
+    if (t < uint(N)) {                                   /* inverse, rows */
+        int line[N];
+        for (int c = 0; c < N; c++) {
+            int acc = 0;
+            for (int k = 0; k < N; k++) acc += tmat(LOG2N, k, c) * s_blk[int(t) * N + k];
+            line[c] = clamp((acc + 2048) >> 12, -32768, 32767);
+        }
+        for (int c = 0; c < N; c++) s_tmp[int(t) * N + c] = line[c];
+    }
+    barrier();
+
+    imageStore(reconY, ivec2(bx + px, by + py),
+               vec4(float(clip8(s_pred[t] + s_tmp[t])) / 255.0, 0.0, 0.0, 1.0));
+}
