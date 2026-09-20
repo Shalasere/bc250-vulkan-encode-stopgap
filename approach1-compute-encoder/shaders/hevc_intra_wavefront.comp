@@ -203,10 +203,13 @@ int chroma_mode_from_idx(int idx, int luma) {
 /* ---- shared state, one CTU's worth ---- */
 shared int  s_ctbx, s_ctby;
 shared int  s_scan[4 * N + 1];     /* references in 8.4.4.2.2 scan order */
-shared int  s_left[SIDE];          /* p[-1][0..2N-1], substituted        */
-shared int  s_top[SIDE];           /* p[0..2N-1][-1], substituted        */
-shared int  s_corner;
-shared int  s_fl[SIDE], s_ft[SIDE], s_fc;   /* smoothed, current mode     */
+/* Two reference sets, built once: [0] as gathered, [1] smoothed per
+ * 8.4.4.2.3. filterFlag is binary, so a mode selects a set rather than
+ * causing a re-smooth - which is what lets the mode search run with no
+ * barrier at all between candidates. */
+shared int  s_refl[2][SIDE];       /* p[-1][0..2N-1], substituted        */
+shared int  s_reft[2][SIDE];       /* p[0..2N-1][-1], substituted        */
+shared int  s_refc[2];
 shared int  s_dc;
 shared int  s_pred[N * N];
 shared int  s_blk[N * N];          /* residual, then coefficients, reused */
@@ -272,62 +275,57 @@ void gather(int bx, int by) {
     barrier();
 
     if (t < uint(SIDE)) {
-        s_left[t] = s_scan[SIDE - 1 - int(t)];
-        s_top[t]  = s_scan[SIDE + 1 + int(t)];
+        s_refl[0][t] = s_scan[SIDE - 1 - int(t)];
+        s_reft[0][t] = s_scan[SIDE + 1 + int(t)];
     }
     if (t == 0u) {
-        s_corner = s_scan[SIDE];
+        s_refc[0] = s_scan[SIDE];
         int sum = N;
         for (int i = 0; i < N; i++) sum += s_scan[SIDE - 1 - i] + s_scan[SIDE + 1 + i];
-        s_dc = sum >> (LOG2N + 1);
+        s_dc = sum >> (LOG2N + 1);   /* DC is never filtered, so this is fixed */
     }
+    barrier();
+
+    /* Build the smoothed set once. */
+    if (t < uint(SIDE)) {
+        int i = int(t);
+        if (i == 0) {
+            s_refl[1][0] = (s_refc[0] + 2 * s_refl[0][0] + s_refl[0][1] + 2) >> 2;
+            s_reft[1][0] = (s_refc[0] + 2 * s_reft[0][0] + s_reft[0][1] + 2) >> 2;
+        } else if (i == SIDE - 1) {
+            s_refl[1][i] = s_refl[0][i];
+            s_reft[1][i] = s_reft[0][i];
+        } else {
+            s_refl[1][i] = (s_refl[0][i - 1] + 2 * s_refl[0][i] + s_refl[0][i + 1] + 2) >> 2;
+            s_reft[1][i] = (s_reft[0][i - 1] + 2 * s_reft[0][i] + s_reft[0][i + 1] + 2) >> 2;
+        }
+    }
+    if (t == 0u) s_refc[1] = (s_refl[0][0] + 2 * s_refc[0] + s_reft[0][0] + 2) >> 2;
     barrier();
 }
 
-/* ---- 8.4.4.2.3 reference smoothing into s_fl/s_ft/s_fc, plus the DC
- * value. Luma, nTbS >= 8, not DC; intraHorVerDistThres[16] is 1. Caller
- * must barrier() after. */
-void smooth_for(int mode) {
-    uint t = gl_LocalInvocationID.x;
-    bool filt = (mode != 1);
-    if (filt && mode != 0) filt = (min(abs(mode - 26), abs(mode - 10)) > 1);
-
-    if (t < uint(SIDE)) {
-        int i = int(t);
-        if (!filt) {
-            s_fl[i] = s_left[i];
-            s_ft[i] = s_top[i];
-        } else if (i == 0) {
-            s_fl[0] = (s_corner + 2 * s_left[0] + s_left[1] + 2) >> 2;
-            s_ft[0] = (s_corner + 2 * s_top[0]  + s_top[1]  + 2) >> 2;
-        } else if (i == SIDE - 1) {
-            s_fl[i] = s_left[i];
-            s_ft[i] = s_top[i];
-        } else {
-            s_fl[i] = (s_left[i - 1] + 2 * s_left[i] + s_left[i + 1] + 2) >> 2;
-            s_ft[i] = (s_top[i - 1]  + 2 * s_top[i]  + s_top[i + 1]  + 2) >> 2;
-        }
-    }
-    /* s_dc is NOT recomputed here: DC is never filtered, so its value
-     * depends only on the unsmoothed references and is set once after
-     * the gather. Recomputing it per candidate had one thread looping
-     * 2*N times inside the mode search. */
-    if (t == 0u)
-        s_fc = filt ? ((s_left[0] + 2 * s_corner + s_top[0] + 2) >> 2) : s_corner;
+/* 8.4.4.2.3: which reference set a mode uses. 0 for DC and for modes
+ * within intraHorVerDistThres (1 at nTbS 16) of exactly horizontal or
+ * vertical; 1 otherwise. */
+int refset_for(int mode) {
+    if (mode == 1) return 0;
+    if (mode == 0) return 1;
+    return (min(abs(mode - 26), abs(mode - 10)) > 1) ? 1 : 0;
 }
 
-/* One predicted sample. Reads only shared references. */
-int predict(int mode, int x, int y) {
+/* One predicted sample from reference set `rs`. Reads only shared
+ * state, so candidates can be evaluated back to back with no barrier. */
+int predict(int rs, int mode, int x, int y) {
     if (mode == 0) {                                   /* 8.4.4.2.5 planar */
-        int v = (N - 1 - x) * s_fl[y] + (x + 1) * s_ft[N] +
-                (N - 1 - y) * s_ft[x] + (y + 1) * s_fl[N] + N;
+        int v = (N - 1 - x) * s_refl[rs][y] + (x + 1) * s_reft[rs][N] +
+                (N - 1 - y) * s_reft[rs][x] + (y + 1) * s_refl[rs][N] + N;
         return v >> (LOG2N + 1);
     }
     if (mode == 1) {                                   /* 8.4.4.2.4 DC */
         int dc = s_dc;
-        if (x == 0 && y == 0) return (s_fl[0] + 2 * dc + s_ft[0] + 2) >> 2;
-        if (y == 0) return (s_ft[x] + 3 * dc + 2) >> 2;
-        if (x == 0) return (s_fl[y] + 3 * dc + 2) >> 2;
+        if (x == 0 && y == 0) return (s_refl[rs][0] + 2 * dc + s_reft[rs][0] + 2) >> 2;
+        if (y == 0) return (s_reft[rs][x] + 3 * dc + 2) >> 2;
+        if (x == 0) return (s_refl[rs][y] + 3 * dc + 2) >> 2;
         return dc;
     }
 
@@ -344,20 +342,21 @@ int predict(int mode, int x, int y) {
     for (int pass = 0; pass < 2; pass++) {
         int k = i + idx + 1 + pass;
         int v;
-        if (k == 0) v = s_fc;
-        else if (k > 0) v = vert ? s_ft[min(k - 1, SIDE - 1)] : s_fl[min(k - 1, SIDE - 1)];
+        if (k == 0) v = s_refc[rs];
+        else if (k > 0) v = vert ? s_reft[rs][min(k - 1, SIDE - 1)]
+                                 : s_refl[rs][min(k - 1, SIDE - 1)];
         else {
             int m = -1 + ((k * INVANG[mode - 11] + 128) >> 8);   /* Table 8-6 */
-            if (m < 0) v = s_fc;
-            else v = vert ? s_fl[min(m, SIDE - 1)] : s_ft[min(m, SIDE - 1)];
+            if (m < 0) v = s_refc[rs];
+            else v = vert ? s_refl[rs][min(m, SIDE - 1)] : s_reft[rs][min(m, SIDE - 1)];
         }
         if (pass == 0) r0 = v; else r1 = v;
     }
     int p = (fact != 0) ? (((32 - fact) * r0 + fact * r1 + 16) >> 5) : r0;
 
     /* exactly-vertical / exactly-horizontal edge filter (luma, N < 32) */
-    if (mode == 26 && x == 0) return clip8(s_ft[0] + ((s_fl[y] - s_fc) >> 1));
-    if (mode == 10 && y == 0) return clip8(s_fl[0] + ((s_ft[x] - s_fc) >> 1));
+    if (mode == 26 && x == 0) return clip8(s_reft[rs][0] + ((s_refl[rs][y] - s_refc[rs]) >> 1));
+    if (mode == 10 && y == 0) return clip8(s_refl[rs][0] + ((s_reft[rs][x] - s_refc[rs]) >> 1));
     return p;
 }
 
@@ -475,15 +474,17 @@ void main() {
     int src = srcLuma(bx + px, by + py);
 
     /* ---- mode search over the coarse grid plus planar/DC ---- */
+    /* No barrier inside this loop: both reference sets are already
+     * built and never change, and the accumulators are per-mode atomics.
+     * Re-smoothing per candidate used to cost two barriers each, ~20 in
+     * all, on a shader whose critical path is barrier-dominated. */
     if (t < 35u) s_sad[t] = 0u;
     barrier();
     for (int m = 0; m < 35; m++) {
         if (m >= 2 && ((m - 2) % 4) != 0) continue;     /* coarse grid */
-        smooth_for(m);
-        barrier();
-        atomicAdd(s_sad[m], uint(abs(src - predict(m, px, py))));
-        barrier();
+        atomicAdd(s_sad[m], uint(abs(src - predict(refset_for(m), m, px, py))));
     }
+    barrier();
     if (t == 0u) {
         int best = 1; uint bc = 0xffffffffu;
         for (int m = 0; m < 35; m++) {
@@ -495,9 +496,7 @@ void main() {
     barrier();
 
     int mode = s_best_mode;
-    smooth_for(mode);
-    barrier();
-    s_pred[t] = predict(mode, px, py);
+    s_pred[t] = predict(refset_for(mode), mode, px, py);
     barrier();
     s_blk[t] = src - s_pred[t];
     barrier();
@@ -596,17 +595,17 @@ void main() {
     }
 
     /* Both planes share one signalled mode, so score them together. */
+    /* Chroma is never smoothed, so this loop needs no barrier either. */
     if (t < 5u) s_csad[t] = 0u;
     barrier();
-    for (int idx = 0; idx < 5; idx++) {
-        int cm = chroma_mode_from_idx(idx, mode);
-        if (cthread) {
-            uint d = uint(abs(csrc0 - predict_c(0, cm, cpx, cpy))) +
-                     uint(abs(csrc1 - predict_c(1, cm, cpx, cpy)));
-            atomicAdd(s_csad[idx], d);
+    if (cthread) {
+        for (int idx = 0; idx < 5; idx++) {
+            int cm = chroma_mode_from_idx(idx, mode);
+            atomicAdd(s_csad[idx], uint(abs(csrc0 - predict_c(0, cm, cpx, cpy))) +
+                                    uint(abs(csrc1 - predict_c(1, cm, cpx, cpy))));
         }
-        barrier();
     }
+    barrier();
     if (t == 0u) {
         int bi = 4; uint bc = 0xffffffffu;
         for (int idx = 0; idx < 5; idx++) if (s_csad[idx] < bc) { bc = s_csad[idx]; bi = idx; }
