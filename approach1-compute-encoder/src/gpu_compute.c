@@ -1732,7 +1732,10 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
     {
         uint32_t nctu = wc * hc;
         VkDeviceSize mode_sz  = (VkDeviceSize)nctu * sizeof(int32_t);
-        VkDeviceSize coeff_sz = (VkDeviceSize)nctu * 256u * sizeof(int32_t);
+        /* 384 ints per CTU: 256 luma + 64 Cb + 64 Cr. That is exactly the
+         * per-macroblock capacity the coefficient buffer already has
+         * (24 blocks x 16 coefficients), so it fits without resizing. */
+        VkDeviceSize coeff_sz = (VkDeviceSize)nctu * 384u * sizeof(int32_t);
         VkDeviceSize cbf_sz   = (VkDeviceSize)nctu * sizeof(uint32_t);
         if (mode_sz  > ctx->quant_staging_size)     mode_sz  = ctx->quant_staging_size;
         if (coeff_sz > ctx->coeff_staging_size)     coeff_sz = ctx->coeff_staging_size;

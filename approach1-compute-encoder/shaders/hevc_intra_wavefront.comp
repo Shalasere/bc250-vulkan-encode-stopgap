@@ -86,8 +86,10 @@ layout(push_constant) uniform PC {
     uint step;
 } pc;
 
-layout(set = 0, binding = 0, r8) uniform readonly image2D srcY;
-layout(set = 0, binding = 2, r8) uniform image2D reconY;      /* read AND write */
+layout(set = 0, binding = 0, r8)  uniform readonly image2D srcY;
+layout(set = 0, binding = 1, rg8) uniform readonly image2D srcUV;
+layout(set = 0, binding = 2, r8)  uniform image2D reconY;      /* read AND write */
+layout(set = 0, binding = 3, rg8) uniform image2D reconUV;     /* read AND write */
 layout(std430, set = 0, binding = 4) buffer ModeOut  { int  modes[];  };
 layout(std430, set = 0, binding = 5) buffer CoeffOut { int  coeffs[]; };
 layout(std430, set = 0, binding = 6) buffer CbfOut   { uint cbf[];    };
@@ -148,6 +150,21 @@ const int INVANG[15] = int[15](
     -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
      -482,  -630, -910, -1638, -4096 );
 const int LEVELSCALE[6] = int[6]( 40, 45, 51, 57, 64, 72 );
+/* Table 8-2's intra_chroma_pred_mode candidate list. */
+const int CHROMA_CAND[4] = int[4]( 0, 26, 10, 1 );
+
+#define NC      8        /* chroma block side for a 16x16 CU, 4:2:0 */
+#define LOG2NC  3
+#define SIDE_C  (2 * NC)
+
+/* 8.4.3: resolve an intra_chroma_pred_mode index against the luma mode.
+ * A candidate colliding with luma would be redundant - DM_CHROMA already
+ * reaches it - so the spec substitutes mode 34 in that slot. */
+int chroma_mode_from_idx(int idx, int luma) {
+    if (idx == 4) return luma;                 /* DM_CHROMA */
+    int m = CHROMA_CAND[idx];
+    return (m == luma) ? 34 : m;
+}
 
 /* ---- shared state, one CTU's worth ---- */
 shared int  s_ctbx, s_ctby;
@@ -162,6 +179,17 @@ shared int  s_blk[N * N];          /* residual, then coefficients, reused */
 shared int  s_tmp[N * N];
 shared uint s_sad[35];
 shared int  s_best_mode;
+
+/* Chroma, both planes: [0] = Cb, [1] = Cr. They share one signalled
+ * mode, so the candidate search scores them together. */
+shared int  s_cl[2][SIDE_C], s_ct[2][SIDE_C], s_cc[2];
+shared int  s_cdc[2];
+shared int  s_cpred[2][NC * NC];
+shared int  s_cblk[2][NC * NC];
+shared int  s_ctmp[2][NC * NC];
+shared uint s_csad[5];
+shared int  s_cidx, s_cmode;
+shared uint s_nzl;          /* luma cbf, held until the chroma flags join it */
 
 int clip8(int v) { return clamp(v, 0, 255); }
 int srcLuma(int x, int y) { return int(imageLoad(srcY,   ivec2(x, y)).r * 255.0 + 0.5); }
@@ -291,6 +319,114 @@ int predict(int mode, int x, int y) {
     return p;
 }
 
+/* ---- chroma ------------------------------------------------------
+ * Same structure as luma at 8x8, minus everything the spec gates on
+ * cIdx == 0: no 8.4.4.2.3 reference smoothing, no DC edge filter, no
+ * mode 10/26 edge filter. Availability is identical - left, above and
+ * above-right are earlier CTUs, below-left is a later one. */
+int recCb(int x, int y) { return int(imageLoad(reconUV, ivec2(x, y)).r * 255.0 + 0.5); }
+int recCr(int x, int y) { return int(imageLoad(reconUV, ivec2(x, y)).g * 255.0 + 0.5); }
+
+void gather_chroma(int plane, int cx, int cy, int cw, int chh) {
+    uint t = gl_LocalInvocationID.x;
+    int total = 4 * NC + 1;
+
+    if (t < uint(total)) {
+        int i = int(t);
+        int v = -1;
+        int sx = -1, sy = -1;
+        if (i < SIDE_C) {
+            int yy = SIDE_C - 1 - i;
+            if (yy < NC && cx > 0 && (cy + yy) < chh) { sx = cx - 1; sy = cy + yy; }
+        } else if (i == SIDE_C) {
+            if (cx > 0 && cy > 0) { sx = cx - 1; sy = cy - 1; }
+        } else {
+            int xx = i - SIDE_C - 1;
+            bool ok = (xx < NC) ? (cy > 0) : (cy > 0 && (cx + NC) < cw);
+            if (ok && (cx + xx) < cw) { sx = cx + xx; sy = cy - 1; }
+        }
+        if (sx >= 0) v = (plane == 0) ? recCb(sx, sy) : recCr(sx, sy);
+        s_scan[i] = v;
+    }
+    barrier();
+
+    if (t == 0u) {
+        int first = -1;
+        for (int i = 0; i < total; i++) { if (s_scan[i] >= 0) { first = i; break; } }
+        if (first < 0) {
+            for (int i = 0; i < total; i++) s_scan[i] = 128;
+        } else {
+            for (int i = first - 1; i >= 0; i--) s_scan[i] = s_scan[first];
+            for (int i = first + 1; i < total; i++) if (s_scan[i] < 0) s_scan[i] = s_scan[i - 1];
+        }
+    }
+    barrier();
+
+    if (t < uint(SIDE_C)) {
+        s_cl[plane][t] = s_scan[SIDE_C - 1 - int(t)];
+        s_ct[plane][t] = s_scan[SIDE_C + 1 + int(t)];
+    }
+    if (t == 0u) {
+        s_cc[plane] = s_scan[SIDE_C];
+        int sum = NC;
+        for (int i = 0; i < NC; i++) sum += s_scan[SIDE_C - 1 - i] + s_scan[SIDE_C + 1 + i];
+        s_cdc[plane] = sum >> (LOG2NC + 1);
+    }
+    barrier();
+}
+
+int predict_c(int plane, int mode, int x, int y) {
+    if (mode == 0) {
+        int v = (NC - 1 - x) * s_cl[plane][y] + (x + 1) * s_ct[plane][NC] +
+                (NC - 1 - y) * s_ct[plane][x] + (y + 1) * s_cl[plane][NC] + NC;
+        return v >> (LOG2NC + 1);
+    }
+    if (mode == 1) return s_cdc[plane];        /* no edge filter for chroma */
+
+    int ang = ANGLE[mode];
+    bool vert = (mode >= 18);
+    int i = vert ? x : y;
+    int j = vert ? y : x;
+    int idx  = ((j + 1) * ang) >> 5;
+    int fact = ((j + 1) * ang) & 31;
+
+    int r0 = 0, r1 = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int k = i + idx + 1 + pass;
+        int v;
+        if (k == 0) v = s_cc[plane];
+        else if (k > 0) v = vert ? s_ct[plane][min(k - 1, SIDE_C - 1)]
+                                 : s_cl[plane][min(k - 1, SIDE_C - 1)];
+        else {
+            int m = -1 + ((k * INVANG[mode - 11] + 128) >> 8);
+            if (m < 0) v = s_cc[plane];
+            else v = vert ? s_cl[plane][min(m, SIDE_C - 1)] : s_ct[plane][min(m, SIDE_C - 1)];
+        }
+        if (pass == 0) r0 = v; else r1 = v;
+    }
+    return (fact != 0) ? (((32 - fact) * r0 + fact * r1 + 16) >> 5) : r0;
+}
+
+/* 1-D partial butterfly forward transform of 8 samples, in place. */
+void fwd8(inout int v[NC]) {
+    int e4[4], o4[4], e2[2], o2[2], out_[NC];
+    for (int k = 0; k < 4; k++) { e4[k] = v[k] + v[7 - k]; o4[k] = v[k] - v[7 - k]; }
+    for (int k = 0; k < 2; k++) { e2[k] = e4[k] + e4[3 - k]; o2[k] = e4[k] - e4[3 - k]; }
+    for (int k = 0; k < 4; k++) {
+        int acc = 0;
+        for (int jj = 0; jj < 4; jj++) acc += tmat(3, 2 * k + 1, jj) * o4[jj];
+        out_[2 * k + 1] = acc;
+    }
+    for (int k = 0; k < 2; k++) {
+        int acc = 0;
+        for (int jj = 0; jj < 2; jj++) acc += tmat(2, 2 * k + 1, jj) * o2[jj];
+        out_[(2 * k + 1) * 2] = acc;
+    }
+    out_[0] = 64 * (e2[0] + e2[1]);
+    out_[4] = 64 * (e2[0] - e2[1]);
+    for (int k = 0; k < NC; k++) v[k] = out_[k];
+}
+
 /* 1-D partial butterfly forward transform of 16 samples, in place.
  * Same decomposition as the CPU reference: even outputs are the
  * half-size transform of the sums, odd outputs the direct product with
@@ -405,13 +541,16 @@ void main() {
     s_blk[t] = clamp(lvl, -32768, 32767);
     barrier();
 
+    /* 384 ints per CTU: 256 luma, then 64 Cb, then 64 Cr. That is exactly
+     * what the existing coefficient buffer provides per macroblock-sized
+     * unit (24 blocks x 16), so nothing had to be resized. */
     uint ctu = uint(s_ctby * int(pc.width_ctu) + s_ctbx);
-    coeffs[ctu * uint(N * N) + t] = s_blk[t];
+    coeffs[ctu * 384u + t] = s_blk[t];
     if (t == 0u) {
         modes[ctu] = mode;
         uint nz = 0u;
         for (int i = 0; i < N * N; i++) { if (s_blk[i] != 0) { nz = 1u; break; } }
-        cbf[ctu] = nz;
+        s_nzl = nz;    /* written to cbf[] with the chroma flags below */
     }
 
     /* ---- dequantize + inverse transform + reconstruct ---- */
@@ -442,4 +581,143 @@ void main() {
 
     imageStore(reconY, ivec2(bx + px, by + py),
                vec4(float(clip8(s_pred[t] + s_tmp[t])) / 255.0, 0.0, 0.0, 1.0));
+
+    /* ================= chroma: one 8x8 Cb and Cr per CTU ============= */
+    int cw = int(pc.width) / 2, chh = int(pc.height) / 2;
+    int cx = bx / 2, cy = by / 2;
+    int cpx = int(t) & (NC - 1), cpy = (int(t) >> LOG2NC) & (NC - 1);
+    bool cthread = (t < uint(NC * NC));
+
+    gather_chroma(0, cx, cy, cw, chh);
+    gather_chroma(1, cx, cy, cw, chh);
+
+    int csrc0 = 0, csrc1 = 0;
+    if (cthread) {
+        vec2 uv = imageLoad(srcUV, ivec2(cx + cpx, cy + cpy)).rg;
+        csrc0 = int(uv.r * 255.0 + 0.5);
+        csrc1 = int(uv.g * 255.0 + 0.5);
+    }
+
+    /* Both planes share one signalled mode, so score them together. */
+    if (t < 5u) s_csad[t] = 0u;
+    barrier();
+    for (int idx = 0; idx < 5; idx++) {
+        int cm = chroma_mode_from_idx(idx, mode);
+        if (cthread) {
+            uint d = uint(abs(csrc0 - predict_c(0, cm, cpx, cpy))) +
+                     uint(abs(csrc1 - predict_c(1, cm, cpx, cpy)));
+            atomicAdd(s_csad[idx], d);
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        int bi = 4; uint bc = 0xffffffffu;
+        for (int idx = 0; idx < 5; idx++) if (s_csad[idx] < bc) { bc = s_csad[idx]; bi = idx; }
+        s_cidx = bi;
+        s_cmode = chroma_mode_from_idx(bi, mode);
+    }
+    barrier();
+
+    int cmode = s_cmode;
+    if (cthread) {
+        s_cpred[0][t] = predict_c(0, cmode, cpx, cpy);
+        s_cpred[1][t] = predict_c(1, cmode, cpx, cpy);
+        s_cblk[0][t] = csrc0 - s_cpred[0][t];
+        s_cblk[1][t] = csrc1 - s_cpred[1][t];
+    }
+    barrier();
+
+    int cshift1 = LOG2NC + 8 - 9, cshift2 = LOG2NC + 6;
+    int cbdshift = 8 + LOG2NC - 5;
+    int cdenom = (LEVELSCALE[rem] * 16) << per;
+
+    /* Threads 0..7 do Cb columns, 8..15 do Cr columns, and so on - each
+     * plane gets NC lines per pass. */
+    for (int pl = 0; pl < 2; pl++) {
+        if (t < uint(NC)) {
+            int line[NC];
+            for (int r = 0; r < NC; r++) line[r] = s_cblk[pl][r * NC + int(t)];
+            fwd8(line);
+            for (int r = 0; r < NC; r++)
+                s_ctmp[pl][r * NC + int(t)] = (line[r] + (1 << (cshift1 - 1))) >> cshift1;
+        }
+        barrier();
+        if (t < uint(NC)) {
+            int line[NC];
+            for (int c = 0; c < NC; c++) line[c] = s_ctmp[pl][int(t) * NC + c];
+            fwd8(line);
+            for (int c = 0; c < NC; c++)
+                s_cblk[pl][int(t) * NC + c] = (line[c] + (1 << (cshift2 - 1))) >> cshift2;
+        }
+        barrier();
+    }
+
+    if (cthread) {
+        for (int pl = 0; pl < 2; pl++) {
+            int rawc = s_cblk[pl][t];
+            int l = (rawc < 0 ? -1 : 1) * (((abs(rawc) << cbdshift) + cdenom / 2) / cdenom);
+            s_cblk[pl][t] = clamp(l, -32768, 32767);
+        }
+    }
+    barrier();
+
+    if (cthread) {
+        coeffs[ctu * 384u + 256u + t]       = s_cblk[0][t];
+        coeffs[ctu * 384u + 256u + 64u + t] = s_cblk[1][t];
+    }
+
+    /* cbf MUST be read off s_cblk here, before the inverse transform
+     * below reuses it as scratch. */
+    if (t == 0u) {
+        uint nzb = 0u, nzr = 0u;
+        for (int i = 0; i < NC * NC; i++) {
+            if (s_cblk[0][i] != 0) nzb = 1u;
+            if (s_cblk[1][i] != 0) nzr = 1u;
+        }
+        /* cbf_luma | cbf_cb<<1 | cbf_cr<<2 | chroma_idx<<8 */
+        cbf[ctu] = s_nzl | (nzb << 1) | (nzr << 2) | (uint(s_cidx) << 8);
+    }
+    barrier();
+
+    /* dequantize + inverse transform, per plane */
+    if (cthread) {
+        for (int pl = 0; pl < 2; pl++) {
+            int dqc = (s_cblk[pl][t] * 16 * LEVELSCALE[rem]) << per;
+            s_ctmp[pl][t] = clamp((dqc + (1 << (cbdshift - 1))) >> cbdshift, -32768, 32767);
+        }
+    }
+    barrier();
+    for (int pl = 0; pl < 2; pl++) {
+        if (t < uint(NC)) {
+            int line[NC];
+            for (int r = 0; r < NC; r++) {
+                int acc = 0;
+                for (int k = 0; k < NC; k++) acc += tmat(LOG2NC, k, r) * s_ctmp[pl][k * NC + int(t)];
+                line[r] = clamp((acc + 64) >> 7, -32768, 32767);
+            }
+            for (int r = 0; r < NC; r++) s_cblk[pl][r * NC + int(t)] = line[r];
+        }
+        barrier();
+        if (t < uint(NC)) {
+            int line[NC];
+            for (int c = 0; c < NC; c++) {
+                int acc = 0;
+                for (int k = 0; k < NC; k++) acc += tmat(LOG2NC, k, c) * s_cblk[pl][int(t) * NC + k];
+                line[c] = clamp((acc + 2048) >> 12, -32768, 32767);
+            }
+            for (int c = 0; c < NC; c++) s_ctmp[pl][int(t) * NC + c] = line[c];
+        }
+        barrier();
+    }
+
+    /* ONE thread writes both components of the packed rg8 texel. Split
+     * across two threads this would be a read-modify-write race on the
+     * same texel - the H.264 shader hit exactly that. */
+    if (cthread) {
+        int rcb = clip8(s_cpred[0][t] + s_ctmp[0][t]);
+        int rcr = clip8(s_cpred[1][t] + s_ctmp[1][t]);
+        imageStore(reconUV, ivec2(cx + cpx, cy + cpy),
+                   vec4(float(rcb) / 255.0, float(rcr) / 255.0, 0.0, 1.0));
+    }
+
 }
