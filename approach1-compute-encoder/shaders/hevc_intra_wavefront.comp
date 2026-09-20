@@ -595,31 +595,39 @@ void main() {
     /* ================= chroma: one 8x8 Cb and Cr per CTU ============= */
     int cw = int(pc.width) / 2, chh = int(pc.height) / 2;
     int cx = bx / 2, cy = by / 2;
-    int cpx = int(t) & (NC - 1), cpy = (int(t) >> LOG2NC) & (NC - 1);
-    bool cthread = (t < uint(NC * NC));
+    /* 128 threads, not 64: thread t handles ONE sample of ONE plane
+     * (t>>6 selects Cb or Cr). Doing both planes on 64 threads left half
+     * the workgroup idle and made a chroma candidate cost 0.52 ms
+     * against a luma candidate's 0.28, despite chroma being a quarter
+     * the samples. */
+    int cpl   = int(t) >> 6;                /* 0 = Cb, 1 = Cr */
+    int cidxn = int(t) & 63;
+    int cpx = cidxn & (NC - 1), cpy = cidxn >> LOG2NC;
+    int crow = cpy, ccol = cpx;
+    bool cthread  = (t < uint(NC * NC));            /* one plane's worth */
+    bool c2thread = (t < uint(2 * NC * NC));        /* both planes */
 
     gather_chroma(0, cx, cy, cw, chh);
     gather_chroma(1, cx, cy, cw, chh);
 
-    int csrc0 = 0, csrc1 = 0;
-    if (cthread) {
+    int csrc = 0;
+    if (c2thread) {
         ivec2 sp = ivec2(min(cx + cpx, int(pc.src_width) / 2 - 1),
                          min(cy + cpy, int(pc.src_height) / 2 - 1));
         vec2 uv = imageLoad(srcUV, sp).rg;
-        csrc0 = int(uv.r * 255.0 + 0.5);
-        csrc1 = int(uv.g * 255.0 + 0.5);
+        csrc = (cpl == 0) ? int(uv.r * 255.0 + 0.5) : int(uv.g * 255.0 + 0.5);
     }
 
-    /* Both planes share one signalled mode, so score them together. */
-    /* Chroma is never smoothed, so this loop needs no barrier either. */
+    /* Both planes accumulate into the same per-index total - that is
+     * what "one shared signalled mode" means - but each thread now
+     * contributes ONE plane's sample instead of both. Chroma is never
+     * smoothed, so no barrier is needed between candidates. */
     if (t < 5u) s_csad[t] = 0u;
     barrier();
-    if (cthread) {
-        for (int idx = 0; idx < 5; idx++) {
-            int cm = chroma_mode_from_idx(idx, mode);
-            atomicAdd(s_csad[idx], uint(abs(csrc0 - predict_c(0, cm, cpx, cpy))) +
-                                    uint(abs(csrc1 - predict_c(1, cm, cpx, cpy))));
-        }
+    if (c2thread) {
+        for (int idx = 0; idx < 5; idx++)
+            atomicAdd(s_csad[idx],
+                      uint(abs(csrc - predict_c(cpl, chroma_mode_from_idx(idx, mode), cpx, cpy))));
     }
     barrier();
     if (t == 0u) {
@@ -631,11 +639,9 @@ void main() {
     barrier();
 
     int cmode = s_cmode;
-    if (cthread) {
-        s_cpred[0][t] = predict_c(0, cmode, cpx, cpy);
-        s_cpred[1][t] = predict_c(1, cmode, cpx, cpy);
-        s_cblk[0][t] = csrc0 - s_cpred[0][t];
-        s_cblk[1][t] = csrc1 - s_cpred[1][t];
+    if (c2thread) {
+        s_cpred[cpl][cidxn] = predict_c(cpl, cmode, cpx, cpy);
+        s_cblk[cpl][cidxn]  = csrc - s_cpred[cpl][cidxn];
     }
     barrier();
 
@@ -643,14 +649,9 @@ void main() {
     int cbdshift = 8 + LOG2NC - 5;
     int cdenom = (LEVELSCALE[rem] * 16) << per;
 
-    /* One thread per chroma coefficient, both planes at once: threads
-     * 0..63 are Cb, 64..127 are Cr. Same reasoning as luma - the plain
-     * product spreads across 128 threads where a per-line butterfly
-     * would occupy 8. */
-    int cpl  = int(t) >> 6;                 /* 0 = Cb, 1 = Cr */
-    int cidxn = int(t) & 63;
-    int crow = cidxn >> LOG2NC, ccol = cidxn & (NC - 1);
-    bool c2thread = (t < uint(2 * NC * NC));
+    /* One thread per chroma coefficient, both planes at once - the plain
+     * matrix product across 128 threads rather than a per-line butterfly
+     * on 8. */
     {
         int acc = 0;
         if (c2thread) for (int r = 0; r < NC; r++) acc += m8(crow, r) * s_cblk[cpl][r * NC + ccol];
@@ -668,40 +669,34 @@ void main() {
     }
     barrier();
 
-    if (cthread) {
-        for (int pl = 0; pl < 2; pl++) {
-            int rawc = s_cblk[pl][t];
-            int l = (rawc < 0 ? -1 : 1) * (((abs(rawc) << cbdshift) + cdenom / 2) / cdenom);
-            s_cblk[pl][t] = clamp(l, -32768, 32767);
-        }
+    if (c2thread) {
+        int rawc = s_cblk[cpl][cidxn];
+        int l = (rawc < 0 ? -1 : 1) * (((abs(rawc) << cbdshift) + cdenom / 2) / cdenom);
+        s_cblk[cpl][cidxn] = clamp(l, -32768, 32767);
     }
     barrier();
 
-    if (cthread) {
-        coeffs[ctu * 384u + 256u + t]       = s_cblk[0][t];
-        coeffs[ctu * 384u + 256u + 64u + t] = s_cblk[1][t];
-    }
+    if (c2thread)
+        coeffs[ctu * 384u + 256u + uint(cpl) * 64u + uint(cidxn)] = s_cblk[cpl][cidxn];
 
     /* cbf MUST be read off s_cblk here, before the inverse transform
      * below reuses it as scratch. Again by atomicOr rather than a
      * serial scan on one thread. */
     if (t == 0u) { s_nzcb = 0u; s_nzcr = 0u; }
     barrier();
-    if (cthread) {
-        if (s_cblk[0][t] != 0) atomicOr(s_nzcb, 1u);
-        if (s_cblk[1][t] != 0) atomicOr(s_nzcr, 1u);
+    if (c2thread && s_cblk[cpl][cidxn] != 0) {
+        /* The atomic target must be a real l-value, not a ternary. */
+        if (cpl == 0) atomicOr(s_nzcb, 1u); else atomicOr(s_nzcr, 1u);
     }
     barrier();
     if (t == 0u)   /* cbf_luma | cbf_cb<<1 | cbf_cr<<2 | chroma_idx<<8 */
         cbf[ctu] = s_nzl | (s_nzcb << 1) | (s_nzcr << 2) | (uint(s_cidx) << 8);
     barrier();
 
-    /* dequantize + inverse transform, per plane */
-    if (cthread) {
-        for (int pl = 0; pl < 2; pl++) {
-            int dqc = (s_cblk[pl][t] * 16 * LEVELSCALE[rem]) << per;
-            s_ctmp[pl][t] = clamp((dqc + (1 << (cbdshift - 1))) >> cbdshift, -32768, 32767);
-        }
+    /* dequantize + inverse transform */
+    if (c2thread) {
+        int dqc = (s_cblk[cpl][cidxn] * 16 * LEVELSCALE[rem]) << per;
+        s_ctmp[cpl][cidxn] = clamp((dqc + (1 << (cbdshift - 1))) >> cbdshift, -32768, 32767);
     }
     barrier();
     {
