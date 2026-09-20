@@ -2588,14 +2588,36 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                                encoder->output_buf_size - total_written,
                                is_idr);
 
-    /* 2. Write SPS / PPS on IDR */
+    /* 2. Write SPS / PPS on IDR.
+     *
+     * The PPS is emitted with entropy_coding_mode_flag forced to 0, which
+     * the encoder's own PPS may not have: h264_encoder_create() turns
+     * CABAC on for any non-Baseline profile, and this raw path has no
+     * CABAC writer at all - every macroblock below goes through
+     * cavlc_write_mb_*(). Advertising CABAC and then writing CAVLC bits
+     * produced a stream that parses perfectly through the entire slice
+     * header and then dies immediately after it, because a decoder's very
+     * next read is cabac_alignment_one_bit and CAVLC data does not satisfy
+     * it. ffmpeg reports that as "top block unavailable for requested
+     * intra mode" / "error while decoding MB 0 0" - a misleading symptom
+     * that looks like a prediction-mode bug at the first macroblock, but
+     * is really the whole macroblock layer being read in the wrong entropy
+     * coder from byte zero. Confirmed with ffmpeg's trace_headers
+     * bitstream filter, which parses against the real spec independently
+     * of anything in this codebase and pinpointed the exact syntax element
+     * ("cabac_alignment_one_bit out of range: 0, but must be in [1,1]").
+     *
+     * The GPU path (h264_encoder_encode_frame) is unaffected - it has both
+     * writers and honours encoder->use_cabac. */
     if (is_idr) {
+        h264_pps_t raw_pps = encoder->pps;
+        raw_pps.entropy_coding_mode = 0;
         total_written += bs_write_sps(encoder->output_buf + total_written,
                                       encoder->output_buf_size - total_written,
                                       &encoder->sps);
         total_written += bs_write_pps(encoder->output_buf + total_written,
                                       encoder->output_buf_size - total_written,
-                                      &encoder->pps);
+                                      &raw_pps);
     }
 
     /* 3. Encode Slices (supporting multi-slice partitioning for network resilience) */
@@ -2675,10 +2697,52 @@ int h264_encoder_encode_raw(h264_encoder_t *encoder,
                         h_diff += abs((int)p[0] - (int)p[1]);
                     }
                 }
+                /* Intra_16x16_Vertical needs the macroblock above and
+                 * Intra_16x16_Horizontal needs the one to the left; neither
+                 * exists at the corresponding picture edge, and neither
+                 * counts as available across a slice boundary either
+                 * (constrained_intra_pred aside, a decoder resets
+                 * availability at first_mb_in_slice). Choosing one anyway
+                 * produces a stream real decoders reject outright - ffmpeg
+                 * says "top block unavailable for requested intra mode"
+                 * and abandons the macroblock, which for MB 0 means the
+                 * whole frame. This path had no such check at all, so any
+                 * non-flat content made MB 0 illegal and the entire raw
+                 * encode undecodable.
+                 *
+                 * The GPU path never had this bug: residual_predict.comp
+                 * derives top_avail/left_avail (including the slice test)
+                 * and gates every non-DC candidate on them. This is that
+                 * same constraint, which the self-contained CPU path
+                 * simply never got. */
+                int top_avail = (mby > 0) && (mb >= encoder->width_in_mbs) &&
+                                (mb - encoder->width_in_mbs >= start_mb);
+                int left_avail = (mbx > 0) && (mb - 1 >= start_mb);
+
                 int mode = H264_I16x16_DC;
-                if (v_diff * 3 < h_diff * 2) mode = H264_I16x16_VERT;
-                else if (h_diff * 3 < v_diff * 2) mode = H264_I16x16_HORIZ;
+                if (top_avail && v_diff * 3 < h_diff * 2) mode = H264_I16x16_VERT;
+                else if (left_avail && h_diff * 3 < v_diff * 2) mode = H264_I16x16_HORIZ;
                 cavlc_write_mb_i16x16_header(&bs, mode, H264_CHROMA_DC, 0, 0, 0);
+
+                /* An Intra_16x16 macroblock ALWAYS codes its
+                 * Intra16x16DCLevel block, whatever CodedBlockPatternLuma
+                 * says - ITU-T H.264 7.3.5.3's residual() calls
+                 * residual_luma() unconditionally for Intra_16x16, and
+                 * only the AC blocks are gated on the CBP. This path
+                 * emitted the macroblock header and then nothing at all,
+                 * so a decoder read the NEXT macroblock's mb_type as this
+                 * one's DC coeff_token and every macroblock after the
+                 * first was garbage. It presented as an intra-prediction
+                 * error one macroblock later than the real fault, which
+                 * is what made it look like a mode-availability bug.
+                 *
+                 * All coefficients here are zero (this path codes no
+                 * residual by design - see the function's own note), so
+                 * this is a TotalCoeff=0 coeff_token, one bit at nC=0,
+                 * and nC stays 0 for every neighbour precisely because
+                 * every block is empty. */
+                static const int zero_dc[16] = { 0 };
+                cavlc_write_4x4_block(&bs, zero_dc, 0);
             }
         } else {
             uint32_t current_skip_run = 0;
