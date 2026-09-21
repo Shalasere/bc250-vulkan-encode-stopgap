@@ -17,6 +17,56 @@
 extern "C" {
 #endif
 
+/*
+ * ===========================================================================
+ * Off-board profiling hooks (CAVLC_PROFILE) - NOT part of the shipped driver
+ * ===========================================================================
+ * `tools/cavlc_bench.c` drives this file directly with synthetic coefficient
+ * data so CAVLC can be profiled and optimised on a dev machine (the shipping
+ * H.264 entry point h264_encoder_encode_raw() is header-only by design and
+ * never reaches residual coding - see docs/backlog.md A2).
+ *
+ * Everything below, and every CAVLC_STAGE() use in cavlc.c, is inside
+ * `#ifdef CAVLC_PROFILE`. The driver build never defines it, so the
+ * preprocessed driver source is unchanged - CAVLC_STAGE(s, ...) expands to
+ * its body verbatim. Only the `cavlc_bench_prof` CMake target defines it.
+ *
+ * The profile build supports two things the normal build does not:
+ *   - `cavlc_ablate_mask`: suppress one syntax element's bitstream writes
+ *     while leaving every other instruction in the function untouched, so
+ *     stage cost can be measured as a wall-clock delta between two runs of
+ *     the SAME binary over the SAME data (no sampling profiler, no probe
+ *     inserted into the timed path - see docs/performance-measurement.md on
+ *     why gprof is not trusted here).
+ *   - `cavlc_count_enable`: exact per-stage call and bit counts. Only ever
+ *     enabled in an untimed run.
+ */
+#ifdef CAVLC_PROFILE
+enum {
+    CAVLC_S_TOKEN = 0,   /* coeff_token */
+    CAVLC_S_SIGNS = 1,   /* trailing_ones_sign_flag */
+    CAVLC_S_LEVELS = 2,  /* level_prefix/level_suffix */
+    CAVLC_S_TZEROS = 3,  /* total_zeros */
+    CAVLC_S_RUNS = 4,    /* run_before */
+    CAVLC_S_HEADER = 5,  /* macroblock_layer() headers + mb_skip_run */
+    CAVLC_S_COUNT = 6
+};
+/* Bit i set => stage i writes nothing. 0 = normal operation. */
+extern unsigned cavlc_ablate_mask;
+extern int cavlc_count_enable;
+extern unsigned long long cavlc_stage_bits[CAVLC_S_COUNT];
+extern unsigned long long cavlc_stage_calls[CAVLC_S_COUNT];
+/* Number of times each of the three residual entry points was called, and
+ * how many of those calls were on an entirely-zero block. */
+extern unsigned long long cavlc_blocks_total[3];
+extern unsigned long long cavlc_blocks_zero[3];
+/* Gather+scan only, no bitstream writes: lets the harness price
+ * cavlc_scan_coeffs()+the zigzag gather in isolation. Returns the discovered
+ * total_coeff so the call cannot be optimised away. */
+int cavlc_prof_scan_only(const int16_t *coeffs, int max_coeff);
+void cavlc_prof_reset(void);
+#endif /* CAVLC_PROFILE */
+
 /* Intra 16x16 Prediction Modes */
 #define H264_I16x16_VERT  0
 #define H264_I16x16_HORIZ 1

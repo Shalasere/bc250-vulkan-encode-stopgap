@@ -47,12 +47,42 @@ upstream shipped a fix for a buffer boundary overrun on exactly those
 resolutions, and this tree inherited the code before that fix. Cheap,
 and likely to find something.
 
-**A2. H.264 CAVLC needs an off-board harness before it can be optimised.**
-CAVLC is ~57% of the shipping path's frame time and is the last
-untouched performance lever, but `h264_encoder_encode_raw()` is
-header-only by design (codes no residual), so `test_encode` cannot
-exercise residual coding at all. A direct harness over `cavlc_write_*`
-with synthetic coefficient blocks would unblock this entirely off-board.
+**A2. H.264 CAVLC off-board harness — DONE (2026-09-21). The lever is
+open; the first obvious optimisation measured zero.**
+`tools/cavlc_bench.c` (CMake targets `cavlc_bench` and
+`cavlc_bench_prof`) drives `cavlc_write_*` directly with synthetic
+quantized coefficients, mirroring `encode_mb_i16x16()`/
+`encode_mb_p16x16()`'s syntax order, cbp gating and nC derivation. No
+GPU, no board. `verify` runs in CI as `CavlcHarnessRoundTrip`.
+
+Where the time goes, measured by ablation at `-O3 -march=znver2`
+(`cavlc_bench profile`, 13 samples/side, A/A floor 0.5%; 1280x720,
+`typical` density):
+
+| | share of the timed macroblock loop |
+|---|---|
+| inside `cavlc.c` | **83%** (the other 17% is the MB-layer glue: cbp, nC, bookkeeping) |
+| all bitstream writes combined | **41%** — levels 19%, run_before 7%, coeff_token 5%, mb headers 6%, total_zeros 4.5%, t1 signs 2% |
+| **coefficient discovery** (zigzag gather + `cavlc_scan_coeffs`) | **~41%** — `cavlc.c` minus its writes |
+
+So the next lever in this file is *discovery, not bit-writing*: the
+zigzag gather into `int scanned[16]` plus the backwards scan cost about
+as much as every syntax element put together.
+
+**Measured zero, do not redo off-board:** an all-zero-block fast path
+(48% of blocks reaching CAVLC are entirely zero). A 16-element
+`acc |= c[i]` reduction was 2-7% *slower*; the cheap four-`uint64_t`
+form came in at 0.990x against an A/A control of 0.995-1.011x in the
+same session — inside the noise, far inside the 2.5% bar. Reverted;
+full reasoning is in `cavlc.c`'s "MEASURED AND REJECTED" comment. It is
+still worth one *board* run, since Zen 2 at BC-250 clocks could shift
+the balance, but nothing off-board justifies the branch.
+
+Still open here: a cheaper `cavlc_scan_coeffs` (e.g. deriving `last_idx`
+and the zero runs from a nonzero bitmask instead of walking every scan
+position, or narrowing `scanned[]` to `int16_t` so the gather is a
+16-bit shuffle). Untried. Byte-identity is easy to check - `cavlc_bench
+emit` md5, the reference decoder, and ffmpeg.
 
 **A3. Audit the GPU shader against the spec for more defects of the
 chroma-QP class.** `hevc_intra_wavefront.comp` quantised chroma at QpY

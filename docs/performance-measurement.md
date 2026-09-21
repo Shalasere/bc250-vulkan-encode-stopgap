@@ -187,12 +187,72 @@ sounds.
 | tool | status |
 |---|---|
 | `tools/lab` | **canonical.** Dev-machine entry point. |
+| `tools/cavlc_bench.c` | **canonical for H.264 CAVLC, off-board.** CMake targets `cavlc_bench` / `cavlc_bench_prof`. The only thing in this tree that exercises residual coding without a GPU. See below. |
 | `tools/bc250_lab.sh` | **canonical.** The on-board half; `lab` ships it. |
 | `tools/bc250_lab_parse.py` | component. All log parsing, so there is one parser rather than twelve. |
 | `tools/quality_test.sh` | component. PSNR/SSIM, invoked by `lab quality`. |
 | `tools/perf_test.sh` | **superseded.** `lab bench` does the same per-stage breakdown and adds a noise floor, load conditions and significance testing. Retained only because DEVLOG, `hevc_scope_note.md` and a CMakeLists comment cite it as the provenance of published numbers. |
 | `tools/bc250_diagnose.sh` | user-facing probe, not a benchmark. This is what the issue and PR templates ask people to run. |
 | `tools/benchmark.sh` | **deleted.** See this repo's history for why; it is the cautionary tale at the top of this page. |
+
+## Measuring H.264 CAVLC without a board
+
+`tools/lab` needs the board. CAVLC is ~57% of the shipping H.264 path's
+frame time and nothing off-board could reach it, because
+`h264_encoder_encode_raw()` is header-only by design and codes no
+residual, so `tests/test_encode` never enters residual coding.
+`tools/cavlc_bench.c` closes that: it drives `cavlc_write_*` directly
+with synthetic quantized coefficients, mirroring `encode_mb_i16x16()`/
+`encode_mb_p16x16()`'s syntax order, cbp gating and nC derivation.
+
+```bash
+cmake ... && make cavlc_bench cavlc_bench_prof
+./cavlc_bench   stats                  # input distribution - check it before trusting a number
+./cavlc_bench   verify                 # reference-decoder round trip (also a ctest)
+./cavlc_bench   emit --out=x.264       # then: ffmpeg -v error -i x.264 -f null -
+./cavlc_bench   bench --samples=11     # A/A self-test: must come back ~1.00x
+./cavlc_bench_prof profile --samples=13   # where the time goes
+./cavlc_bench_prof count               # exact bits/calls per syntax element
+```
+
+Four things about it are load-bearing and worth not undoing:
+
+**It is a CMake target, not a `gcc` line.** `tools/hevc_host_drift.sh`
+builds `hevc_host_repro.c` by hand at `-O2`, which this page says is
+wrong in both directions. Configured as part of the project, the harness
+gets the real `-O3 -DNDEBUG`; it also opts into `-march=znver2` on any
+dev machine that can execute it (Zen 2 code runs on every later AMD core
+and on Intel from Skylake-X), so the codegen matches what ships rather
+than the generic x86-64 the auto-detection would leave off-board.
+`-falign-functions=64 -falign-loops=32` are pinned for the same reason
+they were pinned the last time a rig here reported a 1.30x phantom.
+
+**The profile is ablation, not sampling.** Each stage's cost is the
+wall-clock difference between two runs of the *same binary* over the
+*same data*, one with only that stage's bitstream writes suppressed.
+Nothing is inserted into the timed path. The suppression switch lives
+behind `#ifdef CAVLC_PROFILE`, and the shipped `cavlc.c` compiles to
+**byte-identical machine code** with it present (verified by
+disassembly diff). Two caveats it prints itself: the deltas are
+*marginal*, not additive, so the parts need not sum to the whole (the
+"ALL WRITES" row is measured separately as the cross-check, and the gap
+is printed); and the A/A row is the rig's resolution floor, so anything
+smaller than it is not a result.
+
+**A/B runs ABBAABBA, not ABABAB.** Plain alternation left whichever side
+ran first in each pair carrying a reproducible ~2% penalty *with both
+sides running identical code* - the same size as a win worth chasing.
+
+**Two oracles, covering different bugs, both demonstrated able to fail.**
+See the comment on `verify_frame()` for the full statement. Briefly: the
+built-in reference decoder checks coefficient *placement* (reintroduce
+the `run_before` ordering bug and it fails, while ffmpeg reports **zero**
+decode errors - that bug shipped once and cost ~15.5 dB luma); the
+ffmpeg round trip on `emit`'s output checks VLC table *content*, which
+the reference decoder cannot, because its tables are copies of
+`cavlc.c`'s (corrupt one entry in both and the reference decoder is
+happy while ffmpeg errors). Neither oracle says anything about rate or
+quality - the harness has no pixels.
 
 ## If the harness is genuinely missing something
 
