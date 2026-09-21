@@ -31,9 +31,12 @@ The same method reported 9.66 dB for H.264 and 10.48 dB for the
 signature of frame misalignment. Run through `lab qsweep`, H.264 scores
 **42.55 dB**. The ad-hoc method is trustworthy for "is the picture
 black" and not for ranking encoders, which is exactly what DEVLOG §22
-warns about. `lab qsweep` does not yet take `--codec`, so the HEVC
-figures have not been re-taken through it; the byte-exact `lab drift`
-result is the authoritative correctness statement here, not the PSNR.
+warns about. `lab qsweep` now takes `--codec=hevc` (run
+`lab qsweep <key> --codec=hevc --env=BC250_HEVC_GPU=1`), but the HEVC
+figures above have **not** been re-taken through it yet — they are still
+the ad-hoc numbers. Until someone runs that on the board, the byte-exact
+`lab drift` result is the authoritative correctness statement here, not
+the PSNR.
 
 Two real bugs were found and fixed during that validation, both worth
 knowing about because neither was visible to a silent decode:
