@@ -282,9 +282,24 @@ Full analysis + exact next board commands: `docs/notes/c3-h264-chroma-drift.md`.
 > "should match" bound — and chroma differs **44347/1036800, max 8**.
 > Luma should match under real decode (the encoder does deblock luma);
 > it doesn't, by a lot. This rules out "chroma-only gap" as the
-> complete picture and points sharper at the leading candidate above —
-> whoever picks this up next should start with why LUMA drifts under
-> real decode, not with the missing chroma binding. DEVLOG §36.
+> complete picture. DEVLOG §36.
+
+> **Leading candidate REFUTED (2026-09-21).** `residual_predict.comp`
+> predicting from source neighbours is dead code for this test:
+> `gpu_compute_dispatch_encode()` only dispatches it inside
+> `if (!is_intra)`, and `lab drift` always encodes with `-g 1` (every
+> frame IDR) — independently re-confirmed before merging. The real
+> intra path (`intra_wavefront.comp`) reads genuinely-reconstructed
+> neighbours and was already fixed for exactly this bug class, board-
+> validated 2026-09-08 (DEVLOG §1, bug #5 of 15), well before this item
+> was opened. Two more candidates were tested computationally, not just
+> read about (`tools/deblock_strong_vs_weak_check.py`): the documented
+> missing strong bS=4 deblock filter, and a newly-found cross-workgroup
+> race in `deblock_filter.comp`. Both real, both bounded to ~1-2 levels
+> at QP 27 — nowhere near the measured max-57 delta. **Still genuinely
+> open**; ranked next steps (pixel-coordinate clustering, slice-boundary
+> interaction, CAVLC/entropy re-derivation) in
+> `docs/notes/c3-h264-chroma-drift.md`, needing a board run.
 
 **C4. DONE — and it found a live bug.** Re-taking the retracted PSNR
 figures through `lab qsweep --codec=hevc` gave HEVC GPU **42.71–42.94
