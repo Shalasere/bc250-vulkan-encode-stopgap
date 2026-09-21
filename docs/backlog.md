@@ -74,10 +74,12 @@ core HEVC source).
 
 ---
 
-## B. Off-board, in flight
+## B. Off-board, landed 2026-09-20
 
-**B1. `test_encode` determinism.** Blocks every byte-exactness claim
-about H.264.
+**B1. DONE.** `test_encode` is deterministic (12/12). Root cause was
+`rc_update_stats()`'s `CLOCK_MONOTONIC` bucket drain under `RC_LOW_LATENCY`;
+fixed test-side via the existing `BC250_RC_NOMINAL_DRAIN=1` hook, production
+rate control untouched. The difference was ONE byte in 350,979.
 **B2. DONE — with a caveat that needs the board.** `bs_rbsp_to_ebsp` is
 3.9x faster in situ and byte-identical, but **end-to-end it measured
 zero** (median -0.64%, inside a 5.9% sd). It was kept anyway because the
@@ -93,13 +95,22 @@ lands as ~1.7% and a shorter run inflates the same bucket to 5.9%.
 Direct instrumentation put the function at 0.93%. **Do not size a task
 off a sub-2% gprof number on this codebase** — instrument the function
 directly first.
-**B3. `--codec` for `lab qsweep`.** Blocks proper HEVC quality numbers;
-`docs/hevc-gpu-intra.md` currently has to mark its PSNR "indicative".
-**B4. 4x4 transform/quant pair (~31% combined).** Note the recorded
-negative result: replacing the 64-bit division with 32-bit was
-byte-identical and *slightly slower*; the cost is the matrix multiplies.
-**B5. Host-drift gate in CI.** The check needs no GPU, so it can run on
-every push.
+**B3. DONE.** `lab qsweep --codec=h264|hevc`. `scoreboard` deliberately
+NOT extended - its reference is libx264, so an HEVC scoreboard would score
+our HEVC against x264's H.264 and hand this encoder a win that belongs to
+the codec. Needs a libx265 reference verified against Sunshine's own
+construction first. **The HEVC figures still need re-taking on the board.**
+**B4. DONE, +2.1% shipped.** Division-free quantiser, partial-butterfly
+transforms, dead inverse clip removed, dequant folded into inverse stage 1.
+Byte-identical under three oracles plus exhaustion over 218M quantiser
+pairs. **The headline is +2.1% at `-O3 -march=znver2`, not the +15.4% that
+`-O2` shows** - see the optimisation-level rule in
+`performance-measurement.md`.
+**B5. DONE, and it found a bug in the oracle itself.**
+`hevc_host_diff.py` exited 0 on every path, so the drift script printed
+per-case failures and still reported PASS with rc=0 - two million wrong
+pixels scored as green. Fixed, gate added (+3.3s on a ~40s job), and the
+step asserts on the case count so `BC250_DRIFT_CASES` cannot quietly gut it.
 
 ---
 

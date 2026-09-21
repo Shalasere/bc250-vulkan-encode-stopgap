@@ -65,6 +65,25 @@ expensive-looking instruction turned out to be free. Treat gprof as a
 pointer to *where to instrument*, then instrument the function directly
 before committing to the work.
 
+**Measure at the optimisation level the driver actually ships.** CMake
+appends `-O3 -DNDEBUG` via `CMAKE_C_FLAGS_RELEASE` after the `-O2` in
+`CMAKE_C_FLAGS`, and auto-detects `-march=znver2 -mtune=znver2` on real
+BC-250 hardware. A `-O2` figure — which is what a hand-rolled `gcc -O2`
+harness and `tools/hevc_host_drift.sh` produce — can be wrong in *either
+direction*, and both have happened here:
+
+| change | `-O2` | `-O3` | `-O3 -march=znver2` |
+|---|---|---|---|
+| partial-butterfly 4x4 transforms | +15.4% | +5.3% | **+2.1%** |
+| zorder shifts + gather hoist + CABAC inline | +29.4% | +40.3% | **+44.5%** |
+
+The pattern is not random. The butterfly is largely what `-O3`'s
+vectoriser already derives, so hand-writing it buys little once the
+vectoriser is on. Removing integer divisions, call overhead and
+redundant work is *not* something the optimiser can do for you, so those
+wins survive and can even grow as the surrounding code gets cheaper.
+Quote the shipped number; if you cite a `-O2` one, say so.
+
 **Validate the A/B rig before believing the A/B.** A benchmark harness
 that cannot report 1.00x when both sides are the same code cannot report
 anything else either. One rig here was wrong twice on identical code —
