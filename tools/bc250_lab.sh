@@ -204,10 +204,22 @@ build() {
     echo "$key"
 }
 
+# NOTE the `|| exit 1` at every call site, and do not drop it. art_dir is
+# always called in a command substitution, and `die` there exits the
+# SUBSHELL, not the caller - so a bad key used to print "unknown build key"
+# to stderr and then let the whole command carry on with bd="".
+#
+# That is not a cosmetic failure. With bd="" the harness measured whatever
+# driver libva happened to load - the one installed on the system - and
+# `quality` printed "PSNR=48.48 PASS" for a build key that does not exist.
+# A green PASS attributed to a binary that was never in the picture is the
+# worst output this tool can produce, and it is the same shape as the
+# deleted benchmark.sh reporting two fast timings for two encodes that
+# never ran. Found 2026-09-21 when a caller mis-parsed the key.
 art_dir() {
     local key="${1:?}"
     [ "$key" = libx264 ] && { echo "libx264"; return 0; }
-    [ -d "$ART/$key" ] || die "unknown build key '$key' (run build first)"
+    [ -d "$ART/$key" ] || { echo "lab: unknown build key '$key' (run build first)" >&2; return 1; }
     echo "$ART/$key"
 }
 
@@ -503,7 +515,7 @@ run_encode() {
             -threads "${BC250_SW_THREADS:-2}" -b:v "$bitrate" \
             -f h264 "${out}.h264" > "${out}.log" 2>&1
     else
-        local bd; bd=$(art_dir "$key")
+        local bd; bd=$(art_dir "$key") || exit 1
         local -a envv=(BC250_PERF_STATS=1)
         [ "$audit" = 1 ] && envv+=(BC250_NZ_AUDIT=1)
         # HEVC is not advertised by default (va_backend.c's hevc_advertised()),
@@ -766,7 +778,7 @@ audit() {
 
 units() {
     local key="${1:?units <key>}"
-    local bd; bd=$(art_dir "$key")
+    local bd; bd=$(art_dir "$key") || exit 1
     local ok=0
     for t in test_bitstream test_cavlc test_encode test_hevc_encode test_va_api; do
         if [ ! -x "$bd/tests/$t" ]; then echo "  MISSING $t"; ok=1; continue; fi
@@ -784,7 +796,7 @@ quality() {
     local key="${1:?quality <key>}"; shift
     local reps=2
     for x in "$@"; do case "$x" in -r|--repeat=*) reps="${x#*=}";; esac; done
-    local bd; bd=$(art_dir "$key")
+    local bd; bd=$(art_dir "$key") || exit 1
     [ -f "$REPO/tools/quality_test.sh" ] || die "quality_test.sh not in $REPO (run setup)"
     local ok=1
     for i in $(seq 1 "$reps"); do
@@ -840,9 +852,10 @@ qsweep() {
         esac
     done
     case "$codec" in h264|hevc) ;; *) die "qsweep: --codec must be h264 or hevc (got '$codec')";; esac
-    local bd; bd=$(art_dir "$key")
+    local bd; bd=$(art_dir "$key") || exit 1
     local stamp; stamp=$(date +%s)
     local d="$RUNS/qsweep-$stamp-$codec"; mkdir -p "$d"
+    local qs_ours_ok=0 qs_ours_failed=0
 
     echo "# qsweep: $key codec=$codec @ $content $res, $frames frames, gop=120"
     if [ "$codec" = hevc ]; then
@@ -878,8 +891,10 @@ qsweep() {
             local rc; rc=$(run_encode "$enc" "$content" "$res" "$frames" 120 "$br" "$this_env" 0 "$base" "$this_codec")
             if [ "$rc" != 0 ]; then
                 printf "%-9s %-9s ENCODE FAILED (rc=%s) - see %s.log\n" "$br" "$enc" "$rc" "$base"
+                [ "$enc" = libx264 ] || qs_ours_failed=$((qs_ours_failed + 1))
                 continue
             fi
+            [ "$enc" = libx264 ] || qs_ours_ok=$((qs_ours_ok + 1))
             local fps; fps=$(awk '{print $3}' "$base.wall" 2>/dev/null)
 
             # Per-frame PSNR: decode to raw YUV, compare against a raw-YUV
@@ -923,6 +938,21 @@ qsweep() {
     done
     rm -f "$d/ref.yuv"
     note "logs kept at: $d (*.log per run, for anything the summary doesn't show)"
+
+    # Exit status, because a sweep in which OUR encoder never ran is not a
+    # measurement. This used to return 0 after printing ENCODE FAILED for
+    # every bitrate, so a caller chaining commands - or a CI step - saw a
+    # clean run. The libx264 column can still print, which makes the output
+    # look populated; only our own encoder's count decides the status.
+    if [ "$qs_ours_ok" = 0 ]; then
+        echo "lab: qsweep: $qs_ours_failed/$qs_ours_failed encodes of '$key' FAILED - no measurement taken" >&2
+        return 1
+    fi
+    if [ "$qs_ours_failed" != 0 ]; then
+        echo "lab: qsweep: $qs_ours_failed of $((qs_ours_ok + qs_ours_failed)) encodes of '$key' failed - partial result" >&2
+        return 1
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -961,7 +991,7 @@ dims() {
             *) die "dims: unknown option '$a'";;
         esac
     done
-    local bd; bd=$(art_dir "$key")
+    local bd; bd=$(art_dir "$key") || exit 1
     [ -f "$bd/bc250_drv_video.so" ] || die "dims: no driver in $bd (run build first)"
     local d="$RUNS/dims-$(date +%Y%m%d-%H%M%S)-$key"; mkdir -p "$d"
 
@@ -1103,7 +1133,7 @@ drift() {
     [ -n "$qp" ] && RCARGS=(-rc_mode CQP -qp "$qp")
     case "$codec" in h264|hevc) ;; *) die "drift: --codec must be h264 or hevc";; esac
 
-    local bd; bd=$(art_dir "$key")
+    local bd; bd=$(art_dir "$key") || exit 1
     [ -f "$bd/bc250_drv_video.so" ] || die "drift: no driver in $bd (run build first)"
     local w="${res%x*}" h="${res#*x}"
     local cw=$(( (w + 15) / 16 * 16 )) ch=$(( (h + 15) / 16 * 16 ))
@@ -1266,7 +1296,7 @@ wake_display() {
 
 deploy() {
     local key="${1:?deploy <key>}"
-    local bd; bd=$(art_dir "$key")
+    local bd; bd=$(art_dir "$key") || exit 1
     sudo cp -f "$DRV_DIR/bc250_drv_video.so" "$DRV_DIR/bc250_drv_video.so.prev" 2>/dev/null
     sudo cp -f "$bd/bc250_drv_video.so" "$DRV_DIR/bc250_drv_video.so"
     sudo chmod 755 "$DRV_DIR/bc250_drv_video.so"
