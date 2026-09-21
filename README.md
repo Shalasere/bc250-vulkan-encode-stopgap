@@ -211,7 +211,13 @@ LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 & HEVC profiles + VAEntrypointE
 >
 > It also takes `--fixed-frequency 1200` or `--range 500 1500` before `%command%`, and needs that project's `cyan-skillfish-governor-smu` service running with D-Bus enabled.
 >
-> **Not measured by this project.** It is a plausible mechanism and a third-party report, not a number we have taken — and note that DEVLOG §203 records forcing performance mode as *refuted*, though that test predates the fix that removed an 81 ms uncached-read stall, so it was measured when GPU clocks could not have mattered. Treat both as open. This is deliberately a user-side launch option rather than something the driver does: clock policy is a system-management concern, the same reasoning that removed `dynamic_governor.c` (see [Known Limitations](#known-limitations)).
+> **Attempted here, and inconclusive — do not read either way into it.** On an idle board, `cyan-skillfish-performance-mode --on` and `--fixed-frequency 2000` both produced no throughput change (94.0 vs 94.6 fps at 1080p, inside a 3.63% noise floor). But `pp_dpm_sclk` still reported the active level at 7–100 MHz *after* the pin, i.e. the request did not visibly take — the script drives the governor over D-Bus and wants root for that, and it was run unprivileged and reported success anyway. So this tests nothing: it cannot separate "no effect" from "never engaged". It also does not reproduce the case the tip is actually about, which is a *light game* occupying the GPU, not an idle one.
+>
+> Also on the record: DEVLOG §203 lists forcing performance mode as *refuted*, but that test predates the fix that removed an 81 ms uncached-read stall, so it ran when GPU clocks could not have mattered. Treat the question as open.
+>
+> `tools/lab bench` now records the DPM level seen during each run in an `sclk_mhz` column, so anyone retrying this can check the clock actually moved before believing the result.
+>
+> This is deliberately a user-side launch option rather than something the driver does: clock policy is a system-management concern, the same reasoning that removed `dynamic_governor.c` (see [Known Limitations](#known-limitations)).
 
 **OBS**: `LIBVA_DRIVER_NAME=bc250 obs` → Output → Advanced → Video Encoder: FFmpeg VAAPI, Device: `/dev/dri/renderD128`.
 

@@ -432,6 +432,23 @@ run_encode() {
     local key="$1" content="$2" res="$3" frames="$4" gop="$5" bitrate="$6" \
           envs="$7" audit="$8" out="$9" codec="${10:-h264}"
     local t0 t1
+    # Sample the GPU's active DPM level for the duration of the encode.
+    #
+    # This is not decoration. The encoder occupies the GPU for only ~25-30%
+    # of a frame, which is not enough load for a utilization-driven
+    # governor to raise clocks, and this board idles at the bottom of a
+    # 25 / 350 / 2230 MHz ladder. So the clock a run actually got is a real
+    # independent variable, and until this existed every A/B here had it
+    # uncontrolled - two builds could differ only in which DPM level the
+    # governor happened to pick. Recorded per run so a surprising delta can
+    # be checked against it before it gets explained as a code change.
+    local sclk_file="${out}.sclk"
+    : > "$sclk_file"
+    ( while :; do
+        sed -n 's/.*: *\([0-9]\+\)Mhz *\*.*/\1/p' /sys/class/drm/card*/device/pp_dpm_sclk 2>/dev/null | head -1
+        sleep 0.25
+      done ) >> "$sclk_file" 2>/dev/null &
+    local sclk_pid=$!
     t0=$(date +%s.%N)
     # /usr/bin/time rather than the `times` builtin: the builtin accumulates
     # across every child of this shell, so repeated runs would drift upward.
@@ -495,6 +512,7 @@ run_encode() {
     fi
     local rc=$?
     t1=$(date +%s.%N)
+    kill "$sclk_pid" 2>/dev/null; wait "$sclk_pid" 2>/dev/null
     # wall_s  wall_ms/frame  fps  cpu_s  cpu_ms/frame  maxrss_kb
     local cpu_s=0 rss=0
     if [ -f "${out}.time" ]; then
@@ -557,12 +575,18 @@ bench() {
         # End-to-end throughput first: it is the only column that exists for
         # every encoder, and the one a user feels.
         read -r e2e_s e2e_ms e2e_fps cpu_s cpu_ms rss_kb < "$base.wall"
+        # GPU DPM level actually seen during this run - see run_encode().
+        local sclk="?"
+        if [ -s "$base.sclk" ]; then
+            sclk=$(awk 'NF{if(mn==""||$1<mn)mn=$1; if($1>mx)mx=$1}
+                        END{ if(mn=="")print "?"; else if(mn==mx)print mn; else printf "%s-%s", mn, mx }' "$base.sclk")
+        fi
         if [ "$first" = 1 ] && [ "$quiet" = 0 ]; then
-            printf "e2e_fps\te2e_ms\tcpu_ms\trss_mb\t%s\n" "$(echo "$BENCH_FIELDS" | tr ',' '\t')"
+            printf "e2e_fps\te2e_ms\tcpu_ms\trss_mb\tsclk_mhz\t%s\n" "$(echo "$BENCH_FIELDS" | tr ',' '\t')"
             first=0
         fi
-        printf "%s\t%s\t%s\t%s\t" "$e2e_fps" "$e2e_ms" "$cpu_ms" \
-            "$(awk -v r="${rss_kb:-0}" 'BEGIN{printf "%.0f", r/1024}')"
+        printf "%s\t%s\t%s\t%s\t%s\t" "$e2e_fps" "$e2e_ms" "$cpu_ms" \
+            "$(awk -v r="${rss_kb:-0}" 'BEGIN{printf "%.0f", r/1024}')" "$sclk"
         python3 "$PARSE" "$base.log" --tsv --tag "$tag" --fields "$BENCH_FIELDS"
         python3 "$PARSE" "$base.log" --tag "$tag" > "$base.json"
     done
