@@ -1194,6 +1194,13 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
                 enc->recon_y[(py + y) * cw + (px + x)] = clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
 
         enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = (int8_t)mode;
+        /* BC250_HEVC_DEBUG_MODES=1: one line per 4x4 luma PU, so a block
+         * that a decoder reconstructs differently can be correlated with
+         * the mode it was predicted with. Diagnostic only - this path is
+         * the one docs/hevc_scope_note.md still has an open luma defect
+         * in, and "which of the four modes" is the first question. */
+        if (getenv("BC250_HEVC_DEBUG_MODES"))
+            fprintf(stderr, "[MODE] x=%d y=%d mode=%d\n", px, py, mode);
     }
 
     /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only (matching

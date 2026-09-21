@@ -15,8 +15,28 @@
 > identical defect. Both fixed; chroma is now byte-exact against ffmpeg at
 > every QP tested.
 >
-> **Luma: still open, but much smaller than it looked.** Narrowed by
-> measurement, not inspection:
+> **Luma: FOUND AND FIXED.** `gather_neighbors()` in `hevc_intra.c`
+> hardcoded `left[4] = left[3]`, i.e. it assumed the below-left reference
+> sample `p[-1][nTbS]` is always z-scan-unavailable. It is not. For the
+> first 4x4 of the CU at (8,8) in a CTU, `p[-1][4]` is the sample at
+> (7,12), which lies in the CU at (0,8) — and CU order within a CTU is
+> (0,0), (8,0), (0,8), (8,8), so that CU is already reconstructed and the
+> sample IS available. A decoder used it; this encoder substituted
+> `left[3]`. Planar is the only one of this encoder's four modes that
+> reads `p[-1][nTbS]`, which is why the error was ±1 at first and then
+> propagated. Fixed by giving `p[-1][4]` a real availability test and its
+> correct position at the head of the substitution scan.
+>
+> After the fix, the encoder's reconstruction is **byte-identical** to
+> ffmpeg's across every case tried: 16x16 / 32x32 / 64x64 / 128x128 /
+> 256x256, flat / vertical-bars / diagonal-ramp / pseudo-random, at QP 4,
+> 20 and 30.
+>
+> The whole root-cause was done **off-board** — `hevc_encoder_encode_raw()`
+> needs no GPU, so encode → dump recon → decode → diff runs on a dev
+> machine. That is the loop to reuse for anything in this file.
+>
+> How it was narrowed, kept because the sequence is reusable:
 >
 > | source | CQP | luma vs decoder |
 > |---|---|---|
