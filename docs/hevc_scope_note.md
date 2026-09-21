@@ -84,6 +84,20 @@
 > = 0 + AMVP + `mvd_coding` + `rqt_root_cbf`), which is a genuine piece of
 > work and a separate backlog item, not a sixth entry in a list.
 >
+> **Update 2026-09-21:** that consequence was verified empirically and
+> `hevc_motion_search_diamond_8x8()` is **gone**. Perturbing its result
+> vector arbitrarily left all 38 `tools/hevc_host_drift.sh` bitstreams
+> byte-identical; removing it is worth 7.6–20.7% of CPU encode time
+> off-board at the shipped `-O3 -march=znver2`. Rate control now gets the
+> zero-MV SAD instead of the search's best, which changes the bytes of one
+> VBR drift case. Two corrections to the paragraph above: the search's SAD
+> was **not** only a rate-control feed (it reached the skip decision, and
+> so constant-QP output, through a shortcut in the candidate loop), and the
+> GPU ME dispatch is still here — it is unconsumed, but `motion_estimation
+> .comp` is dispatched unconditionally from code shared with H.264, so
+> removing it needs the board. Full writeup:
+> `docs/notes/dead-motion-search.md`.
+>
 > ### What was ruled out
 >
 > Checked against the spec and/or measured, and **not** the problem:
@@ -195,10 +209,13 @@
    - Full short-term RPS signaling with Decoded Picture Buffer (DPB) management for multi-frame GOPs.
    - ITU-T Section 8.5.3.2.2 spatial merge candidate derivation ($A_1, B_1, B_0, A_0, B_2$) with spatial deduplication and Skip CU signaling (`cu_skip_flag = 1`, `merge_idx`).
    - Mathematical **Zero Chroma Drift Invariant**: all tested motion displacements strictly enforce even integers ($dx, dy \equiv 0 \pmod 2$). At phase 0, the 4-tap HEVC chroma interpolation filter evaluates to identity $\{64, 0, 0, 0\}$, guaranteeing bit-exact reconstruction against standard HEVC decoders across arbitrary GOP lengths.
-4. **Vulkan Compute Motion Estimation & SSE2 SIMD Acceleration**:
-   - P-frame dispatches trigger `motion_estimation.comp` across the APU's 40 CUs, staging motion vectors back to host memory.
-   - CUs evaluate GPU motion vector candidates first; if $SAD \le 48$, coarse diamond steps (8 and 4) are bypassed.
-   - Fully vectorized 8x8 luma and 4x4 chroma SAD using `_mm_sad_epu8` (`psadbw`), cutting CPU motion search time by ~10x.
+4. **Vulkan Compute Motion Estimation & SSE2 SIMD Acceleration** — ⚠️ **the
+   CPU half of this is GONE as of 2026-09-21**; see the update at the top of
+   this file and `docs/notes/dead-motion-search.md`. Kept as written for
+   provenance:
+   - P-frame dispatches trigger `motion_estimation.comp` across the APU's 40 CUs, staging motion vectors back to host memory. *(Still dispatched, still staged, and now read by nothing.)*
+   - CUs evaluate GPU motion vector candidates first; if $SAD \le 48$, coarse diamond steps (8 and 4) are bypassed. *(Removed — the whole diamond search was, because it could not change one bit of output.)*
+   - Fully vectorized 8x8 luma and 4x4 chroma SAD using `_mm_sad_epu8` (`psadbw`), cutting CPU motion search time by ~10x. *(Still used: one zero-MV SAD per CU now feeds the skip decision and rate control.)*
 5. **Rate Control & Quality Presets**:
    - Leaky-bucket rate control (CQP, CBR, VBR, Low-Latency) with dynamic frame SAD feedback.
    - Quality presets 1–7 (Speed / Balanced / Quality) and `VAEncMiscParameterTypeMaxFrameSize` burst suppression.

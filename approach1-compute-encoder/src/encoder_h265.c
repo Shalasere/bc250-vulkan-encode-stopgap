@@ -850,11 +850,27 @@ static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
  * candidates are read back from mv_x_map/mv_y_map, which only SKIP CUs
  * write, and a SKIP CU can only write a vector it took from this list. With
  * the GPU vector gone the list has no way to ever contain a non-zero
- * vector, so every P-frame MV is (0,0) and hevc_motion_search_diamond_8x8()
- * can no longer influence the bitstream at all - it survives only as the
- * source of last_frame_sad for rate control. Giving this encoder real
- * motion needs explicit MVD signalling (merge_flag = 0 + AMVP +
- * mvd_coding + rqt_root_cbf), not a sixth entry in this list. */
+ * vector, so every P-frame motion vector is (0,0). This function is a
+ * fixpoint at zero.
+ *
+ * That killed the motion search. hevc_motion_search_diamond_8x8() - a
+ * hierarchical diamond over up to ~39 SAD positions per 8x8 CU, seeded from
+ * the GPU MV and the spatial predictors - used to run here and could not
+ * affect one bit of output, because the only vector this encoder can signal
+ * is the one at the merge index it picks out of the all-zero list above. It
+ * was removed (docs/notes/dead-motion-search.md) after an empirical check,
+ * not a reading of this comment: perturbing its result arbitrarily left all
+ * 38 tools/hevc_host_drift.sh bitstreams byte-identical. Rate control now
+ * gets the zero-MV SAD that encode_cu() computes for the skip decision
+ * anyway - see there for why that is the right number and not merely the
+ * cheap one.
+ *
+ * Giving this encoder real motion needs explicit MVD signalling (merge_flag
+ * = 0 + AMVP + mvd_coding + rqt_root_cbf), not a sixth entry in this list.
+ * Whoever does that re-introduces a motion search, and should re-read
+ * hevc_encoder_encode_raw()'s BC250_HEVC_FAKE_GPU_MV comment first: that
+ * hook and the six drift cases using it are the only way a non-zero vector
+ * reaches this code on a machine with no GPU. */
 static int derive_merge_candidates(const hevc_encoder_t *enc,
                                    int cux, int cuy,
                                    hevc_mv_t cand_mvs[5])
@@ -969,164 +985,7 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
     return num_cand;
 }
 
-/* Hierarchical integer-pel diamond search around (0,0), spatial predictors, and GPU MV.
- * All tested displacements are even integers (2k) guaranteeing zero chroma drift. */
-static void hevc_motion_search_diamond_8x8(const hevc_encoder_t *enc,
-                                           int cu_x, int cu_y,
-                                           const hevc_mv_t *spatial_preds,
-                                           int num_spatial_preds,
-                                           const hevc_mv_t *gpu_mv,
-                                           int *out_best_dx, int *out_best_dy,
-                                           uint32_t *out_best_sad)
-{
-    uint32_t cw = enc->coded_width;
-    uint32_t ch = enc->coded_height;
-    uint32_t ccw = enc->coded_width / 2;
-    int cx = cu_x / 2, cy = cu_y / 2;
-
-    int min_dx = -16, max_dx = 16;
-    int min_dy = -16, max_dy = 16;
-    if (cu_x + min_dx < 0) min_dx = -cu_x;
-    if (cu_x + max_dx + 8 > (int)cw) max_dx = (int)cw - 8 - cu_x;
-    if (cu_y + min_dy < 0) min_dy = -cu_y;
-    if (cu_y + max_dy + 8 > (int)ch) max_dy = (int)ch - 8 - cu_y;
-
-    /* Ensure bounds are even integers for zero chroma drift */
-    if (min_dx & 1) min_dx++;
-    if (max_dx & 1) max_dx--;
-    if (min_dy & 1) min_dy++;
-    if (max_dy & 1) max_dy--;
-
-    /* 1. Evaluate (0, 0) */
-    uint32_t sad0 = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
-                    compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                           enc->prev_recon_cb, enc->prev_recon_cr,
-                                           ccw, cx, cy, 0, 0);
-    int best_dx = 0, best_dy = 0;
-    uint32_t best_sad = sad0;
-
-    /* Early exit if stationary background */
-    uint32_t early_exit_sad = (enc && enc->quality_level >= 5) ? 64 : 32;
-    if (best_sad <= early_exit_sad) {
-        *out_best_dx = 0;
-        *out_best_dy = 0;
-        *out_best_sad = best_sad;
-        return;
-    }
-
-    /* 2. Evaluate GPU motion vector candidate if provided */
-    if (gpu_mv) {
-        int gdx = (gpu_mv->x / 4) & ~1;
-        int gdy = (gpu_mv->y / 4) & ~1;
-        if (gdx >= min_dx && gdx <= max_dx && gdy >= min_dy && gdy <= max_dy) {
-            if (gdx != 0 || gdy != 0) {
-                uint32_t gsad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, gdx, gdy) +
-                                compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                       enc->prev_recon_cb, enc->prev_recon_cr,
-                                                       ccw, cx, cy, gdx / 2, gdy / 2);
-                if (gsad < best_sad) {
-                    best_sad = gsad;
-                    best_dx = gdx;
-                    best_dy = gdy;
-                    if (best_sad <= early_exit_sad) {
-                        *out_best_dx = best_dx;
-                        *out_best_dy = best_dy;
-                        *out_best_sad = best_sad;
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    /* 3. Evaluate spatial predictors */
-    for (int i = 0; i < num_spatial_preds; i++) {
-        int pdx = spatial_preds[i].x / 4;
-        int pdy = spatial_preds[i].y / 4;
-        pdx &= ~1;
-        pdy &= ~1;
-        if (pdx == best_dx && pdy == best_dy) continue;
-        if (pdx >= min_dx && pdx <= max_dx && pdy >= min_dy && pdy <= max_dy) {
-            uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, pdx, pdy) +
-                           compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                  enc->prev_recon_cb, enc->prev_recon_cr,
-                                                  ccw, cx, cy, pdx / 2, pdy / 2);
-            if (sad < best_sad) {
-                best_sad = sad;
-                best_dx = pdx;
-                best_dy = pdy;
-            }
-        }
-    }
-
-    /* 4. Multi-step Diamond Search with steps 8, 4, 2 (all even offsets)
-     * If best_sad is already low (e.g. from GPU MV or spatial predictor), skip coarse steps! */
-    static const int steps[3] = { 8, 4, 2 };
-    int start_s = 0;
-    if (best_sad <= 48) {
-        start_s = 2;
-    } else if (best_sad <= 96) {
-        start_s = 1;
-    }
-    for (int s = start_s; s < 3; s++) {
-        int step = steps[s];
-        bool improved = true;
-        int iter = 0;
-        while (improved && iter < 2) {
-            improved = false;
-            iter++;
-            static const int d_offsets[4][2] = {
-                { 0, -1 }, { -1, 0 }, { 1, 0 }, { 0, 1 }
-            };
-            for (int d = 0; d < 4; d++) {
-                int nx = best_dx + d_offsets[d][0] * step;
-                int ny = best_dy + d_offsets[d][1] * step;
-                if (nx >= min_dx && nx <= max_dx && ny >= min_dy && ny <= max_dy) {
-                    uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, nx, ny) +
-                                   compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                          enc->prev_recon_cb, enc->prev_recon_cr,
-                                                          ccw, cx, cy, nx / 2, ny / 2);
-                    if (sad < best_sad) {
-                        best_sad = sad;
-                        best_dx = nx;
-                        best_dy = ny;
-                        improved = true;
-                    }
-                }
-            }
-        }
-    }
-
-    /* 5. Fine 8-point refinement around best center at step 2 */
-    if (!(enc && enc->quality_level >= 5 && best_sad <= 96)) {
-        static const int refine_offsets[8][2] = {
-            { -2, -2 }, {  0, -2 }, {  2, -2 },
-            { -2,  0 },             {  2,  0 },
-            { -2,  2 }, {  0,  2 }, {  2,  2 }
-        };
-        for (int r = 0; r < 8; r++) {
-            int rx = best_dx + refine_offsets[r][0];
-            int ry = best_dy + refine_offsets[r][1];
-            if (rx >= min_dx && rx <= max_dx && ry >= min_dy && ry <= max_dy) {
-                uint32_t sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, rx, ry) +
-                               compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                      enc->prev_recon_cb, enc->prev_recon_cr,
-                                                      ccw, cx, cy, rx / 2, ry / 2);
-                if (sad < best_sad) {
-                    best_sad = sad;
-                    best_dx = rx;
-                    best_dy = ry;
-                }
-            }
-        }
-    }
-
-    *out_best_dx = best_dx;
-    *out_best_dy = best_dy;
-    *out_best_sad = best_sad;
-}
-
-static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr, const hevc_mv_t *gpu_mv) {
+static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
     uint32_t ccw = cw / 2, cch = ch / 2;
@@ -1147,12 +1006,34 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         hevc_mv_t cand_mvs[5];
         derive_merge_candidates(enc, cux, cuy, cand_mvs);
 
-        int best_dx = 0, best_dy = 0;
-        uint32_t best_sad = UINT32_MAX;
-        hevc_motion_search_diamond_8x8(enc, cu_x, cu_y, cand_mvs, 5, gpu_mv,
-                                       &best_dx, &best_dy, &best_sad);
+        int cx = cu_x / 2, cy = cu_y / 2;
 
-        enc->last_frame_sad += best_sad;
+        /* SAD of the co-located block of the reference - the prediction this
+         * encoder can actually emit, since derive_merge_candidates() is a
+         * fixpoint at zero (see its comment). Computed once here and reused
+         * by the candidate loop below, which used to recompute it up to five
+         * times per CU because all five candidates are (0,0).
+         *
+         * This is also what rate control now gets. The number it used to get
+         * was hevc_motion_search_diamond_8x8()'s best SAD, which is <= this
+         * one by construction (the search starts at (0,0) and only ever
+         * accepts an improvement) and describes a motion-compensated block
+         * the bitstream has no syntax to ask for. Rate control's only use of
+         * it (rate_control.c, RC_VBR) is est_sad / prev_frame_sad as a
+         * temporal-complexity ratio, so feeding it a residual the encoder
+         * cannot realise systematically under-states how hard the frame is.
+         * The zero-MV SAD is the residual energy the encoder will really
+         * face, it is exactly the number the skip decision three lines down
+         * is already making, and it costs nothing extra. Measured effect on
+         * output: of the 38 tools/hevc_host_drift.sh cases, the 35 CQP ones
+         * are byte-identical (RC_CQP ignores est_sad entirely) and of the
+         * three VBR ones only 128x128 p2 gop8 @4000 kbps changes - one QP
+         * step on one frame. docs/notes/dead-motion-search.md. */
+        uint32_t sad_zero = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
+                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                   enc->prev_recon_cb, enc->prev_recon_cr,
+                                                   ccw, cx, cy, 0, 0);
+        enc->last_frame_sad += sad_zero;
 
         uint32_t threshold = 96 * (1 + (enc->qp / 8));
         if (enc->quality_level >= 5) {
@@ -1167,10 +1048,13 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             threshold = (uint32_t)s_skip_override;
         }
 
-        /* Evaluate candidates in cand_mvs to find the best merge candidate */
+        /* Evaluate candidates in cand_mvs to find the best merge candidate.
+         * Every candidate is (0,0) today, so this loop costs nothing beyond
+         * the sad_zero above - but it is left general on purpose: it is the
+         * piece that stays correct if a future AMVP/MVD path ever puts a
+         * real vector in the list. */
         int best_cand_idx = -1;
         uint32_t best_cand_sad = UINT32_MAX;
-        int cx = cu_x / 2, cy = cu_y / 2;
 
         for (int i = 0; i < 5; i++) {
             int c_dx = cand_mvs[i].x / 4;
@@ -1178,13 +1062,8 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             if (cu_x + c_dx >= 0 && cu_x + c_dx + 8 <= (int)cw &&
                 cu_y + c_dy >= 0 && cu_y + c_dy + 8 <= (int)ch) {
                 uint32_t c_sad;
-                if (c_dx == best_dx && c_dy == best_dy) {
-                    c_sad = best_sad;
-                } else if (c_dx == 0 && c_dy == 0) {
-                    c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
-                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                   enc->prev_recon_cb, enc->prev_recon_cr,
-                                                   ccw, cx, cy, 0, 0);
+                if (c_dx == 0 && c_dy == 0) {
+                    c_sad = sad_zero;
                 } else {
                     c_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, c_dx, c_dy) +
                             compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
@@ -1402,23 +1281,17 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
     int cond_a = ctu_row > 0 ? 1 : 0;
     hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
 
-    /* Look up GPU motion vector for this CTU if available */
-    hevc_mv_t gpu_mv_storage;
-    const hevc_mv_t *gpu_mv_ptr = NULL;
-    if (enc->gpu_mvs && enc->num_gpu_mvs > 0) {
-        uint32_t ctu_idx = (uint32_t)ctu_row * enc->width_ctu + (uint32_t)ctu_col;
-        if (ctu_idx < enc->num_gpu_mvs) {
-            const gpu_mv_t *gm = &enc->gpu_mvs[ctu_idx];
-            gpu_mv_storage.x = (int16_t)gm->mvx;
-            gpu_mv_storage.y = (int16_t)gm->mvy;
-            gpu_mv_ptr = &gpu_mv_storage;
-        }
-    }
-
+    /* No per-CTU GPU motion vector is looked up any more. enc->gpu_mvs is
+     * still filled (motion_estimation.comp's readback in
+     * hevc_encoder_encode_frame(), or BC250_HEVC_FAKE_GPU_MV off-board) but
+     * nothing downstream can use it: the merge list is a fixpoint at zero,
+     * so the only vector this encoder can signal is (0,0) whatever the GPU
+     * found. See derive_merge_candidates()'s comment and
+     * docs/notes/dead-motion-search.md. */
     static const int cu_off_x[4] = { 0, 8, 0, 8 };
     static const int cu_off_y[4] = { 0, 0, 8, 8 };
     for (int i = 0; i < 4; i++)
-        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr, gpu_mv_ptr);
+        encode_cu(enc, cab, ctu_x + cu_off_x[i], ctu_y + cu_off_y[i], is_idr);
 }
 
 /* ============================================================================
@@ -1932,6 +1805,15 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         gpu_compute_end_picture(gpu_ctx);
         gpu_compute_sync(gpu_ctx);
 
+        /* Unconsumed since the motion search was removed - see
+         * derive_merge_candidates() and docs/notes/dead-motion-search.md.
+         * Deliberately NOT deleted here: it is the tail of the GPU ME
+         * dispatch above, that dispatch is shared with the H.264 path and
+         * is kept for its Vulkan layout/fence bookkeeping (this file's top
+         * comment), and neither half can be validated without the board.
+         * Removing the pair is a board-run item, not an off-board one. The
+         * cost is one memcpy per P-frame against a search that was ~39 SADs
+         * per 8x8 CU, so leaving it costs approximately nothing. */
         if (!is_idr && encoder->has_ref && encoder->gpu_mvs) {
             void *mv_data = NULL;
             size_t mv_size = 0;
@@ -1985,7 +1867,16 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
      * derive_merge_candidates() that actually pick between different
      * vectors never run. Without this hook tools/hevc_host_drift.sh can
      * confirm the P-frame *syntax* but cannot reach the MV-selection logic
-     * at all - and that is where the real defect turned out to be. */
+     * at all - and that is where the real defect turned out to be.
+     *
+     * Say the current state plainly: since the motion search was removed
+     * (docs/notes/dead-motion-search.md) NOTHING reads encoder->gpu_mvs, so
+     * this hook has no effect on the output and the six drift cases that
+     * set it are byte-identical to the same cases without it. It is kept,
+     * with the readback in hevc_encoder_encode_frame() it stands in for,
+     * because it is the seam a real MVD/AMVP path would reconnect to, and
+     * because deleting the only off-board source of a non-zero vector is
+     * how the injection bug above stayed invisible the first time. */
     if (encoder->gpu_mvs && encoder->has_ref) {
         const char *fake = getenv("BC250_HEVC_FAKE_GPU_MV");
         if (fake) {

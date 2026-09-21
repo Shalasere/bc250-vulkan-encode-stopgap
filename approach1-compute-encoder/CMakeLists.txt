@@ -362,6 +362,51 @@ if(BUILD_CAVLC_BENCH)
     endif()
 endif()
 
+# ----------------------------------------------------------------------------
+# hevc_host_repro - the CPU HEVC path, off-board, at SHIPPED codegen
+# ----------------------------------------------------------------------------
+# tools/hevc_host_drift.sh builds the same source with a hand-rolled
+# `gcc -O2` line. That is fine for the byte-exactness oracle it drives (the
+# comparison is against a decoder, not against a stopwatch) and is
+# deliberately left alone so the oracle keeps working on a machine with no
+# CMake configure. It is NOT fine for a performance number:
+# docs/performance-measurement.md has two measured cases where -O2 was wrong
+# about a win in opposite directions, one of them by 40 points.
+#
+# Configured here, this target inherits the real shipped flag set - the -O2
+# above, CMAKE_C_FLAGS_RELEASE's "-O3 -DNDEBUG" after it, and the
+# -march=znver2 auto-detection - and, like cavlc_bench, opts into znver2
+# codegen and pinned alignment on a dev machine that can execute it, because
+# the driver never ships generic x86-64 and a 1.30x alignment phantom has
+# already cost this project a day. Same flag variable as cavlc_bench so the
+# two harnesses cannot drift apart: -DCAVLC_BENCH_MARCH=off disables both.
+#
+# It is the CPU path only: hevc_encoder_encode_raw() never touches the GPU.
+# gpu_compute.c is linked because encoder_h265.c references it on the
+# GPU-assisted entry points, which this harness does not call.
+option(BUILD_HEVC_HOST_REPRO "Build the off-board HEVC host harness (tools/hevc_host_repro.c)" ON)
+if(BUILD_HEVC_HOST_REPRO)
+    set(HEVC_HOST_REPRO_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/hevc_host_repro.c)
+    if(EXISTS ${HEVC_HOST_REPRO_SRC})
+        set(HEVC_HOST_REPRO_FLAGS -falign-functions=64 -falign-loops=32)
+        if(NOT CAVLC_BENCH_MARCH STREQUAL "off")
+            check_c_compiler_flag("-march=${CAVLC_BENCH_MARCH}" COMPILER_SUPPORTS_BENCH_MARCH)
+            if(COMPILER_SUPPORTS_BENCH_MARCH)
+                list(APPEND HEVC_HOST_REPRO_FLAGS -march=${CAVLC_BENCH_MARCH} -mtune=${CAVLC_BENCH_MARCH})
+            endif()
+        endif()
+
+        add_executable(hevc_host_repro ${HEVC_HOST_REPRO_SRC}
+                       src/encoder_h265.c src/hevc_intra.c src/hevc_cabac.c
+                       src/bitstream.c src/rate_control.c src/gpu_compute.c)
+        target_include_directories(hevc_host_repro PRIVATE src)
+        target_compile_options(hevc_host_repro PRIVATE ${HEVC_HOST_REPRO_FLAGS})
+        target_link_libraries(hevc_host_repro PRIVATE ${Vulkan_LIBRARIES} m)
+    else()
+        message(WARNING "BUILD_HEVC_HOST_REPRO=ON but ${HEVC_HOST_REPRO_SRC} is missing")
+    endif()
+endif()
+
 # Tests
 #
 # enable_testing() MUST be called here, in the top-level CMakeLists.txt,
