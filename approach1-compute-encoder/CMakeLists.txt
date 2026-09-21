@@ -362,6 +362,66 @@ if(BUILD_CAVLC_BENCH)
     endif()
 endif()
 
+# ----------------------------------------------------------------------------
+# hevc_bench - off-board HEVC CPU-path timing harness (docs/backlog.md A5)
+# ----------------------------------------------------------------------------
+# Same reasoning as cavlc_bench above, for the CPU HEVC path:
+# tools/hevc_host_drift.sh already reaches this code off-board but builds it
+# by hand at -O2, and docs/performance-measurement.md says an -O2 figure can
+# be wrong in either direction. A CMake target inherits the shipped
+# -O3 -DNDEBUG and the -march auto-detection, and takes cavlc_bench's
+# alignment pins for the same reason cavlc_bench has them.
+#
+# Unlike cavlc_bench this does need Vulkan and libva at link time, because
+# encoder_h265.c references gpu_compute.c. It never CALLS the GPU:
+# hevc_encoder_encode_raw() is the GPU-free entry point.
+#
+# Off in the 32-bit build by default: that build exists for Steam Link's
+# 32-bit VA-API client, not for measurement, and there is no reason to make
+# a dev-machine harness a new way for that job to fail.
+if(BUILD_32BIT)
+    option(BUILD_HEVC_BENCH "Build the off-board HEVC CPU-path harness (tools/hevc_bench.c)" OFF)
+else()
+    option(BUILD_HEVC_BENCH "Build the off-board HEVC CPU-path harness (tools/hevc_bench.c)" ON)
+endif()
+set(HEVC_BENCH_MARCH "znver2" CACHE STRING "-march for hevc_bench ('off' for host default)")
+
+if(BUILD_HEVC_BENCH)
+    set(HEVC_BENCH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/hevc_bench.c)
+    if(EXISTS ${HEVC_BENCH_SRC})
+        set(HEVC_BENCH_CORE
+            src/encoder_h265.c src/hevc_intra.c src/hevc_cabac.c
+            src/bitstream.c src/rate_control.c src/gpu_compute.c)
+        set(HEVC_BENCH_FLAGS -falign-functions=64 -falign-loops=32)
+        if(NOT HEVC_BENCH_MARCH STREQUAL "off")
+            check_c_compiler_flag("-march=${HEVC_BENCH_MARCH}" COMPILER_SUPPORTS_HEVC_BENCH_MARCH)
+            if(COMPILER_SUPPORTS_HEVC_BENCH_MARCH)
+                list(APPEND HEVC_BENCH_FLAGS -march=${HEVC_BENCH_MARCH} -mtune=${HEVC_BENCH_MARCH})
+            endif()
+        endif()
+
+        add_executable(hevc_bench ${HEVC_BENCH_SRC} ${HEVC_BENCH_CORE})
+        target_include_directories(hevc_bench PRIVATE src)
+        target_compile_options(hevc_bench PRIVATE ${HEVC_BENCH_FLAGS})
+        target_link_libraries(hevc_bench PRIVATE
+            ${Vulkan_LIBRARIES} ${LIBVA_LIBRARIES} ${DRM_LIBRARIES}
+            ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS} ${BC250_EXTRA_LIBS} m)
+
+        # Same harness, same flags, with hevc_intra.c's HEVC_PROF_* ablation
+        # hooks compiled in. A SEPARATE binary on purpose, so `bench`
+        # numbers are taken on code carrying no instrumentation at all.
+        add_executable(hevc_bench_prof ${HEVC_BENCH_SRC} ${HEVC_BENCH_CORE})
+        target_include_directories(hevc_bench_prof PRIVATE src)
+        target_compile_options(hevc_bench_prof PRIVATE ${HEVC_BENCH_FLAGS})
+        target_compile_definitions(hevc_bench_prof PRIVATE HEVC_INTRA_PROFILE)
+        target_link_libraries(hevc_bench_prof PRIVATE
+            ${Vulkan_LIBRARIES} ${LIBVA_LIBRARIES} ${DRM_LIBRARIES}
+            ${CMAKE_THREAD_LIBS_INIT} ${CMAKE_DL_LIBS} ${BC250_EXTRA_LIBS} m)
+    else()
+        message(WARNING "BUILD_HEVC_BENCH=ON but ${HEVC_BENCH_SRC} is missing")
+    endif()
+endif()
+
 # Tests
 #
 # enable_testing() MUST be called here, in the top-level CMakeLists.txt,

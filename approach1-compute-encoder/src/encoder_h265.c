@@ -1256,11 +1256,15 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
      * from the earlier PUs of the SAME CU, exactly like a real decoder). */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mode = hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw, (int)cw, (int)ch, px, py);
-        pu_modes[pu] = mode;
-
+        /* One call, not two: the mode search already builds the winning
+         * mode's prediction, and nothing writes recon_y between here and
+         * the hevc_predict_4x4() this replaced, so re-gathering the
+         * neighbours and re-predicting was pure repetition. Byte-identical
+         * - see hevc_choose_luma_mode_pred()'s comment. */
         uint8_t pred[16];
-        hevc_predict_4x4(enc->recon_y, cw, cw, ch, px, py, mode, 1, pred);
+        int mode = hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw,
+                                         (int)cw, (int)ch, px, py, pred);
+        pu_modes[pu] = mode;
 
         int16_t residual[16];
         for (int y = 0; y < 4; y++)

@@ -17,6 +17,47 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* ===================== off-board profiling hook ===================== */
+/*
+ * Compiled in ONLY for tools/hevc_bench.c's `hevc_bench_prof` target
+ * (-DHEVC_INTRA_PROFILE). In the shipped build both macros below expand to
+ * nothing at all, so src/hevc_intra.c compiles to byte-identical machine
+ * code with this block present - the same property tools/cavlc_bench.c's
+ * CAVLC_PROFILE hooks carry, and verified the same way (disassembly diff).
+ *
+ * The ablation is a RECURSIVE self-call with the flag cleared, rather than
+ * a restructure into an inner function plus a wrapper, precisely so the
+ * shipped code path is not reshaped for the benefit of the profiler. The
+ * second call's answer is asserted equal and thrown away, so the bitstream
+ * is bit-identical either way and the A/B difference is the marginal cost
+ * of exactly one mode search. Single-threaded harness only.
+ */
+#ifdef HEVC_INTRA_PROFILE
+#include <x86intrin.h>
+int hevc_intra_prof_dup_mode_search = 0;
+int hevc_intra_prof_timing = 0;
+unsigned long long hevc_intra_prof_mode_cycles = 0;
+unsigned long long hevc_intra_prof_mode_calls = 0;
+unsigned long long hevc_intra_prof_rdtsc(void) { return __rdtsc(); }
+#define HEVC_PROF_ENTER()                                                   \
+    unsigned long long prof_t0_ = hevc_intra_prof_timing ? __rdtsc() : 0ull
+#define HEVC_PROF_LEAVE(result, ...) do {                                   \
+    if (hevc_intra_prof_timing)                                             \
+        hevc_intra_prof_mode_cycles += __rdtsc() - prof_t0_;                \
+    hevc_intra_prof_mode_calls++;                                           \
+    if (hevc_intra_prof_dup_mode_search) {                                  \
+        hevc_intra_prof_dup_mode_search = 0;                                \
+        uint8_t prof_p2_[16];                                               \
+        int prof_m2_ = hevc_choose_luma_mode(__VA_ARGS__, prof_p2_);        \
+        hevc_intra_prof_dup_mode_search = 1;                                \
+        if (prof_m2_ != (result)) abort();                                  \
+    }                                                                       \
+} while (0)
+#else
+#define HEVC_PROF_ENTER()          ((void)0)
+#define HEVC_PROF_LEAVE(result, ...) ((void)0)
+#endif
+
 /* ===================== mode/scan helpers ===================== */
 
 int hevc_scan_idx_for_mode(int mode) {
@@ -226,8 +267,12 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
  * hevc_intra_wavefront.comp); this brings the CPU path in line. Output is
  * unchanged - it is the same gather feeding the same mode arithmetic,
  * just not repeated. */
-static void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
-                              int mode, int is_luma, uint8_t pred_out[16]);
+/* PERF: `inline`, so the four constant-mode calls in the mode search below
+ * each collapse to one branch of the switch with no dispatch. It is still
+ * one function and one copy of the arithmetic in the source; the runtime-
+ * mode call in hevc_predict_4x4() keeps the full switch. */
+static inline void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
+                                     int mode, int is_luma, uint8_t pred_out[16]);
 
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
                       int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
@@ -239,8 +284,8 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
 /* is_luma is still needed here, not just for the gather: DC and the
  * horizontal/vertical modes apply their edge filtering only for cIdx == 0
  * (8.4.4.2.5-8.4.4.2.6). */
-static void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
-                              int mode, int is_luma, uint8_t pred_out[16]) {
+static inline void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
+                                     int mode, int is_luma, uint8_t pred_out[16]) {
     switch (mode) {
     case HEVC_MODE_PLANAR:
         for (int y = 0; y < 4; y++)
@@ -288,30 +333,104 @@ static void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8
     }
 }
 
+/* Sum of absolute differences over two contiguous 16-byte blocks. Written
+ * as a plain loop on purpose rather than as an _mm_sad_epu8() intrinsic:
+ * at -O3 the vectoriser already emits one packed SAD for this shape, and a
+ * hand-written intrinsic would have to carry its own runtime dispatch for
+ * the 32-bit build (docs: BUILD_32BIT, Steam Link) while producing the same
+ * instruction. Exact integer arithmetic, so summation order is irrelevant
+ * and the result is bit-identical to the scalar form it replaced. */
+static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
+    int sad = 0;
+    for (int i = 0; i < 16; i++) {
+        int d = (int)a[i] - (int)b[i];
+        sad += d < 0 ? -d : d;
+    }
+    return sad;
+}
+
+/* PERF: the mode search and the winning mode's prediction are ONE function,
+ * because the caller needs both and the second was being recomputed from
+ * scratch.
+ *
+ * encoder_h265.c's per-PU sequence was hevc_choose_luma_mode() followed
+ * immediately by hevc_predict_4x4() with the mode it returned - and nothing
+ * writes recon_y in between, so that second call re-ran gather_neighbors()
+ * (five z-scan availability tests over an 11-entry substitution scan) and
+ * re-ran predict_from_refs() for a prediction the search had already built
+ * and discarded. Two gathers and five predictions per 4x4 luma PU, for a
+ * block whose reference set and candidate predictions do not change between
+ * the two calls.
+ *
+ * Keeping the winner costs one 16-byte copy per improvement (at most three
+ * per block) and removes a whole gather plus a whole prediction. The
+ * arithmetic is untouched: same gather, same predict_from_refs(), same SAD,
+ * same strict `<` so ties still go to the earlier candidate in
+ * Planar/DC/Horizontal/Vertical order. Output is byte-identical.
+ *
+ * NOTE for anyone comparing against the GPU path: hevc_intra_wavefront.comp
+ * is NOT a second implementation of this function. It searches 35 modes
+ * over an undivided 16x16 CU with 8.4.4.2.3 reference smoothing; this
+ * searches four modes per 4x4 TU. The two paths have never agreed on mode
+ * decisions and are not required to - see that shader's SCOPE comment. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0) {
-    static const int candidates[4] = { HEVC_MODE_PLANAR, HEVC_MODE_DC, HEVC_MODE_HORIZONTAL, HEVC_MODE_VERTICAL };
-    int best_mode = HEVC_MODE_DC;
-    long best_sad = -1;
+                           int width, int height, int x0, int y0,
+                           uint8_t pred_out[16]) {
+    HEVC_PROF_ENTER();
 
     /* Gather ONCE for all four candidates - the reference set does not
      * depend on the mode. See predict_from_refs()'s comment. */
     uint8_t left[5], top[5], corner;
     gather_neighbors(recon_y, stride, width, height, x0, y0, 1, left, top, &corner);
 
-    for (int c = 0; c < 4; c++) {
-        uint8_t pred[16];
-        predict_from_refs(left, top, corner, candidates[c], 1 /* luma */, pred);
-        long sad = 0;
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++) {
-                int src = src_y[(y0 + y) * stride + (x0 + x)];
-                int p = pred[y * 4 + x];
-                int d = src - p;
-                sad += d < 0 ? -d : d;
-            }
-        if (best_sad < 0 || sad < best_sad) { best_sad = sad; best_mode = candidates[c]; }
-    }
+    /* PERF: hoist the source block. The four SAD loops each re-derived
+     * src_y[(y0+y)*stride + (x0+x)] for all 16 samples, i.e. 64 strided
+     * byte loads off a row multiply per block. Copied once into a
+     * contiguous 16-byte local it is four 4-byte loads, and the SAD below
+     * then has two contiguous 16-byte operands, which is what lets the
+     * vectoriser reduce it to a single packed sum-of-absolute-differences
+     * instead of 16 scalar subtract/abs/add chains. Same samples, same
+     * order, same sum. */
+    uint8_t src16[16];
+    const uint8_t *srow = src_y + (size_t)y0 * (size_t)stride + (size_t)x0;
+    memcpy(src16 + 0,  srow,                      4);
+    memcpy(src16 + 4,  srow + stride,             4);
+    memcpy(src16 + 8,  srow + 2 * (size_t)stride, 4);
+    memcpy(src16 + 12, srow + 3 * (size_t)stride, 4);
+
+    /* Unrolled over the four candidates, with the mode a compile-time
+     * constant in each, so predict_from_refs() inlines to just that mode's
+     * arithmetic. The candidates[] array and its loop were what forced the
+     * switch to stay a runtime dispatch.
+     *
+     * Planar is evaluated straight into pred_out because it is always the
+     * first candidate and the old `best_sad < 0` sentinel meant it always
+     * won the first comparison - so this is the same initialisation, one
+     * 16-byte copy cheaper. Ties still go to the earlier candidate
+     * (strict `<`), and the order is unchanged: Planar, DC, Horizontal,
+     * Vertical. A 4x4 SAD cannot exceed 16*255 = 4080, so the accumulator
+     * being `int` rather than `long` cannot change an outcome. */
+    predict_from_refs(left, top, corner, HEVC_MODE_PLANAR, 1 /* luma */, pred_out);
+    int best_mode = HEVC_MODE_PLANAR;
+    int best_sad = sad_4x4(src16, pred_out);
+
+#define HEVC_TRY_MODE(M) do {                                              \
+        uint8_t pred_[16];                                                 \
+        predict_from_refs(left, top, corner, (M), 1 /* luma */, pred_);    \
+        int sad_ = sad_4x4(src16, pred_);                                  \
+        if (sad_ < best_sad) {                                             \
+            best_sad = sad_;                                               \
+            best_mode = (M);                                               \
+            memcpy(pred_out, pred_, 16);                                   \
+        }                                                                  \
+    } while (0)
+
+    HEVC_TRY_MODE(HEVC_MODE_DC);
+    HEVC_TRY_MODE(HEVC_MODE_HORIZONTAL);
+    HEVC_TRY_MODE(HEVC_MODE_VERTICAL);
+#undef HEVC_TRY_MODE
+
+    HEVC_PROF_LEAVE(best_mode, src_y, recon_y, stride, width, height, x0, y0);
     return best_mode;
 }
 
