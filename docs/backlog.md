@@ -350,9 +350,37 @@ unprivileged and reported success anyway). Needs root, and needs the
 *light game* load it is actually about. `lab bench` records `sclk_mhz`
 now, so the next attempt can confirm the clock moved first.
 
-**C7. STILL OPEN, and now the highest-value HEVC item.** P-frames for
-the GPU intra path. It is all-intra only, which is what blocks C5 and
-what keeps HEVC from being a real alternative to H.264 for streaming.
+**C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off, NO BOARD RUN.**
+Zero-motion-SKIP parity with the CPU path (not real motion
+compensation — that's a further step, "still open after this" for
+*both* paths now per C9's own wording). Design insight: `recon_image`
+already persists across frames untouched, so a SKIP CTU just needs a
+6-line shader early-return, not a new reference image; every merge
+candidate this path could ever derive is provably `(0,0)`, so
+`merge_idx` is always signalled as `0`, exact rather than a shortcut.
+
+Off-board verification found and fixed a real bug: `split_cu_flag` was
+coded after `cu_skip_flag` / omitted entirely for skip CTUs, and
+ffmpeg reported **zero decode errors** the whole time — the same
+"decoder error names where it noticed, not the fault" shape this
+project has hit before. After the fix, a fully-skipped P-frame decodes
+byte-identical to its reference at 7 sizes plus a non-CTU-aligned
+100x60, via a new GPU-free test entry point
+(`hevc_encoder_encode_gpu_raw()`).
+
+**Nothing about real GPU execution is verified** — the shader, the new
+buffer/descriptor plumbing, and the skip threshold have never run on
+any Vulkan implementation, software or real. Gated behind
+`BC250_HEVC_GPU_PFRAME=1` (default off, independent of
+`BC250_HEVC_GPU=1`) precisely so this cannot regress the already
+board-validated all-intra baseline while a board run is pending — same
+precedent C5 set for `BC250_HEVC_GPU` itself. **Do not enable near real
+hardware or a real client without a board session first.**
+`docs/notes/c7-gpu-pframes.md` has the full design and exactly what
+still needs the board: the skip threshold's rate/quality tradeoff, any
+throughput cost (a new per-P-frame download the all-intra path never
+had), the CPU-fallback interaction, and GOPs longer than one P after
+one I.
 
 **C8. NEW — HEVC rounds odd frame sizes up to a multiple of 8.**
 854x480 encodes as 856x480. Not fixable as the driver stands: ffmpeg

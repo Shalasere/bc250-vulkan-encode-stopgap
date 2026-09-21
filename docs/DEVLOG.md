@@ -4622,3 +4622,106 @@ root-caused here - this is the board confirmation that C3's own
 "needs the board" line was right, and a sharper target for whoever
 picks it up next: start with why luma drifts under real decode, not
 with the missing chroma binding.
+
+## 37. C7 first cut: zero-motion-skip P-frames for the GPU intra path — gated off, unexecuted on any GPU
+
+`docs/backlog.md` C7 asked for P-frames on the GPU intra path
+(`BC250_HEVC_GPU=1`, `hevc_intra_wavefront.comp`), which had been
+all-intra only since it existed. Scope was deliberately narrowed to
+zero-motion-SKIP-plus-intra-fallback parity with the CPU path, not real
+motion compensation - that remains "still open after this" for both
+paths now, matching C9's own wording for the CPU path alone.
+
+### The design that makes this cheap
+
+The hard part isn't the skip decision - it's that a non-skip CTU's
+intra prediction reads already-reconstructed neighbour samples, and
+those must match what a real decoder has, which for a skip-CTU
+neighbour is that CTU's *reference-picture* content, not a fresh intra
+guess. `ctx->recon_image` already persists across frames untouched
+until each CTU's own step overwrites it, so a flagged CTU's correct
+zero-motion reconstruction is *already sitting at its coordinates*
+right up until this frame's dispatch would otherwise overwrite it. The
+shader change is therefore six lines: a `skip_mask` SSBO (binding 7)
+and an early `return` right after the existing z-scan-availability
+guard, before any image read/write. No new reference image, no copy
+shader.
+
+Second: this path never signals a non-zero motion vector anywhere
+(matching the CPU path's post-C9 state), so every merge-list entry a
+decoder could ever derive for this CU is provably `(0,0)`
+(`sps_temporal_mvp_enabled_flag=0`, single ref_idx, no split).
+`merge_idx` is therefore always signalled as `0` - exact, not a
+shortcut, because the value cannot change the reconstructed picture no
+matter which of the five candidate slots a decoder would have resolved
+it to.
+
+### What actually needed real derivation
+
+`cu_skip_flag`'s ctxInc (9.3.4.2.2, the same `condL+condA` formula the
+CPU path uses, reused at CTU instead of 8x8-CU granularity) and the
+MPM DC-for-skip-neighbour rule (8.4.2). The P-slice header itself
+reuses the CPU path's RPS/PPS syntax byte for byte.
+
+### Off-board verification found a real bug
+
+A new GPU-free test entry point, `hevc_encoder_encode_gpu_raw()` (same
+role `BC250_HEVC_FAKE_GPU_MV` already plays for the CPU path), is the
+only way this code has run at all, ever, in this environment. It
+immediately found: `split_cu_flag` - which must be coded before
+`coding_unit()` for every CTU regardless of slice type - was only
+written on the intra branch, and written *after* `cu_skip_flag` even
+there. Every skip CTU was missing the bin entirely; every non-skip
+P-slice CTU had it in the wrong position. **ffmpeg reported zero
+decode errors the whole time** - pixels drifted by small amounts
+(never catastrophic), the same "a decoder error names where it
+noticed, not the fault" shape this project has hit before. All-intra
+frames never hit this (`is_idr` never takes the skip branch, and
+`pred_mode_flag` is never coded there either, so the ordering was
+already correct on that path) - it only broke once a P-slice existed
+to code something ahead of it.
+
+Fixed by moving `split_cu_flag` to the top of the per-CTU body,
+unconditionally. After the fix: a fully-skipped P-frame decodes
+byte-identical to its reference at 7 sizes (32x32-128x128) plus a
+non-CTU-aligned 100x60; a mixed skip/intra case (constructed 50/50
+spatial split) decodes silently with real ctxInc variation, confirmed
+32/64 CTUs chosen skip matching the construction; `ffmpeg -bsf:v
+trace_headers` confirms the P-slice header parses exactly as intended.
+
+### What this session independently re-verified before merging
+
+Rebuilt from scratch (confirming the shader change goes through the
+real `compile_shaders` step, not just standalone `glslangValidator`),
+re-ran `ctest` (same pre-existing WSL/llvmpipe `VaApiDriverTest`
+limitation, nothing new) and `tools/hevc_host_drift.sh` (53/53,
+confirming the CPU path - which shares `hevc_encoder_t` - is
+genuinely unaffected), and read the actual gating logic directly:
+`is_idr_candidate = !encoder->use_gpu_pframe || ...` collapses to
+unconditionally true with `BC250_HEVC_GPU_PFRAME` unset, reproducing
+the exact pre-existing all-intra behaviour. No new call site touches
+`gpu_compute_end_picture()`/`gpu_compute_submitted_slot()`, so the
+`DRIVER_LOCK` discipline is unaffected.
+
+### What is NOT verified, deliberately not overclaimed
+
+Nothing about real GPU execution - the shader's early return, the
+`recon_image` reuse argument, and the new buffer/descriptor plumbing
+(`hevc_skip_buffers`, the binding-7 rewrite every dispatch,
+`out_recon_was_reset`) have been reviewed carefully but have not
+executed on any Vulkan implementation, software or real, anywhere.
+Also unmeasured: the zero-motion skip threshold's rate/quality
+tradeoff (cannot be wrong in a way that breaks conformance - a skip
+CTU always reconstructs as an exact reference copy by construction -
+but the bitrate/quality cost of the heuristic threshold is real and
+open), any throughput cost (a new per-P-frame source+reference
+download the all-intra fast path never had), the CPU-fallback
+interaction if a GPU P-frame dispatch fails mid-session, and any GOP
+longer than one P after one I.
+
+Gated behind `BC250_HEVC_GPU_PFRAME=1` (default off, independent of
+`BC250_HEVC_GPU=1`) - the same precedent C5 already set for
+`BC250_HEVC_GPU` itself: don't change validated default behaviour for
+something unvalidated, however carefully reasoned. **Do not enable
+this near real hardware or a real client without a board session
+first.**
