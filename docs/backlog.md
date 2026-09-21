@@ -168,9 +168,16 @@ a board `lab qsweep` BD-rate run before any number here is trusted.
 > pass already flagged as sensitive). **Explicitly not the board's
 > +52.42% number brought down to a new figure** — this off-board
 > harness's mode-search share of total time is much larger than a real
-> frame's, so only the mechanism and relative recovery transfer. A
-> board `lab compare` run is the only way to get the real number now.
+> frame's, so only the mechanism and relative recovery transfer.
 > `docs/notes/a6-mode-search-perf.md`.
+
+> **Board-confirmed (2026-09-21): -16.46% per-frame encode time
+> (SIGNIFICANT), bytes unchanged (within noise).** `lab compare` against
+> the immediately-preceding key, same HEVC/gop=120 settings as the
+> original board review. Recovers a real fraction of the +52.42%
+> regression — not a full return to the pre-A6 4-mode search's speed,
+> which was never the goal. Compression unaffected, confirming the
+> off-board RD-quality accounting held on real hardware too.
 
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
@@ -350,7 +357,28 @@ unprivileged and reported success anyway). Needs root, and needs the
 *light game* load it is actually about. `lab bench` records `sclk_mhz`
 now, so the next attempt can confirm the clock moved first.
 
-**C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off, NO BOARD RUN.**
+**C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off.** First board
+execution attempt (same day): **survives contact with real hardware** —
+two bounded, `timeout`-wrapped encodes (128x128/20 frames/gop=5,
+256x256/64 frames/gop=8, both `BC250_HEVC_GPU_PFRAME=1`) both encoded
+rc=0 and **decoded cleanly through ffmpeg's independent HEVC decoder**,
+the 128x128 case producing exactly 491520 bytes (20 full YUV420p
+frames, no truncation) and the 256x256 case "decodes silently." No
+crash, no hang, no board wedge. Driver log confirms the path actually
+engaged: `P-frame zero-motion skip enabled ... UNVALIDATED ON
+HARDWARE`.
+
+**This confirms syntactic validity on real Vulkan, not pixel
+correctness** — a malformed P-slice can still decode cleanly while
+being pixel-wrong (the exact class of bug the off-board pass already
+caught once, invisible to ffmpeg the whole time). The planned
+`trace_headers` byte-level check came back empty (a grep-pattern
+mistake, not a finding) and needs re-running. **Still needed before
+trusting output on this path**: a pixel-level board `drift`-style
+check with real P-frames (the harness's `drift` command hardcodes
+`-g 1`, so it can't reach this — needs a small custom recon-dump
+comparison), the skip threshold's rate/quality tradeoff, and any
+throughput cost.
 Zero-motion-SKIP parity with the CPU path (not real motion
 compensation — that's a further step, "still open after this" for
 *both* paths now per C9's own wording). Design insight: `recon_image`
