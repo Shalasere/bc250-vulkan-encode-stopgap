@@ -211,6 +211,22 @@ void hevc_cabac_code_cbf_chroma(hevc_cabac_t *cb, int cbf, int trafo_depth);
 void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
                                    int is_luma, int scan_idx);
 
+/* Off-board profiling hook for the function above - see hevc_cabac.c's
+ * HEVC_CABAC_PROFILE block and tools/hevc_cabac_bench.c (docs/backlog.md
+ * A4). Defined only in the hevc_cabac_bench_prof target; the shipped
+ * driver compiles none of it. */
+#ifdef HEVC_CABAC_PROFILE
+#define HEVC_RES4_MODE_OFF    0
+#define HEVC_RES4_MODE_ABLATE 1
+#define HEVC_RES4_MODE_CYCLES 2
+#define HEVC_RES4_MODE_STATS  3
+extern int      g_hevc_res4_mode;
+extern uint64_t g_hevc_res4_cycles;
+extern uint64_t g_hevc_res4_calls;
+extern uint64_t g_hevc_res4_nonzero;
+extern uint64_t g_hevc_res4_luma;
+#endif
+
 /* ---- transform blocks larger than 4x4 -------------------------------
  * Used by the GPU reconstruction path (hevc_intra_wavefront.comp), which
  * codes one 16x16 luma TU and one 8x8 chroma pair per CTU. The CPU path

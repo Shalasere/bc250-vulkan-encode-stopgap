@@ -212,7 +212,8 @@ sounds.
 | tool | status |
 |---|---|
 | `tools/lab` | **canonical.** Dev-machine entry point. |
-| `tools/cavlc_bench.c` | **canonical for H.264 CAVLC, off-board.** CMake targets `cavlc_bench` / `cavlc_bench_prof`. The only thing in this tree that exercises residual coding without a GPU. See below. |
+| `tools/cavlc_bench.c` | **canonical for H.264 CAVLC, off-board.** CMake targets `cavlc_bench` / `cavlc_bench_prof`. The only thing in this tree that exercises H.264 residual coding without a GPU. See below. |
+| `tools/hevc_cabac_bench.c` | **canonical for the CPU HEVC path, off-board.** CMake targets `hevc_cabac_bench` / `hevc_cabac_bench_prof`. Drives the real `hevc_encoder_encode_raw()` frame path and measures `hevc_cabac_code_residual_4x4()`'s share two independent ways (rdtsc bracket and in-process ablation), with an A/A floor. `docs/notes/a4-cabac-residual.md` has the numbers and the three things it measured at zero. |
 | `tools/bc250_lab.sh` | **canonical.** The on-board half; `lab` ships it. |
 | `tools/bc250_lab_parse.py` | component. All log parsing, so there is one parser rather than twelve. |
 | `tools/quality_test.sh` | component. PSNR/SSIM, invoked by `lab quality`. |
