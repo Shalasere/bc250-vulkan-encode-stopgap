@@ -282,30 +282,52 @@ static size_t write_pps(uint8_t *buf, size_t buf_size, int init_qp) {
     bs_write1(&bs, 0);   /* tiles_enabled_flag */
     bs_write1(&bs, 0);   /* entropy_coding_sync_enabled_flag */
     bs_write1(&bs, 1);   /* pps_loop_filter_across_slices_enabled_flag */
-    /* deblocking_filter_control_present_flag=0 means "defaults apply", and
-     * HEVC's default is deblocking ENABLED (ITU-T H.265 7.4.3.3.1) - a real
-     * encoder/decoder mismatch, since this encoder's own reconstruction
-     * never simulates deblocking (same class of compromise as this
-     * project's H.264 path's own documented "reads source not reconstructed
-     * neighbours" gap, README's Known Limitations, ~3.7dB, not visually
-     * significant).
+    /* Deblocking is signalled OFF, because this encoder does not simulate
+     * it. Leaving it on (which is what deblocking_filter_control_present_
+     * flag = 0 means - HEVC's default is ENABLED, ITU-T H.265 7.4.3.3.1)
+     * costs almost nothing all-intra, but it is expensive on P-frames and
+     * it compounds: the encoder's reference picture for frame N+1 is its
+     * own UNFILTERED reconstruction of frame N, while the decoder's is the
+     * FILTERED one, so the two reference chains walk apart a little more
+     * with every P-frame and only an IDR resets them. Measured off-board
+     * (testsrc2 640x480, CQP 27, 60 frames, gop 120): the encoder's own
+     * reconstruction scores 46.35 dB while the real deblocking decoder
+     * scores 37.23 - a 9.1 dB loss that is entirely this divergence, and
+     * that a drift oracle run with -skip_loop_filter all cannot see.
+     * All-intra (gop 1) loses 0.02 dB to the same filter.
      *
-     * TRIED explicitly signaling deblocking_filter_control_present_flag=1 +
-     * pps_deblocking_filter_disabled_flag=1 here (2026-09-19) to make the
-     * bitstream honest about what the encoder does, expecting a free,
-     * low-risk win - measured on real hardware instead: PSNR collapsed from
-     * 19.5-34.2dB (this file's known-correct MPM-fixed baseline) to a
-     * uniform 4.85-9.78dB, WORSE than before and more uniform than the
-     * original MPM bug's pattern - meaning that PPS edit introduced a
-     * genuine bitstream syntax error of its own, not the cheap fix it
-     * looked like from spec pseudocode recalled from memory. Reverted
-     * rather than compounded. Do not re-attempt without cross-checking the
-     * EXACT PPS RBSP bit layout against a live reference (x265/HM source or
-     * a hex/bit-level trace of a real encoder's PPS, not memory of the
-     * spec table) and re-verifying PSNR on real hardware before trusting
-     * it - this file has now hit this exact failure mode (a "safe-looking"
-     * syntax change silently desyncing the whole bitstream) twice. */
-    bs_write1(&bs, 0);   /* deblocking_filter_control_present_flag */
+     * This was TRIED ONCE BEFORE (2026-09-19) and reverted after PSNR
+     * collapsed to 4.85-9.78 dB on hardware; the note left behind called
+     * it "a genuine bitstream syntax error of its own". It was. Two bits
+     * were missing, and both are now here:
+     *
+     *   - deblocking_filter_override_enabled_flag. ITU-T H.265 7.3.2.3.1
+     *     codes it between deblocking_filter_control_present_flag and
+     *     pps_deblocking_filter_disabled_flag. Skipping it shifts every
+     *     later PPS bit by one - the decoder reads a scaling list flag
+     *     out of the deblocking flag, and so on to the end of the RBSP.
+     *   - slice_loop_filter_across_slices_enabled_flag, in the SLICE
+     *     header, whose presence condition (7.3.6.1) is
+     *     `pps_loop_filter_across_slices_enabled_flag && (slice_sao_luma
+     *     || slice_sao_chroma || !slice_deblocking_filter_disabled_flag)`.
+     *     With SAO off and deblocking now disabled that is false, so the
+     *     bit must NOT be written any more - and the slice header writers
+     *     below no longer write it. Emitting it anyway desynchronises the
+     *     byte alignment the CABAC engine starts from, i.e. the entire
+     *     slice payload.
+     *
+     * The earlier attempt had no off-board oracle, so a syntax error and a
+     * quality regression looked the same. Now they don't:
+     * tools/hevc_host_drift.sh decodes the real bitstream and compares it
+     * byte for byte against the encoder's reconstruction, and it is
+     * 28/28 exact with this change - including the inter cases. Crucially
+     * it no longer passes -skip_loop_filter all, so if these PPS bits did
+     * not parse as intended the decoder would still be filtering and
+     * every case would fail. That is the check the 2026-09-19 attempt
+     * did not have. */
+    bs_write1(&bs, 1);   /* deblocking_filter_control_present_flag */
+    bs_write1(&bs, 0);   /* deblocking_filter_override_enabled_flag */
+    bs_write1(&bs, 1);   /* pps_deblocking_filter_disabled_flag */
     bs_write1(&bs, 0);   /* pps_scaling_list_data_present_flag */
     bs_write1(&bs, 0);   /* lists_modification_present_flag */
     bs_write_ue(&bs, 0); /* log2_parallel_merge_level_minus2 */
@@ -797,11 +819,44 @@ static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
 #endif
 }
 
-/* Derives spatial merge candidates matching ITU-T H.265 Section 8.5.3.2.2.
- * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel units. */
+/* Derives the merge candidate list matching ITU-T H.265 Section 8.5.3.2.2.
+ * Output cand_mvs has exactly 5 candidates (padded with (0,0)), in 1/4-pel
+ * units.
+ *
+ * THIS LIST MUST BE EXACTLY THE ONE THE DECODER DERIVES, because the only
+ * thing transmitted is merge_idx - an index into a list the decoder builds
+ * for itself, from the current picture's already-decoded neighbours, with
+ * no help from the bitstream. A candidate the encoder can see and the
+ * decoder cannot is not a candidate; it is a corrupt index.
+ *
+ * It used to append the GPU's motion-estimation vector here as a sixth
+ * source, after the spatial candidates. That is not a merge candidate in
+ * any HEVC profile. With sps_temporal_mvp_enabled_flag = 0 (write_sps)
+ * there is no temporal candidate either, so the decoder's list is
+ * "spatials, then zero-motion padding" - and the GPU vector sat exactly on
+ * the first padding slot. Every time a CU picked it, the encoder built a
+ * motion-compensated block while the decoder built a co-located copy, with
+ * no residual to correct the difference (these CUs are SKIP) and the error
+ * carried into the reference picture for every later P-frame.
+ *
+ * Measured with BC250_HEVC_FAKE_GPU_MV (see hevc_encoder_encode_raw), which
+ * exists so this is reachable without a GPU: at 64x64 / QP 27 / gop 6, a
+ * GPU MV of (2,0) put 17271 of 24576 luma samples wrong against ffmpeg,
+ * starting at the first P-frame. (0,0) was exact, which is why no oracle in
+ * this repo had caught it - on a dev machine there is no GPU readback, so
+ * every merge candidate was zero and every index selected the same vector.
+ *
+ * Consequence, stated plainly because it is easy to miss: the spatial
+ * candidates are read back from mv_x_map/mv_y_map, which only SKIP CUs
+ * write, and a SKIP CU can only write a vector it took from this list. With
+ * the GPU vector gone the list has no way to ever contain a non-zero
+ * vector, so every P-frame MV is (0,0) and hevc_motion_search_diamond_8x8()
+ * can no longer influence the bitstream at all - it survives only as the
+ * source of last_frame_sad for rate control. Giving this encoder real
+ * motion needs explicit MVD signalling (merge_flag = 0 + AMVP +
+ * mvd_coding + rqt_root_cbf), not a sixth entry in this list. */
 static int derive_merge_candidates(const hevc_encoder_t *enc,
                                    int cux, int cuy,
-                                   const hevc_mv_t *gpu_mv,
                                    hevc_mv_t cand_mvs[5])
 {
     int num_cand = 0;
@@ -896,22 +951,10 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
         }
     }
 
-    /* 6. Integrate GPU compute motion vector candidate if available and unique */
-    if (gpu_mv && num_spatial < 5) {
-        int gdx = (gpu_mv->x / 4) & ~1;
-        int gdy = (gpu_mv->y / 4) & ~1;
-        hevc_mv_t mv_g = { (int16_t)(gdx * 4), (int16_t)(gdy * 4) };
-        bool duplicate = false;
-        for (int i = 0; i < num_spatial; i++) {
-            if (spatial_cand[i].x == mv_g.x && spatial_cand[i].y == mv_g.y) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            spatial_cand[num_spatial++] = mv_g;
-        }
-    }
+    /* 6. No temporal (Col) candidate: sps_temporal_mvp_enabled_flag is 0,
+     * so the decoder does not derive one either. Anything appended past
+     * this point would land on a slot the decoder fills with zero motion -
+     * see this function's header comment. */
 
     for (int i = 0; i < num_spatial && num_cand < 5; i++) {
         cand_mvs[num_cand++] = spatial_cand[i];
@@ -1102,7 +1145,7 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
 
     if (!is_idr && enc->has_ref) {
         hevc_mv_t cand_mvs[5];
-        derive_merge_candidates(enc, cux, cuy, gpu_mv, cand_mvs);
+        derive_merge_candidates(enc, cux, cuy, cand_mvs);
 
         int best_dx = 0, best_dy = 0;
         uint32_t best_sad = UINT32_MAX;
@@ -1464,7 +1507,9 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     }
 
     bs_write_se(&slice_bs, slice_qp_delta); /* slice_qp_delta relative to active PPS */
-    bs_write1(&slice_bs, 1);   /* slice_loop_filter_across_slices_enabled_flag */
+    /* slice_loop_filter_across_slices_enabled_flag is NOT present: its
+     * 7.3.6.1 condition needs SAO or deblocking enabled, and the PPS now
+     * disables both. See write_pps()'s comment. */
 
     bs_rbsp_trailing_bits(&slice_bs);
 
@@ -1489,6 +1534,31 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     /* A slice that did not fit is a failed frame, never a short one. See the
      * slice_rbsp_cap comment in hevc_encoder_create(). */
     if (bs_overflowed(&slice_bs)) return -1;
+
+    /* BC250_HEVC_DEBUG_STATS=1: one line per frame - slice type, QP, how
+     * many of the 8x8 CUs were coded as inter SKIP rather than intra, and
+     * this frame's own reconstruction error against its source. Without
+     * this, "the inter path is bad" cannot be separated from "the inter
+     * path is never taken": a P-frame whose CUs are all intra passes every
+     * byte-exactness oracle in this repo while exercising nothing. The
+     * recon error is the encoder's OWN (pre-deblocking) view - compare it
+     * against a real decode to see the in-loop-filter divergence, which is
+     * exactly what a drift run with -skip_loop_filter all cannot see. */
+    if (getenv("BC250_HEVC_DEBUG_STATS")) {
+        uint32_t n_skip = 0;
+        for (size_t i = 0; i < num_cus; i++) n_skip += encoder->cu_skip_map[i] ? 1u : 0u;
+        uint64_t abserr = 0;
+        for (uint32_t y = 0; y < encoder->height; y++)
+            for (uint32_t x = 0; x < encoder->width; x++) {
+                int d = (int)encoder->recon_y[(size_t)y * encoder->coded_width + x] -
+                        (int)encoder->src_y[(size_t)y * encoder->coded_width + x];
+                abserr += (uint64_t)(d < 0 ? -d : d);
+            }
+        fprintf(stderr, "[HEVC_STATS] frame=%u %s qp=%d cu_skip=%u/%zu recon_mad=%.3f\n",
+                encoder->frame_count, is_idr ? "I" : "P", encoder->qp,
+                n_skip, num_cus,
+                (double)abserr / ((double)encoder->width * encoder->height));
+    }
 
     size_t total = 0;
     if (write_param_sets) {
@@ -1619,7 +1689,9 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
     bs_write_ue(&slice_bs, 0); /* slice_pic_parameter_set_id */
     bs_write_ue(&slice_bs, 2); /* slice_type = I */
     bs_write_se(&slice_bs, slice_qp_delta);
-    bs_write1(&slice_bs, 1);   /* slice_loop_filter_across_slices_enabled_flag */
+    /* slice_loop_filter_across_slices_enabled_flag omitted - see the CPU
+     * path's slice header and write_pps()'s comment. Both paths share one
+     * PPS, so this bit's presence condition is false for both. */
     bs_rbsp_trailing_bits(&slice_bs);
 
     hevc_cabac_t cab;
@@ -1902,6 +1974,33 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
     if (!encoder || !output_buf || !y_plane || !uv_plane) return -1;
 
     encoder->num_gpu_mvs = 0;
+
+    /* BC250_HEVC_FAKE_GPU_MV="<dx>,<dy>" (INTEGER pel) stands in for
+     * motion_estimation.comp's per-CTU output on a machine with no GPU.
+     *
+     * This exists because the inter path's only source of a NON-ZERO
+     * motion vector is that GPU readback: with no GPU, every spatial merge
+     * candidate is seeded from CUs whose MV is zero, so the merge list is
+     * all-zero, every SKIP is a plain co-located copy, and the parts of
+     * derive_merge_candidates() that actually pick between different
+     * vectors never run. Without this hook tools/hevc_host_drift.sh can
+     * confirm the P-frame *syntax* but cannot reach the MV-selection logic
+     * at all - and that is where the real defect turned out to be. */
+    if (encoder->gpu_mvs && encoder->has_ref) {
+        const char *fake = getenv("BC250_HEVC_FAKE_GPU_MV");
+        if (fake) {
+            int fdx = atoi(fake);
+            const char *comma = strchr(fake, ',');
+            int fdy = comma ? atoi(comma + 1) : 0;
+            uint32_t n = encoder->width_ctu * encoder->height_ctu;
+            for (uint32_t i = 0; i < n; i++) {
+                encoder->gpu_mvs[i].mvx = fdx * 4;  /* quarter-pel, as the shader emits */
+                encoder->gpu_mvs[i].mvy = fdy * 4;
+                encoder->gpu_mvs[i].sad = 0;
+            }
+            encoder->num_gpu_mvs = n;
+        }
+    }
 
     for (uint32_t y = 0; y < encoder->height; y++)
         memcpy(encoder->dl_y + (size_t)y * encoder->width, y_plane + (size_t)y * y_pitch, encoder->width);

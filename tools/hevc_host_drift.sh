@@ -22,14 +22,40 @@
 # 856x480 on the board) does not apply here. Confirmed with ffprobe on the
 # generated streams - they report exactly the requested display size.
 #
-# -skip_loop_filter all is required on the decode side: this encoder does
-# not simulate deblocking while the PPS leaves it enabled, and SAO is off
-# in our SPS. Without that flag the comparison is guaranteed to differ and
-# tells you nothing.
+# The decode side no longer passes -skip_loop_filter all. It used to have
+# to: the encoder does not simulate deblocking, and the PPS left deblocking
+# enabled, so an unfiltered comparison was guaranteed to differ. The PPS now
+# signals deblocking off (write_pps in encoder_h265.c) and SAO was always
+# off in our SPS, so there is no in-loop filter left to skip - and dropping
+# the flag makes this a check on the REAL decode path. It is also the only
+# thing that proves the new PPS bits parse the way the encoder believes:
+# if they did not, the decoder would still be filtering and every case here
+# would fail.
 #
 # usage: tools/hevc_host_drift.sh [build-dir]
-#   BC250_DRIFT_CASES="w h qp pattern; ..."  override the case list
+#   BC250_DRIFT_CASES="w h qp pattern [frames] [gop] [gpu_mv]; ..."  cases
 #   pattern: 0=flat 1=vertical bars 2=diagonal ramp 3=pseudo-random
+#   frames:  default 1
+#   gop:     default 1 (= IDR every frame). gop > 1 encodes one IDR then
+#            P-frames, so this oracle covers the INTER path - cu_skip/merge
+#            signalling, the reference-picture chain and the P-slice header.
+#            Until that existed every case here was all-intra and the
+#            encoder's entire inter branch was invisible to the strongest
+#            check in the project.
+#   gpu_mv:  "dx,dy" in INTEGER pel, or - for none (default). Stands in for
+#            motion_estimation.comp's per-CTU output via
+#            BC250_HEVC_FAKE_GPU_MV, because that readback is the inter
+#            path's ONLY source of a non-zero motion vector and it does not
+#            exist on a machine with no GPU. Without it every merge
+#            candidate is (0,0), every merge_idx selects the same vector,
+#            and a wrong merge list is indistinguishable from a right one.
+#            A real bug hid there: see derive_merge_candidates().
+#   kbps:    0 (default) = constant QP. >0 = VBR rate control, so QP moves
+#            between frames - which is how the driver is actually driven
+#            (`lab qsweep` passes a bitrate, never a QP) and the only way
+#            to reach a non-zero slice_qp_delta on a P-frame.
+#
+# BC250_DRIFT_ONLY=intra|inter restricts the built-in list.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,7 +73,7 @@ gcc -std=c11 -O2 -D_GNU_SOURCE -I"$SRC" -o hostrepro "$REPO/tools/hevc_host_repr
 # A stale binary silently "passing" is a real failure mode - refuse to run.
 [ -x hostrepro ] || { echo "BUILD FAILED"; exit 1; }
 
-# Cases 1-11 are the original set: 16-multiple squares plus 1920x1080.
+# Intra cases 1-11 are the original set: 16-multiple squares plus 1920x1080.
 #
 # Cases 12-21 cover the padding and conformance-window crop path, which the
 # original set barely touched - every one of those except 1080p has both
@@ -94,7 +120,28 @@ gcc -std=c11 -O2 -D_GNU_SOURCE -I"$SRC" -o hostrepro "$REPO/tools/hevc_host_repr
 #      encoder limit at small sizes.
 # No padding or crop defect was found: with those two fixed, 600 sweep cases
 # across 30 sizes x 5 QPs x 4 patterns are byte-exact on luma AND chroma.
-CASES="${BC250_DRIFT_CASES:-16 16 4 2; 32 32 4 2; 64 64 4 0; 64 64 4 1; 64 64 4 2; 64 64 4 3; 64 64 30 1; 64 64 30 2; 128 128 20 3; 256 256 27 3; 1920 1080 27 3; 1918 1080 27 3; 1920 1078 27 3; 1918 1078 27 3; 1366 768 27 2; 854 480 30 1; 640 358 0 3; 100 60 27 3; 20 12 27 1; 18 18 27 2; 4 4 27 3}"
+INTRA_CASES="16 16 4 2; 32 32 4 2; 64 64 4 0; 64 64 4 1; 64 64 4 2; 64 64 4 3; 64 64 30 1; 64 64 30 2; 128 128 20 3; 256 256 27 3; 1920 1080 27 3"
+INTRA_CASES="$INTRA_CASES; 1918 1080 27 3; 1920 1078 27 3; 1918 1078 27 3; 1366 768 27 2; 854 480 30 1; 640 358 0 3; 100 60 27 3; 20 12 27 1; 18 18 27 2; 4 4 27 3"
+# Inter cases: same patterns, but a real GOP. Patterns 2/3 advance with the
+# frame index, so these are moving content and every frame after the first
+# is a P-frame whose reference is the encoder's own previous reconstruction.
+INTER_CASES="64 64 4 0 4 4; 64 64 4 2 4 4; 64 64 27 2 4 4; 64 64 27 3 4 4; 128 128 27 2 4 4; 128 128 27 3 8 8; 256 256 27 3 4 4; 64 64 4 2 8 8"
+# Same again with a non-zero stand-in for the GPU's motion vector, which is
+# the only thing that makes the merge list contain more than one distinct
+# vector. (2,0) and (0,2) each failed 17k+/24k luma samples before
+# derive_merge_candidates() stopped appending a candidate the decoder does
+# not have; they are kept as the regression test for that.
+INTER_CASES="$INTER_CASES; 64 64 27 2 6 6 2,0; 64 64 27 2 6 6 0,2; 64 64 27 2 6 6 4,4; 64 64 27 3 6 6 -4,2; 128 128 27 3 6 6 2,2; 128 128 27 2 6 6 -2,0"
+# Rate-controlled: QP moves per frame, so slice_qp_delta is non-zero on
+# P-frames and the CABAC contexts re-init at a QP the PPS never announced.
+INTER_CASES="$INTER_CASES; 128 128 27 3 8 8 - 400; 128 128 27 2 8 8 - 4000; 256 256 27 3 8 8 2,0 2000"
+
+case "${BC250_DRIFT_ONLY:-all}" in
+  intra) DEFAULT_CASES="$INTRA_CASES" ;;
+  inter) DEFAULT_CASES="$INTER_CASES" ;;
+  *)     DEFAULT_CASES="$INTRA_CASES; $INTER_CASES" ;;
+esac
+CASES="${BC250_DRIFT_CASES:-$DEFAULT_CASES}"
 
 fail=0; n=0
 IFS=';' read -ra LIST <<< "$CASES"
@@ -102,14 +149,22 @@ for c in "${LIST[@]}"; do
     set -- $c
     [ $# -ge 4 ] || continue
     w=$1 h=$2 qp=$3 pat=$4
+    nf=${5:-1} gop=${6:-1} gmv=${7:--} kbps=${8:-0}
     cw=$(( (w + 15) / 16 * 16 )); ch=$(( (h + 15) / 16 * 16 ))
     lbl="c_${w}x${h}_q${qp}_p${pat}"
+    [ "$gop" != 1 ] && lbl="${lbl}_n${nf}g${gop}"
+    [ "$gmv" != - ] && lbl="${lbl}_mv${gmv/,/_}"
+    [ "$kbps" != 0 ] && lbl="${lbl}_vbr${kbps}"
+    fakemv=(); [ "$gmv" != - ] && fakemv=(env "BC250_HEVC_FAKE_GPU_MV=$gmv")
     rm -f bc250_hevc_debug_recon_i420.raw "$lbl".hevc "$lbl".yuv
-    BC250_HEVC_DEBUG_RECON=1 ./hostrepro "$w" "$h" "$qp" 1 "$lbl" "$pat" >/dev/null 2>&1 \
+    BC250_HEVC_DEBUG_RECON=1 ${fakemv[@]+"${fakemv[@]}"} \
+        ./hostrepro "$w" "$h" "$qp" "$nf" "$lbl" "$pat" "$gop" "$kbps" >/dev/null 2>&1 \
         || { echo "  $lbl: ENCODE FAILED"; fail=1; continue; }
-    ffmpeg -v error -y -skip_loop_filter all -i "$lbl".hevc \
+    # No -skip_loop_filter: the PPS now disables deblocking outright (see
+    # write_pps), so this is the real decode path, not a filtered-off one.
+    ffmpeg -v error -y -i "$lbl".hevc \
            -f rawvideo -pix_fmt yuv420p "$lbl".yuv 2>/dev/null
-    python3 "$REPO/tools/hevc_host_diff.py" "$lbl" "$w" "$h" "$cw" "$ch" || fail=1
+    python3 "$REPO/tools/hevc_host_diff.py" "$lbl" "$w" "$h" "$cw" "$ch" "$nf" || fail=1
     n=$((n+1))
 done
 

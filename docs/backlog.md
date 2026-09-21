@@ -253,5 +253,46 @@ headers**, which would let ffmpeg's own SPS through — a real change with
 its own risks. `lab dims` reports these as LIMIT rather than failing.
 H.264 is exact at every resolution tested.
 
-**C9. NEW — CPU HEVC inter/P-frame quality.** See C4: 24.93 dB at
-gop=120 against 42.9 all-intra. Unexplained.
+**C9. ROOT-CAUSED — two real bugs, both fixed off-board, needs a board
+re-measure.** The gap was not tuning. See `docs/hevc_scope_note.md` for
+the full writeup and the measurements.
+
+1. **The PPS left deblocking enabled and the encoder never modelled it.**
+   Harmless all-intra (0.02 dB), compounding on P-frames: the encoder's
+   reference is its own unfiltered reconstruction, the decoder's is the
+   filtered one, and they diverge further with every P-frame until the
+   next IDR. `testsrc2` 640x480 CQP 27 gop 120: the encoder reconstructs
+   43.64 dB and the decoder delivers 38.07. Now signalled off — same
+   bytes, **38.07 → 43.64 dB**. `tools/hevc_host_drift.sh` was blind to
+   this by construction because it decoded with `-skip_loop_filter all`;
+   it no longer does, and is byte-exact without it, which is what proves
+   the new PPS bits parse correctly (the 2026-09-19 attempt at this edit
+   really was a syntax error — two bits missing).
+2. **`derive_merge_candidates()` appended the GPU's motion vector to the
+   merge list.** It is not a merge candidate; with TMVP off the decoder
+   fills that slot with zero motion, so encoder and decoder built
+   different blocks with no residual to correct it. On-board only, which
+   is why nothing caught it: off-board every candidate is (0,0), so every
+   `merge_idx` picks the same vector. `BC250_HEVC_FAKE_GPU_MV` now
+   supplies a non-zero one — (2,0) failed 17271/24576 luma samples before
+   the fix, 0 after, and six such cases are permanent oracle cases.
+
+**Consequence to be aware of:** with the GPU vector gone, the merge list
+is a fixpoint at zero, so every P-frame MV is (0,0) and both
+`hevc_motion_search_diamond_8x8()` and the P-frame GPU ME dispatch are
+now pure cost with no effect on the bitstream (the search still feeds
+`last_frame_sad` for rate control). Not a regression — the encoder could
+never legally signal a non-zero vector — but it is dead weight, and
+removing it is a free CPU win for whoever picks up C2's thread.
+
+**Still open after this:** real inter coding. The P path is zero-motion
+SKIP plus intra fallback, with no motion compensation and no inter
+residual. Doing it properly means `merge_flag`=0 + AMVP + `mvd_coding` +
+`rqt_root_cbf`. That is the item that would make HEVC a real streaming
+alternative, alongside C7.
+
+**Not yet re-measured on hardware.** Everything above is off-board
+(`hevc_encoder_encode_raw()` is GPU-free). Re-run `lab qsweep
+--codec=hevc` and `lab gate` on the board to confirm, and note the GPU
+intra path's slice header changed too (symmetrically, same PPS) and has
+had no hardware run at all.
