@@ -89,6 +89,93 @@ static void test_emulation_prevention(void) {
     printf("[PASS] Emulation prevention (EBSP) test\n");
 }
 
+/* The spec definition of emulation prevention, written the slow obvious
+ * way: one byte at a time, no run detection, no bulk copy. This is
+ * literally the implementation bs_rbsp_to_ebsp() had before it was
+ * rewritten to scan for zero pairs with memchr()/memcpy(), kept here as
+ * the oracle that rewrite is checked against - including its exact
+ * truncation behaviour when the destination fills up mid-stream. */
+static size_t ebsp_reference(uint8_t *dst, size_t dst_size,
+                             const uint8_t *src, size_t src_size) {
+    size_t i, j = 0;
+    int zero_count = 0;
+    for (i = 0; i < src_size; i++) {
+        if (j >= dst_size) break;
+        if (zero_count == 2 && src[i] <= 0x03) {
+            dst[j++] = 0x03;
+            zero_count = 0;
+            if (j >= dst_size) break;
+        }
+        dst[j++] = src[i];
+        if (src[i] == 0x00) {
+            zero_count++;
+        } else {
+            zero_count = 0;
+        }
+    }
+    return j;
+}
+
+static void test_emulation_prevention_vs_reference(void) {
+    /* Deterministic xorshift, so a failure is reproducible. */
+    uint64_t rs = 0x9e3779b97f4a7c15ULL;
+    #define NEXT_RND() (rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17, (uint32_t)(rs >> 32))
+
+    static uint8_t src[300];
+    static uint8_t got[640], want[640];
+
+    /* Hand-picked shapes first: the boundary cases the bulk path has to
+     * get right - a pair at the very start, at the very end, a long zero
+     * run (escapes every third byte), 00 00 03 (the escape byte itself
+     * must be escaped), and 00 00 04 (must NOT be). */
+    static const uint8_t fixed[][10] = {
+        { 0x00, 0x00, 0x00 },
+        { 0x00, 0x00, 0x03 },
+        { 0x00, 0x00, 0x04 },
+        { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+        { 0xAA, 0x00, 0x00, 0x01, 0xBB },
+        { 0x00, 0x00 },
+        { 0x00 },
+        { 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0xFF },
+    };
+    static const size_t fixed_len[] = { 3, 3, 3, 8, 5, 2, 1, 10 };
+
+    for (size_t t = 0; t < sizeof(fixed_len) / sizeof(fixed_len[0]); t++) {
+        for (size_t cap = 0; cap <= fixed_len[t] * 2 + 2; cap++) {
+            memset(got, 0xA5, sizeof(got));
+            memset(want, 0xA5, sizeof(want));
+            size_t a = bs_rbsp_to_ebsp(got, cap, fixed[t], fixed_len[t]);
+            size_t b = ebsp_reference(want, cap, fixed[t], fixed_len[t]);
+            assert(a == b);
+            assert(memcmp(got, want, sizeof(got)) == 0);
+        }
+    }
+
+    /* Then fuzz, at several zero densities, against every destination
+     * capacity from 0 to just past the worst-case expansion - so the
+     * bulk path's memcpy clamp is exercised at every possible cut. */
+    for (int trial = 0; trial < 400; trial++) {
+        size_t n = NEXT_RND() % (sizeof(src) + 1);
+        unsigned density = 1u + (NEXT_RND() % 60u);   /* % of bytes forced to 0 */
+        for (size_t k = 0; k < n; k++) {
+            src[k] = (NEXT_RND() % 100u < density) ? 0x00
+                                                   : (uint8_t)(NEXT_RND() | 1u);
+        }
+        for (size_t cap = 0; cap <= n + n / 2 + 2; cap++) {
+            memset(got, 0xA5, sizeof(got));
+            memset(want, 0xA5, sizeof(want));
+            size_t a = bs_rbsp_to_ebsp(got, cap, src, n);
+            size_t b = ebsp_reference(want, cap, src, n);
+            assert(a == b);
+            assert(memcmp(got, want, sizeof(got)) == 0);
+        }
+    }
+    #undef NEXT_RND
+
+    printf("[PASS] EBSP matches the byte-at-a-time reference (fixed + fuzz,\n"
+           "       every destination capacity, including truncation)\n");
+}
+
 static void test_sps_pps_generation(void) {
     uint8_t sps_buf[512];
     uint8_t pps_buf[512];
@@ -118,6 +205,7 @@ int main(void) {
     test_exp_golomb_unsigned();
     test_exp_golomb_signed();
     test_emulation_prevention();
+    test_emulation_prevention_vs_reference();
     test_sps_pps_generation();
     printf("=== All Bitstream Tests Passed Successfully! ===\n");
     return 0;
