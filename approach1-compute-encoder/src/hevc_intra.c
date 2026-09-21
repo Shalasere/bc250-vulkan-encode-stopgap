@@ -369,6 +369,19 @@ static const int levelScale[6] = { 40, 45, 51, 57, 64, 72 };
 #define HEVC_BDSHIFT 5
 #define HEVC_FLAT_M  16
 
+int hevc_chroma_qp_from_luma(int qp_luma) {
+    /* qPiCb = Clip3(-QpBdOffsetC, 57, QpY + pps_cb_qp_offset +
+     * slice_cb_qp_offset). Both PPS chroma offsets are written as 0 and
+     * pps_slice_chroma_qp_offsets_present_flag is 0 (see write_pps()), and
+     * QpBdOffsetC is 0 at 8-bit, so qPi is just QpY clamped - and Cb and Cr
+     * therefore share one value. */
+    static const int qpc_30_43[14] = { 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37 };
+    int qpi = qp_luma < 0 ? 0 : (qp_luma > 57 ? 57 : qp_luma);
+    if (qpi < 30) return qpi;
+    if (qpi > 43) return qpi - 6;
+    return qpc_30_43[qpi - 30];
+}
+
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]) {
     int32_t raw[16];

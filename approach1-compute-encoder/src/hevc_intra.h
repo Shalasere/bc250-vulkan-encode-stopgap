@@ -106,6 +106,20 @@ void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int hei
  * quantization (8.6.3) of a 4x4 pixel-domain residual (row-major,
  * residual[y*4+x] = source-prediction, may be negative). Writes 16
  * quantized signed coefficient levels, row-major, clipped to int16. */
+/* Rec. ITU-T H.265 Table 8-10: the qPi -> QpC mapping for
+ * ChromaArrayType == 1 (4:2:0). Chroma is NOT quantized at the luma QP -
+ * the mapping is the identity below 30, compresses 30..43, and is qPi - 6
+ * above that. Pass the result, not QpY, as the `qp` argument of
+ * hevc_transform_quant_4x4()/hevc_dequant_itransform_4x4() for a chroma
+ * block.
+ *
+ * Omitting this is invisible below QP 30 and grows with QP above it. It
+ * was measured on this encoder before the fix, against ffmpeg's own
+ * decode: chroma byte-exact at QP 4 and 20, then mean absolute delta 6.5
+ * at QP 30, 21.9 at QP 40 and 29.4 at QP 51 - the threshold landing
+ * exactly on the table's boundary is what identified it. */
+int hevc_chroma_qp_from_luma(int qp_luma);
+
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]);
 

@@ -892,18 +892,25 @@ qsweep() {
 # ---------------------------------------------------------------------------
 drift() {
     local key="${1:?drift <key> [opts]}"; shift
-    local res=1920x1080 frames=3 codec=hevc envs="" bitrate=10M content=testsrc
+    local res=1920x1080 frames=3 codec=hevc envs="" bitrate=10M content=testsrc qp=""
     for a in "$@"; do
         case "$a" in
             --res=*)     res="${a#*=}";;
             --frames=*)  frames="${a#*=}";;
             --codec=*)   codec="${a#*=}";;
             --bitrate=*) bitrate="${a#*=}";;
+            --qp=*)      qp="${a#*=}";;
             --content=*) content="${a#*=}";;
             --env=*)     envs="${a#*=}";;
             *) die "drift: unknown option '$a'";;
         esac
     done
+    # --qp forces constant-QP. Needed for any experiment that varies QP,
+    # because with a bitrate target and a short clip rate control never
+    # adapts - every run then uses the SAME initial QP and a bitrate sweep
+    # silently measures one operating point four times.
+    local -a RCARGS=(-b:v "$bitrate")
+    [ -n "$qp" ] && RCARGS=(-rc_mode CQP -qp "$qp")
     case "$codec" in h264|hevc) ;; *) die "drift: --codec must be h264 or hevc";; esac
 
     local bd; bd=$(art_dir "$key")
@@ -926,7 +933,7 @@ drift() {
         BC250_SHADER_DIR="$bd" "${envv[@]}" \
         ffmpeg -v error -y -f lavfi -i "${content}=size=${res}:rate=60" \
         -frames:v "$frames" -g 1 -vaapi_device "$RENDER" \
-        -vf 'format=nv12,hwupload' -c:v "$venc" -b:v "$bitrate" \
+        -vf 'format=nv12,hwupload' -c:v "$venc" "${RCARGS[@]}" \
         -f "$fmt" "stream.$fmt" > enc.log 2>&1 )
     local erc=$?
     if [ $erc -ne 0 ] || [ ! -s "$d/stream.$fmt" ]; then
