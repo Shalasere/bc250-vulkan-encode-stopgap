@@ -7,7 +7,9 @@
  *
  * usage: hostrepro <w> <h> <qp> <frames> <out-prefix> [pattern] [gop] [kbps]
  *   pattern: 0 = flat grey (expected byte-exact), 1 = vertical bars,
- *            2 = diagonal ramp, 3 = pseudo-random blocks
+ *            2 = diagonal ramp, 3 = pseudo-random blocks, 4 = horizontal
+ *            bars, 5 = shallow diagonal ramp (slope 1:2), 6 = steep
+ *            diagonal ramp (slope 2:1) - see the fill() comment below
  *   gop:     1 (default) = force an IDR on every frame, which is what the
  *            intra cases want and what this tool did unconditionally before.
  *            >1 = a real GOP: one IDR then gop-1 P-frames, so the drift
@@ -19,6 +21,19 @@
  *
  * Patterns 2 and 3 are frame-dependent (they advance with `frame`), so a
  * multi-frame run is genuinely moving content, not a repeated still.
+ *
+ * Patterns 4-6 were added for backlog A6 (the 33-angular-intra-mode port,
+ * see docs/notes/a6-cavlc-residual-port.md): 0-3 alone leave most of the
+ * angular mode range untouched - pattern 1 (vertical bars) only ever
+ * drives mode 26, pattern 2 (diagonal ramp, slope 1:1) only the extreme
+ * diagonal modes 2/34, and only pattern 3 (pseudo-random) reaches a broad
+ * mix, incidentally rather than by construction. 4 is horizontal bars
+ * (mode 10's mirror of pattern 1), 5 and 6 are shallower/steeper diagonal
+ * ramps (slope 1:2 and 2:1) landing on intermediate angles neither the
+ * 1:1 ramp nor noise reliably hits. Confirmed with
+ * BC250_HEVC_DEBUG_MODES=1 - see that note for the measured histograms.
+ *
+ * 4 = horizontal bars, 5 = shallow diagonal ramp, 6 = steep diagonal ramp.
  *
  *   kbps:    0 (default) = constant QP, which is what every byte-exactness
  *            case wants. >0 switches to VBR rate control at that bitrate,
@@ -63,6 +78,10 @@ static void fill(uint8_t *y, uint8_t *uv, int w, int h, int pat, int frame) {
             case 0:  v = 128; break;
             case 1:  v = ((i / 8) & 1) ? 200 : 40; break;
             case 2:  v = (i + j + frame * 3) & 0xFF; break;
+            case 3:  v = (((i * 73 + j * 151 + frame * 37) >> 3) * 2654435761u) >> 24; break;
+            case 4:  v = ((j / 8) & 1) ? 200 : 40; break;
+            case 5:  v = (i + 2 * j + frame * 3) & 0xFF; break;
+            case 6:  v = (2 * i + j + frame * 3) & 0xFF; break;
             default: v = (((i * 73 + j * 151 + frame * 37) >> 3) * 2654435761u) >> 24; break;
             }
             y[j * w + i] = (uint8_t)v;

@@ -60,6 +60,11 @@ unsigned long long hevc_intra_prof_rdtsc(void) { return __rdtsc(); }
 
 /* ===================== mode/scan helpers ===================== */
 
+/* Rec. ITU-T H.265 Table 8-... scan derivation, general over the whole
+ * 0-34 mode range. This predates backlog A6 (the port that added modes
+ * 2-9/11-25/27-34 below) and needed NO change for it - it was already
+ * written against the spec's real predModeIntra ranges, not against the
+ * four modes this encoder happened to reach at the time. */
 int hevc_scan_idx_for_mode(int mode) {
     if (mode >= 6 && mode <= 14) return 2;  /* SCAN_VER */
     if (mode >= 22 && mode <= 30) return 1; /* SCAN_HOR */
@@ -69,7 +74,10 @@ int hevc_scan_idx_for_mode(int mode) {
 /* Rec. ITU-T H.265 8.4.2: build the 3-entry candidate mode list from the
  * left/above neighbor PUs' real intra modes. Unavailable neighbors
  * (off-picture, or - not applicable here, one slice per picture - a
- * different slice) are treated as INTRA_DC per the spec's substitution. */
+ * different slice) are treated as INTRA_DC per the spec's substitution.
+ *
+ * Also already general over the full mode range - see the comment on
+ * hevc_scan_idx_for_mode() above, same reasoning. */
 void hevc_derive_mpm(int left_mode, int left_avail, int above_mode, int above_avail,
                       int mpm_out[3]) {
     int cand_a = left_avail ? left_mode : HEVC_MODE_DC;
@@ -166,10 +174,15 @@ static inline int zorder_available(int nx, int ny, int width, int height, int is
 }
 
 /* Gathers left[0..4] (p[-1][0..4]), top[0..4] (p[0..4][-1]) and the corner
- * (p[-1][-1]), applying the spec's neighbor-substitution scan. Positions
- * past p[-1][4] and p[4][-1] are never referenced - this encoder emits
- * only Planar, DC, Horizontal and Vertical, and none of them reads
- * further - so the scan below covers exactly what those four modes need.
+ * (p[-1][-1]), applying the spec's neighbor-substitution scan. This is
+ * kept ONLY as the historical record of the below-left fix referenced
+ * elsewhere in this file (docs/hevc_scope_note.md); backlog A6 (below)
+ * replaced every live caller with gather_neighbors_wide(), which needs
+ * the full 2*nTbS extent for angular modes - see its comment for why this
+ * narrow gather could not simply be extended in place. This function is
+ * DEAD CODE, compiled out by -Wunused-function's absence of a call site;
+ * left in place for the history rather than deleted so the below-left
+ * bug's fix is still visible next to the comment that explains it.
  *
  * NOTE: an earlier version of this comment claimed "below and below-left
  * are always z-scan-unavailable in this encoder's coding order" and the
@@ -179,6 +192,7 @@ static inline int zorder_available(int nx, int ny, int width, int height, int is
  * Every one of left/top/corner/top-right/below-left needs a rank check,
  * because each can be positionally plausible while genuinely undecoded
  * (see zorder_rank()'s comment above). */
+__attribute__((unused))
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
                               int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner) {
     int cur_rank = zorder_rank(x0, y0, width, is_luma);
@@ -252,85 +266,186 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
     top[4] = sv[10];
 }
 
-/* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
-
-/* PERF: prediction split into "gather the references" and "apply a mode to
- * already-gathered references". The reference set for a block does not
- * depend on which mode is being tried, but hevc_choose_luma_mode() tries
- * four candidates and the old single-entry-point shape re-gathered for
- * every one of them, then a fifth time for the chosen mode - five
- * identical gathers per 4x4 block, each running five z-scan availability
- * tests. Profiling 1080p put gather_neighbors()'s zorder_rank alone at 21%
- * of total runtime across 25.7M calls.
+/* ============ A6: full-extent neighbour gather for angular prediction ====
  *
- * The GPU shader already had this shape ("build both reference sets once",
- * hevc_intra_wavefront.comp); this brings the CPU path in line. Output is
- * unchanged - it is the same gather feeding the same mode arithmetic,
- * just not repeated. */
-/* PERF: `inline`, so the four constant-mode calls in the mode search below
- * each collapse to one branch of the switch with no dispatch. It is still
- * one function and one copy of the arithmetic in the source; the runtime-
- * mode call in hevc_predict_4x4() keeps the full switch. */
-static inline void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
-                                     int mode, int is_luma, uint8_t pred_out[16]);
+ * Backlog A6 ports the full 33 angular intra modes (2-34) into this
+ * file's 4x4-TU path. Planar/DC/Horizontal/Vertical only ever read as far
+ * as p[-1][nTbS] (5 samples each side - what gather_neighbors() above
+ * computed). Rec. ITU-T H.265 8.4.4.2.2's angular branch can reach
+ * p[-1][2*nTbS-1] and p[2*nTbS-1][-1], almost twice as far, so every mode
+ * needs the wider set below regardless of orientation (a "horizontal"
+ * angular mode can still project into the TOP reference through the
+ * negative-angle/invAngle path, and vice versa - see
+ * predict_angular_sample()).
+ *
+ * This is the SAME formula hevc_intra_wavefront.comp's gather()/predict()
+ * run for a 16x16 undivided CU - board-verified byte-exact against
+ * ffmpeg's decode via `lab drift` (docs/hevc-gpu-intra.md). The angular
+ * arithmetic itself is nTbS-agnostic (only the reference extent, 2*nTbS,
+ * changes), so this is a direct parameterization to nTbS=4, not a new
+ * derivation - the shader's ANGLE[]/INVANG[] tables are reproduced
+ * verbatim below.
+ *
+ * This is NOT built by extending gather_neighbors() above: that
+ * function's substitution scan starts partway through the real 4*nTbS+1
+ * scan (at p[-1][nTbS] rather than p[-1][2*nTbS-1]), on the assumption -
+ * true for Planar/DC/H/V, not provably true in general - that nothing
+ * beyond nTbS is ever read. Layering the extra samples on top of that
+ * truncated scan would substitute unavailable deep samples from the
+ * wrong "first available" point; below is a straight, independent
+ * application of 8.4.4.2.2's substitution process over the real extent. */
+static void gather_neighbors_wide(const uint8_t *plane, int stride, int width, int height,
+                                   int x0, int y0, int is_luma,
+                                   uint8_t left[8], uint8_t top[8], uint8_t *corner) {
+    int cur_rank = zorder_rank(x0, y0, width, is_luma);
+    enum { HEVC_WIDE_SCAN_TOTAL = 17 };   /* 4*nTbS+1, nTbS=4 */
+    uint8_t sv[HEVC_WIDE_SCAN_TOTAL];
+    uint8_t sa[HEVC_WIDE_SCAN_TOTAL];
 
-void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
-                      int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
-    uint8_t left[5], top[5], corner;
-    gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner);
-    predict_from_refs(left, top, corner, mode, is_luma, pred_out);
+    /* Scan order per spec: p[-1][2N-1] first (deepest below-left) up
+     * through p[-1][0], then the corner, then p[0][-1] across to
+     * p[2N-1][-1]. sv[i], i=0..7 -> y=7-i; sv[8] -> corner; sv[9..16] ->
+     * x=i-9. (N = nTbS = 4, so 2N = 8, matching left[]/top[]'s width.) */
+    for (int i = 0; i < 8; i++) {
+        int y = 7 - i;
+        int avail = zorder_available(x0 - 1, y0 + y, width, height, is_luma, cur_rank);
+        sa[i] = (uint8_t)avail;
+        if (avail) sv[i] = plane[(y0 + y) * stride + (x0 - 1)];
+    }
+    sa[8] = (uint8_t)zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
+    if (sa[8]) sv[8] = plane[(y0 - 1) * stride + (x0 - 1)];
+    for (int i = 9; i < HEVC_WIDE_SCAN_TOTAL; i++) {
+        int x = i - 9;
+        int avail = zorder_available(x0 + x, y0 - 1, width, height, is_luma, cur_rank);
+        sa[i] = (uint8_t)avail;
+        if (avail) sv[i] = plane[(y0 - 1) * stride + (x0 + x)];
+    }
+
+    int first = -1;
+    for (int i = 0; i < HEVC_WIDE_SCAN_TOTAL; i++) { if (sa[i]) { first = i; break; } }
+    if (first < 0) {
+        for (int i = 0; i < HEVC_WIDE_SCAN_TOTAL; i++) sv[i] = 128;
+    } else {
+        for (int i = 0; i < first; i++) sv[i] = sv[first];
+        for (int i = first + 1; i < HEVC_WIDE_SCAN_TOTAL; i++) if (!sa[i]) sv[i] = sv[i - 1];
+    }
+
+    for (int y = 0; y < 8; y++) left[y] = sv[7 - y];   /* left[y] = p[-1][y] */
+    *corner = sv[8];
+    for (int x = 0; x < 8; x++) top[x] = sv[9 + x];    /* top[x]  = p[x][-1] */
 }
 
-/* is_luma is still needed here, not just for the gather: DC and the
- * horizontal/vertical modes apply their edge filtering only for cIdx == 0
- * (8.4.4.2.5-8.4.4.2.6). */
-static inline void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
-                                     int mode, int is_luma, uint8_t pred_out[16]) {
-    switch (mode) {
-    case HEVC_MODE_PLANAR:
+/* ===================== prediction (8.4.4.2.4-8.4.4.2.7) ===================== */
+
+/* Angle table (8.4.4.2.6, predModeIntra 2..34) and Table 8-6's inverse,
+ * lifted verbatim from hevc_intra_wavefront.comp's ANGLE[]/INVANG[] - the
+ * same public spec constants, addressed here by an 8-entry (2*nTbS,
+ * nTbS=4) reference set instead of the shader's 32-entry (2*nTbS, nTbS=16)
+ * one. Both are exactly Table 8-5/8-6; nothing is nTbS-specific in the
+ * tables themselves. */
+static const int8_t  HEVC_ANGLE_TABLE[35] = {
+      0,   0,  32,  26,  21,  17,  13,   9,   5,   2,   0,  -2,
+     -5,  -9, -13, -17, -21, -26, -32, -26, -21, -17, -13,  -9,
+     -5,  -2,   0,   2,   5,   9,  13,  17,  21,  26,  32
+};
+static const int16_t HEVC_INVANGLE_TABLE[15] = {
+    -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
+     -482,  -630, -910, -1638, -4096
+};
+
+/* One sample of the angular branch (8.4.4.2.6), mode 2..34, at (x,y) in a
+ * 4x4 TU. No reference-sample smoothing (8.4.4.2.3): filterFlag is
+ * unconditionally 0 whenever nTbS==4 (the minDistVerHor threshold table,
+ * 8.4.4.2.3/Table 8-3, has rows only for nTbS in {8,16,32} - nTbS==4 skips
+ * the whole filtering decision), so unlike the GPU shader's 16x16 CU this
+ * needs only ONE reference set, not a raw/smoothed pair - one fewer thing
+ * to get wrong porting this down from a 16x16 CU to a 4x4 TU. */
+static int predict_angular_sample(const uint8_t left[8], const uint8_t top[8], uint8_t corner,
+                                   int mode, int x, int y) {
+    int ang = HEVC_ANGLE_TABLE[mode];
+    int vert = (mode >= 18);
+    int i = vert ? x : y;
+    int j = vert ? y : x;
+    int idx = ((j + 1) * ang) >> 5;
+    int fact = ((j + 1) * ang) & 31;
+
+    int r[2];
+    for (int pass = 0; pass < 2; pass++) {
+        int k = i + idx + 1 + pass;
+        int v;
+        if (k == 0) {
+            v = corner;
+        } else if (k > 0) {
+            int kk = k - 1; if (kk > 7) kk = 7;
+            v = vert ? top[kk] : left[kk];
+        } else {
+            /* Table 8-6: project through the OTHER reference array via
+             * the inverse angle. Only reachable for the modes with a
+             * negative HEVC_ANGLE_TABLE entry (predModeIntra 11..25),
+             * which is exactly INVANGLE_TABLE's domain. */
+            int m = -1 + ((k * HEVC_INVANGLE_TABLE[mode - 11] + 128) >> 8);
+            if (m < 0) v = corner;
+            else { if (m > 7) m = 7; v = vert ? left[m] : top[m]; }
+        }
+        r[pass] = v;
+    }
+    return (fact != 0) ? (((32 - fact) * r[0] + fact * r[1] + 16) >> 5) : r[0];
+}
+
+/* Predict one 4x4 block from an already-gathered wide reference set, for
+ * ANY of the 35 modes (0=Planar, 1=DC, 2-34=angular - Rec. ITU-T H.265
+ * 8.4.4.2.4/.5/.6). This is backlog A6's replacement for the old
+ * Planar/DC/Horizontal/Vertical-only switch: modes 10 (Horizontal) and 26
+ * (Vertical) are not special-cased for the BASE prediction, because
+ * HEVC_ANGLE_TABLE[10] == HEVC_ANGLE_TABLE[26] == 0 collapses the general
+ * angular formula to exactly the same straight copy the old dedicated
+ * cases computed (checked by inspection: ang=0 => fact=0 => idx=0 => r[0]
+ * is simply the reference sample one step along the corresponding line,
+ * i.e. left[y] for mode 10 / top[x] for mode 26). They ARE still
+ * special-cased for 8.4.4.2.6's exactly-horizontal/exactly-vertical edge
+ * filter, which genuinely is mode-specific and luma-only. */
+static inline void predict_block4(const uint8_t left[8], const uint8_t top[8], uint8_t corner,
+                                   int mode, int is_luma, uint8_t pred_out[16]) {
+    if (mode == HEVC_MODE_PLANAR) {
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++) {
                 int v = (3 - x) * left[y] + (x + 1) * top[4] +
                         (3 - y) * top[x] + (y + 1) * left[4] + 4;
                 pred_out[y * 4 + x] = (uint8_t)(v >> 3);
             }
-        break;
-
-    case HEVC_MODE_DC: {
-        int dc = (left[0] + left[1] + left[2] + left[3] + top[0] + top[1] + top[2] + top[3] + 4) >> 3;
+        return;
+    }
+    if (mode == HEVC_MODE_DC) {
+        int dc = (left[0] + left[1] + left[2] + left[3] +
+                  top[0]  + top[1]  + top[2]  + top[3]  + 4) >> 3;
         for (int i = 0; i < 16; i++) pred_out[i] = (uint8_t)dc;
         if (is_luma) {
             pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
             for (int x = 1; x < 4; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
             for (int y = 1; y < 4; y++) pred_out[y * 4] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
         }
-        break;
+        return;
     }
 
-    case HEVC_MODE_HORIZONTAL:
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                pred_out[y * 4 + x] = left[y];
-        if (is_luma) {
-            for (int x = 0; x < 4; x++)
-                pred_out[x] = clip8(left[0] + ((top[x] - corner) >> 1));
-        }
-        break;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++)
+            pred_out[y * 4 + x] = (uint8_t)predict_angular_sample(left, top, corner, mode, x, y);
 
-    case HEVC_MODE_VERTICAL:
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                pred_out[y * 4 + x] = top[x];
-        if (is_luma) {
+    if (is_luma) {
+        if (mode == HEVC_MODE_VERTICAL)          /* 26 */
             for (int y = 0; y < 4; y++)
                 pred_out[y * 4] = clip8(top[0] + ((left[y] - corner) >> 1));
-        }
-        break;
-
-    default:
-        for (int i = 0; i < 16; i++) pred_out[i] = 128;
-        break;
+        else if (mode == HEVC_MODE_HORIZONTAL)   /* 10 */
+            for (int x = 0; x < 4; x++)
+                pred_out[x] = clip8(left[0] + ((top[x] - corner) >> 1));
     }
+}
+
+void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
+                      int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
+    uint8_t left[8], top[8], corner;
+    gather_neighbors_wide(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner);
+    predict_block4(left, top, corner, mode, is_luma, pred_out);
 }
 
 /* Sum of absolute differences over two contiguous 16-byte blocks. Written
@@ -355,42 +470,45 @@ static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
  *
  * encoder_h265.c's per-PU sequence was hevc_choose_luma_mode() followed
  * immediately by hevc_predict_4x4() with the mode it returned - and nothing
- * writes recon_y in between, so that second call re-ran gather_neighbors()
- * (five z-scan availability tests over an 11-entry substitution scan) and
- * re-ran predict_from_refs() for a prediction the search had already built
- * and discarded. Two gathers and five predictions per 4x4 luma PU, for a
- * block whose reference set and candidate predictions do not change between
- * the two calls.
+ * writes recon_y in between, so that second call re-ran the gather and
+ * re-ran the prediction for a result the search had already built and
+ * discarded. Keeping the winner costs one 16-byte copy per improvement and
+ * removes a whole gather plus a whole prediction; that part of the shape
+ * is unchanged by A6.
  *
- * Keeping the winner costs one 16-byte copy per improvement (at most three
- * per block) and removes a whole gather plus a whole prediction. The
- * arithmetic is untouched: same gather, same predict_from_refs(), same SAD,
- * same strict `<` so ties still go to the earlier candidate in
- * Planar/DC/Horizontal/Vertical order. Output is byte-identical.
+ * A6 (2026-09-21): backlog.md's A6 - port the 33 angular modes,
+ * all-TU-size transforms and undivided 16x16 CUs from cavlc-residual-coding
+ * - widened this from a 4-candidate unrolled search to a 35-candidate loop.
+ * Only piece (1), the angular modes, is done here; see
+ * docs/notes/a6-cavlc-residual-port.md for why (2) and (3) were not
+ * attempted and what would be needed. The old A5 comment about this being
+ * "four modes... unrolled... a compile-time constant in each" no longer
+ * applies - a runtime loop is the only shape that makes sense over 35
+ * candidates, and this is now an ordinary SAD-only, no-RDO exhaustive
+ * search (still no rate term, matching this encoder's existing "SAD only"
+ * convention, just over more candidates). Ties go to the lowest-numbered
+ * mode (strict `<`), which is this encoder's own convention, not a spec
+ * requirement - HEVC does not mandate a tie-break.
  *
- * NOTE for anyone comparing against the GPU path: hevc_intra_wavefront.comp
- * is NOT a second implementation of this function. It searches 35 modes
- * over an undivided 16x16 CU with 8.4.4.2.3 reference smoothing; this
- * searches four modes per 4x4 TU. The two paths have never agreed on mode
- * decisions and are not required to - see that shader's SCOPE comment. */
+ * This is exhaustive, NOT coarse-to-fine, unlike
+ * hevc_intra_wavefront.comp's 11-of-35 coarse grid search (that shader's
+ * own SCOPE comment: "mode refinement... not implemented here yet"). A
+ * cheaper search here is legitimate future perf work in the spirit of A5,
+ * now against a 35-entry candidate set, and is explicitly NOT attempted -
+ * see docs/notes/a6-cavlc-residual-port.md. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0,
                            uint8_t pred_out[16]) {
     HEVC_PROF_ENTER();
 
-    /* Gather ONCE for all four candidates - the reference set does not
-     * depend on the mode. See predict_from_refs()'s comment. */
-    uint8_t left[5], top[5], corner;
-    gather_neighbors(recon_y, stride, width, height, x0, y0, 1, left, top, &corner);
+    /* Gather ONCE for all 35 candidates - the reference set does not
+     * depend on the mode. See gather_neighbors_wide()'s comment. */
+    uint8_t left[8], top[8], corner;
+    gather_neighbors_wide(recon_y, stride, width, height, x0, y0, 1, left, top, &corner);
 
-    /* PERF: hoist the source block. The four SAD loops each re-derived
-     * src_y[(y0+y)*stride + (x0+x)] for all 16 samples, i.e. 64 strided
-     * byte loads off a row multiply per block. Copied once into a
-     * contiguous 16-byte local it is four 4-byte loads, and the SAD below
-     * then has two contiguous 16-byte operands, which is what lets the
-     * vectoriser reduce it to a single packed sum-of-absolute-differences
-     * instead of 16 scalar subtract/abs/add chains. Same samples, same
-     * order, same sum. */
+    /* PERF: hoist the source block - unchanged from A5, still valid with
+     * any candidate count since it has nothing to do with how many modes
+     * are tried. */
     uint8_t src16[16];
     const uint8_t *srow = src_y + (size_t)y0 * (size_t)stride + (size_t)x0;
     memcpy(src16 + 0,  srow,                      4);
@@ -398,37 +516,24 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
     memcpy(src16 + 8,  srow + 2 * (size_t)stride, 4);
     memcpy(src16 + 12, srow + 3 * (size_t)stride, 4);
 
-    /* Unrolled over the four candidates, with the mode a compile-time
-     * constant in each, so predict_from_refs() inlines to just that mode's
-     * arithmetic. The candidates[] array and its loop were what forced the
-     * switch to stay a runtime dispatch.
-     *
-     * Planar is evaluated straight into pred_out because it is always the
-     * first candidate and the old `best_sad < 0` sentinel meant it always
-     * won the first comparison - so this is the same initialisation, one
-     * 16-byte copy cheaper. Ties still go to the earlier candidate
-     * (strict `<`), and the order is unchanged: Planar, DC, Horizontal,
-     * Vertical. A 4x4 SAD cannot exceed 16*255 = 4080, so the accumulator
-     * being `int` rather than `long` cannot change an outcome. */
-    predict_from_refs(left, top, corner, HEVC_MODE_PLANAR, 1 /* luma */, pred_out);
+    /* Mode 0 (Planar) evaluated straight into pred_out, same as before -
+     * it is always tried first, so this is the same "first candidate wins
+     * ties by default" initialisation as the old code, one 16-byte copy
+     * cheaper than a sentinel `best_sad < 0` scheme. */
+    predict_block4(left, top, corner, HEVC_MODE_PLANAR, 1 /* luma */, pred_out);
     int best_mode = HEVC_MODE_PLANAR;
     int best_sad = sad_4x4(src16, pred_out);
 
-#define HEVC_TRY_MODE(M) do {                                              \
-        uint8_t pred_[16];                                                 \
-        predict_from_refs(left, top, corner, (M), 1 /* luma */, pred_);    \
-        int sad_ = sad_4x4(src16, pred_);                                  \
-        if (sad_ < best_sad) {                                             \
-            best_sad = sad_;                                               \
-            best_mode = (M);                                               \
-            memcpy(pred_out, pred_, 16);                                   \
-        }                                                                  \
-    } while (0)
-
-    HEVC_TRY_MODE(HEVC_MODE_DC);
-    HEVC_TRY_MODE(HEVC_MODE_HORIZONTAL);
-    HEVC_TRY_MODE(HEVC_MODE_VERTICAL);
-#undef HEVC_TRY_MODE
+    for (int m = 1; m < HEVC_MODE_COUNT; m++) {
+        uint8_t pred_[16];
+        predict_block4(left, top, corner, m, 1 /* luma */, pred_);
+        int sad_ = sad_4x4(src16, pred_);
+        if (sad_ < best_sad) {
+            best_sad = sad_;
+            best_mode = m;
+            memcpy(pred_out, pred_, 16);
+        }
+    }
 
     HEVC_PROF_LEAVE(best_mode, src_y, recon_y, stride, width, height, x0, y0);
     return best_mode;

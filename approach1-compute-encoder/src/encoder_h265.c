@@ -1589,10 +1589,13 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
              * staging boundary, and a stale or partially-written buffer
              * would otherwise index the MPM tables or the chroma
              * candidate list out of range. */
-            /* 35 intra modes, 0..34 (Planar, DC, and 33 angular). This tree
-             * has no HEVC_MODE_COUNT constant, hence the literal. */
+            /* HEVC_MODE_COUNT (35) intra modes, 0..34 (Planar, DC, and 33
+             * angular). Added to hevc_intra.h by backlog A6, which also
+             * gave the CPU path (hevc_choose_luma_mode()) this same full
+             * range - this clamp predates that and needed no other
+             * change. */
             int mode = gmodes[ctu];
-            if (mode < 0 || mode > 34) mode = HEVC_MODE_DC;
+            if (mode < 0 || mode >= HEVC_MODE_COUNT) mode = HEVC_MODE_DC;
             uint32_t flags = gcbf[ctu];
             int cbf_luma = (int)(flags & 1u);
             int cbf_cb   = (int)((flags >> 1) & 1u);

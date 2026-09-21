@@ -35,6 +35,11 @@
 # usage: tools/hevc_host_drift.sh [build-dir]
 #   BC250_DRIFT_CASES="w h qp pattern [frames] [gop] [gpu_mv]; ..."  cases
 #   pattern: 0=flat 1=vertical bars 2=diagonal ramp 3=pseudo-random
+#            4=horizontal bars 5=shallow diagonal ramp 6=steep diagonal ramp
+#            (4-6 added for backlog A6, the 33-angular-intra-mode port -
+#            0-3 alone leave most of the angular mode range unreached, see
+#            hevc_host_repro.c's comment and docs/notes/a6-cavlc-residual-
+#            port.md for the measured per-pattern mode histograms)
 #   frames:  default 1
 #   gop:     default 1 (= IDR every frame). gop > 1 encodes one IDR then
 #            P-frames, so this oracle covers the INTER path - cu_skip/merge
@@ -147,10 +152,21 @@ gcc -std=c11 -O2 -D_GNU_SOURCE -I"$SRC" -o hostrepro "$REPO/tools/hevc_host_repr
 # across 30 sizes x 5 QPs x 4 patterns are byte-exact on luma AND chroma.
 INTRA_CASES="16 16 4 2; 32 32 4 2; 64 64 4 0; 64 64 4 1; 64 64 4 2; 64 64 4 3; 64 64 30 1; 64 64 30 2; 128 128 20 3; 256 256 27 3; 1920 1080 27 3"
 INTRA_CASES="$INTRA_CASES; 1918 1080 27 3; 1920 1078 27 3; 1918 1078 27 3; 1366 768 27 2; 854 480 30 1; 640 358 0 3; 100 60 27 3; 20 12 27 1; 18 18 27 2; 4 4 27 3"
+# Patterns 4-6 (backlog A6): forces angular modes 0-3 barely reach - see
+# hevc_host_repro.c's comment. 64x64 at three QPs each, plus one bigger
+# size per pattern so the wide-scan neighbour gather (gather_neighbors_wide,
+# hevc_intra.c) sees real CTU/CU boundaries, not just one CTU's edge.
+INTRA_CASES="$INTRA_CASES; 64 64 4 4; 64 64 20 4; 64 64 40 4; 256 256 27 4"
+INTRA_CASES="$INTRA_CASES; 64 64 4 5; 64 64 20 5; 64 64 40 5; 256 256 27 5"
+INTRA_CASES="$INTRA_CASES; 64 64 4 6; 64 64 20 6; 64 64 40 6; 256 256 27 6"
 # Inter cases: same patterns, but a real GOP. Patterns 2/3 advance with the
 # frame index, so these are moving content and every frame after the first
 # is a P-frame whose reference is the encoder's own previous reconstruction.
 INTER_CASES="64 64 4 0 4 4; 64 64 4 2 4 4; 64 64 27 2 4 4; 64 64 27 3 4 4; 128 128 27 2 4 4; 128 128 27 3 8 8; 256 256 27 3 4 4; 64 64 4 2 8 8"
+# Patterns 4-6 (backlog A6): the inter path's intra fallback (see
+# hevc_scope_note.md's "still open" note - P-CUs are zero-motion SKIP or
+# intra) should reach the same angular modes on P-frames as on I-frames.
+INTER_CASES="$INTER_CASES; 64 64 27 5 4 4; 64 64 27 6 4 4; 128 128 27 4 4 4"
 # Same again with a non-zero stand-in for the GPU's motion vector, which is
 # the only thing that makes the merge list contain more than one distinct
 # vector. (2,0) and (0,2) each failed 17k+/24k luma samples before

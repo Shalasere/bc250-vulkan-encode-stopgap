@@ -52,15 +52,25 @@
 extern "C" {
 #endif
 
-/* The only four HEVC intra modes this encoder ever chooses (mirroring the
- * four H.264 Intra16x16 modes the GPU shaders already know how to pick
- * between by SAD, conceptually - DC, Planar, Horizontal, Vertical), applied
- * per-4x4-block with real chained reconstruction rather than GPU-computed
- * whole-macroblock prediction. See hevc_intra.c's mode-decision comment. */
+/* Named constants for the four "axis" modes this file has always singled
+ * out (Planar, DC, and the two exactly-horizontal/exactly-vertical
+ * angular modes, which alone get 8.4.4.2.6's edge filter). Backlog A6
+ * (2026-09-21) widened hevc_choose_luma_mode()/hevc_predict_4x4() from
+ * choosing only among these four to the full HEVC_MODE_COUNT-mode range
+ * (0=Planar, 1=DC, 2-34=angular) - see hevc_intra.c's mode-decision
+ * comment and docs/notes/a6-cavlc-residual-port.md. These four constants
+ * remain because the code still needs to name them specifically (mode 10
+ * and 26's edge filter, the MPM substitution's Planar/DC/Vertical
+ * default), not because they are the only modes reachable. */
 #define HEVC_MODE_PLANAR      0
 #define HEVC_MODE_DC          1
 #define HEVC_MODE_HORIZONTAL 10
 #define HEVC_MODE_VERTICAL   26
+/* Rec. ITU-T H.265's full intra mode count (0=Planar, 1=DC, 2-34=angular).
+ * encoder_h265.c's GPU path (encode_core_gpu) already clamped against the
+ * literal 34 with a comment noting "no HEVC_MODE_COUNT constant" - this is
+ * that constant, added by A6 so both paths can name it. */
+#define HEVC_MODE_COUNT       35
 
 /* Rec. ITU-T H.265 Table 8-10 (scan derivation for intra 4x4/8x8 luma, and
  * 4:4:4 chroma - not applicable to our 4:2:0 chroma, which always scans
@@ -68,9 +78,11 @@ extern "C" {
  * else SCAN_DIAG(0). Matches hevc_cabac.c's scan_idx numbering. */
 int hevc_scan_idx_for_mode(int mode);
 
-/* Real intra mode decision (SAD-minimizing among the 4 supported modes,
- * the same "no rate-distortion, SAD-only" criterion the GPU's own I16x16
- * decision uses) for one 4x4 luma block at pixel position (x0,y0). Each
+/* Real intra mode decision (SAD-minimizing, exhaustive, among all
+ * HEVC_MODE_COUNT (35) modes as of backlog A6 - the same "no
+ * rate-distortion, SAD-only" criterion the GPU's own mode search uses,
+ * just over the full candidate set rather than 4) for one 4x4 luma block
+ * at pixel position (x0,y0). Each
  * candidate mode's prediction is built from `recon_y` (real already-
  * reconstructed neighbor pixels, or the substituted default where
  * unavailable per 8.4.4.2.2 - the same values a real decoder's own
