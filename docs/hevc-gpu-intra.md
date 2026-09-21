@@ -18,11 +18,22 @@ chroma is not bit-exact and has a known root cause (below).**
 | check | result |
 |---|---|
 | Decodes silently under ffmpeg | yes, every bitrate 1M–30M |
-| Picture vs source, 1080p all-intra @10M | **35.26 dB avg, 49.61 dB luma** (CPU path: 36.51 / 35.00) |
+| Picture vs source, 1080p all-intra @10M | 35.26 dB avg, 49.61 dB luma (CPU path: 36.51 / 35.00) — **indicative only, see note** |
 | Encoder recon vs decoder, **luma** | **byte-identical**, full plane, 3/3 frames, md5 match |
 | Encoder recon vs decoder, **chroma** | **differs** — mean abs delta 5.7, max 16 |
 | Throughput, 1080p all-intra, 240 frames | 85.5 / 92.9 / 94.4 fps (CPU path 5.0; H.264 74–77) |
 | Noise floor | `p_wall` sd 3.63%, n=5 — nothing under ~7% is a result |
+
+⚠️ **The PSNR row above came from an ad-hoc raw-YUV comparison, not from
+`lab qsweep`, and should be treated as indicative rather than quoted.**
+The same method reported 9.66 dB for H.264 and 10.48 dB for the
+`cavlc-residual-coding` build, both with *correct* luma means — the
+signature of frame misalignment. Run through `lab qsweep`, H.264 scores
+**42.55 dB**. The ad-hoc method is trustworthy for "is the picture
+black" and not for ranking encoders, which is exactly what DEVLOG §22
+warns about. `lab qsweep` does not yet take `--codec`, so the HEVC
+figures have not been re-taken through it; the byte-exact `lab drift`
+result is the authoritative correctness statement here, not the PSNR.
 
 Two real bugs were found and fixed during that validation, both worth
 knowing about because neither was visible to a silent decode:
