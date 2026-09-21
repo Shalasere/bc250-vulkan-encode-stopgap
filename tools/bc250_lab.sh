@@ -58,7 +58,15 @@
 #                                            decoder, byte-exact - the only
 #                                            oracle here that shares none of
 #                                            our own code (--codec, --res,
-#                                            --frames, --bitrate, --env)
+#                                            --frames, --bitrate, --qp,
+#                                            --content, --env, --real-decode)
+#                                            --real-decode: decode with
+#                                            whatever the PPS actually
+#                                            signals instead of forcing
+#                                            -skip_loop_filter all (needed to
+#                                            interpret H.264 chroma numbers -
+#                                            backlog C3, docs/notes/
+#                                            c3-h264-chroma-drift.md)
 #   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + dims + drift
 #                                            + exact
 #   ./bc250_lab.sh health                    is the live Sunshine healthy?
@@ -1129,10 +1137,43 @@ dims() {
 # Found, in two days: a near-black picture at 5 dB (split_cu_flag ctxInc),
 # a QP-before-dispatch ordering bug, the chroma QP defect above, and a
 # ~33 dB luma divergence in the CPU HEVC path that is still open.
+#
+# backlog C3 ("H.264 chroma drift, max delta 241-252, unexplained"): the
+# default `-skip_loop_filter all` decode is doubly wrong for H.264, not
+# singly. This encoder deblocks LUMA only (deblock_filter.comp binding 0 is
+# `r8` - no chroma binding exists at all; see DEVLOG §14.3) while the PPS
+# signals disable_deblocking_filter_idc=0 (deblocking ON) by default. So:
+#
+#   - luma:   encoder ref IS deblocked, `-skip_loop_filter all` decodes
+#             WITHOUT filtering -> mismatched by construction, in the
+#             OPPOSITE direction from the chroma case below.
+#   - chroma: encoder ref is NEVER deblocked (no shader path touches it),
+#             `-skip_loop_filter all` decodes without filtering too ->
+#             both sides unfiltered, so THIS comparison should be exact.
+#
+# `--real-decode` below drops the flag so the decoder filters exactly what
+# the PPS actually signals (both planes), which is the only configuration
+# where "luma should match, chroma is expected to differ" is even a
+# coherent statement to test.
+#
+# Do not assume a large chroma delta IS the luma-only-deblocking gap,
+# either way: ITU-T 8.7.2.4's tc clipping bounds any single deblocking
+# sample change to at most tc0+2 (luma) / tc0+1 (chroma-if-filtered), which
+# tops out at 27/26 across the entire QP range (see TC0_MAX_Z below, copied
+# from deblock_filter.comp's TC0_TABLE). A max delta anywhere near 241-252
+# is ~9x that ceiling and CANNOT be a deblocking artifact under any decode
+# configuration - it is a different, larger, still-unidentified defect.
+# See docs/notes/c3-h264-chroma-drift.md for the full analysis, including
+# why this cannot be C9's compounding-P-frame shape (drift() always uses
+# `-g 1`, so every frame here is an independent IDR - nothing to compound
+# across), and why `h264_encoder_encode_raw()` cannot serve as an off-board
+# oracle for this the way `hevc_encoder_encode_raw()` does (it transmits
+# zero residual by construction - see its own body/cavlc.h - so it never
+# exercises the real reconstruction path this bug lives in).
 # ---------------------------------------------------------------------------
 drift() {
     local key="${1:?drift <key> [opts]}"; shift
-    local res=1920x1080 frames=3 codec=hevc envs="" bitrate=10M content=testsrc qp=""
+    local res=1920x1080 frames=3 codec=hevc envs="" bitrate=10M content=testsrc qp="" real_decode=0
     # Loop var deliberately not `a` - see bench()'s comment on the same
     # pattern colliding with compare()'s `local a`.
     for opt in "$@"; do
@@ -1144,6 +1185,14 @@ drift() {
             --qp=*)      qp="${opt#*=}";;
             --content=*) content="${opt#*=}";;
             --env=*)     envs="${opt#*=}";;
+            # Decode with whatever the PPS actually signals instead of
+            # forcing every filter off. For HEVC this is already a no-op
+            # (deblocking is signalled off outright, C9). For H.264, whose
+            # PPS signals deblocking ON by default, this is the ONLY mode
+            # in which "luma should match, chroma is expected to differ by
+            # the luma-only-deblocking gap" is a comparison that means
+            # anything - see the top-of-function comment (backlog C3).
+            --real-decode) real_decode=1;;
             *) die "drift: unknown option '$opt'";;
         esac
     done
@@ -1182,17 +1231,45 @@ drift() {
         echo "drift: ENCODE FAILED (rc=$erc)"; tail -5 "$d/enc.log" 2>/dev/null; return 1
     fi
 
-    ffmpeg -v error -y -skip_loop_filter all -i "$d/stream.$fmt" \
+    local -a SKIPARGS=(-skip_loop_filter all)
+    [ "$real_decode" = 1 ] && SKIPARGS=()
+    ffmpeg -v error -y "${SKIPARGS[@]}" -i "$d/stream.$fmt" \
            -f rawvideo -pix_fmt nv12 "$d/dec.nv12" 2>/dev/null
     [ -s "$d/dec.nv12" ] || { echo "drift: DECODE produced nothing"; return 1; }
 
     BC250_DRIFT_DIR="$d" BC250_DRIFT_W="$w" BC250_DRIFT_H="$h" \
-    BC250_DRIFT_CW="$cw" BC250_DRIFT_CH="$ch" python3 - <<'PY'
+    BC250_DRIFT_CW="$cw" BC250_DRIFT_CH="$ch" BC250_DRIFT_CODEC="$codec" \
+    BC250_DRIFT_QP="$qp" BC250_DRIFT_REALDECODE="$real_decode" python3 - <<'PY'
 import os, glob, sys
 d  = os.environ["BC250_DRIFT_DIR"]
 W  = int(os.environ["BC250_DRIFT_W"]);  H  = int(os.environ["BC250_DRIFT_H"])
 CW = int(os.environ["BC250_DRIFT_CW"]); CH = int(os.environ["BC250_DRIFT_CH"])
+CODEC = os.environ.get("BC250_DRIFT_CODEC", "hevc")
+QP_STR = os.environ.get("BC250_DRIFT_QP", "")
+REAL_DECODE = os.environ.get("BC250_DRIFT_REALDECODE", "0") == "1"
 DEC = W*H*3//2
+
+# ITU-T H.264 Table 8-17 tc0, column .z (bS=3, reused for bS=4 - see
+# deblock_filter.comp's TC0_TABLE, copied verbatim). Only the z column is
+# needed: it is the worst case across this encoder's possible boundary
+# strengths, so TC0_MAX_Z[qp]+2 is a hard ceiling on how much any ONE pixel
+# can move due to luma deblocking at that QP (filter_edge's tc = tc0 +
+# (ap?1:0) + (aq?1:0), max +2), and TC0_MAX_Z[qp]+1 is the analogous
+# ceiling for chroma IF chroma were deblocked (ITU-T 8.7.2.4: chroma tc =
+# tc0+1, no p1/q1 update). backlog C3: a measured delta bigger than these
+# bounds is NOT explainable by the luma-only-deblocking gap under ANY
+# decode configuration, real or -skip_loop_filter'd - it is a different bug.
+TC0_MAX_Z = [
+    0,0,0,0,0, 0,0,0,0,0, 0,0,0,0,0, 0,0,1,1,1,
+    1,1,1,1,1, 1,1,2,2,2, 2,3,3,3,4, 4,4,5,6,6,
+    7,8,9,10,11, 13,14,16,18,20, 23,25,
+]
+def deblock_bound(qp, plane):
+    """Theoretical max |delta| a real deblocking filter could produce at
+    this QP - luma is what this encoder actually runs, chroma is the
+    hypothetical bound IF the missing chroma path existed."""
+    qp = max(0, min(51, qp))
+    return TC0_MAX_Z[qp] + (2 if plane == "luma" else 1)
 
 dec = open(os.path.join(d, "dec.nv12"), "rb").read()
 
@@ -1224,6 +1301,7 @@ def chroma_planes(kind, rec):
     return rec[off:off+half], rec[off+half:off+2*half], CW//2
 
 bad = 0
+qp_int = int(QP_STR) if QP_STR.strip().isdigit() else None
 n = min(len(frames), len(dec)//DEC)
 for f in range(n):
     kind, rec = frames[f]
@@ -1233,7 +1311,13 @@ for f in range(n):
     ry = rec[:CW*CH]
     rcb, rcr, rp = chroma_planes(kind, rec)
 
-    ld = sum(1 for y in range(H) for i in range(W) if ry[y*CW+i] != dy[y*W+i])
+    ld = 0; ld_max = 0
+    for y in range(H):
+        for i in range(W):
+            v = abs(ry[y*CW+i] - dy[y*W+i])
+            if v:
+                ld += 1
+                if v > ld_max: ld_max = v
     cw2, ch2 = W//2, H//2
     def cmpc(r, dpl):
         nd = mx = 0; s = 0
@@ -1248,11 +1332,48 @@ for f in range(n):
     nr, mr, xr = cmpc(rcr, dcr)
     ok = (ld == 0 and nb == 0 and nr == 0)
     if not ok: bad += 1
-    print("  frame %d  %-4s  luma %s | Cb %d differ (mean %.2f max %d) | Cr %d differ (mean %.2f max %d)"
+
+    # backlog C3 annotation: label each plane's max delta against the
+    # theoretical deblocking-mismatch ceiling at this QP (CQP runs only -
+    # see deblock_bound() above), so a FAIL prints its own diagnosis
+    # instead of a bare number nobody can interpret without re-deriving
+    # this from the shader. This does NOT change bad/pass-fail counting -
+    # byte-exactness is still byte-exactness - it only annotates.
+    def tag(codec, plane, xmax):
+        if codec != "h264" or qp_int is None or xmax == 0:
+            return ""
+        bound = deblock_bound(qp_int, plane)
+        if plane == "chroma" and not REAL_DECODE:
+            # -skip_loop_filter all: encoder never filters chroma, decoder
+            # isn't filtering anything either -> both sides unfiltered.
+            # ANY chroma delta here is unexplained by deblocking at all.
+            return "  [[unexplained under -skip_loop_filter all: neither side filters chroma - not a deblocking gap]]"
+        if plane == "luma" and not REAL_DECODE:
+            # encoder DOES deblock luma; this decode mode forces it off.
+            return ("  [[expected: luma-deblock-vs-unfiltered-decode gap, bound %d]]" % bound
+                    if xmax <= bound else
+                    "  [[EXCEEDS luma-deblock bound %d - a different bug]]" % bound)
+        if plane == "chroma" and REAL_DECODE:
+            return ("  [[expected: known luma-only-deblocking gap (C3), bound %d]]" % bound
+                    if xmax <= bound else
+                    "  [[EXCEEDS deblocking-explicable bound %d - see docs/notes/c3-h264-chroma-drift.md]]" % bound)
+        if plane == "luma" and REAL_DECODE:
+            return ("  [[within noise, bound %d]]" % bound if xmax <= bound else
+                    "  [[EXCEEDS bound %d - luma should match under real decode]]" % bound)
+        return ""
+
+    print("  frame %d  %-4s  luma %s%s | Cb %d differ (mean %.2f max %d)%s | Cr %d differ (mean %.2f max %d)%s"
           % (f, "OK" if ok else "DRIFT",
-             "exact" if ld == 0 else "%d/%d differ" % (ld, W*H),
-             nb, mb, xb, nr, mr, xr))
+             "exact" if ld == 0 else "%d/%d differ (max %d)" % (ld, W*H, ld_max),
+             tag(CODEC, "luma", ld_max),
+             nb, mb, xb, tag(CODEC, "chroma", max(xb, xr)),
+             nr, mr, xr, ""))
 print("  DRIFT %s (%d/%d frames exact)" % ("PASS" if bad == 0 else "FAIL", n-bad, n))
+if CODEC == "h264" and bad and qp_int is None:
+    print("  drift: NOTE - pass --qp=<N> (CQP mode) to get a theoretical")
+    print("         deblocking bound for this QP; without it the per-plane")
+    print("         tags above are blank and the raw numbers need manual")
+    print("         interpretation (see docs/notes/c3-h264-chroma-drift.md).")
 sys.exit(1 if bad else 0)
 PY
     local prc=$?
