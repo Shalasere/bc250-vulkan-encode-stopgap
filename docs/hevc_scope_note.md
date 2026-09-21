@@ -1,5 +1,49 @@
 # H.265/HEVC — Architecture & Scope Note
 
+> ## ⚠️ 2026-09-20: the "busy content mismatches the decoder" defect, narrowed
+>
+> This file previously recorded that busy, multi-directional luma content
+> mismatches ffmpeg's decoder "in ways not yet root-caused". It now has a
+> measurement, a mechanism for half of it, and a minimal reproduction.
+> Use `tools/lab drift` (docs/performance-measurement.md) to reproduce any
+> of this in one command.
+>
+> **Chroma: found and FIXED.** The CPU path quantized chroma at QpY
+> instead of QpC, ignoring Table 8-10. Its error switched on at exactly
+> QP 30 — the table's boundary — and grew with QP (exact at QP 4 and 20;
+> mean abs delta 6.5 at 30, 21.9 at 40, 29.4 at 51). The GPU path had the
+> identical defect. Both fixed; chroma is now byte-exact against ffmpeg at
+> every QP tested.
+>
+> **Luma: still open, but much smaller than it looked.** Narrowed by
+> measurement, not inspection:
+>
+> | source | CQP | luma vs decoder |
+> |---|---|---|
+> | flat (`color`) | 4 | **exact** |
+> | flat (`color`) | 30 | **exact** |
+> | `testsrc` 1920x1080 | 4 | 501,104 / 2,073,600 differ |
+> | `testsrc2` 1920x1080 | 4 | 1,750,478 differ |
+> | **`testsrc` 64x64** | **4** | **136 / 4,096 differ** |
+>
+> What that rules out: the transform, quantization, dequantization,
+> inverse transform, entropy coding and reconstruction chain are all
+> **correct** — flat content is byte-exact at both a low and a high QP, and
+> it exercises every one of them. The defect is content-dependent, so it
+> is in the **prediction** path (or in the reference samples feeding it),
+> not the residual path.
+>
+> **Start from the 64x64 case.** 136 wrong pixels out of 4,096 is a
+> tractable debugging target; the 1080p figure is the same bug amplified.
+> The CPU path only ever selects Planar, DC, Horizontal and Vertical, so
+> the next step is identifying which of those four mispredicts and at
+> which block position — `gather_neighbors()` in `hevc_intra.c` already
+> carries a comment about one previous bug of exactly this class
+> (`left[4]` reading uninitialized stack), which is the shape to look for.
+>
+> Note the GPU intra path (`BC250_HEVC_GPU=1`) is **byte-exact on both
+> planes at every QP tested** and does not share this defect.
+
 **Status as of v0.3.0: Full H.265/HEVC Main Profile Encoder (IDR & P-Frames, GPU Compute ME, SIMD SAD, Rate Control, CI Oracle Verified)**
 
 `encoder_h265.c` + `hevc_cabac.c/.h` + `hevc_intra.c/.h` implement a fully functional, spec-compliant ITU-T H.265 Main-profile video encoder exposed via VA-API (`VAProfileHEVCMain` / `VAEntrypointEncSlice`):
