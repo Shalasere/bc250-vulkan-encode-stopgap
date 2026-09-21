@@ -151,6 +151,27 @@ a board `lab qsweep` BD-rate run before any number here is trusted.
 > cost — HEVC CPU was already far from real-time and is opt-in-only, so
 > practical impact on the one real client is limited, but the trade was
 > never surfaced as one until now. DEVLOG §36.
+
+> **Partially addressed (2026-09-21): coarse-then-refine recovers
+> ~1.5-1.85x of the mode-search cost, off-board.** Instrumented first:
+> angular prediction alone (33/35 candidates) is 33-37% of encode time
+> by itself, localizing the cost to candidate *count*. Replaced the
+> exhaustive search with Planar+DC, a step-4 angular grid (the same
+> coarse grid the GPU shader already uses), ±1/±2 refinement, plus the
+> 3 real MPMs always — same RD cost function, at most 18 candidates
+> instead of 35. Off-board: 1.45-1.82x speedup over exhaustive,
+> content-dependent; independently reproduced before merging
+> (183-184ms → 98-100ms at one config, ~1.85x). RD cost: 8/9 sample
+> points flat vs the exhaustive search, one disclosed exception
+> (+10.9% bytes, -0.81 dB at 256x256/QP27/diagonal-ramp — traced to a
+> mode-histogram shift on the same near-zero-SAD regime the RD-bias
+> pass already flagged as sensitive). **Explicitly not the board's
+> +52.42% number brought down to a new figure** — this off-board
+> harness's mode-search share of total time is much larger than a real
+> frame's, so only the mechanism and relative recovery transfer. A
+> board `lab compare` run is the only way to get the real number now.
+> `docs/notes/a6-mode-search-perf.md`.
+
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
 `cavlc-residual-coding`): `docs/notes/a6-cavlc-residual-port.md`.
