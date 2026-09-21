@@ -343,8 +343,41 @@ top of this item.
 
 ## D. Opened by the 2026-09-21 board run
 
-**D1. Rate control does not spend a higher bitrate.** In the same run,
-across 15M → 31M at 1440p `testsrc2`:
+**D1. ROOT-CAUSED AND FIXED OFF-BOARD (2026-09-21) — needs a board
+re-measure before "done."** `VAEncPictureParameterBufferH264/HEVC.pic_init_qp`
+and `VAEncMiscParameterRateControl.initial_qp` are mandatory **per-frame**
+VA-API fields (DEVLOG §10.7: Sunshine really does resend one every frame),
+wired straight into `*_encoder_set_qp()`. That function stomped
+`rc.base_qp`/`rc.current_qp` on *every* call with no "did this actually
+change" guard — unlike `*_encoder_set_bitrate()`, which has always had
+one. The feedback loop kept running every frame, but around an anchor
+reset back to the resent hint before it ever accumulated more than one
+frame's `±2`/`±3` step, which is why mean QP tracked the hint almost
+exactly and barely moved between bitrates on any path.
+
+Fixed the same way `set_bitrate()` already was. Reproduced off-board
+*before* touching the fix: `tools/rc_bench.c` drives the raw encode path
+directly (no VA-API, no GPU, no board) and simulating the stomp alone
+reproduces the board's flat pattern almost exactly; post-fix, a resent
+unchanged hint is a no-op and the real controller responds to a 2x
+bitrate change with an 11.5 QP swing — matched independently by rebuilding
+and re-running before merging. HEVC CPU PSNR at 15M→31M: **44.39→44.49 dB
+(+0.10, matches the board's flat +0.03) before the fix, 35.39→42.40 dB
+(+7.00, libx264-shaped) after.**
+
+**Read that last number carefully — quality at 15M *drops* (44.39→35.39
+dB) after the fix.** That's the controller correctly spending the lower
+budget the caller actually asked for instead of ignoring it, not a
+regression, but it's a real operating-point change with real
+client-perceived-quality implications and needs a board re-measure
+against a real session before this is called fully done, not just
+root-caused. `docs/notes/d1-rate-control.md` has the full writeup.
+H.264's raw path codes no residual by construction, so only the QP-walk
+*mechanism* is validated for H.264 off-board — the quality claim there
+still needs the GPU path or the board.
+
+Original finding, in the same board run, across 15M → 31M at 1440p
+`testsrc2`:
 
 | encoder | 15M | 31M | delta |
 |---|---|---|---|
