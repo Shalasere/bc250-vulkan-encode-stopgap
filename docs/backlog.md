@@ -1,0 +1,130 @@
+# Work index
+
+Serial-able work items, split by whether they need the BC-250 board. Kept
+here rather than in a tracker because every item's verification story
+lives in this repo.
+
+**The off-board list is long on purpose.** `hevc_encoder_encode_raw()` is
+GPU-free and `tools/hevc_host_drift.sh` gives a byte-exact correctness
+oracle on a dev machine, so most HEVC correctness and CPU-side
+performance work does *not* queue behind hardware. Only the GPU paths,
+throughput figures and anything touching the VA-API surface lifecycle
+genuinely need the board.
+
+## Standing rules for anything on this list
+
+- **Byte-identical means byte-identical.** A performance change that
+  alters output is a correctness change and needs a different review.
+- **`test_hevc_encode` is a valid byte oracle** (deterministic, 3/3).
+  **`test_encode` is NOT** — it alternates between two md5s run to run
+  (`rate_control.c`'s `CLOCK_MONOTONIC` bucket drain). See B1.
+- **Run `tools/hevc_host_drift.sh`** on anything touching prediction,
+  transform, quantisation or entropy coding. It is the only oracle here
+  that does not share our own code.
+- **A measured zero is a result.** Record it and revert; do not keep
+  complexity that bought nothing.
+- **gprof has misattributed twice** in this codebase (`hevc_sbac_init_state`
+  reported at 7.9M calls when it is reachable ~810 times; a 17.7%
+  attribution whose "obvious" hot instruction turned out to be free).
+  Treat the profile as a hint and confirm end to end.
+
+---
+
+## A. Off-board, ready to pick up
+
+**A1. Extend host-drift coverage to non-multiple-of-16 resolutions.**
+Current cases are 16/32/64/128/256 squares plus 1920x1080. Widths that
+are not a multiple of 16 (1918, 1366, 854) and odd heights exercise the
+padding and conformance-window crop path, which is a known bug class —
+upstream shipped a fix for a buffer boundary overrun on exactly those
+resolutions, and this tree inherited the code before that fix. Cheap,
+and likely to find something.
+
+**A2. H.264 CAVLC needs an off-board harness before it can be optimised.**
+CAVLC is ~57% of the shipping path's frame time and is the last
+untouched performance lever, but `h264_encoder_encode_raw()` is
+header-only by design (codes no residual), so `test_encode` cannot
+exercise residual coding at all. A direct harness over `cavlc_write_*`
+with synthetic coefficient blocks would unblock this entirely off-board.
+
+**A3. Audit the GPU shader against the spec for more defects of the
+chroma-QP class.** `hevc_intra_wavefront.comp` quantised chroma at QpY
+for its whole life because nothing compared it against an independent
+decoder. Worth a careful read for siblings: transform shift / bdShift
+derivation, scan order selection, the `cbf` packing, reference
+substitution. Inspection only — the shader cannot run off-board — so
+produce a list of *claims to test*, not conclusions.
+
+**A4. `hevc_cabac_code_residual_4x4` (~5.9% of profile).** Entropy coding
+of the CPU path.
+
+**A5. `hevc_choose_luma_mode` (~7.8%).** Tries all four candidates with a
+full prediction + SAD each. A cheaper first-pass metric or early
+termination may cut it, but it changes mode decisions unless done
+carefully — if output changes, this becomes a compression change and
+needs BD-rate on the board, not a byte comparison.
+
+**A6. Port the compression work from `cavlc-residual-coding`.** Undivided
+16x16 CUs (measured -34.8% BD-rate there), all-TU-size transforms, the
+full 33 angular modes. Correctness is verifiable off-board with
+`hevc_host_drift.sh`; the BD-rate claim is not. Large, and it collides
+with main's own `hevc_intra.c`, so it is a port not a merge — the two
+trees implemented HEVC independently (58 conflicts, add/add on every
+core HEVC source).
+
+---
+
+## B. Off-board, in flight
+
+**B1. `test_encode` determinism.** Blocks every byte-exactness claim
+about H.264.
+**B2. `bs_rbsp_to_ebsp` (~5.9%).** Emulation-prevention byte insertion.
+**B3. `--codec` for `lab qsweep`.** Blocks proper HEVC quality numbers;
+`docs/hevc-gpu-intra.md` currently has to mark its PSNR "indicative".
+**B4. 4x4 transform/quant pair (~31% combined).** Note the recorded
+negative result: replacing the 64-bit division with 32-bit was
+byte-identical and *slightly slower*; the cost is the matrix multiplies.
+**B5. Host-drift gate in CI.** The check needs no GPU, so it can run on
+every push.
+
+---
+
+## C. Needs the board
+
+**C1. Validate the HEVC fixes at 1080p on hardware.** `lab drift`,
+`lab gate`, `lab scoreboard`. Four correctness fixes landed against
+off-board evidence: split_cu_flag ctxInc, QP-before-dispatch, chroma QP
+(both paths), and the below-left reference sample.
+
+**C2. Re-measure the CPU HEVC speedup on hardware.** +23% on this dev
+machine (7.82 -> 10.14 fps at 1080p). Board numbers will differ.
+
+**C3. H.264 chroma drift, max delta 241-252, unexplained.** Needs the GPU
+path, which cannot run off-board. Note the luma part of that same
+measurement is confounded: `lab drift` disables the decoder's loop
+filter, but this encoder does luma-only deblocking, so the comparison is
+mismatched by construction for H.264. **Design a deblocking-aware drift
+mode before trusting any H.264 drift number.**
+
+**C4. Re-take the retracted PSNR figures.** 9.66 dB (H.264) and 10.48 dB
+were a frame-misalignment artifact of an ad-hoc comparison; the real
+H.264 number through `lab qsweep` is 42.55 dB. The GPU HEVC 35.26 dB
+figure came through the same bad method and needs re-taking once B3
+lands.
+
+**C5. Decide whether `BC250_ENABLE_HEVC` should default on.** Only
+together with `BC250_HEVC_GPU`, never alone — advertising the ~5 fps CPU
+path would let Sunshine negotiate it over the 45-77 fps H.264 one. See
+the note in `va_backend.c`'s `hevc_advertised()`.
+
+**C6. Settle the performance-mode governor question properly.** The
+attempt so far is inconclusive, not negative: `pp_dpm_sclk` still read
+7 MHz after a `--fixed-frequency 2000` pin, so the request never visibly
+took (the script drives the governor over D-Bus and wants root; it was
+run unprivileged and reported success anyway). Needs root, and needs the
+*light game* load it is actually about — an idle board does not
+reproduce the case. `lab bench` now records `sclk_mhz` so the next
+attempt can confirm the clock moved before believing the result.
+
+**C7. P-frames for the GPU HEVC path.** It is all-intra only, which is
+the real gap for live streaming.
