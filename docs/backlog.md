@@ -39,14 +39,6 @@ genuinely need the board.
 
 ## A. Off-board, ready to pick up
 
-**A1. Extend host-drift coverage to non-multiple-of-16 resolutions.**
-Current cases are 16/32/64/128/256 squares plus 1920x1080. Widths that
-are not a multiple of 16 (1918, 1366, 854) and odd heights exercise the
-padding and conformance-window crop path, which is a known bug class —
-upstream shipped a fix for a buffer boundary overrun on exactly those
-resolutions, and this tree inherited the code before that fix. Cheap,
-and likely to find something.
-
 **A2. H.264 CAVLC needs an off-board harness before it can be optimised.**
 CAVLC is ~57% of the shipping path's frame time and is the last
 untouched performance lever, but `h264_encoder_encode_raw()` is
@@ -81,7 +73,7 @@ core HEVC source).
 
 ---
 
-## B. Off-board, landed 2026-09-20
+## B. Off-board, landed 2026-09-20/21
 
 **B1. DONE.** `test_encode` is deterministic (12/12). Root cause was
 `rc_update_stats()`'s `CLOCK_MONOTONIC` bucket drain under `RC_LOW_LATENCY`;
@@ -121,6 +113,40 @@ pairs. **The headline is +2.1% at `-O3 -march=znver2`, not the +15.4% that
 per-case failures and still reported PASS with rc=0 - two million wrong
 pixels scored as green. Fixed, gate added (+3.3s on a ~40s job), and the
 step asserts on the case count so `BC250_DRIFT_CASES` cannot quietly gut it.
+
+**B6 (was A1), landed 2026-09-21. DONE. Its premise was wrong and it
+found two real bugs anyway.**
+`hevc_host_drift.sh` now runs 21 cases, adding each axis alone and both
+together (1918x1080 / 1920x1078 / 1918x1078), 1366x768, 854x480, 100x60,
+20x12, 18x18 and sub-CTU 4x4. Padding and the conformance window are
+**correct at every size tried** — 600 sweep cases are byte-exact on luma
+and chroma. What the coverage gap was hiding:
+
+- **A silently truncated slice, and it is not a resolution bug.**
+  `slice_rbsp_cap` was ~1.03 bytes/luma-sample; this encoder emits up to
+  1.53 on noise at QP 0 and **1.10 at QP 10**, which is inside the
+  shipping `qp_min = 12` range. `bitstream_t` sets `overflow` and stops
+  writing, nothing checked it, and the encoder returned the short slice
+  as a success — decodes correctly down to one row, garbage below.
+  1280x720, fully 16-aligned, failed identically. Fixed by sizing
+  (2.0 bytes/luma-sample) *and* by failing the frame on overflow.
+- **A heap-buffer-overflow at odd widths**, ASan-confirmed on `HEAD` and
+  clean after: `dl_uv` was allocated at a `(width/2)*2` stride while both
+  writers use `width`. This is the inherited "buffer boundary overrun on
+  non-16-multiple resolutions" the item predicted, except it needs an
+  *odd* dimension, not merely an unaligned one.
+- Plus a SEGV at 1x1 (`pad_replicate()` wrapping `src_h - 1` on a
+  `uint32_t`; UBSan cannot see it, unsigned wraparound is defined), now
+  refused at create time.
+
+The oracle itself was also blind to the bug that motivated the item: it
+sliced `dec[:W*H]`, so an H.264-style 1080-decodes-as-1088 crop error
+scored zero drift. It now asserts the decoded frame size first, and
+compares chroma as well as luma. Odd dimensions are excluded with
+reasoning (no 4:2:0 representation, and the conformance window is
+specified in chroma units so it can only crop an even number of luma
+samples) — they stay in the ASan sweep. `test_hevc_encode`'s md5 is
+unchanged. CI +1.5 s (~3.3 s -> ~4.8 s). DEVLOG §33.
 
 ---
 

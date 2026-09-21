@@ -202,6 +202,18 @@ void bs_rbsp_trailing_bits(bitstream_t *bs);
 /** Get total bytes written so far (rounded up if mid-byte). */
 size_t bs_bytes_written(const bitstream_t *bs);
 
+/**
+ * True if any write was dropped because the buffer was full. Every writer
+ * here fails soft - it sets this flag and silently stops emitting - so a
+ * caller that does not test it ships a truncated bitstream as if it were a
+ * short one. HEVC found this the expensive way: an under-sized slice buffer
+ * produced streams that decoded correctly down to one row and into garbage
+ * below it, with no error anywhere. Test it before using the output.
+ */
+static inline bool bs_overflowed(const bitstream_t *bs) {
+    return !bs || bs->overflow;
+}
+
 /** Flush any partial byte (zero-pad remaining bits in current byte). */
 void bs_flush(bitstream_t *bs);
 
@@ -228,6 +240,18 @@ size_t bs_write_nal_header_hevc(bitstream_t *bs, int nal_unit_type);
  */
 size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size,
                        const uint8_t *src, size_t src_size);
+
+/**
+ * Destination capacity that guarantees bs_rbsp_to_ebsp() converts all
+ * `rbsp_size` bytes. The function stops at the end of `dst` and returns only
+ * how much it wrote, so a caller cannot tell a complete conversion from a
+ * truncated one after the fact - size the destination with this instead.
+ * Worst case is an all-zero payload, where every third byte gets an 0x03
+ * (00 00 00 00 00 00 -> 00 00 03 00 00 03 00 00), i.e. 4/3 plus rounding.
+ */
+static inline size_t ebsp_worst_case(size_t rbsp_size) {
+    return rbsp_size + rbsp_size / 3 + 2;
+}
 
 /**
  * A filler_data_rbsp() NAL (see bs_write_filler()'s doc comment) with zero

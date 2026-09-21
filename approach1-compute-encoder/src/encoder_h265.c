@@ -414,6 +414,18 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
                                     uint32_t width, uint32_t height,
                                     uint32_t fps, uint32_t bitrate)
 {
+    /* A 4:2:0 picture has one chroma sample per 2x2 luma block, so below 2
+     * in either axis there is no chroma plane at all: encode_core()'s
+     * chroma pad_replicate() gets src_w/src_h = 0 and computes `src_h - 1`
+     * on a uint32_t, which wraps to 4294967295 and reads off into space.
+     * ASan SEGV at 1x1, caught while sweeping odd sizes. Refuse the size
+     * rather than crash - this returns NULL like every other create-time
+     * failure here, and 1x1 is not a picture anyone can encode anyway.
+     * Sizes below one 16x16 CTU are fine and are covered by the drift
+     * oracle (4x4): the picture is coded at 16x16 and the conformance
+     * window crops the rest away. */
+    if (width < 2 || height < 2) return NULL;
+
     hevc_encoder_t *enc = calloc(1, sizeof(hevc_encoder_t));
     if (!enc) return NULL;
 
@@ -477,12 +489,36 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     enc->luma_mode_map = malloc((size_t)enc->mode_map_stride * (enc->coded_height / HEVC_PU_SIZE));
 
     enc->dl_y = malloc((size_t)width * height);
-    enc->dl_uv = malloc((size_t)(width / 2) * (height / 2) * 2);
+    /* Both writers of dl_uv (hevc_encoder_encode_raw()'s memcpy and
+     * gpu_compute_download_nv12()) use a row stride of `width`, not
+     * `(width/2)*2` - so for an odd width the old `(width/2)*(height/2)*2`
+     * was one byte per row short and the last row's copy ran off the end of
+     * the allocation. Size it from the stride that is actually used. */
+    enc->dl_uv = malloc((size_t)width * ((height + 1) / 2));
 
-    enc->slice_rbsp_cap = luma_size + 65536;
+    /* An 8-bit 4:2:0 picture is 12 bits per luma sample uncompressed, i.e.
+     * 1.5 bytes/luma-sample, and an entropy coder is not bounded by its own
+     * input: measured worst case out of this encoder is 1.53 bytes/luma-
+     * sample (pseudo-random content at QP 0), and 1.10 at QP 10. The old
+     * `luma_size + 65536` was ~1.03 bytes/luma-sample, so any busy frame at
+     * a low QP overran it - and because nothing checked bitstream_t's
+     * `overflow` flag, the result was a silently *truncated* slice that a
+     * decoder happily decodes into garbage from the truncation point down.
+     * That is how it presented: tools/hevc_host_drift.sh at QP 4 on
+     * pattern 3 showed every resolution >= 640x360 correct down to a
+     * particular row and wrong below it.
+     *
+     * 2.0 bytes/luma-sample is above the uncompressed bound with ~30%
+     * headroom over the measured worst case; encode_core() now also fails
+     * the frame outright if the slice still overflows, so exceeding this
+     * can never be silent again. */
+    enc->slice_rbsp_cap = luma_size * 2 + 65536;
     enc->slice_rbsp = malloc(enc->slice_rbsp_cap);
 
-    enc->scratch_out_cap = luma_size + 131072;
+    /* Holds VPS+SPS+PPS plus the slice after RBSP->EBSP escaping. Worst-case
+     * escaping expansion is 4/3 (a run of zero bytes takes an 0x03 every
+     * third byte); 3/2 plus 64 KiB of parameter sets is comfortably clear. */
+    enc->scratch_out_cap = enc->slice_rbsp_cap + enc->slice_rbsp_cap / 2 + 65536;
     enc->scratch_out = malloc(enc->scratch_out_cap);
 
     size_t num_mbs = (size_t)enc->width_ctu * enc->height_ctu;
@@ -647,6 +683,12 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
  * since coded dims are always >= real dims by construction. */
 static void pad_replicate(uint8_t *dst, uint32_t dst_w, uint32_t dst_h,
                            const uint8_t *src, uint32_t src_stride, uint32_t src_w, uint32_t src_h) {
+    /* `src_w - 1` / `src_h - 1` below are unsigned: an empty source plane
+     * would wrap them to 4294967295 rather than clamp. hevc_encoder_create()
+     * rejects the sizes that can produce one; this is the second line of
+     * defence, because the wrap is silent (not UB, so UBSan does not see it)
+     * and the read lands far out of bounds. */
+    if (!src_w || !src_h) return;
     for (uint32_t y = 0; y < dst_h; y++) {
         uint32_t sy = y < src_h ? y : src_h - 1;
         const uint8_t *srow = src + (size_t)sy * src_stride;
@@ -1444,6 +1486,10 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     hevc_cabac_finish(&cab);
     bs_rbsp_trailing_bits(&slice_bs);
 
+    /* A slice that did not fit is a failed frame, never a short one. See the
+     * slice_rbsp_cap comment in hevc_encoder_create(). */
+    if (bs_overflowed(&slice_bs)) return -1;
+
     size_t total = 0;
     if (write_param_sets) {
         total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
@@ -1460,8 +1506,14 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
         bs_write_nal_header_hevc(&out_bs, is_idr ? NAL_UNIT_CODED_SLICE_IDR_W_RADL : NAL_UNIT_CODED_SLICE_TRAIL_R);
         size_t off = bs_bytes_written(&out_bs);
+        size_t rbsp = bs_bytes_written(&slice_bs);
+        /* bs_rbsp_to_ebsp() stops at the destination end and reports only how
+         * much it wrote, so a short destination is indistinguishable from a
+         * complete conversion. Check the worst case up front instead. */
+        if (bs_overflowed(&out_bs) ||
+            encoder->scratch_out_cap - total - off < ebsp_worst_case(rbsp)) return -1;
         size_t ebsp = bs_rbsp_to_ebsp(encoder->scratch_out + total + off, encoder->scratch_out_cap - total - off,
-                                       encoder->slice_rbsp, bs_bytes_written(&slice_bs));
+                                       encoder->slice_rbsp, rbsp);
         total += off + ebsp;
     }
 
@@ -1671,6 +1723,8 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
     hevc_cabac_finish(&cab);
     bs_rbsp_trailing_bits(&slice_bs);
 
+    if (bs_overflowed(&slice_bs)) return -1;
+
     size_t total = 0;
     if (write_param_sets) {
         total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
@@ -1687,8 +1741,11 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
         bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
         bs_write_nal_header_hevc(&out_bs, NAL_UNIT_CODED_SLICE_IDR_W_RADL);
         size_t off = bs_bytes_written(&out_bs);
+        size_t rbsp = bs_bytes_written(&slice_bs);
+        if (bs_overflowed(&out_bs) ||
+            encoder->scratch_out_cap - total - off < ebsp_worst_case(rbsp)) return -1;
         size_t ebsp = bs_rbsp_to_ebsp(encoder->scratch_out + total + off, encoder->scratch_out_cap - total - off,
-                                      encoder->slice_rbsp, bs_bytes_written(&slice_bs));
+                                      encoder->slice_rbsp, rbsp);
         total += off + ebsp;
     }
 

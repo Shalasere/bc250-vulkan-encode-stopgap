@@ -173,13 +173,17 @@ jobs:
       # by the decode oracle.
       #
       # Deliberately NOT pinning a BC250_DRIFT_CASES subset. Measured: the
-      # full run is ~3.3 s, of which ~2.0 s is the one-off gcc build of the
-      # host repro and ~1.3 s is all 11 cases; 1920x1080 - the expensive one
-      # - is ~0.43 s of that. Dropping it would save under half a second on
-      # a ~40 s job while removing the only case at the resolution this
-      # driver ships at and the only one with enough CTU rows for a
-      # raster-order bug to appear. Pinning a subset would also freeze CI
-      # coverage silently every time a case is added to the script.
+      # full run is ~4.8 s, of which ~2.1 s is the one-off gcc build of the
+      # host repro and ~2.7 s is all 21 cases. That is +1.5 s against the
+      # 11-case version (~3.3 s) on a ~44 s job: the ten non-multiple-of-16
+      # cases added ~1.6 s, and extending the comparison to the chroma
+      # planes gave ~0.1 s of it back, because hevc_host_diff.py now tests
+      # each plane in bulk and only walks it pixel by pixel to explain a
+      # failure. Dropping the large cases would save about a second while
+      # removing the only coverage at the resolution this driver ships at
+      # and the only cases with enough CTU rows for a raster-order bug to
+      # appear. Pinning a subset would also freeze CI coverage silently
+      # every time a case is added to the script.
       #
       # No new apt packages needed - checked against the install step above:
       # gcc from build-essential, vulkan/vulkan.h and -lvulkan from
@@ -211,8 +215,8 @@ jobs:
         fi
         CASES_RUN=$(sed -n 's/^HOST DRIFT PASS (\([0-9]*\) cases byte-exact)$/\1/p' \
                     "$RUNNER_TEMP/drift.log")
-        if [ -z "$CASES_RUN" ] || [ "$CASES_RUN" -lt 11 ]; then
-          echo "ERROR: expected at least 11 byte-exact drift cases, got '${CASES_RUN:-none}'."
+        if [ -z "$CASES_RUN" ] || [ "$CASES_RUN" -lt 21 ]; then
+          echo "ERROR: expected at least 21 byte-exact drift cases, got '${CASES_RUN:-none}'."
           echo "       If a case was removed on purpose, lower this floor in the same commit."
           exit 1
         fi

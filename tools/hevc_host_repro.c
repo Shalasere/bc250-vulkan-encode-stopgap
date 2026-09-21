@@ -27,8 +27,10 @@ static void fill(uint8_t *y, uint8_t *uv, int w, int h, int pat, int frame) {
             }
             y[j * w + i] = (uint8_t)v;
         }
+    /* i + 1 < w, not i < w: an odd width would otherwise write one byte past
+     * the end of the row (and of the allocation on the last row). */
     for (int j = 0; j < h / 2; j++)
-        for (int i = 0; i < w; i += 2) {
+        for (int i = 0; i + 1 < w; i += 2) {
             int v = (pat == 0) ? 128 : (128 + ((i / 16 + j / 16) & 1) * 40);
             uv[j * w + i]     = (uint8_t)v;
             uv[j * w + i + 1] = (uint8_t)(255 - v);
@@ -49,8 +51,17 @@ int main(int argc, char **argv) {
 
     uint8_t *y  = malloc((size_t)w * h);
     uint8_t *uv = malloc((size_t)w * (h / 2));
-    size_t cap = (size_t)w * h * 3;
+    /* Must clear the encoder's own worst case, not scale with the picture:
+     * 2 bytes/luma-sample at the CODED (16-aligned) size, plus a fixed
+     * allowance for parameter sets. The old `w * h * 3` was both too small
+     * at low QP on busy content *and*, for a picture smaller than one CTU,
+     * smaller than VPS+SPS+PPS alone - 4x4 gave 48 bytes of budget for a
+     * ~140-byte access unit, and encode_raw() failed with -1. That looked
+     * like an encoder limit at small sizes and was only ever this buffer. */
+    size_t cw = (size_t)((w + 15) / 16 * 16), chh = (size_t)((h + 15) / 16 * 16);
+    size_t cap = cw * chh * 3 + (1u << 20);
     uint8_t *bs = malloc(cap);
+    if (!y || !uv || !bs) { fprintf(stderr, "oom\n"); return 1; }
 
     char path[512];
     snprintf(path, sizeof(path), "%s.hevc", out);
