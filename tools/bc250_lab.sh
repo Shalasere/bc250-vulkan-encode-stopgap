@@ -44,7 +44,8 @@
 #   ./bc250_lab.sh quality <key> [-r N]      PSNR/SSIM via quality_test.sh
 #   ./bc250_lab.sh qsweep <key> [opts]       PSNR/SSIM vs libx264 across bitrates,
 #                                            with per-frame QP correlation
-#                                            (--env=K=V, --no-ref, --bitrates)
+#                                            (--env=K=V, --no-ref, --bitrates,
+#                                             --codec=h264|hevc)
 #   ./bc250_lab.sh units <key>               unit-test binaries
 #   ./bc250_lab.sh scoreboard <key> [opts]   THE headline number: this encoder
 #                                            vs libx264, per load condition
@@ -74,6 +75,16 @@
 #                                since HEVC is not advertised by default; add
 #                                --env=BC250_HEVC_GPU=1 for the GPU intra path
 #   --audit                      also enable BC250_NZ_AUDIT=1
+#
+# QSWEEP OPTIONS
+#   --content=, --res=, --frames=, --env=   as above
+#   --bitrates=A,B,C             default 8M,15M,20M,25M,31M
+#   --no-ref                     drop the libx264 reference column
+#   --codec=h264|hevc            default h264; same meaning as bench's, and it
+#                                likewise implies BC250_ENABLE_HEVC=1. The
+#                                libx264 reference column stays H.264 either
+#                                way, so read it as a cross-codec reference
+#                                under --codec=hevc, or pass --no-ref
 #
 set -uo pipefail
 
@@ -803,11 +814,17 @@ quality() {
 # the misalignment compounds every frame - which is also why it never reset
 # at a fresh IDR, the tell that gave it away. Decoding first removes every
 # container/SPS timing question from the comparison path entirely.
+#
+# That applies identically to --codec=hevc: the HEVC stream is decoded to raw
+# YUV exactly the same way, against the same raw-YUV reference and the same
+# forced `-f rawvideo -s WxH -r N` framing on both sides. Nothing in this
+# path may read a raw elementary stream straight into `-lavfi psnr`,
+# whichever codec produced it.
 qsweep() {
     local key="${1:?qsweep <key> [opts]}"; shift
     local content=testsrc2 res=2560x1440 frames=150
     local bitrates="8M,15M,20M,25M,31M"
-    local envs="" skip_ref=0
+    local envs="" skip_ref=0 codec=h264
     for a in "$@"; do
         case "$a" in
             --content=*)  content="${a#*=}";;
@@ -815,13 +832,24 @@ qsweep() {
             --frames=*)   frames="${a#*=}";;
             --bitrates=*) bitrates="${a#*=}";;
             --env=*)      envs="${a#*=}";;
+            --codec=*)    codec="${a#*=}";;
             --no-ref)     skip_ref=1;;
         esac
     done
+    case "$codec" in h264|hevc) ;; *) die "qsweep: --codec must be h264 or hevc (got '$codec')";; esac
     local bd; bd=$(art_dir "$key")
     local stamp; stamp=$(date +%s)
-    local d="$RUNS/qsweep-$stamp"; mkdir -p "$d"
+    local d="$RUNS/qsweep-$stamp-$codec"; mkdir -p "$d"
 
+    echo "# qsweep: $key codec=$codec @ $content $res, $frames frames, gop=120"
+    if [ "$codec" = hevc ]; then
+        # run_encode() sets BC250_ENABLE_HEVC=1 for us (HEVC is not advertised
+        # by default), and --env=BC250_HEVC_GPU=1 selects the GPU intra path.
+        echo "# hevc: the libx264 column is still H.264 - a cross-codec reference, not"
+        echo "#       a like-for-like one. Use --no-ref for an HEVC-vs-HEVC A/B."
+        echo "# hevc: the qp_* columns come from [BC250_PERF_FRAME], which only the"
+        echo "#       H.264 encoder emits, so they read 'na' here. PSNR is unaffected."
+    fi
     printf "%-9s %-9s %8s %9s %9s %9s %9s %9s %9s\n" \
         bitrate encoder fps psnr_avg psnr_min psnr_max qp_avg qp_min qp_max
     local IFS=,
@@ -838,9 +866,13 @@ qsweep() {
         for enc in $encoders; do
             local base="$d/${br}_${enc//\//_}"
             # libx264 ignores driver env; passing it only to our own encoder
-            # keeps the reference column an honest constant.
-            local this_env=""; [ "$enc" != libx264 ] && this_env="$envs"
-            local rc; rc=$(run_encode "$enc" "$content" "$res" "$frames" 120 "$br" "$this_env" 0 "$base")
+            # keeps the reference column an honest constant. Same for the
+            # codec: the reference is libx264, i.e. always H.264, so its
+            # stream is named .h264 whatever --codec asked our encoder for.
+            local this_env="" this_codec="$codec"
+            if [ "$enc" = libx264 ]; then this_env=""; this_codec=h264; else this_env="$envs"; fi
+            local ext="$this_codec"
+            local rc; rc=$(run_encode "$enc" "$content" "$res" "$frames" 120 "$br" "$this_env" 0 "$base" "$this_codec")
             if [ "$rc" != 0 ]; then
                 printf "%-9s %-9s ENCODE FAILED (rc=%s) - see %s.log\n" "$br" "$enc" "$rc" "$base"
                 continue
@@ -855,7 +887,7 @@ qsweep() {
             [ -f "$qref" ] || ffmpeg -y -v error -f lavfi -i "${content}=size=${res}:rate=60" \
                 -frames:v "$frames" -pix_fmt yuv420p -f rawvideo "$qref"
             local dec="$base.dec.yuv" pstats="$base.psnr.txt"
-            ffmpeg -y -v error -i "$base.h264" -frames:v "$frames" \
+            ffmpeg -y -v error -i "$base.$ext" -frames:v "$frames" \
                 -pix_fmt yuv420p -f rawvideo "$dec" 2>/dev/null
             local pavg pmin pmax
             if [ -s "$dec" ]; then
@@ -883,7 +915,7 @@ qsweep() {
 
             printf "%-9s %-9s %8s %9s %9s %9s %9s %9s %9s\n" \
                 "$br" "${enc:0:9}" "${fps:-na}" "$pavg" "$pmin" "$pmax" "$qavg" "$qmin" "$qmax"
-            rm -f "$base.h264" "$pstats"
+            rm -f "$base.$ext" "$pstats"
         done
     done
     rm -f "$d/ref.yuv"

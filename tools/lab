@@ -23,11 +23,12 @@
 #   tools/lab scoreboard <key> [--quality]   vs libx264, per load condition
 #
 #   tools/lab quality <key>                  PSNR/SSIM
-#   tools/lab qsweep <key>                   PSNR/SSIM across bitrates
+#   tools/lab qsweep <key> [--codec=hevc]    PSNR/SSIM across bitrates
 #   tools/lab exact <keyA> <keyB>            byte-exactness (deterministic only)
 #   tools/lab audit <key>                    nonzero-mask exactness audit
 #   tools/lab units <key>                    unit tests
-#   tools/lab gate <key> [<baseKey>]         audit + units + quality + exact
+#   tools/lab drift <key> [--codec=hevc]     recon vs a REAL decoder, byte-exact
+#   tools/lab gate <key> [<baseKey>]         audit + units + quality + drift + exact
 #
 #   tools/lab health                         is the live Sunshine healthy?
 #   tools/lab deploy <key>                   install, health-check, auto-rollback
