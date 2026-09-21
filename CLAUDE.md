@@ -256,10 +256,22 @@ H.264 is real and validated. **H.265/HEVC is no longer a stub** — it now has
 a real CABAC-coded encoder with GOP/P-frame prediction and zero-motion CU
 skip, wired into the VA-API backend (`VAProfileHEVCMain` advertised,
 config/rate-control attributes, CI decode-oracle test in
-`.github/workflows/build.yml`; DEVLOG §27–§28). It is still **not verified
-correct on generic content** — the last documented correctness pass found
-real, busy, multi-directional luma content still mismatches ffmpeg's decoder
-in ways not yet root-caused (`docs/hevc_scope_note.md`). Do not point real
-streaming clients at it, and read `docs/hevc_scope_note.md` in full before
-touching it further — it has the itemized bug list and the exact open
-failure mode.
+`.github/workflows/build.yml`; DEVLOG §27–§28).
+
+**2026-09-21: the systematic P-frame mismatch is root-caused, fixed, and
+board-validated.** It was the in-loop deblocking filter — the PPS signalled
+it enabled while neither encoder path modelled it, so the encoder's
+reference for frame N+1 was its own unfiltered reconstruction while the
+decoder's was filtered, and the two chains diverged further with every
+P-frame. Fixed by signalling deblocking off (matching what both paths
+actually do). Board result: CPU HEVC at `qsweep`'s default gop=120 went
+**24.93 → 44.56/44.59 dB** (DEVLOG §35). `tools/hevc_host_drift.sh`
+(38 cases, GPU-free) and the board's `lab gate`/`lab drift` are both
+byte-exact on this path now, with the decoder's real loop filter *on* —
+that is what proves the new PPS bits parse the way the encoder believes.
+
+**Still genuinely open, not overclaiming past this:** P-frame motion is
+zero-motion SKIP plus intra fallback only — no real motion compensation, no
+inter residual (backlog C7/C9's "still open" note). The GPU intra path is
+all-intra only. Read `docs/hevc_scope_note.md` and `docs/backlog.md`
+section C before extending either path further.

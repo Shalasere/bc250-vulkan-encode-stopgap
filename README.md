@@ -42,7 +42,7 @@ On moving 1440p content the encode ceiling is **67 fps, up 46% from 46 fps** (st
 
 ## Known Limitations
 
-- **H.265/HEVC Architecture & Streaming Advice**: HEVC Main profile encoding is fully functional via VA-API (`VAProfileHEVCMain` / `VAEntrypointEncSlice`) with periodic/forced IDR I-slices, inter-predicted P-slices, 5-candidate spatial merge skip, rate control (CQP/VBR/CBR), quality presets (1–7), max frame size limits, Vulkan compute motion estimation, and SSE2 SIMD acceleration. Because HEVC's 4x4 DST-VII/DCT-II transform and CABAC entropy coding currently execute on the host CPU rather than compute shaders, real-time 1080p60 encoding incurs higher CPU load than H.264. For low-latency real-time game streaming (Sunshine/Moonlight), H.264 remains strongly recommended.
+- **H.265/HEVC Architecture & Streaming Advice**: HEVC Main profile encoding is fully functional via VA-API (`VAProfileHEVCMain` / `VAEntrypointEncSlice`) with periodic/forced IDR I-slices, inter-predicted P-slices, 5-candidate spatial merge skip, rate control (CQP/VBR/CBR), quality presets (1–7), max frame size limits, Vulkan compute motion estimation, and SSE2 SIMD acceleration. Because HEVC's 4x4 DST-VII/DCT-II transform and CABAC entropy coding currently execute on the host CPU rather than compute shaders, real-time 1080p60 encoding incurs higher CPU load than H.264. For low-latency real-time game streaming (Sunshine/Moonlight), H.264 remains strongly recommended. **P-frame motion is still zero-motion SKIP plus intra fallback only** — no real motion compensation or inter residual yet — and the GPU intra path is all-intra only; neither is a real alternative to H.264 for streaming today. See `docs/backlog.md` items C7/C9 for the open work.
 - **Packed Headers Warning**: When encoding via FFmpeg (`h264_vaapi` or `hevc_vaapi`), FFmpeg logs `Driver does not support some wanted packed headers (wanted 0xd, found 0)`. This is a harmless informational warning: the driver directly generates and embeds its own authoritative in-band AUD, SPS, PPS, and Slice headers rather than relying on external application-provided headers. See [Troubleshooting](docs/troubleshooting.md#8-ffmpeg-warning-driver-does-not-support-some-wanted-packed-headers-wanted-0xd-found-0).
 - **Sunshine specifically** needs more than `LIBVA_DRIVER_NAME=bc250` — its binary's `cap_sys_admin` capability (needed for KMS capture) puts it in the kernel's secure-exec mode, where libva's `secure_getenv()`-based driver-name lookup can't see any environment variable at all, regardless of what's set. Run `sudo ./tools/install_vaapi_boot_redirect.sh` once (redirects the system `radeonsi` VA-API driver slot to this driver, persists across reboots). `docs/DEVLOG.md` §10.5/§10.6/§12.6.
 - **Display must not be asleep** when Sunshine initializes capture, or it reads the output as `0x0` and fails with *"Failed to initialize video capture/encoding"* (Moonlight Error 503) — including on a client launching an app hours after Sunshine started, since each launch re-initializes capture. Disable screen blanking on the host (on KDE: PowerDevil "Screen Energy Saving" off). This is the single most likely reason a working install appears broken. `docs/DEVLOG.md` §14.4.
@@ -235,11 +235,16 @@ ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload'
 # this fails with "No usable encoding profile found".
 export BC250_ENABLE_HEVC=1
 
-# ...CPU path (~5 fps at 1080p), correct but not real-time:
+# ...CPU path, correct but not real-time. Both quality and speed moved
+# since v0.3.x, board-measured at 2560x1440/gop=120: a deblocking-
+# signalling fix took quality from 24.93 -> 44.56 dB (it was compounding
+# unfiltered-reference drift across P-frames, not a tuning gap), and three
+# unrelated perf changes took throughput 13.32 -> 15.6 fps at that res:
 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc.mp4
 
-# ...GPU intra path (~92 fps at 1080p all-intra). All-intra only, and its
-# chroma is not yet bit-exact - see docs/hevc-gpu-intra.md before relying on it:
+# ...GPU intra path (~92 fps at 1080p all-intra). All-intra only. Byte-exact
+# against ffmpeg's decode on both luma and chroma at every QP tested - the
+# chroma-QP defect docs/hevc-gpu-intra.md used to warn about here is fixed:
 BC250_HEVC_GPU=1 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc_gpu.mp4
 ```
 

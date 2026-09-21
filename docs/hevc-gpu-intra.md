@@ -259,8 +259,15 @@ candidates, which trades quality directly and measurably.
 - The host `recon_*` buffers are not maintained on this path (nothing
   reads them when every frame is intra), so `BC250_HEVC_DEBUG_RECON`
   does not work here.
-- Like the CPU path, the reconstruction does not simulate deblocking
-  while the PPS leaves it enabled by default — see `write_pps()`.
+- ~~Like the CPU path, the reconstruction does not simulate deblocking
+  while the PPS leaves it enabled by default.~~ **Fixed 2026-09-21**:
+  `write_pps()` now signals `pps_deblocking_filter_disabled_flag=1`,
+  matching what neither path actually does. This was the mechanism
+  behind the CPU path's P-frame quality gap — unfiltered self-reference
+  diverging from the decoder's filtered one, compounding every frame —
+  and while this GPU path is all-intra and so was never exposed to that
+  compounding, it shared the same wrong PPS bit. See `docs/backlog.md`
+  C9 and DEVLOG §35 for the board-validated fix.
 
 One unexplained detail from the source tree, recorded rather than
 hidden: rethreading the chroma stages changed the synthetic bitstream by
