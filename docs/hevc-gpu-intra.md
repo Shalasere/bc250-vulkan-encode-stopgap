@@ -12,25 +12,57 @@ this path has *less* validation on this tree than the CPU one, not more.
 
 ## Validation status on this tree
 
-**Not yet measured on the board from this tree.** The numbers in
-"Results" below were measured on the `cavlc-residual-coding` branch,
-whose `hevc_intra.c` / `hevc_cabac.c` had diverged from `main`. The port
-onto `main` changed how the GPU path is wired, not the shader, but per
-this project's rules that makes those figures *provenance*, not evidence
-for this binary.
+Board-validated 2026-09-20. Summary: **luma is correct and bit-exact;
+chroma is not bit-exact and has a known root cause (below).**
 
-What **has** been verified on this tree, in WSL:
+| check | result |
+|---|---|
+| Decodes silently under ffmpeg | yes, every bitrate 1M–30M |
+| Picture vs source, 1080p all-intra @10M | **35.26 dB avg, 49.61 dB luma** (CPU path: 36.51 / 35.00) |
+| Encoder recon vs decoder, **luma** | **byte-identical**, full plane, 3/3 frames, md5 match |
+| Encoder recon vs decoder, **chroma** | **differs** — mean abs delta 5.7, max 16 |
+| Throughput, 1080p all-intra, 240 frames | 85.5 / 92.9 / 94.4 fps (CPU path 5.0; H.264 74–77) |
+| Noise floor | `p_wall` sd 3.63%, n=5 — nothing under ~7% is a result |
 
-- Builds clean, 17 translation units, `-Wall -Wextra`, zero warnings.
-- The CPU HEVC bitstream is **byte-identical** to `origin/main`
-  (`dfc6adfea4d87b539708d1fd1c936272`), as is the H.264 one
-  (`49ab863ae10eeb1c1b10bbcf7130fc8a`). The port is purely additive.
-- `ctest` 4/5, with `VaApiDriverTest` failing identically on pristine
-  `origin/main` (no Vulkan device in WSL).
+Two real bugs were found and fixed during that validation, both worth
+knowing about because neither was visible to a silent decode:
 
-Still outstanding: bit-exactness of the GPU reconstruction against a CPU
-recomputation, an ffmpeg decode oracle, and throughput — all of which
-need the board.
+- **`split_cu_flag` ctxInc.** Coded as `(col>0)+(row>0)`; 9.3.4.2.2 tests
+  whether the neighbour is *deeper*, which on this all-depth-0 path is
+  never, so ctxInc is always 0. Cost: a near-black picture at 5.0 dB that
+  decoded without a single decoder error.
+- **QP chosen after dispatch.** The shader quantized at the previous
+  frame's QP while the slice header signalled the new one. Tell: output
+  size was pinned near 520 KB from 1M to 8M.
+
+### Known-wrong: chroma QP
+
+The shader derives `per`/`rem` once from the **luma** QP and reuses them
+for chroma:
+
+```glsl
+int qp = int(pc.qp);
+int per = qp / 6, rem = qp - per * 6;
+...
+int dqc = (s_cblk[cpl][cidxn] * 16 * LEVELSCALE[rem]) << per;  /* chroma */
+```
+
+A conforming decoder derives QpC from QpY through Table 8-10
+(ChromaArrayType 1), which is the identity below qPi 30 and diverges by 1
+to 6 steps above it. So encoder and decoder agree on chroma at low QP and
+drift at high QP — measured as mean abs delta 5.7, max 16, with plane
+means matching to 0.3, i.e. the picture is right and the precision is
+not. Fixing it means applying Table 8-10 in the shader before computing
+the chroma `per`/`rem`.
+
+**This was not caught by the branch's "bit-exact" claim**, and the reason
+is worth keeping: that check compared the GPU reconstruction against a
+CPU *recomputation of the same algorithm*. Both sides shared the missing
+table, so they agreed with each other while both differing from the spec.
+The check here compares against ffmpeg with the in-loop filter disabled
+(`-skip_loop_filter all`; SAO is off in our SPS), which is an independent
+implementation and cannot fail that way. An exact oracle is only exact
+about what it compares.
 
 ## Why it is wired as a separate descriptor set
 

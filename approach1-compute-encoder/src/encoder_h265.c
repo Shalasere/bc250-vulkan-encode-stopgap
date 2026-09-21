@@ -1717,6 +1717,22 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
         int slot = gpu_compute_submitted_slot(gpu_ctx);
         gpu_compute_sync_slot(gpu_ctx, slot);
 
+        /* BC250_DUMP_RECON_FRAMES=1: the encoder's OWN reconstruction, as the
+         * shader left it. The drift oracle - decode the resulting bitstream
+         * with the loop filter disabled (ffmpeg -skip_loop_filter all; SAO is
+         * off in our SPS) and it must match this byte for byte, because a
+         * conforming decoder derives exactly the picture the encoder
+         * predicted from. Anything else means the bitstream does not describe
+         * what the encoder actually built, which is the failure mode a
+         * silent decode and a good PSNR can both miss.
+         *
+         * CODED dimensions, not display: recon_image is allocated at the
+         * padded size (1088 for 1080p), and the decoder's output is cropped
+         * by the SPS conformance window, so the comparison is against the
+         * top `height` rows of this dump. */
+        gpu_compute_debug_dump_recon(gpu_ctx, (int)encoder->coded_width,
+                                     (int)encoder->coded_height);
+
         if (rc == 0) {
             void *md = NULL, *cd = NULL, *bd = NULL;
             size_t ms = 0, cs = 0, bs_sz = 0;
