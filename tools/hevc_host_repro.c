@@ -39,7 +39,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 #include "encoder_h265.h"
+
+/* Wall-clock spent inside hevc_encoder_encode_raw(), and nothing else -
+ * not the synthetic pattern fill, not the bitstream fwrite, not process
+ * startup. Printed as the last line so this harness can drive an A/B of a
+ * CPU-path change when built through CMake at the shipped -O3/-march (see
+ * the hevc_host_repro target in approach1-compute-encoder/CMakeLists.txt;
+ * tools/hevc_host_drift.sh's hand-rolled -O2 build is for the correctness
+ * oracle, never for a number). */
+static double now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec / 1e6;
+}
 
 static void fill(uint8_t *y, uint8_t *uv, int w, int h, int pat, int frame) {
     for (int j = 0; j < h; j++)
@@ -105,6 +119,7 @@ int main(int argc, char **argv) {
         if (!fin) { perror("BC250_HOSTREPRO_INPUT"); return 1; }
     }
 
+    double encode_ms = 0.0;
     for (int k = 0; k < nf; k++) {
         if (fin) {
             size_t ysz = (size_t)w * h, uvsz = (size_t)w * (h / 2);
@@ -122,7 +137,9 @@ int main(int argc, char **argv) {
          * For gop > 1 the encoder's own frame_count % gop_size rule decides,
          * so frame 0 is the IDR and the rest are P. */
         if (gop == 1) hevc_encoder_set_force_idr(enc);
+        double t0 = now_ms();
         int n = hevc_encoder_encode_raw(enc, y, w, uv, w, bs, cap);
+        encode_ms += now_ms() - t0;
         if (n <= 0) { fprintf(stderr, "frame %d: encode returned %d\n", k, n); return 1; }
         fwrite(bs, 1, (size_t)n, f);
         printf("frame %d: %d bytes\n", k, n);
@@ -131,6 +148,7 @@ int main(int argc, char **argv) {
     if (fin) fclose(fin);
     printf("wrote %s.hevc (%dx%d qp=%d pattern=%d gop=%d frames=%d kbps=%d)\n",
            out, w, h, qp, pat, gop, nf, kbps);
+    printf("encode_ms_total %.3f\n", encode_ms);
     hevc_encoder_destroy(enc);
     return 0;
 }

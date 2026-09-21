@@ -50,12 +50,30 @@
 #            candidate is (0,0), every merge_idx selects the same vector,
 #            and a wrong merge list is indistinguishable from a right one.
 #            A real bug hid there: see derive_merge_candidates().
+#            HONEST STATUS: since the motion search was removed
+#            (docs/notes/dead-motion-search.md) nothing in the encoder
+#            reads the GPU MV, so these six cases are currently
+#            byte-identical to the same cases without it - that was
+#            measured, not assumed. They are kept as the regression guard
+#            for the day an MV consumer is reconnected; if the GPU MV path
+#            is ever removed, remove them with it.
 #   kbps:    0 (default) = constant QP. >0 = VBR rate control, so QP moves
 #            between frames - which is how the driver is actually driven
 #            (`lab qsweep` passes a bitrate, never a QP) and the only way
 #            to reach a non-zero slice_qp_delta on a P-frame.
 #
 # BC250_DRIFT_ONLY=intra|inter restricts the built-in list.
+#
+# BC250_DRIFT_BS_MD5=<absolute path> additionally records "<md5>  <label>"
+# for every emitted BITSTREAM. That is a different question from the one
+# this oracle answers: the diff below compares the encoder's reconstruction
+# against the decoder's, so it passes for ANY self-consistent bitstream and
+# is blind to a change that alters the bytes while staying decodable. Run it
+# before and after a change that is claimed to be output-neutral and diff the
+# two lists. Recording implies BC250_RC_NOMINAL_DRAIN=1, because the VBR
+# cases below otherwise drain their leaky bucket by real elapsed time and are
+# not byte-reproducible against themselves (docs/performance-measurement.md,
+# "a second, CPU-only way to lose byte-exactness").
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,6 +82,13 @@ WORK="${1:-/tmp/bc250_host_drift}"
 rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
 
 command -v ffmpeg >/dev/null || { echo "ffmpeg required"; exit 2; }
+
+BS_MD5="${BC250_DRIFT_BS_MD5:-}"
+if [ -n "$BS_MD5" ]; then
+    case "$BS_MD5" in /*) ;; *) echo "BC250_DRIFT_BS_MD5 must be an absolute path"; exit 2 ;; esac
+    export BC250_RC_NOMINAL_DRAIN=1
+    : > "$BS_MD5"
+fi
 
 echo "building host repro..."
 gcc -std=c11 -O2 -D_GNU_SOURCE -I"$SRC" -o hostrepro "$REPO/tools/hevc_host_repro.c" \
@@ -160,6 +185,7 @@ for c in "${LIST[@]}"; do
     BC250_HEVC_DEBUG_RECON=1 ${fakemv[@]+"${fakemv[@]}"} \
         ./hostrepro "$w" "$h" "$qp" "$nf" "$lbl" "$pat" "$gop" "$kbps" >/dev/null 2>&1 \
         || { echo "  $lbl: ENCODE FAILED"; fail=1; continue; }
+    [ -n "$BS_MD5" ] && md5sum "$lbl".hevc | sed "s|$lbl.hevc|$lbl|" >> "$BS_MD5"
     # No -skip_loop_filter: the PPS now disables deblocking outright (see
     # write_pps), so this is the real decode path, not a filtered-off one.
     ffmpeg -v error -y -i "$lbl".hevc \
