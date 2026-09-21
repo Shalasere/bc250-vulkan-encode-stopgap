@@ -185,6 +185,33 @@ const int INVANG[15] = int[15](
     -4096, -1638, -910, -630, -482, -390, -315, -256, -315, -390,
      -482,  -630, -910, -1638, -4096 );
 const int LEVELSCALE[6] = int[6]( 40, 45, 51, 57, 64, 72 );
+
+/* Rec. ITU-T H.265 Table 8-10, the qPi -> QpC mapping for
+ * ChromaArrayType == 1 (4:2:0). Chroma is NOT quantized at the luma QP:
+ * the mapping is the identity below 30, compresses the 30..43 range, and
+ * becomes qPi - 6 above it.
+ *
+ * Getting this wrong is invisible below QP 30 and drifts by 1 to 6 QP
+ * steps above it, which is why it survived a "bit-exact" check that
+ * compared this shader against a CPU recomputation carrying the same
+ * omission - both agreed with each other and both differed from a real
+ * decoder. Measured before the fix: chroma mean absolute delta 5.7 with
+ * a max of 16 against ffmpeg, while luma was byte-identical. See
+ * docs/hevc-gpu-intra.md. */
+const int QPC_30_43[14] = int[14]( 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37 );
+
+int chroma_qp_from_luma(int qpy) {
+    /* qPiCb = Clip3(-QpBdOffsetC, 57, QpY + pps_cb_qp_offset +
+     * slice_cb_qp_offset). Both offsets are 0 in our PPS
+     * (pps_cb_qp_offset/pps_cr_qp_offset are written as 0 and
+     * pps_slice_chroma_qp_offsets_present_flag is 0), and QpBdOffsetC is 0
+     * at 8-bit, so qPi is just QpY clamped - and QpY is already 1..51.
+     * Cb and Cr therefore share one value. */
+    int qpi = clamp(qpy, 0, 57);
+    if (qpi < 30) return qpi;
+    if (qpi > 43) return qpi - 6;
+    return QPC_30_43[qpi - 30];
+}
 /* Table 8-2's intra_chroma_pred_mode candidate list. */
 const int CHROMA_CAND[4] = int[4]( 0, 26, 10, 1 );
 
@@ -648,7 +675,12 @@ void main() {
 
     int cshift1 = LOG2NC + 8 - 9, cshift2 = LOG2NC + 6;
     int cbdshift = 8 + LOG2NC - 5;
-    int cdenom = (LEVELSCALE[rem] * 16) << per;
+    /* Chroma quantizes at QpC, not QpY - see chroma_qp_from_luma(). Using
+     * the luma per/rem here (as this did) matches a decoder only below
+     * QP 30. */
+    int cqp = chroma_qp_from_luma(qp);
+    int cper = cqp / 6, crem = cqp - cper * 6;
+    int cdenom = (LEVELSCALE[crem] * 16) << cper;
 
     /* One thread per chroma coefficient, both planes at once - the plain
      * matrix product across 128 threads rather than a per-line butterfly
@@ -696,7 +728,7 @@ void main() {
 
     /* dequantize + inverse transform */
     if (c2thread) {
-        int dqc = (s_cblk[cpl][cidxn] * 16 * LEVELSCALE[rem]) << per;
+        int dqc = (s_cblk[cpl][cidxn] * 16 * LEVELSCALE[crem]) << cper;
         s_ctmp[cpl][cidxn] = clamp((dqc + (1 << (cbdshift - 1))) >> cbdshift, -32768, 32767);
     }
     barrier();
