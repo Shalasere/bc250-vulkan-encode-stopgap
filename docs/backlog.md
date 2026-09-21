@@ -62,6 +62,15 @@ derivation, scan order selection, the `cbf` packing, reference
 substitution. Inspection only — the shader cannot run off-board — so
 produce a list of *claims to test*, not conclusions.
 
+**First pass done: `docs/hevc-shader-audit.md`.** No confirmed defect;
+9 ranked claims with a `lab drift` experiment each, plus a list of what
+was checked against the spec and agrees (don't re-derive it). The two
+structural findings are that most of the shader has no second
+implementation in this tree, and that the forward transform, quantiser
+and mode search are invisible to *every* oracle here. The items still
+need running on the board — start with the mode histogram plus
+`drift --content=testsrc2`.
+
 **A4. `hevc_cabac_code_residual_4x4` (~5.9% of profile).** Entropy coding
 of the CPU path.
 
