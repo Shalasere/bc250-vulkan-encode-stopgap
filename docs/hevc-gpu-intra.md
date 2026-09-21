@@ -12,15 +12,15 @@ this path has *less* validation on this tree than the CPU one, not more.
 
 ## Validation status on this tree
 
-Board-validated 2026-09-20. Summary: **luma is correct and bit-exact;
-chroma is not bit-exact and has a known root cause (below).**
+Board-validated 2026-09-20. Summary: **bit-exact against an independent
+decoder on both planes, at every QP tested.**
 
 | check | result |
 |---|---|
 | Decodes silently under ffmpeg | yes, every bitrate 1M–30M |
 | Picture vs source, 1080p all-intra @10M | 35.26 dB avg, 49.61 dB luma (CPU path: 36.51 / 35.00) — **indicative only, see note** |
 | Encoder recon vs decoder, **luma** | **byte-identical**, full plane, 3/3 frames, md5 match |
-| Encoder recon vs decoder, **chroma** | **differs** — mean abs delta 5.7, max 16 |
+| Encoder recon vs decoder, **chroma** | **byte-identical** after the Table 8-10 fix (`f6876cc`); verified at CQP 4, 30, 51 |
 | Throughput, 1080p all-intra, 240 frames | 85.5 / 92.9 / 94.4 fps (CPU path 5.0; H.264 74–77) |
 | Noise floor | `p_wall` sd 3.63%, n=5 — nothing under ~7% is a result |
 
@@ -38,7 +38,7 @@ the ad-hoc numbers. Until someone runs that on the board, the byte-exact
 `lab drift` result is the authoritative correctness statement here, not
 the PSNR.
 
-Two real bugs were found and fixed during that validation, both worth
+Three real bugs were found and fixed during that validation, all worth
 knowing about because neither was visible to a silent decode:
 
 - **`split_cu_flag` ctxInc.** Coded as `(col>0)+(row>0)`; 9.3.4.2.2 tests
@@ -49,10 +49,10 @@ knowing about because neither was visible to a silent decode:
   frame's QP while the slice header signalled the new one. Tell: output
   size was pinned near 520 KB from 1M to 8M.
 
-### Known-wrong: chroma QP
+### Third bug: chroma QP — found and FIXED (`f6876cc`)
 
-The shader derives `per`/`rem` once from the **luma** QP and reuses them
-for chroma:
+The shader derived `per`/`rem` once from the **luma** QP and reused them
+for chroma quantization and dequantization:
 
 ```glsl
 int qp = int(pc.qp);
@@ -63,11 +63,16 @@ int dqc = (s_cblk[cpl][cidxn] * 16 * LEVELSCALE[rem]) << per;  /* chroma */
 
 A conforming decoder derives QpC from QpY through Table 8-10
 (ChromaArrayType 1), which is the identity below qPi 30 and diverges by 1
-to 6 steps above it. So encoder and decoder agree on chroma at low QP and
-drift at high QP — measured as mean abs delta 5.7, max 16, with plane
-means matching to 0.3, i.e. the picture is right and the precision is
-not. Fixing it means applying Table 8-10 in the shader before computing
-the chroma `per`/`rem`.
+to 6 steps above it — so encoder and decoder agreed at low QP and drifted
+at high QP. Measured before the fix: mean abs delta 5.7, max 16, with
+plane means matching to 0.3, i.e. the picture was right and the precision
+was not. Now `chroma_qp_from_luma()` applies the table before computing
+the chroma `per`/`rem`, and chroma is byte-identical at CQP 4, 30 and 51.
+
+**The CPU HEVC path had the identical defect** and was fixed the same way
+in `317bb3f` (`hevc_chroma_qp_from_luma()` in `hevc_intra.c`). Its error
+switched on at exactly QP 30 — the table's boundary — which is what
+identified it.
 
 **This was not caught by the branch's "bit-exact" claim**, and the reason
 is worth keeping: that check compared the GPU reconstruction against a
