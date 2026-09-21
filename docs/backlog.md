@@ -106,13 +106,27 @@ termination may cut it, but it changes mode decisions unless done
 carefully — if output changes, this becomes a compression change and
 needs BD-rate on the board, not a byte comparison.
 
-**A6. Port the compression work from `cavlc-residual-coding`.** Undivided
-16x16 CUs (measured -34.8% BD-rate there), all-TU-size transforms, the
-full 33 angular modes. Correctness is verifiable off-board with
-`hevc_host_drift.sh`; the BD-rate claim is not. Large, and it collides
-with main's own `hevc_intra.c`, so it is a port not a merge — the two
-trees implemented HEVC independently (58 conflicts, add/add on every
-core HEVC source).
+**A6. PIECE (1) DONE (2026-09-21) — angular modes ported and RD-biased.
+Pieces (2)/(3) still open.** All 35 HEVC intra modes now searched (was
+4), sourced from the GPU shader's already board-verified angular
+formula rather than transcribed from `cavlc-residual-coding`. Byte-exact
+(`HOST DRIFT PASS`, 53 cases). Shipped in two passes because the first
+one shipped a real, measured RD regression — SAD-only search never
+charged a non-MPM mode for the extra bits it costs to signal, so 2 of 5
+sampled points came back smaller *and* worse. Second pass biases the
+search against the *exact* signalling bit-cost (read off the CABAC
+binarization, not estimated) with a QP-dependent lambda; the two
+regressive points improved substantially on both axes but were **not
+eliminated**, and 3 of 5 flipped to genuine Pareto improvements.
+
+**Do not treat this as a validated compression win.** `k=0.15` (the
+lambda scale) is tuned on synthetic content only, a single-QP byte/PSNR
+pair is not a BD-rate curve, and the original `-34.8%` figure almost
+certainly reflects pieces (2)/(3) together, not this piece alone. Needs
+a board `lab qsweep` BD-rate run before any number here is trusted.
+Full writeup, including exactly what (2) undivided-CU splitting and (3)
+all-TU-size transforms would need (a concrete starting point, read from
+`cavlc-residual-coding`): `docs/notes/a6-cavlc-residual-port.md`.
 
 ---
 
