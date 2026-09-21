@@ -125,16 +125,19 @@ static inline int zorder_available(int nx, int ny, int width, int height, int is
 }
 
 /* Gathers left[0..4] (p[-1][0..4]), top[0..4] (p[0..4][-1]) and the corner
- * (p[-1][-1]), applying the spec's neighbor-substitution scan. Bottom-left
- * (p[-1][5..7], not needed since this encoder only supports Planar/DC/H/V,
- * none of which read past left[4]/top[4]) and positions beyond top[4] are
- * never referenced, so the scan below only covers what those four modes
- * actually need. "Below" and "below-left" are always z-scan-unavailable
- * in this encoder's coding order (nothing below the current row, at any
- * CTU/CU/PU nesting level, is ever decoded first), so those still don't
- * need a rank check - only left/top/corner/top-right do, since those CAN
- * be positionally-plausible but z-scan-unavailable (see zorder_rank()'s
- * comment above). */
+ * (p[-1][-1]), applying the spec's neighbor-substitution scan. Positions
+ * past p[-1][4] and p[4][-1] are never referenced - this encoder emits
+ * only Planar, DC, Horizontal and Vertical, and none of them reads
+ * further - so the scan below covers exactly what those four modes need.
+ *
+ * NOTE: an earlier version of this comment claimed "below and below-left
+ * are always z-scan-unavailable in this encoder's coding order" and the
+ * code hardcoded left[4] = left[3] on the strength of it. That was wrong
+ * and it was a real decoder-visible bug; p[-1][4] gets a genuine
+ * availability test below, and the reasoning is in the comment on it.
+ * Every one of left/top/corner/top-right/below-left needs a rank check,
+ * because each can be positionally plausible while genuinely undecoded
+ * (see zorder_rank()'s comment above). */
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
                               int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner) {
     int cur_rank = zorder_rank(x0, y0, width, is_luma);
