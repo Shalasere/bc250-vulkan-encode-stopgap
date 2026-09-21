@@ -69,9 +69,35 @@
  * =====================================================================
  * Every CTU is one undivided 16x16 CU: one intra mode, one 16x16 luma
  * transform, one 8x8 Cb and Cr. That is a legal configuration the CPU
- * encoder already emits for flat CTUs, and both luma and chroma are
- * verified bit-exact against the CPU. Split CUs, mode refinement and
+ * encoder already emits for flat CTUs. Split CUs, mode refinement and
  * the MPM rate term are not implemented here yet.
+ *
+ * WHAT IS ACTUALLY VERIFIED, and what is not. This comment used to say
+ * "both luma and chroma are verified bit-exact against the CPU", which
+ * overstated it twice over:
+ *
+ *   - The CPU encoder in src/hevc_intra.c is 4x4-TU, four-mode
+ *     (Planar/DC/Hor/Ver), bdShift 5, and never reads past p[-1][nTbS].
+ *     It therefore has NO counterpart for this shader's angular branch,
+ *     its 8.4.4.2.3 smoothing, refset_for(), the 2*nTbS reference
+ *     extent, or the 16x16/8x8 transforms. Most of this file has no
+ *     second implementation in the tree to be bit-exact against.
+ *   - Agreeing with the CPU is weak evidence anyway. The chroma QP
+ *     defect fixed in f6876cc/317bb3f was present in BOTH, so the two
+ *     agreed with each other while both differed from Table 8-10.
+ *
+ * What IS verified is stronger but narrower: `tools/lab drift` compares
+ * this path's reconstruction against ffmpeg's decode of its own
+ * bitstream, byte for byte, and passes on both planes at QP 4/27/51.
+ * That is an independent implementation, so it cannot fail the way the
+ * CPU cross-check did.
+ *
+ * It is also structurally blind to half of this shader. drift compares
+ * RECONSTRUCTIONS, so it exercises prediction, dequant, inverse
+ * transform and the reconstruction clip - and says nothing about the
+ * forward transform, the quantiser, or the mode search. A defect there
+ * would not be caught by anything currently run. See
+ * docs/hevc-shader-audit.md.
  *
  * =====================================================================
  * THREADING: ONE THREAD PER COEFFICIENT, NOT PER LINE
