@@ -88,21 +88,20 @@ core HEVC source).
 fixed test-side via the existing `BC250_RC_NOMINAL_DRAIN=1` hook, production
 rate control untouched. The difference was ONE byte in 350,979.
 
-**B2. DONE — with a caveat that needs the board.** `bs_rbsp_to_ebsp` is
-3.9x faster in situ and byte-identical, but **end-to-end it measured
-zero** (median -0.64%, inside a 5.9% sd). It was kept anyway because the
-function moved from compute-bound to memory-bound and that share is
-unmeasured on the board's slower CPU, and because reverting would make
-the new differential fuzz test vacuous. **If C2's board run also shows
-zero, revert it** — 111 lines of pointer arithmetic in the bitstream
-writer is not worth 0%.
+**B2. REVERTED on board evidence, as the trigger required.**
+`bs_rbsp_to_ebsp` was 3.9x faster in situ and byte-identical, but zero
+end-to-end on the dev machine and **+0.9% on the board** (9.78 -> 9.87
+fps, n=4 each, overlapping ranges, 2.3% run-to-run spread). Not a
+result, so the 111 lines of pointer arithmetic went. The differential
+fuzz test it brought was **kept** — its `ebsp_reference` oracle now
+guards the simple byte loop against any future rewrite, and it checks
+every destination capacity from 0 past worst-case expansion.
 
 Also: the 5.9% figure that motivated this task was wrong. gprof's
 resolution here is a single 10 ms bucket out of ~0.6 s, so one sample
 lands as ~1.7% and a shorter run inflates the same bucket to 5.9%.
 Direct instrumentation put the function at 0.93%. **Do not size a task
-off a sub-2% gprof number on this codebase** — instrument the function
-directly first.
+off a sub-2% gprof number on this codebase** — instrument directly first.
 
 **B3. DONE.** `lab qsweep --codec=h264|hevc`. `scoreboard` deliberately
 NOT extended - its reference is libx264, so an HEVC scoreboard would score
