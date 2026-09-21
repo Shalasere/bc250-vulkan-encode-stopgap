@@ -50,7 +50,13 @@
 #                                            vs libx264, per load condition
 #                                            (--content, --res, --frames,
 #                                             --repeat, --quality)
-#   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + exact
+#   ./bc250_lab.sh drift <key> [opts]        encoder reconstruction vs a REAL
+#                                            decoder, byte-exact - the only
+#                                            oracle here that shares none of
+#                                            our own code (--codec, --res,
+#                                            --frames, --bitrate, --env)
+#   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + drift
+#                                            + exact
 #   ./bc250_lab.sh health                    is the live Sunshine healthy?
 #   ./bc250_lab.sh deploy <key>              install + health-check + rollback
 #   ./bc250_lab.sh rollback                  restore the previous driver
@@ -860,12 +866,159 @@ qsweep() {
     note "logs kept at: $d (*.log per run, for anything the summary doesn't show)"
 }
 
+# ---------------------------------------------------------------------------
+# DRIFT - does a real decoder reproduce the encoder's own reconstruction?
+#
+# The strongest correctness oracle here, and the only one that cannot be
+# fooled by a shared misreading of the spec. PSNR against the source says
+# the picture is plausible; byte-exactness against a previous build says
+# nothing changed; comparing the GPU path against our own CPU path says
+# only that our two implementations agree. This compares the encoder's
+# reconstruction against FFMPEG'S, which shares none of our code.
+#
+# That distinction is not theoretical. The GPU path's chroma was quantized
+# at QpY instead of QpC for its entire life, and a "bit-exact" check that
+# compared it against a CPU recomputation carrying the same omission
+# passed the whole time. This check failed it immediately.
+#
+# The in-loop filter is disabled on the decode side (-skip_loop_filter
+# all) because neither encoder simulates deblocking while the PPS leaves
+# it enabled; SAO is already off in our SPS. Without that flag the
+# comparison is guaranteed to differ and tells you nothing.
+#
+# Found, in two days: a near-black picture at 5 dB (split_cu_flag ctxInc),
+# a QP-before-dispatch ordering bug, the chroma QP defect above, and a
+# ~33 dB luma divergence in the CPU HEVC path that is still open.
+# ---------------------------------------------------------------------------
+drift() {
+    local key="${1:?drift <key> [opts]}"; shift
+    local res=1920x1080 frames=3 codec=hevc envs="" bitrate=10M content=testsrc
+    for a in "$@"; do
+        case "$a" in
+            --res=*)     res="${a#*=}";;
+            --frames=*)  frames="${a#*=}";;
+            --codec=*)   codec="${a#*=}";;
+            --bitrate=*) bitrate="${a#*=}";;
+            --content=*) content="${a#*=}";;
+            --env=*)     envs="${a#*=}";;
+            *) die "drift: unknown option '$a'";;
+        esac
+    done
+    case "$codec" in h264|hevc) ;; *) die "drift: --codec must be h264 or hevc";; esac
+
+    local bd; bd=$(art_dir "$key")
+    [ -f "$bd/bc250_drv_video.so" ] || die "drift: no driver in $bd (run build first)"
+    local w="${res%x*}" h="${res#*x}"
+    local cw=$(( (w + 15) / 16 * 16 )) ch=$(( (h + 15) / 16 * 16 ))
+    local venc=h264_vaapi fmt=h264
+    [ "$codec" = hevc ] && { venc=hevc_vaapi; fmt=hevc; }
+
+    local d; d="$RUNS/drift-$(date +%Y%m%d-%H%M%S)-$key-$codec-$res"
+    rm -rf "$d"; mkdir -p "$d/dump"
+
+    local -a envv=(BC250_DUMP_RECON_FRAMES=1 "BC250_DUMP_DIR=$d/dump" BC250_HEVC_DEBUG_RECON=1)
+    [ "$codec" = hevc ] && envv+=(BC250_ENABLE_HEVC=1)
+    if [ -n "$envs" ]; then
+        local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
+    fi
+
+    ( cd "$d" && env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
+        BC250_SHADER_DIR="$bd" "${envv[@]}" \
+        ffmpeg -v error -y -f lavfi -i "${content}=size=${res}:rate=60" \
+        -frames:v "$frames" -g 1 -vaapi_device "$RENDER" \
+        -vf 'format=nv12,hwupload' -c:v "$venc" -b:v "$bitrate" \
+        -f "$fmt" "stream.$fmt" > enc.log 2>&1 )
+    local erc=$?
+    if [ $erc -ne 0 ] || [ ! -s "$d/stream.$fmt" ]; then
+        echo "drift: ENCODE FAILED (rc=$erc)"; tail -5 "$d/enc.log" 2>/dev/null; return 1
+    fi
+
+    ffmpeg -v error -y -skip_loop_filter all -i "$d/stream.$fmt" \
+           -f rawvideo -pix_fmt nv12 "$d/dec.nv12" 2>/dev/null
+    [ -s "$d/dec.nv12" ] || { echo "drift: DECODE produced nothing"; return 1; }
+
+    BC250_DRIFT_DIR="$d" BC250_DRIFT_W="$w" BC250_DRIFT_H="$h" \
+    BC250_DRIFT_CW="$cw" BC250_DRIFT_CH="$ch" python3 - <<'PY'
+import os, glob, sys
+d  = os.environ["BC250_DRIFT_DIR"]
+W  = int(os.environ["BC250_DRIFT_W"]);  H  = int(os.environ["BC250_DRIFT_H"])
+CW = int(os.environ["BC250_DRIFT_CW"]); CH = int(os.environ["BC250_DRIFT_CH"])
+DEC = W*H*3//2
+
+dec = open(os.path.join(d, "dec.nv12"), "rb").read()
+
+# Two dump shapes exist. The GPU/H.264 paths write NV12 per frame via
+# gpu_compute_debug_dump_recon(); the CPU HEVC path appends planar I420 via
+# BC250_HEVC_DEBUG_RECON. Detect rather than assume.
+nv12 = sorted(glob.glob(os.path.join(d, "dump", "recon_*.nv12")))
+i420 = os.path.join(d, "bc250_hevc_debug_recon_i420.raw")
+frames = []
+if nv12:
+    for p in nv12:
+        b = open(p, "rb").read()
+        frames.append(("nv12", b))
+elif os.path.exists(i420):
+    b = open(i420, "rb").read()
+    fs = CW*CH*3//2
+    for i in range(len(b)//fs):
+        frames.append(("i420", b[i*fs:(i+1)*fs]))
+if not frames:
+    print("  drift: NO RECON DUMP - is this build instrumented?"); sys.exit(1)
+
+def chroma_planes(kind, rec):
+    """Return (cb, cr, pitch) for the recon dump, de-interleaving NV12."""
+    off = CW*CH
+    if kind == "nv12":
+        uv = rec[off:off + CW*(CH//2)]
+        return uv[0::2], uv[1::2], CW//2
+    half = (CW//2)*(CH//2)
+    return rec[off:off+half], rec[off+half:off+2*half], CW//2
+
+bad = 0
+n = min(len(frames), len(dec)//DEC)
+for f in range(n):
+    kind, rec = frames[f]
+    db = dec[f*DEC:(f+1)*DEC]
+    dy, duv = db[:W*H], db[W*H:]
+    dcb, dcr = duv[0::2], duv[1::2]
+    ry = rec[:CW*CH]
+    rcb, rcr, rp = chroma_planes(kind, rec)
+
+    ld = sum(1 for y in range(H) for i in range(W) if ry[y*CW+i] != dy[y*W+i])
+    cw2, ch2 = W//2, H//2
+    def cmpc(r, dpl):
+        nd = mx = 0; s = 0
+        for y in range(ch2):
+            for i in range(cw2):
+                v = abs(r[y*rp+i] - dpl[y*cw2+i])
+                if v: nd += 1
+                s += v
+                if v > mx: mx = v
+        return nd, s/(cw2*ch2), mx
+    nb, mb, xb = cmpc(rcb, dcb)
+    nr, mr, xr = cmpc(rcr, dcr)
+    ok = (ld == 0 and nb == 0 and nr == 0)
+    if not ok: bad += 1
+    print("  frame %d  %-4s  luma %s | Cb %d differ (mean %.2f max %d) | Cr %d differ (mean %.2f max %d)"
+          % (f, "OK" if ok else "DRIFT",
+             "exact" if ld == 0 else "%d/%d differ" % (ld, W*H),
+             nb, mb, xb, nr, mr, xr))
+print("  DRIFT %s (%d/%d frames exact)" % ("PASS" if bad == 0 else "FAIL", n-bad, n))
+sys.exit(1 if bad else 0)
+PY
+    local prc=$?
+    note "artifacts: $d"
+    return $prc
+}
+
 gate() {
     local key="${1:?gate <key> [<baselineKey>]}" base="${2:-}"
     local rc=0
     echo "=== units ==="   ; units "$key"   || rc=1
     echo "=== audit ==="   ; audit "$key"   || rc=1
     echo "=== quality ===" ; quality "$key" || rc=1
+    echo "=== drift (HEVC GPU: recon vs decoder) ==="
+    drift "$key" --codec=hevc --env=BC250_HEVC_GPU=1 || rc=1
     if [ -n "$base" ]; then
         echo "=== byte-exactness vs $base ==="; exact "$base" "$key" || rc=1
     else
@@ -964,6 +1117,7 @@ case "$cmd" in
     units)    units "$@";;
     quality)  quality "$@";;
     qsweep)   qsweep "$@";;
+    drift)    drift "$@";;
     gate)     gate "$@";;
     scoreboard) scoreboard "$@";;
     health)   health "$@";;

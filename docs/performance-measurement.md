@@ -21,7 +21,8 @@ tools/lab build work                  # or: build local:<unpushed-ref>  -> print
 tools/lab noise <key> --repeat=5      # establish the floor BEFORE measuring
 tools/lab compare <keyA> <keyB>       # significance-tested A/B
 tools/lab scoreboard <key>            # the headline: vs libx264, per load condition
-tools/lab gate <key> [<baseKey>]      # units + mask audit + PSNR + byte-exactness
+tools/lab drift <key>                 # correctness: recon vs a REAL decoder
+tools/lab gate <key> [<baseKey>]      # units + audit + PSNR + drift + byte-exactness
 tools/lab deploy <key>                # health-checked, auto-rollback
 ```
 
@@ -99,6 +100,21 @@ forced `-f rawvideo -s WxH -r N` framing. `lab qsweep` and `scoreboard
 per-block nonzero mask was silently wrong on every I-frame because
 `intra_wavefront.comp` bypasses `quantize.comp`. `BC250_NZ_AUDIT=1`
 recomputes it on the CPU and caught it (§19.4); `lab audit` runs it.
+
+**Correctness needs an oracle that does not share our code.** PSNR
+against the source says the picture is plausible. Byte-exactness against
+a previous build says nothing changed. Comparing the GPU path against
+our own CPU path says only that our two implementations agree — and they
+can agree while both are wrong, which is exactly what happened: the GPU
+chroma was quantized at QpY instead of QpC for its whole life, and a
+"bit-exact" check against a CPU recomputation carrying the same omission
+passed the entire time. `lab drift` compares the encoder's own
+reconstruction against **ffmpeg's**, with the in-loop filter disabled
+(`-skip_loop_filter all`; SAO is off in our SPS). In two days it found a
+near-black picture at 5 dB, a QP-ordering bug, the chroma QP defect, and
+a ~33 dB luma divergence in the CPU HEVC path that is still open. Run it
+on anything that touches prediction, transform, quantization or entropy
+coding.
 
 And one that no harness can enforce for you: **an exact oracle is only
 exact about what it compares.** The mask audit reported EXACT across 401
