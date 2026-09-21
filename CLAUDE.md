@@ -85,6 +85,16 @@ that never happened — all three commands ended in `&>/dev/null`.
 DEVLOG and `hevc_scope_note.md` cite it as the provenance of published
 numbers. Don't measure with it.
 
+The one sanctioned exception to "extend the harness" is
+**`tools/cavlc_bench.c`** — H.264 CAVLC is ~57% of the shipping path's
+frame time and `tools/lab` cannot reach it without a board, because
+`h264_encoder_encode_raw()` codes no residual. It is a real CMake target
+(so it gets the shipped `-O3`/`-march`, not a hand-rolled `-O2` line), its
+`verify` mode runs in ctest, and it carries its own A/A self-test and two
+independent oracles. Read `docs/performance-measurement.md`'s "Measuring
+H.264 CAVLC without a board" before using or changing it; DEVLOG §33 has
+the profile it produced and the optimisation that measured zero.
+
 ## Hard-won rules
 
 - **Byte-exactness is only a valid oracle on `testsrc`, and only all-intra

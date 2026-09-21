@@ -10,6 +10,55 @@
 #include <stdlib.h>
 #include <string.h>
 
+/*
+ * CAVLC_STAGE(stage, body...) - see cavlc.h's "Off-board profiling hooks"
+ * comment. In the shipped driver CAVLC_PROFILE is undefined and this expands
+ * to `do { body } while (0)`, i.e. the body verbatim with no added branch,
+ * no added state and no added call. Only tools/cavlc_bench.c's profile build
+ * sees the instrumented form.
+ */
+#ifdef CAVLC_PROFILE
+unsigned cavlc_ablate_mask = 0;
+int cavlc_count_enable = 0;
+unsigned long long cavlc_stage_bits[CAVLC_S_COUNT];
+unsigned long long cavlc_stage_calls[CAVLC_S_COUNT];
+unsigned long long cavlc_blocks_total[3];
+unsigned long long cavlc_blocks_zero[3];
+
+void cavlc_prof_reset(void) {
+    memset(cavlc_stage_bits, 0, sizeof(cavlc_stage_bits));
+    memset(cavlc_stage_calls, 0, sizeof(cavlc_stage_calls));
+    memset(cavlc_blocks_total, 0, sizeof(cavlc_blocks_total));
+    memset(cavlc_blocks_zero, 0, sizeof(cavlc_blocks_zero));
+}
+
+static inline unsigned long long cavlc_prof_bitpos(const bitstream_t *bs) {
+    return (unsigned long long)bs->byte_offset * 8u + (unsigned long long)bs->bit_offset;
+}
+
+#define CAVLC_STAGE(stage, ...)                                            \
+    do {                                                                   \
+        if (!(cavlc_ablate_mask & (1u << (stage)))) {                      \
+            unsigned long long cavlc__p0 = cavlc_prof_bitpos(bs);          \
+            { __VA_ARGS__ }                                                \
+            if (cavlc_count_enable) {                                      \
+                cavlc_stage_bits[stage] += cavlc_prof_bitpos(bs) - cavlc__p0; \
+                cavlc_stage_calls[stage]++;                                \
+            }                                                              \
+        }                                                                  \
+    } while (0)
+#define CAVLC_BLOCK_TALLY(kind, is_zero)                                   \
+    do {                                                                   \
+        if (cavlc_count_enable) {                                          \
+            cavlc_blocks_total[kind]++;                                    \
+            if (is_zero) cavlc_blocks_zero[kind]++;                        \
+        }                                                                  \
+    } while (0)
+#else
+#define CAVLC_STAGE(stage, ...) do { __VA_ARGS__ } while (0)
+#define CAVLC_BLOCK_TALLY(kind, is_zero) do { } while (0)
+#endif
+
 static inline void bs_write_bit(bitstream_t *bs, uint32_t val) {
     bs_write1(bs, val);
 }
@@ -50,6 +99,44 @@ static inline void bs_write_zeros(bitstream_t *bs, int count) {
     if (count > 0) bs_write_u(bs, count, 0);
 }
 
+/*
+ * MEASURED AND REJECTED: an all-zero-block fast path here (2026-09-21).
+ *
+ * About half the 4x4 blocks that reach CAVLC are entirely zero -
+ * `cavlc_bench stats` says 48% on its `typical` density profile, 25% on
+ * `busy` - because as soon as ONE luma AC block in an I16x16 macroblock is
+ * nonzero the encoder codes all sixteen, most of which are not. Each of
+ * those costs a full 16-entry zigzag-indirected gather into an int[16]
+ * scratch array plus a backwards scan of it, purely to conclude
+ * `last_idx == -1` and write a 1-to-6-bit token. Short-circuiting that
+ * with a whole-block zero test is the obvious idea, and it is
+ * byte-identical by construction.
+ *
+ * It does not pay, at -O3 -march=znver2, on any density profile. Two forms
+ * were measured with tools/cavlc_bench.c (in-process interleaved A/B,
+ * order alternating, 13 samples a side, against an A/A control run in the
+ * same session):
+ *
+ *   - 16-element `acc |= c[i]` OR-reduction: 2-7% SLOWER. GCC vectorises
+ *     it, but into three 8-byte loads plus a four-vpshufb horizontal
+ *     reduction, which costs more on the 52% of blocks that are NOT zero
+ *     than it saves on the 48% that are.
+ *   - four 64-bit loads ORed together (6 instructions, no shuffles):
+ *     0.990x best / 0.990x median on `typical`, 1.000x on `busy`,
+ *     0.99x on `quiet` - against an A/A control of 0.995-1.011x in the
+ *     same session. That is inside the rig's own noise, and far inside
+ *     this project's "no delta under ~2.5% of wall time is a result" rule
+ *     (docs/performance-measurement.md).
+ *
+ * The reason is visible in the generated code: -O3 already vectorises the
+ * zigzag gather itself, so the gather a zero block "wastes" is perhaps 20
+ * cycles, and any test cheap enough to run on every block cannot save much
+ * more than it costs across the whole mix. Do not re-add this without a
+ * BOARD measurement showing otherwise - Zen 2 at the BC-250's clocks and
+ * cache sizes could plausibly shift the balance, and that is the only
+ * thing that would make it worth the branch. See docs/backlog.md A2.
+ */
+
 /* H.264 Zigzag scan order for 4x4 block */
 static const int zigzag_4x4[16] = {
      0,  1,  4,  8,
@@ -81,6 +168,7 @@ void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int chroma_pre
 
     /* Table 7-11: mb_type 1..24 */
     int mb_type = 1 + pred_mode + (cbp_chroma * 4) + (cbp_luma_flag * 12);
+    CAVLC_STAGE(CAVLC_S_HEADER,
     bs_write_ue(bs, (uint32_t)mb_type);
 
     /* Intra chroma prediction mode (ITU-T 8.3.4 / Table 8-3) - a real
@@ -105,6 +193,7 @@ void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int chroma_pre
      * cause anyway. Found via local ffmpeg-decode validation of the fix
      * below ("negative number of zero coeffs" at the second macroblock). */
     bs_write_se(bs, qp_delta);
+    );
 }
 
 /*
@@ -129,7 +218,7 @@ void cavlc_write_mb_i16x16_header(bitstream_t *bs, int pred_mode, int chroma_pre
  */
 void cavlc_write_p_skip_run(bitstream_t *bs, uint32_t skip_run) {
     if (!bs) return;
-    bs_write_ue(bs, skip_run);
+    CAVLC_STAGE(CAVLC_S_HEADER, bs_write_ue(bs, skip_run); );
 }
 
 void cavlc_write_mb_p16x16_header(bitstream_t *bs, int mvd_x, int mvd_y, int cbp, int qp_delta) {
@@ -139,6 +228,7 @@ void cavlc_write_mb_p16x16_header(bitstream_t *bs, int mvd_x, int mvd_y, int cbp
      * cavlc_write_p_skip_run(bs, <accumulated skip count, possibly 0>)
      * exactly once immediately before this call. */
 
+    CAVLC_STAGE(CAVLC_S_HEADER,
     /* mb_type = 0 (P_L0_16x16) */
     bs_write_ue(bs, 0);
 
@@ -152,6 +242,7 @@ void cavlc_write_mb_p16x16_header(bitstream_t *bs, int mvd_x, int mvd_y, int cbp
     if (cbp > 0) {
         bs_write_se(bs, qp_delta);
     }
+    );
 }
 
 /* Table 9-5: coeff_token VLC length and bit tables per ITU-T H.264
@@ -486,11 +577,13 @@ static int cavlc_write_one_level(bitstream_t *bs, int level, int is_first,
  * context across the whole block per 9.2.2.1. */
 static void cavlc_write_levels(bitstream_t *bs, const int *levels, int count,
                                 int trailing_ones, int total_coeff) {
+    CAVLC_STAGE(CAVLC_S_LEVELS,
     int suffix_length = (total_coeff > 10 && trailing_ones < 3) ? 1 : 0;
     for (int i = 0; i < count; i++) {
         int is_first = (i == 0);
         suffix_length = cavlc_write_one_level(bs, levels[i], is_first, trailing_ones < 3, suffix_length);
     }
+    );
 }
 
 /*
@@ -505,6 +598,7 @@ static void cavlc_write_levels(bitstream_t *bs, const int *levels, int count,
  */
 static void cavlc_write_total_zeros(bitstream_t *bs, int max_coeff, int total_coeff, int total_zeros) {
     if (total_coeff <= 0 || total_coeff >= max_coeff) return;
+    CAVLC_STAGE(CAVLC_S_TZEROS,
     int tc_idx = total_coeff - 1;
     if (tc_idx >= 0 && tc_idx < 15 && total_zeros >= 0 && total_zeros < 16) {
         uint8_t tz_len = total_zeros_len[tc_idx][total_zeros];
@@ -517,11 +611,13 @@ static void cavlc_write_total_zeros(bitstream_t *bs, int max_coeff, int total_co
     } else {
         bs_write_ue(bs, (uint32_t)total_zeros);
     }
+    );
 }
 
 /* Write total_zeros for a chroma DC 2x2 block (maxNumCoeff=4) using Table 9-9(a). */
 static void cavlc_write_chroma_dc_total_zeros(bitstream_t *bs, int total_coeff, int total_zeros) {
     if (total_coeff <= 0 || total_coeff >= 4) return;
+    CAVLC_STAGE(CAVLC_S_TZEROS,
     int tc_idx = total_coeff - 1;
     if (tc_idx >= 0 && tc_idx < 3 && total_zeros >= 0 && total_zeros < 4) {
         uint8_t tz_len = chroma_dc_total_zeros_len[tc_idx][total_zeros];
@@ -532,6 +628,7 @@ static void cavlc_write_chroma_dc_total_zeros(bitstream_t *bs, int total_coeff, 
     } else {
         bs_write_ue(bs, (uint32_t)total_zeros);
     }
+    );
 }
 
 /*
@@ -586,6 +683,7 @@ static void cavlc_write_chroma_dc_total_zeros(bitstream_t *bs, int total_coeff, 
  * implementation.
  */
 static void cavlc_write_run_befores(bitstream_t *bs, const int *runs, int total_coeff, int total_zeros) {
+    CAVLC_STAGE(CAVLC_S_RUNS,
     int zeros_left = total_zeros;
     for (int i = 1; i < total_coeff && zeros_left > 0; i++) {
         int run = runs[i - 1];
@@ -603,6 +701,7 @@ static void cavlc_write_run_befores(bitstream_t *bs, const int *runs, int total_
         }
         zeros_left -= run;
     }
+    );
 }
 
 int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
@@ -617,6 +716,7 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     int levels[16], runs[16];
     int last_idx = cavlc_scan_coeffs(scanned, 16, &total_coeff, &trailing_ones,
                                       &trailing_signs, levels, runs, &total_zeros);
+    CAVLC_BLOCK_TALLY(0, last_idx < 0);
 
     /* Determine VLC table context based on nC */
     int vlc_idx = 0;
@@ -627,13 +727,16 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
 
     if (last_idx < 0) {
         /* Zero block (TotalCoeff = 0) */
+        CAVLC_STAGE(CAVLC_S_TOKEN,
         uint8_t len = coeff_token_len[vlc_idx][0];
         uint8_t bits = coeff_token_bits[vlc_idx][0];
         bs_write_bits(bs, (int)len, (uint32_t)bits);
+        );
         return 0;
     }
 
     /* 1. Write coeff_token using Table 9-5 */
+    CAVLC_STAGE(CAVLC_S_TOKEN,
     int token_idx = total_coeff * 4 + trailing_ones;
     if (token_idx < 4 * 17) {
         uint8_t len = coeff_token_len[vlc_idx][token_idx];
@@ -646,6 +749,7 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     } else {
         bs_write_ue(bs, (uint32_t)total_coeff);
     }
+    );
 
     /* 2. Write trailing_ones signs (1 bit per trailing one) */
     /* PERF: batched into a single write - see bs_write_zeros()'s doc comment
@@ -656,7 +760,7 @@ int cavlc_write_4x4_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
      * exactly as bs_write_u()'s own MSB-first `trailing_ones`-bit write
      * would emit it, so this is bit-identical to writing each sign
      * individually. */
-    if (trailing_ones > 0) bs_write_u(bs, trailing_ones, (uint32_t)trailing_signs);
+    if (trailing_ones > 0) CAVLC_STAGE(CAVLC_S_SIGNS, bs_write_u(bs, trailing_ones, (uint32_t)trailing_signs); );
 
     /* 3. Write remaining levels */
     int non_t1 = total_coeff - trailing_ones;
@@ -700,6 +804,7 @@ int cavlc_write_4x4_ac_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     int levels[15], runs[15];
     int last_idx = cavlc_scan_coeffs(scanned, 15, &total_coeff, &trailing_ones,
                                       &trailing_signs, levels, runs, &total_zeros);
+    CAVLC_BLOCK_TALLY(1, last_idx < 0);
 
     int vlc_idx = 0;
     if (nC < 2) vlc_idx = 0;
@@ -708,12 +813,15 @@ int cavlc_write_4x4_ac_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     else vlc_idx = 3;
 
     if (last_idx < 0) {
+        CAVLC_STAGE(CAVLC_S_TOKEN,
         uint8_t len = coeff_token_len[vlc_idx][0];
         uint8_t bits = coeff_token_bits[vlc_idx][0];
         bs_write_bits(bs, (int)len, (uint32_t)bits);
+        );
         return 0;
     }
 
+    CAVLC_STAGE(CAVLC_S_TOKEN,
     int token_idx = total_coeff * 4 + trailing_ones;
     if (token_idx < 4 * 17) {
         uint8_t len = coeff_token_len[vlc_idx][token_idx];
@@ -726,6 +834,7 @@ int cavlc_write_4x4_ac_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
     } else {
         bs_write_ue(bs, (uint32_t)total_coeff);
     }
+    );
 
     /* PERF: batched into a single write - see bs_write_zeros()'s doc comment
      * for the same rationale. trailing_signs is built by cavlc_scan_coeffs()
@@ -735,7 +844,7 @@ int cavlc_write_4x4_ac_block(bitstream_t *bs, const int16_t *coeffs, int nC) {
      * exactly as bs_write_u()'s own MSB-first `trailing_ones`-bit write
      * would emit it, so this is bit-identical to writing each sign
      * individually. */
-    if (trailing_ones > 0) bs_write_u(bs, trailing_ones, (uint32_t)trailing_signs);
+    if (trailing_ones > 0) CAVLC_STAGE(CAVLC_S_SIGNS, bs_write_u(bs, trailing_ones, (uint32_t)trailing_signs); );
 
     int non_t1 = total_coeff - trailing_ones;
     cavlc_write_levels(bs, levels, non_t1, trailing_ones, total_coeff);
@@ -759,15 +868,19 @@ int cavlc_write_chroma_dc_block(bitstream_t *bs, const int *coeffs) {
     int levels[4], runs[4];
     int last_idx = cavlc_scan_coeffs(coeffs, 4, &total_coeff, &trailing_ones,
                                       &trailing_signs, levels, runs, &total_zeros);
+    CAVLC_BLOCK_TALLY(2, last_idx < 0);
 
     if (last_idx < 0) {
         /* TotalCoeff = 0: '01' (2 bits) - see chroma_dc_coeff_token_len note above */
+        CAVLC_STAGE(CAVLC_S_TOKEN,
         uint8_t len = chroma_dc_coeff_token_len[0];
         uint8_t bits = chroma_dc_coeff_token_bits[0];
         bs_write_bits(bs, (int)len, (uint32_t)bits);
+        );
         return 0;
     }
 
+    CAVLC_STAGE(CAVLC_S_TOKEN,
     int token_idx = total_coeff * 4 + trailing_ones;
     if (token_idx < 4 * 5) {
         uint8_t len = chroma_dc_coeff_token_len[token_idx];
@@ -780,6 +893,7 @@ int cavlc_write_chroma_dc_block(bitstream_t *bs, const int *coeffs) {
     } else {
         bs_write_ue(bs, (uint32_t)total_coeff);
     }
+    );
 
     /* PERF: batched into a single write - see bs_write_zeros()'s doc comment
      * for the same rationale. trailing_signs is built by cavlc_scan_coeffs()
@@ -789,7 +903,7 @@ int cavlc_write_chroma_dc_block(bitstream_t *bs, const int *coeffs) {
      * exactly as bs_write_u()'s own MSB-first `trailing_ones`-bit write
      * would emit it, so this is bit-identical to writing each sign
      * individually. */
-    if (trailing_ones > 0) bs_write_u(bs, trailing_ones, (uint32_t)trailing_signs);
+    if (trailing_ones > 0) CAVLC_STAGE(CAVLC_S_SIGNS, bs_write_u(bs, trailing_ones, (uint32_t)trailing_signs); );
 
     int non_t1 = total_coeff - trailing_ones;
     cavlc_write_levels(bs, levels, non_t1, trailing_ones, total_coeff);
@@ -804,3 +918,31 @@ void cavlc_write_slice_trailing_bits(bitstream_t *bs) {
     if (!bs) return;
     bs_rbsp_trailing_bits(bs);
 }
+
+#ifdef CAVLC_PROFILE
+/*
+ * cavlc_prof_scan_only - the zigzag gather + cavlc_scan_coeffs() half of
+ * cavlc_write_4x4_block()/_ac_block(), with no bitstream writes at all.
+ *
+ * Exists so tools/cavlc_bench.c can price coefficient discovery in
+ * isolation: every other stage can be measured by ablating its writes (the
+ * CAVLC_STAGE mask), but the scan cannot - without it there is no
+ * total_coeff to write anything about. Only compiled into the profile
+ * binary. Returns total_coeff so nothing here is dead code.
+ */
+int cavlc_prof_scan_only(const int16_t *coeffs, int max_coeff) {
+    int scanned[16];
+    int total_coeff = 0, trailing_ones = 0, trailing_signs = 0, total_zeros = 0;
+    int levels[16], runs[16];
+    if (max_coeff == 15) {
+        for (int i = 0; i < 15; i++) scanned[i] = coeffs[zigzag_4x4[i + 1]];
+    } else if (max_coeff == 16) {
+        for (int i = 0; i < 16; i++) scanned[i] = coeffs[zigzag_4x4[i]];
+    } else {
+        for (int i = 0; i < max_coeff; i++) scanned[i] = coeffs[i];
+    }
+    cavlc_scan_coeffs(scanned, max_coeff, &total_coeff, &trailing_ones,
+                      &trailing_signs, levels, runs, &total_zeros);
+    return total_coeff + trailing_signs + total_zeros;
+}
+#endif

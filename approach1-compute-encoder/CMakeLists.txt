@@ -301,6 +301,67 @@ if(SPV_OUTPUTS)
     install(FILES ${SPV_OUTPUTS} DESTINATION ${SHADER_INSTALL_PATH})
 endif()
 
+# ----------------------------------------------------------------------------
+# cavlc_bench - off-board H.264 CAVLC harness (docs/backlog.md A2)
+# ----------------------------------------------------------------------------
+# Built here, rather than by a shell script like tools/hevc_host_drift.sh
+# builds tools/hevc_host_repro.c, for one reason: this target exists to
+# produce performance numbers, and a hand-rolled `gcc -O2` line is exactly
+# the thing docs/performance-measurement.md says produces numbers that are
+# wrong in either direction. Configured as part of this project it inherits
+# the real shipped flag set - the -O2 above, CMAKE_C_FLAGS_RELEASE's
+# "-O3 -DNDEBUG" after it, and the -march=znver2 auto-detection.
+#
+# It links only cavlc.c + bitstream.c: no Vulkan, no libva, no GPU, and
+# nothing from the driver library, so it builds and runs anywhere.
+option(BUILD_CAVLC_BENCH "Build the off-board CAVLC harness (tools/cavlc_bench.c)" ON)
+
+# Off-board dev machines are not znver2, so the auto-detection above leaves
+# generic x86-64 codegen - which is NOT what the driver ships (see the
+# measured ~6% CAVLC difference documented with that detection). Zen 2 code
+# runs on every later AMD core and on Intel from Skylake-X onward, so on a
+# machine that supports the flag the harness can be built with the shipped
+# target-CPU codegen even though the host is a different chip. Opt out with
+# -DCAVLC_BENCH_MARCH=off if the dev machine cannot execute it.
+set(CAVLC_BENCH_MARCH "znver2" CACHE STRING "-march for cavlc_bench ('off' for host default)")
+
+if(BUILD_CAVLC_BENCH)
+    set(CAVLC_BENCH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/cavlc_bench.c)
+    if(EXISTS ${CAVLC_BENCH_SRC})
+        # Pin code and loop alignment. A benchmark that cannot report 1.00x
+        # on identical code cannot report anything, and pure hot-loop
+        # alignment luck has already produced a 1.30x phantom on this
+        # codebase once (docs/performance-measurement.md, "Validate the A/B
+        # rig"). These two flags are what settled it; they apply to the
+        # harness only and never to the installed driver.
+        set(CAVLC_BENCH_FLAGS -falign-functions=64 -falign-loops=32)
+        if(NOT CAVLC_BENCH_MARCH STREQUAL "off")
+            check_c_compiler_flag("-march=${CAVLC_BENCH_MARCH}" COMPILER_SUPPORTS_BENCH_MARCH)
+            if(COMPILER_SUPPORTS_BENCH_MARCH)
+                list(APPEND CAVLC_BENCH_FLAGS -march=${CAVLC_BENCH_MARCH} -mtune=${CAVLC_BENCH_MARCH})
+            endif()
+        endif()
+
+        add_executable(cavlc_bench ${CAVLC_BENCH_SRC} src/cavlc.c src/bitstream.c)
+        target_include_directories(cavlc_bench PRIVATE src)
+        target_compile_options(cavlc_bench PRIVATE ${CAVLC_BENCH_FLAGS})
+        target_link_libraries(cavlc_bench PRIVATE m)
+
+        # Same harness, same flags, with the CAVLC_STAGE() ablation hooks and
+        # exact counters compiled in (see cavlc.h). Kept as a SEPARATE binary
+        # so the numbers above are taken on code with no instrumentation in
+        # it at all; comparing the two binaries' baselines prices the
+        # instrumentation itself.
+        add_executable(cavlc_bench_prof ${CAVLC_BENCH_SRC} src/cavlc.c src/bitstream.c)
+        target_include_directories(cavlc_bench_prof PRIVATE src)
+        target_compile_options(cavlc_bench_prof PRIVATE ${CAVLC_BENCH_FLAGS})
+        target_compile_definitions(cavlc_bench_prof PRIVATE CAVLC_PROFILE)
+        target_link_libraries(cavlc_bench_prof PRIVATE m)
+    else()
+        message(WARNING "BUILD_CAVLC_BENCH=ON but ${CAVLC_BENCH_SRC} is missing")
+    endif()
+endif()
+
 # Tests
 #
 # enable_testing() MUST be called here, in the top-level CMakeLists.txt,
@@ -327,6 +388,17 @@ option(BUILD_TESTS "Build test suite" ON)
 if(BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt")
     enable_testing()
     add_subdirectory(tests)
+    # The CAVLC harness's reference-decoder round trip is a real correctness
+    # check (it is the only thing in this tree that exercises residual
+    # coding without a GPU - see tools/cavlc_bench.c), so it runs as a test
+    # rather than only on demand. Small size/frame count to keep it quick;
+    # the same binary scales up for measurement.
+    if(TARGET cavlc_bench)
+        add_test(NAME CavlcHarnessRoundTrip
+                 COMMAND cavlc_bench verify --size=320x192 --frames=4 --profile=busy --seed=7)
+        add_test(NAME CavlcHarnessRoundTripTypical
+                 COMMAND cavlc_bench verify --size=320x192 --frames=4 --profile=typical --seed=99)
+    endif()
 endif()
 
 message(STATUS "VA-API driver target: bc250_drv_video.so")

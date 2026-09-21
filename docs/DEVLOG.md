@@ -4093,3 +4093,160 @@ In §30, integer-pel diamond motion search and spatial merge mode were introduce
 #### D. Bitstream & Specification Compliance
 - Strictly maintained the zero chroma drift invariant: all tested motion vectors enforce $dx, dy \equiv 0 \pmod 2$.
 - Bitstream formatting remains 100% compliant with standard reference decoders (FFmpeg reference oracle decodes all frames with zero errors).
+
+## 33. H.264 CAVLC becomes measurable off-board: `tools/cavlc_bench.c`, where the time actually goes, and one optimisation that measured zero
+
+CAVLC is ~57% of the shipping H.264 path's frame time and was the last
+untouched performance lever, but there was no way to work on it without a
+board: `h264_encoder_encode_raw()` is header-only by design (commit
+629fc1d - it codes no residual), so `tests/test_encode` never enters
+residual coding, and everything that does needs a GPU. Backlog A2.
+
+### 33.1 The harness
+
+`tools/cavlc_bench.c`, built by CMake as `cavlc_bench` (clean) and
+`cavlc_bench_prof` (with the ablation hooks). It links only `cavlc.c` and
+`bitstream.c` - no Vulkan, no libva - and drives the real
+`cavlc_write_*()` functions with synthetic quantized coefficients.
+
+Three things decide what CAVLC actually executes, and all three are
+modelled rather than randomised:
+
+- **Which functions get called, in what order.** The emission path is a
+  deliberate mirror of `encode_mb_i16x16()`/`encode_mb_p16x16()`: same
+  syntax order, same cbp derivation, same "all 16 luma AC blocks are
+  coded once any one of them is nonzero" gating, same `mb_skip_run`
+  discipline, and the same four block shapes this project actually emits
+  (luma DC, luma AC, chroma DC, chroma AC; I_16x16 and P_L0_16x16 only,
+  4:2:0, no 8x8 transform).
+- **Sparsity.** Nonzeros are placed by *zigzag scan index* with
+  geometrically decaying probability and a heavy-1 magnitude profile
+  (~64% are +-1). Uniform random coefficients would make nearly every
+  block dense, which takes a completely different path through
+  coeff_token/total_zeros/run_before than real sparse ones. The default
+  `typical` profile is tuned so 91% of the 4x4 blocks in a frame
+  quantize entirely to zero, inside the ~90-96% band `encoder_h264.c`'s
+  own `nz_mask` comment reports for real content - the only real-content
+  anchor this repo has written down. `cavlc_bench stats` prints the
+  figure so it stays checkable rather than asserted.
+- **nC, i.e. which of the four coeff_token tables is selected.**
+  Macroblocks are drawn from activity classes with spatial persistence
+  (a busy MB likely has busy neighbours) and nC comes from byte-for-byte
+  copies of `luma_nc()`/`chroma_nc()`. Per-block independent randomness
+  would pin nC in one class. `busy` is the profile that reaches the
+  nC>=8 table (2.4% of blocks), which is why `verify` uses it.
+
+The harness also carries the GPU's per-block nonzero bitmask, exactly as
+`nc_ctx_t::nz_mask` does, so its cbp derivation costs what the shipping
+encoder's costs rather than 24 linear scans per macroblock.
+
+### 33.2 The oracle, and what it does not cover
+
+Two checks, covering different bug classes. Both were **demonstrated able
+to fail**, which matters more than either of them passing:
+
+- **Built-in reference CAVLC decoder** (`verify`): parses the slice back
+  and compares every coefficient against what the generator put in. The
+  level state machine, the `level_prefix>=15` escape and the coefficient
+  placement from total_zeros/run_before are re-derived from ITU-T 9.2
+  rather than by inverting `cavlc.c`'s control flow. It also proves each
+  VLC table is a decodable prefix code.
+  *Negative control:* reintroducing the `run_before` ordering bug
+  (commit 8feddef) makes it fail - while ffmpeg reports **zero** decode
+  errors, exactly as it did when that bug shipped and cost ~15.5 dB luma.
+  A decoder-error-count oracle cannot see that class of bug at all.
+- **ffmpeg round trip** (`emit`, then `ffmpeg -v error -i x.264 -f null -`):
+  an independent implementation with its own tables.
+  *Negative control:* corrupting one `coeff_token` entry in *both*
+  `cavlc.c` and the harness's copy - the situation that let the nC>=8
+  table ship with a uniform +4 offset for its whole life - leaves the
+  reference decoder happy and makes ffmpeg error.
+
+Limits, stated plainly: the reference decoder's tables are copies of
+`cavlc.c`'s, so it does not validate table *content* (that is ffmpeg's
+job, plus `tests/test_cavlc.c`'s pinned bytes). And neither oracle says
+anything about rate or quality - this harness has no pixels.
+
+`verify` runs in CI as `CavlcHarnessRoundTrip`.
+
+### 33.3 Where CAVLC time actually goes
+
+By **ablation, not sampling** - gprof has misattributed three times in
+this codebase. Each stage's cost is the wall-clock difference between two
+runs of the *same binary* over the *same data*, one with only that
+stage's bitstream writes suppressed; nothing is inserted into the timed
+path. The switch is behind `#ifdef CAVLC_PROFILE`, and the shipped
+`cavlc.c` compiles to **byte-identical machine code** with it present
+(verified by disassembly diff against HEAD at `-O3 -DNDEBUG
+-march=znver2`).
+
+1280x720, `typical`, `-O3 -march=znver2`, 13 samples a side,
+order-alternating, A/A resolution floor 0.5%:
+
+| stage | % of the timed macroblock loop |
+|---|---|
+| everything inside `cavlc.c` | **83%** |
+| MB-layer glue (cbp, nC, bookkeeping - `encoder_h264.c`'s half) | 17% |
+| all bitstream writes combined | **41%** |
+| - levels (`level_prefix`/`level_suffix`) | 19% |
+| - run_before | 7% |
+| - mb headers + mb_skip_run | 6% |
+| - coeff_token | 5% |
+| - total_zeros | 4.5% |
+| - trailing-one sign bits | 2% |
+| **coefficient discovery** (zigzag gather + `cavlc_scan_coeffs`) | **~41%** |
+
+The six per-stage deltas sum to 43.5% against an independently measured
+"ALL WRITES" row of 41.4% - consistent, and the gap is printed rather
+than hidden, because out-of-order execution overlaps these stages and
+marginal costs do not have to be additive.
+
+**The headline: bit-writing is not the problem. Discovering the
+coefficients costs about as much as writing every syntax element put
+together.** `cavlc_bench count` shows why the writes are cheap - the
+whole 8-frame slice is 173 KB, and coeff_token averages 2.88 bits a call.
+
+### 33.4 Tried and reverted: an all-zero-block fast path
+
+48% of the blocks that reach CAVLC on `typical` (25% on `busy`) are
+entirely zero, and each costs a full zigzag gather plus a backwards scan
+to conclude `last_idx == -1`. Short-circuiting that is byte-identical by
+construction. It does not pay:
+
+- 16-element `acc |= c[i]` OR-reduction: **2-7% slower**. GCC vectorises
+  it into three 8-byte loads and a four-`vpshufb` horizontal reduction,
+  which costs the 52% of non-zero blocks more than it saves on the rest.
+- four `uint64_t` loads ORed together (6 instructions, no shuffles):
+  0.990x best and median on `typical`, 1.000x on `busy`, ~0.99x on
+  `quiet` - against an A/A control of 0.995-1.011x run in the same
+  session.
+
+That is a **measured zero**, inside the rig's own noise and far inside
+the project's 2.5% bar, so it was reverted rather than kept. Byte
+identity held throughout (same md5 on every density profile, reference
+decoder and ffmpeg both clean) - the change was rejected on
+significance, not on correctness. The reasoning lives in `cavlc.c`'s
+"MEASURED AND REJECTED" comment so nobody re-derives it. Worth one
+*board* run before closing it for good, since Zen 2 at BC-250 clocks and
+cache sizes could shift the balance, but nothing off-board justifies the
+branch.
+
+Still open, and now pointed at by a number rather than a hunch: a
+cheaper `cavlc_scan_coeffs` - deriving `last_idx` and the zero runs from
+a nonzero bitmask instead of walking every scan position, or narrowing
+`scanned[]` to `int16_t` so the gather becomes a 16-bit shuffle.
+
+### 33.5 Rig notes worth keeping
+
+- **ABBAABBA, not ABABAB.** Plain alternation left whichever side ran
+  first in each pair carrying a reproducible ~2% penalty *with both
+  sides running identical code* - the same size as a win worth chasing.
+  Alternating the order every sample cancels it; `bench` with no masks
+  is the standing A/A self-test.
+- **Built by CMake on purpose.** A hand-rolled `gcc -O2` line (what
+  `tools/hevc_host_drift.sh` does for `hevc_host_repro.c`) produces
+  numbers this repo has documented as wrong in both directions. The
+  harness also opts into `-march=znver2` on any dev machine that can
+  execute it, so the codegen matches what ships.
+- The `CAVLC_PROFILE` build's own instrumentation branches cost ~5%; run
+  `bench` on both binaries to re-check rather than assuming.
