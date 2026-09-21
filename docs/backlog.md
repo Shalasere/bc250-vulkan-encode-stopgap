@@ -124,6 +124,23 @@ lambda scale) is tuned on synthetic content only, a single-QP byte/PSNR
 pair is not a BD-rate curve, and the original `-34.8%` figure almost
 certainly reflects pieces (2)/(3) together, not this piece alone. Needs
 a board `lab qsweep` BD-rate run before any number here is trusted.
+
+> **Board review, 2026-09-21: this has a real, previously-undisclosed
+> cost.** `lab compare` (HEVC, gop=120): per-frame encode time
+> **+52.42% (SIGNIFICANT)**, bytes within noise. Neither pass measured
+> throughput off-board — both checked bytes/PSNR only. Mechanically
+> tracks: A5's compile-time-constant unrolled 4-candidate search became
+> a 35-candidate runtime loop, an 8.75x increase in full
+> predict+SAD work per 4x4 block, losing the unrolled shape's
+> vectorisation along the way. Confirmed HEVC-specific (H.264's own
+> `compare` in the same run: everything within noise) and consistent
+> with the qsweep fps column (10.2–10.5 fps vs this key's predecessor's
+> own 15.62/15.64 fps at the same settings). **Undecided**: optimise the
+> search (early-exit / coarse-then-refine, the way `cavlc-residual-
+> coding`'s own search already does), gate behind a flag, or accept the
+> cost — HEVC CPU was already far from real-time and is opt-in-only, so
+> practical impact on the one real client is limited, but the trade was
+> never surfaced as one until now. DEVLOG §36.
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
 `cavlc-residual-coding`): `docs/notes/a6-cavlc-residual-port.md`.
@@ -245,6 +262,20 @@ intra chroma *and luma* from **source** neighbours rather than
 **reconstructed** ones — live in exactly the `-g 1` config `drift` uses.
 Full analysis + exact next board commands: `docs/notes/c3-h264-chroma-drift.md`.
 
+> **Board review, 2026-09-21: confirmed bigger than deblocking, luma
+> included.** `lab drift --codec=h264 --qp=27` (`-skip_loop_filter
+> all`): chroma **exact** (0/1036800), confirming the methodology's own
+> prediction; luma differs by 103906/2073600, max 7 — just over the
+> deblocking-gap bound (4), plausibly still explicable. `--real-decode`
+> (the real PPS-signalled filter state — the comparison this item
+> actually asked for): luma differs **37405/2073600, max 57** — 14x the
+> "should match" bound — and chroma differs **44347/1036800, max 8**.
+> Luma should match under real decode (the encoder does deblock luma);
+> it doesn't, by a lot. This rules out "chroma-only gap" as the
+> complete picture and points sharper at the leading candidate above —
+> whoever picks this up next should start with why LUMA drifts under
+> real decode, not with the missing chroma binding. DEVLOG §36.
+
 **C4. DONE — and it found a live bug.** Re-taking the retracted PSNR
 figures through `lab qsweep --codec=hevc` gave HEVC GPU **42.71–42.94
 dB** (replacing the ad-hoc 35.26). It also surfaced that H.264 at
@@ -357,8 +388,23 @@ top of this item.
 
 ## D. Opened by the 2026-09-21 board run
 
-**D1. ROOT-CAUSED AND FIXED OFF-BOARD (2026-09-21) — needs a board
-re-measure before "done."** `VAEncPictureParameterBufferH264/HEVC.pic_init_qp`
+**D1. BOARD-CONFIRMED (2026-09-21) — the flatness is fixed, H.264's
+response shape is now close to libx264's.** `lab qsweep --codec=h264
+--bitrates=8M,15M,20M,25M,31M`: qp_avg falls **45.3 → 27.6** across the
+range (was pinned ~27-28 regardless of bitrate) and 15M→31M PSNR moves
+**+5.55 dB** — against libx264's own **+6.31 dB** over the identical
+range, and against this project's own pre-fix **+0.48 dB** for the same
+comparison. Still trails libx264 in absolute terms (no B-frames/sub-pel
+ME/RDO — disclosed, expected), but the bug D1 targeted (the shape, not
+the absolute level) is gone. HEVC CPU shows a real response low in the
+range (8M→15M: +5.15 dB) then plateaus 15M→31M (+0.11 dB) — consistent
+with `qp_min=12`'s already-documented 1440p floor, not a recurrence,
+though not directly confirmed (HEVC's `[BC250_PERF_FRAME]` qp column is
+H.264-only; a `BC250_PERF_STATS=1` HEVC run would confirm QP is actually
+pinned at 12 by 15M). DEVLOG §36.
+
+**ROOT-CAUSED AND FIXED OFF-BOARD (2026-09-21), before the above —
+the original diagnosis.** `VAEncPictureParameterBufferH264/HEVC.pic_init_qp`
 and `VAEncMiscParameterRateControl.initial_qp` are mandatory **per-frame**
 VA-API fields (DEVLOG §10.7: Sunshine really does resend one every frame),
 wired straight into `*_encoder_set_qp()`. That function stomped

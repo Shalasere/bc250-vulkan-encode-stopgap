@@ -4494,3 +4494,131 @@ proportions — the signature of CPU contention, not the GPU contention
 the synthetic `nlmeans_vulkan` load generator produces. That is the
 closest this project has come to a real-session number, and it is still
 not a controlled one.
+
+## 36. Board review of C3/A6/D1 — D1 confirmed strongly, A6 has an undisclosed cost, C3's real mechanism is bigger than deblocking
+
+Board run against `work-1d9cac09ae98` (current `main`, includes A4/A5/
+dead-motion-search from the earlier batch plus C3/A6/D1 from this one),
+compared against `work-8cc41d897185` (the last board-validated key,
+which already had A4/A5/dead-motion-search). `lab gate` PASS throughout
+(units 5/5, mask EXACT, PSNR 48.55 dB, dims 11/14 + 3 documented LIMITs,
+HEVC drift byte-exact both paths).
+
+### D1 confirmed strongly — H.264 now has the right shape
+
+`lab qsweep --codec=h264 --bitrates=8M,15M,20M,25M,31M`, 2560x1440
+`testsrc2`:
+
+| bitrate | qp_avg | PSNR | libx264 PSNR |
+|---|---|---|---|
+| 8M | 45.3 | 35.46 dB | 38.91 dB |
+| 15M | 38.6 | 37.46 dB | 41.60 dB |
+| 20M | 34.5 | 39.14 dB | 43.72 dB |
+| 25M | 31.1 | 40.95 dB | 45.73 dB |
+| 31M | 27.6 | 43.01 dB | 47.91 dB |
+
+QP now falls monotonically and substantially as bitrate rises (45.3 ->
+27.6 across the range), and 15M -> 31M PSNR moves **+5.55 dB** - close
+to libx264's own +6.31 dB over the same range, against this project's
+own pre-fix figure of +0.48 dB for the identical comparison. We still
+trail libx264 in absolute terms (no B-frames, no sub-pel ME, no RDO -
+disclosed, expected), but the flatness bug D1 targeted is gone, not
+just improved.
+
+HEVC CPU (`--codec=hevc --no-ref`, same bitrates) also shows a real
+response low in the range (8M 45.55 dB -> 15M 50.70 dB, +5.15 dB) then
+flattens 15M -> 31M (50.70 -> 50.81, +0.11 dB). That plateau is
+consistent with `qp_min=12`'s already-documented, deliberate floor
+(`CLAUDE.md`: "at 1440p the encoder settles at QP 12 spending ~15-19 of
+31 Mbps") rather than a recurrence of D1's bug - HEVC's qp_avg column
+isn't available off `[BC250_PERF_FRAME]` (H.264-only), so this reads as
+consistent with the known floor rather than confirmed against it. Worth
+a `BC250_PERF_STATS=1` HEVC run to confirm QP is actually pinned at 12
+by 15M, not asserted.
+
+### A6 has a real cost that neither off-board pass measured: +52% per-frame encode time
+
+`lab compare` (HEVC, gop=120, 3 interleaved reps/side, floor established
+first):
+
+| metric | before | after | delta | verdict |
+|---|---|---|---|---|
+| p_wall_ms | 54.68 | 83.34 | **+52.42%** | **SIGNIFICANT** |
+| bytes_p | 1.984 | 1.987 | +0.15% | within noise |
+
+Cross-checked against the qsweep fps column above (10.2-10.5 fps at
+every bitrate) against this same key's predecessor's own qsweep result
+earlier this session (15.62/15.64 fps, same content/resolution/gop) -
+the two numbers agree (15.6 / 1.52 ~= 10.3).
+
+Neither A6 pass measured throughput at all - both measured bytes and
+PSNR off-board and never ran a timing comparison, because nothing in
+either task brief asked for one (an oversight in how this batch was
+scoped, not in what either agent was told to check). The H.264 compare
+in the same run confirms the regression is HEVC-specific and not a
+measurement artifact: p_wall/fps/gpu_total all "within noise" on H.264,
+which A6 never touches.
+
+Mechanically this tracks: A5 had unrolled the 4-candidate search with
+each mode a compile-time constant, letting the vectoriser emit
+`vpsadbw`s across candidates; A6 replaced that with a runtime loop over
+35 candidates (its own notes say as much - "a runtime loop... 35
+candidates doesn't fit that shape"), an 8.75x increase in candidates
+each doing a full `predict_block4()` + `sad_4x4()`, on top of losing
+the unrolled shape's vectorisation. Pass 2's RD-bias math
+(`hevc_mode_rate_bits()`, a lambda computed once per block, not per
+candidate) is cheap by comparison and is very unlikely to be a
+meaningful part of this delta.
+
+**This is a real trade-off that was never surfaced as one**: a
+partially-validated, still-not-BD-rate-confirmed compression change
+for a measured 52% throughput cost on a path that was already far from
+real-time (10-15 fps vs a 60 fps target) and is opt-in / not
+recommended for real streaming (`README`'s Known Limitations, C5).
+Practical impact on the only real client is limited by that opt-in
+status, but the cost is real, disclosed nowhere until this run, and
+worth a decision: optimise the 35-mode search (an early-exit or a
+coarse-then-refine shape, the way `cavlc-residual-coding`'s own search
+already does per A6's notes), gate it behind a flag, or accept the cost
+as the price of the intra correctness/coverage improvement. Not decided
+here - flagged for the project owner.
+
+### C3: the real mechanism is bigger than deblocking, and luma is not exempt
+
+`lab drift --codec=h264 --qp=27` (the harness's existing default,
+`-skip_loop_filter all`):
+
+- **Chroma: exact (0/1036800 differ), both planes.** This confirms the
+  methodology's own prediction from the off-board pass: under this
+  decode mode neither side filters chroma, so it should match, and on
+  real hardware it does.
+- **Luma: 103906/2073600 differ, max 7** - `[[EXCEEDS luma-deblock bound
+  4 - a different bug]]`, but only barely (max 7 vs a bound of 4, and
+  the bulk of the differing pixels are presumably near that small
+  magnitude) - consistent with "the expected luma-deblock-vs-unfiltered
+  -decode gap, slightly past a conservative single-edge bound," not
+  clearly a second defect on its own.
+
+`lab drift --codec=h264 --qp=27 --real-decode` (the real PPS-signalled
+filter state - the comparison C3 actually asked for):
+
+- **Luma: 37405/2073600 differ, max 57** - `[[EXCEEDS bound 4 - luma
+  should match under real decode]]`, and by a lot: max 57 against a
+  bound of 4 is not a rounding-level discrepancy. Luma is supposed to
+  match here - the encoder's GPU shader does deblock luma - and it
+  doesn't.
+- **Chroma: 44347/1036800 differ (mean 0.10, max 8)** -
+  `[[EXCEEDS deblocking-explicable bound 3]]`.
+
+The luma result under `--real-decode` is the important one: it rules
+out "the encoder's luma deblocking is fine, only chroma is missing" as
+the complete picture. Something is wrong with luma too once the
+decoder is actually filtering the way the PPS says it will - which
+points toward `c3-h264-chroma-drift.md`'s own leading candidate
+(`residual_predict.comp` predicting from **source** neighbours rather
+than **reconstructed** ones, live in exactly this all-intra `-g 1`
+config) affecting luma as well as chroma, not a chroma-only gap. Not
+root-caused here - this is the board confirmation that C3's own
+"needs the board" line was right, and a sharper target for whoever
+picks it up next: start with why luma drifts under real decode, not
+with the missing chroma binding.
