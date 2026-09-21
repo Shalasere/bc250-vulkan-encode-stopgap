@@ -23,10 +23,17 @@ genuinely need the board.
   that does not share our own code.
 - **A measured zero is a result.** Record it and revert; do not keep
   complexity that bought nothing.
-- **gprof has misattributed twice** in this codebase (`hevc_sbac_init_state`
-  reported at 7.9M calls when it is reachable ~810 times; a 17.7%
-  attribution whose "obvious" hot instruction turned out to be free).
-  Treat the profile as a hint and confirm end to end.
+- **gprof has misattributed three times** in this codebase:
+  `hevc_sbac_init_state` reported at 7.9M calls when it is reachable ~810
+  times; a 17.7% attribution whose "obvious" hot instruction turned out
+  to be free; and `bs_rbsp_to_ebsp` at 5.9% when direct instrumentation
+  says 0.93% (its sample bucket is 10 ms against a ~0.6 s run, so one
+  sample reads as ~1.7%). Treat the profile as a pointer to *where to
+  instrument*, not as a finding.
+- **Measure at the shipped `-O3 -march=znver2`, not `-O2`.** A `-O2`
+  figure can be wrong in either direction — the butterfly transforms went
+  +15.4% -> +2.1%, while the zorder/gather/CABAC work went +29.4% ->
+  +44.5%. See `performance-measurement.md`.
 
 ---
 
@@ -80,6 +87,7 @@ core HEVC source).
 `rc_update_stats()`'s `CLOCK_MONOTONIC` bucket drain under `RC_LOW_LATENCY`;
 fixed test-side via the existing `BC250_RC_NOMINAL_DRAIN=1` hook, production
 rate control untouched. The difference was ONE byte in 350,979.
+
 **B2. DONE — with a caveat that needs the board.** `bs_rbsp_to_ebsp` is
 3.9x faster in situ and byte-identical, but **end-to-end it measured
 zero** (median -0.64%, inside a 5.9% sd). It was kept anyway because the
@@ -95,17 +103,20 @@ lands as ~1.7% and a shorter run inflates the same bucket to 5.9%.
 Direct instrumentation put the function at 0.93%. **Do not size a task
 off a sub-2% gprof number on this codebase** — instrument the function
 directly first.
+
 **B3. DONE.** `lab qsweep --codec=h264|hevc`. `scoreboard` deliberately
 NOT extended - its reference is libx264, so an HEVC scoreboard would score
 our HEVC against x264's H.264 and hand this encoder a win that belongs to
 the codec. Needs a libx265 reference verified against Sunshine's own
 construction first. **The HEVC figures still need re-taking on the board.**
+
 **B4. DONE, +2.1% shipped.** Division-free quantiser, partial-butterfly
 transforms, dead inverse clip removed, dequant folded into inverse stage 1.
 Byte-identical under three oracles plus exhaustion over 218M quantiser
 pairs. **The headline is +2.1% at `-O3 -march=znver2`, not the +15.4% that
 `-O2` shows** - see the optimisation-level rule in
 `performance-measurement.md`.
+
 **B5. DONE, and it found a bug in the oracle itself.**
 `hevc_host_diff.py` exited 0 on every path, so the drift script printed
 per-case failures and still reported PASS with rc=0 - two million wrong
@@ -121,8 +132,13 @@ step asserts on the case count so `BC250_DRIFT_CASES` cannot quietly gut it.
 off-board evidence: split_cu_flag ctxInc, QP-before-dispatch, chroma QP
 (both paths), and the below-left reference sample.
 
-**C2. Re-measure the CPU HEVC speedup on hardware.** +23% on this dev
-machine (7.82 -> 10.14 fps at 1080p). Board numbers will differ.
+**C2. Re-measure the CPU HEVC speedup on hardware.** On this dev machine,
+at the settings the driver actually ships (`-O3 -march=znver2`): the
+zorder/gather/CABAC batch is **+44.5%** (8.37 -> 12.09 fps at 1080p) and
+the transform batch a further **+2.1%**. Board silicon will differ — it is
+the same microarchitecture but a slower part with a different memory
+system. This run also decides B2: if `bs_rbsp_to_ebsp` measures zero
+there too, revert it.
 
 **C3. H.264 chroma drift, max delta 241-252, unexplained.** Needs the GPU
 path, which cannot run off-board. Note the luma part of that same
