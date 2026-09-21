@@ -102,7 +102,7 @@
    bitrates: the slice buffer was ~1.03 bytes/luma-sample against a
    measured worst case of 1.53, and nothing checked `bitstream_t`'s
    `overflow` flag, so a short slice was returned as a success. That was
-   resolution-independent — 1280x720 hit it too. DEVLOG §33.
+   resolution-independent — 1280x720 hit it too. DEVLOG §34.
 
 ---
 
