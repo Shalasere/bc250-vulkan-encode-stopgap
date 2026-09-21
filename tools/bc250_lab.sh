@@ -268,12 +268,15 @@ art_dir() {
 scoreboard() {
     local key="${1:?scoreboard <key> [opts]}"; shift
     local content=testsrc2 res=2560x1440 frames=150 reps=2 quality_check=0
-    for a in "$@"; do
-        case "$a" in
-            --content=*) content="${a#*=}";;
-            --res=*)     res="${a#*=}";;
-            --frames=*)  frames="${a#*=}";;
-            --repeat=*)  reps="${a#*=}";;
+    # Loop var deliberately not `a` - see the comment on the same pattern
+    # in bench(), which is where that name collided with a caller's
+    # `local a` and corrupted an A/B comparison.
+    for opt in "$@"; do
+        case "$opt" in
+            --content=*) content="${opt#*=}";;
+            --res=*)     res="${opt#*=}";;
+            --frames=*)  frames="${opt#*=}";;
+            --repeat=*)  reps="${opt#*=}";;
             --quality)   quality_check=1;;
         esac
     done
@@ -566,20 +569,31 @@ bench() {
     local key="${1:?bench <key> [opts]}"; shift
     local content=testsrc res=2560x1440 frames=300 gop=120 bitrate=31M
     local repeat=1 load=none envs="" audit=0 quiet=0 codec=h264
-    for a in "$@"; do
-        case "$a" in
-            --content=*) content="${a#*=}";;
-            --res=*)     res="${a#*=}";;
-            --frames=*)  frames="${a#*=}";;
-            --gop=*)     gop="${a#*=}";;
-            --bitrate=*) bitrate="${a#*=}";;
-            --repeat=*)  repeat="${a#*=}";;
-            --load=*)    load="${a#*=}";;
-            --env=*)     envs="${a#*=}";;
-            --codec=*)   codec="${a#*=}";;
+    # NOT `for a in "$@"`. compare() below has a `local a` live on the call
+    # stack for the whole time it calls this function, and bash's `local`
+    # is scoped to the CALL FRAME, not lexically to the function text - an
+    # unqualified `for a` loop variable here overwrites compare()'s `a` the
+    # moment this function returns. That is a real bug that shipped: on
+    # compare()'s SECOND rep onward, keyA silently became the literal
+    # string "--quiet" (the last option in the args below), corrupting
+    # both the encode (wrong/nonexistent build key) and the printed A/B
+    # labels, while keyB (compare()'s `b`, a name nothing here reuses)
+    # stayed correct throughout - found 2026-09-21 because bench(a)'s
+    # SECOND call in a 3-rep `lab compare` used a key that does not exist.
+    for opt in "$@"; do
+        case "$opt" in
+            --content=*) content="${opt#*=}";;
+            --res=*)     res="${opt#*=}";;
+            --frames=*)  frames="${opt#*=}";;
+            --gop=*)     gop="${opt#*=}";;
+            --bitrate=*) bitrate="${opt#*=}";;
+            --repeat=*)  repeat="${opt#*=}";;
+            --load=*)    load="${opt#*=}";;
+            --env=*)     envs="${opt#*=}";;
+            --codec=*)   codec="${opt#*=}";;
             --audit)     audit=1;;
             --quiet)     quiet=1;;
-            *) die "bench: unknown option '$a'";;
+            *) die "bench: unknown option '$opt'";;
         esac
     done
     case "$codec" in h264|hevc) ;; *) die "bench: --codec must be h264 or hevc (got '$codec')";; esac
@@ -626,8 +640,10 @@ noise() {
     local key="${1:?noise <key> [opts]}"; shift
     local n=5
     local -a passthru=()
-    for a in "$@"; do
-        case "$a" in --repeat=*) n="${a#*=}";; *) passthru+=("$a");; esac
+    # Loop var deliberately not `a` - see bench()'s comment on the same
+    # pattern colliding with compare()'s `local a`.
+    for opt in "$@"; do
+        case "$opt" in --repeat=*) n="${opt#*=}";; *) passthru+=("$opt");; esac
     done
     note "noise floor: $n identical runs of $key"
     local tmp; tmp=$(mktemp)
@@ -840,14 +856,16 @@ qsweep() {
     local content=testsrc2 res=2560x1440 frames=150
     local bitrates="8M,15M,20M,25M,31M"
     local envs="" skip_ref=0 codec=h264
-    for a in "$@"; do
-        case "$a" in
-            --content=*)  content="${a#*=}";;
-            --res=*)      res="${a#*=}";;
-            --frames=*)   frames="${a#*=}";;
-            --bitrates=*) bitrates="${a#*=}";;
-            --env=*)      envs="${a#*=}";;
-            --codec=*)    codec="${a#*=}";;
+    # Loop var deliberately not `a` - see bench()'s comment on the same
+    # pattern colliding with compare()'s `local a`.
+    for opt in "$@"; do
+        case "$opt" in
+            --content=*)  content="${opt#*=}";;
+            --res=*)      res="${opt#*=}";;
+            --frames=*)   frames="${opt#*=}";;
+            --bitrates=*) bitrates="${opt#*=}";;
+            --env=*)      envs="${opt#*=}";;
+            --codec=*)    codec="${opt#*=}";;
             --no-ref)     skip_ref=1;;
         esac
     done
@@ -983,12 +1001,14 @@ dims() {
     local key="${1:?dims <key> [opts]}"; shift
     local codecs="h264 hevc" envs=""
     local res_list="1920x1080 1920x1088 2560x1440 1280x720 854x480 1366x768 1918x1078"
-    for a in "$@"; do
-        case "$a" in
-            --codec=*)  codecs="${a#*=}";;
-            --res=*)    res_list="${a#*=}";;
-            --env=*)    envs="${a#*=}";;
-            *) die "dims: unknown option '$a'";;
+    # Loop var deliberately not `a` - see bench()'s comment on the same
+    # pattern colliding with compare()'s `local a`.
+    for opt in "$@"; do
+        case "$opt" in
+            --codec=*)  codecs="${opt#*=}";;
+            --res=*)    res_list="${opt#*=}";;
+            --env=*)    envs="${opt#*=}";;
+            *) die "dims: unknown option '$opt'";;
         esac
     done
     local bd; bd=$(art_dir "$key") || exit 1
@@ -1113,16 +1133,18 @@ dims() {
 drift() {
     local key="${1:?drift <key> [opts]}"; shift
     local res=1920x1080 frames=3 codec=hevc envs="" bitrate=10M content=testsrc qp=""
-    for a in "$@"; do
-        case "$a" in
-            --res=*)     res="${a#*=}";;
-            --frames=*)  frames="${a#*=}";;
-            --codec=*)   codec="${a#*=}";;
-            --bitrate=*) bitrate="${a#*=}";;
-            --qp=*)      qp="${a#*=}";;
-            --content=*) content="${a#*=}";;
-            --env=*)     envs="${a#*=}";;
-            *) die "drift: unknown option '$a'";;
+    # Loop var deliberately not `a` - see bench()'s comment on the same
+    # pattern colliding with compare()'s `local a`.
+    for opt in "$@"; do
+        case "$opt" in
+            --res=*)     res="${opt#*=}";;
+            --frames=*)  frames="${opt#*=}";;
+            --codec=*)   codec="${opt#*=}";;
+            --bitrate=*) bitrate="${opt#*=}";;
+            --qp=*)      qp="${opt#*=}";;
+            --content=*) content="${opt#*=}";;
+            --env=*)     envs="${opt#*=}";;
+            *) die "drift: unknown option '$opt'";;
         esac
     done
     # --qp forces constant-QP. Needed for any experiment that varies QP,
