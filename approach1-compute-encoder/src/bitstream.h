@@ -225,6 +225,20 @@ size_t bs_write_nal_header_hevc(bitstream_t *bs, int nal_unit_type);
 /**
  * Perform RBSP-to-EBSP emulation prevention (stuffs 0x03 bytes).
  * Takes raw RBSP data, outputs EBSP. Returns output size.
+ *
+ * Writes at most `dst_size` bytes and returns how many it wrote, so a
+ * destination too small to hold the expansion truncates rather than
+ * overruns. Worst-case expansion is 3 bytes out per 2 in (an all-zero
+ * payload); encoder_h264.c's slice writer sizes `dst` at 2x `src_size`
+ * on that basis.
+ *
+ * `dst` and `src` MUST NOT overlap. Every caller in this tree already
+ * passes separate allocations (encoder->output_buf vs a per-slice
+ * slice_rbsp, encoder->scratch_out vs encoder->slice_rbsp, a NAL buffer
+ * vs a local rbsp[] array), and the implementation now bulk-copies
+ * escape-free runs with memcpy(), so an aliasing caller would be
+ * undefined behaviour rather than the byte-at-a-time forward copy the
+ * previous implementation happened to give.
  */
 size_t bs_rbsp_to_ebsp(uint8_t *dst, size_t dst_size,
                        const uint8_t *src, size_t src_size);
