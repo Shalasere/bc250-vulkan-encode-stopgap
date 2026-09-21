@@ -54,9 +54,37 @@ unsigned long long hevc_intra_prof_rdtsc(void) { return __rdtsc(); }
         if (prof_m2_ != (result)) abort();                                  \
     }                                                                       \
 } while (0)
+
+/* A6 mode-search-perf (2026-09-21): per-candidate breakdown WITHIN the mode
+ * search, extending the whole-function ablation above rather than replacing
+ * it. Each of these is rdtsc-bracketed around exactly one call site inside
+ * hevc_choose_luma_mode()'s candidate loop, so like the whole-function rdtsc
+ * estimate above, every number here carries its own probe overhead and is
+ * an upper bound on the real cost - see hevc_bench.c's print of it, which
+ * says so again next to the numbers. The point of this breakdown is not an
+ * absolute figure, it's the RATIO between the same probes on the exhaustive
+ * build and the coarse-then-refine build, since both bracket the identical
+ * call sites and therefore carry comparable overhead. */
+unsigned long long hevc_intra_prof_cyc_predict_planardc = 0;
+unsigned long long hevc_intra_prof_cyc_predict_angular = 0;
+unsigned long long hevc_intra_prof_cyc_sad = 0;
+unsigned long long hevc_intra_prof_calls_predict_planardc = 0;
+unsigned long long hevc_intra_prof_calls_predict_angular = 0;
+unsigned long long hevc_intra_prof_calls_sad = 0;
+#define HEVC_PROF_BRACKET(cyc_, calls_, stmt_) do {                         \
+    if (hevc_intra_prof_timing) {                                          \
+        unsigned long long t0__ = __rdtsc();                               \
+        stmt_;                                                             \
+        (cyc_) += __rdtsc() - t0__;                                        \
+        (calls_)++;                                                        \
+    } else {                                                               \
+        stmt_;                                                             \
+    }                                                                       \
+} while (0)
 #else
 #define HEVC_PROF_ENTER()          ((void)0)
 #define HEVC_PROF_LEAVE(result, ...) ((void)0)
+#define HEVC_PROF_BRACKET(cyc_, calls_, stmt_) do { stmt_; } while (0)
 #endif
 
 /* ===================== mode/scan helpers ===================== */
@@ -363,6 +391,21 @@ static const int16_t HEVC_INVANGLE_TABLE[15] = {
  * to get wrong porting this down from a 16x16 CU to a 4x4 TU. */
 static int predict_angular_sample(const uint8_t left[8], const uint8_t top[8], uint8_t corner,
                                    int mode, int x, int y) {
+    /* Defensive clamp, NOT a behavioural change for any real caller: every
+     * call site passes mode in [2,34] (predict_block4()'s angular branch is
+     * only ever reached for those values - see its own callers). This
+     * exists only to give GCC's -Warray-bounds a provable bound: A6
+     * mode-search-perf's extra static-inline layer
+     * (hevc_eval_mode_candidate()) changed how this function gets
+     * specialised per call site, and one of the new specialisations made
+     * the optimiser flag a theoretically-unreachable OOB path here and at
+     * the INVANGLE_TABLE lookup below that it could no longer prove
+     * unreachable across the new inlining shape (it was always
+     * mathematically unreachable for legitimate input - see that lookup's
+     * own comment - just not provably so to the compiler after this
+     * change). */
+    if (mode < 2) mode = 2;
+    if (mode > 34) mode = 34;
     int ang = HEVC_ANGLE_TABLE[mode];
     int vert = (mode >= 18);
     int i = vert ? x : y;
@@ -383,8 +426,13 @@ static int predict_angular_sample(const uint8_t left[8], const uint8_t top[8], u
             /* Table 8-6: project through the OTHER reference array via
              * the inverse angle. Only reachable for the modes with a
              * negative HEVC_ANGLE_TABLE entry (predModeIntra 11..25),
-             * which is exactly INVANGLE_TABLE's domain. */
-            int m = -1 + ((k * HEVC_INVANGLE_TABLE[mode - 11] + 128) >> 8);
+             * which is exactly INVANGLE_TABLE's domain - the clamp below
+             * is the same defensive, behaviour-preserving bound as this
+             * function's entry clamp above, for the same reason. */
+            int inv_idx = mode - 11;
+            if (inv_idx < 0) inv_idx = 0;
+            if (inv_idx > 14) inv_idx = 14;
+            int m = -1 + ((k * HEVC_INVANGLE_TABLE[inv_idx] + 128) >> 8);
             if (m < 0) v = corner;
             else { if (m > 7) m = 7; v = vert ? left[m] : top[m]; }
         }
@@ -540,6 +588,67 @@ static inline double hevc_luma_mode_lambda(int qp) {
     return sqrt(lambda_ssd);
 }
 
+/* A6 mode-search-perf (2026-09-21): the step-4 coarse grid over the angular
+ * range, Planar/DC excluded (they're handled as their own two candidates -
+ * see hevc_choose_luma_mode() below). 9 entries: 2, 6, ..., 34. This is the
+ * same 11-of-35 (2 + these 9) coarse grid hevc_intra_wavefront.comp's own
+ * shader search already uses (its SCOPE comment: "mode refinement... not
+ * implemented here yet" - this file's exhaustive-search comment used to
+ * cite exactly that line as the reason THIS path stayed exhaustive; this
+ * change is that missing refinement, applied to the CPU path instead). */
+static const int HEVC_COARSE_ANGULAR_MODES[9] = { 2, 6, 10, 14, 18, 22, 26, 30, 34 };
+
+/* Evaluate one candidate mode's RD cost (sad + lambda*rate_bits) against
+ * the already-hoisted source block and already-gathered references, and
+ * keep it as the new best if it improves on *best_mode / *best_cost - same
+ * "first-evaluated candidate wins an exact tie" convention the exhaustive
+ * search used (strict `<`), now applied over whichever candidate subset the
+ * caller assembles rather than the full 0..34 range.
+ *
+ * `tried[]` is a caller-owned de-dup table: the coarse grid, the +/-1/+/-2
+ * refinement around the best angular coarse candidate, and the 3 MPMs
+ * overlap by construction (e.g. a PU whose MPM list contains mode 6 would
+ * otherwise cost that candidate's predict+SAD twice), so every call site
+ * below is required to check-and-set the same table before predicting
+ * anything. A mode already in `tried[]` is skipped with no side effect,
+ * including no change to *best_mode / *best_cost - this is safe because
+ * every mode this file ever considers is evaluated at most once per PU
+ * regardless of which stage reaches it first.
+ *
+ * Returns the candidate's RD cost (defined even for a fresh, non-deduped
+ * evaluation only - callers that need the coarse angular winner's cost for
+ * the refinement step below only ever call this on the coarse grid, which
+ * has no internal duplicates, so the return value is always meaningful
+ * there). */
+static inline double hevc_eval_mode_candidate(const uint8_t left[8], const uint8_t top[8],
+                                                uint8_t corner, const uint8_t src16[16],
+                                                double lambda, const int mpm[3], int m,
+                                                uint8_t tried[HEVC_MODE_COUNT],
+                                                int *best_mode, double *best_cost,
+                                                uint8_t pred_out[16]) {
+    if (tried[m]) return 0.0;
+    tried[m] = 1;
+
+    uint8_t pred_[16];
+    if (m < 2)
+        HEVC_PROF_BRACKET(hevc_intra_prof_cyc_predict_planardc, hevc_intra_prof_calls_predict_planardc,
+            predict_block4(left, top, corner, m, 1 /* luma */, pred_));
+    else
+        HEVC_PROF_BRACKET(hevc_intra_prof_cyc_predict_angular, hevc_intra_prof_calls_predict_angular,
+            predict_block4(left, top, corner, m, 1 /* luma */, pred_));
+    int sad_;
+    HEVC_PROF_BRACKET(hevc_intra_prof_cyc_sad, hevc_intra_prof_calls_sad,
+        sad_ = sad_4x4(src16, pred_));
+    double cost_ = (double)sad_ + lambda * hevc_mode_rate_bits(m, mpm);
+
+    if (*best_mode < 0 || cost_ < *best_cost) {
+        *best_cost = cost_;
+        *best_mode = m;
+        memcpy(pred_out, pred_, 16);
+    }
+    return cost_;
+}
+
 /* PERF: the mode search and the winning mode's prediction are ONE function,
  * because the caller needs both and the second was being recomputed from
  * scratch.
@@ -573,19 +682,56 @@ static inline double hevc_luma_mode_lambda(int qp) {
  * (strict `<`), now on RD cost rather than raw SAD - same tie-break
  * convention, extended the same way.
  *
- * This is exhaustive, NOT coarse-to-fine, unlike
- * hevc_intra_wavefront.comp's 11-of-35 coarse grid search (that shader's
- * own SCOPE comment: "mode refinement... not implemented here yet"). A
- * cheaper search here is legitimate future perf work in the spirit of A5,
- * now against a 35-entry candidate set, and is explicitly NOT attempted -
- * see docs/notes/a6-cavlc-residual-port.md. */
+ * A6 mode-search-perf (2026-09-21): the board review that followed the RD
+ * bias above found the real cost this comment predicted - +52.42%
+ * per-frame HEVC encode time (docs/backlog.md's A6 entry), mechanically an
+ * 8.75x increase (4 candidates -> 35) in full predict_block4()+sad_4x4()
+ * work per 4x4 block, plus losing the old 4-candidate shape's
+ * compile-time unrolling. Off-board instrumentation
+ * (docs/notes/a6-mode-search-perf.md; tools/hevc_bench.c's `profile`, with
+ * this file's HEVC_PROF_BRACKET probes added for the occasion) confirmed
+ * where inside the loop that cost actually sits: angular prediction alone
+ * (33 of the 35 candidates, each doing 16 calls into
+ * predict_angular_sample()'s per-sample table lookups and branches) is
+ * ~34-37% of total encode time by itself, SAD ~13-14%, and Planar/DC
+ * prediction under 1.5% - angular prediction, not SAD or the RD arithmetic,
+ * is where the 8.75x actually spends itself.
+ *
+ * This is now the coarse-then-refine search the comment above always
+ * pointed at as the fix: Planar, DC, a step-4 sweep across the angular
+ * range (HEVC_COARSE_ANGULAR_MODES, 9 entries - the same coarse grid
+ * hevc_intra_wavefront.comp's shader search already uses), a +/-1/+/-2
+ * refinement around whichever angular mode won the coarse pass, and the
+ * PU's 3 real MPM candidates always costed in addition (per the task's own
+ * framing: they are "nearly free to signal" and may sit outside the coarse
+ * grid's step-4 sample points, e.g. mode 7 or 9). At most 2 + 9 + 4 + 3 = 18
+ * candidates, fewer after `tried[]` de-duplication, versus the previous
+ * 35 - see docs/notes/a6-mode-search-perf.md for the measured throughput
+ * recovery and its RD-quality cost.
+ *
+ * This changes WHICH modes are considered, not what a chosen mode means:
+ * mode 10/26's edge filter (predict_block4()) and hevc_scan_idx_for_mode()
+ * both key off the FINAL winning mode value at their own call sites
+ * (encoder_h265.c passes pu_modes[pu]/the returned mode, never the search
+ * path that found it), so neither depends on which candidates were tried
+ * versus skipped - confirmed by reading both call sites, not assumed.
+ * Likewise hevc_derive_mpm()/the CABAC mode-signalling functions are
+ * unchanged and still general over the full 0-34 range regardless of how
+ * narrow this search is. The RD-bias tie-break convention above is
+ * unchanged too - first-evaluated candidate wins an exact tie (strict
+ * `<`) - just applied over a smaller, differently-ordered candidate set;
+ * see hevc_eval_mode_candidate()'s comment. Byte-exactness is NOT expected
+ * to be preserved versus the 35-exhaustive build (a different mode can
+ * win), and isn't the bar here - `tools/hevc_host_drift.sh` still requires
+ * that whichever mode DOES win still decodes byte-exact against ffmpeg. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
                            int width, int height, int x0, int y0, int qp,
                            const int mpm[3], uint8_t pred_out[16]) {
     HEVC_PROF_ENTER();
 
-    /* Gather ONCE for all 35 candidates - the reference set does not
-     * depend on the mode. See gather_neighbors_wide()'s comment. */
+    /* Gather ONCE for every candidate this search ever evaluates - the
+     * reference set does not depend on the mode. See
+     * gather_neighbors_wide()'s comment. */
     uint8_t left[8], top[8], corner;
     gather_neighbors_wide(recon_y, stride, width, height, x0, y0, 1, left, top, &corner);
 
@@ -601,25 +747,54 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
 
     double lambda = hevc_luma_mode_lambda(qp);
 
-    /* Mode 0 (Planar) evaluated straight into pred_out, same as before -
-     * it is always tried first, so this is the same "first candidate wins
-     * ties by default" initialisation as the old code, one 16-byte copy
-     * cheaper than a sentinel `best_cost < 0` scheme. */
-    predict_block4(left, top, corner, HEVC_MODE_PLANAR, 1 /* luma */, pred_out);
-    int best_mode = HEVC_MODE_PLANAR;
-    double best_cost = (double)sad_4x4(src16, pred_out) +
-                        lambda * hevc_mode_rate_bits(HEVC_MODE_PLANAR, mpm);
+    uint8_t tried[HEVC_MODE_COUNT];
+    memset(tried, 0, sizeof(tried));
+    int best_mode = -1;
+    double best_cost = 0.0; /* unread until best_mode >= 0 sets it */
 
-    for (int m = 1; m < HEVC_MODE_COUNT; m++) {
-        uint8_t pred_[16];
-        predict_block4(left, top, corner, m, 1 /* luma */, pred_);
-        int sad_ = sad_4x4(src16, pred_);
-        double cost_ = (double)sad_ + lambda * hevc_mode_rate_bits(m, mpm);
-        if (cost_ < best_cost) {
-            best_cost = cost_;
-            best_mode = m;
-            memcpy(pred_out, pred_, 16);
+    /* Coarse pass: Planar, DC, then the step-4 angular grid. Track the best
+     * ANGULAR candidate separately from the overall best, since Planar/DC
+     * have no "neighbouring angle" for the refinement step below to expand
+     * around. */
+    hevc_eval_mode_candidate(left, top, corner, src16, lambda, mpm,
+                              HEVC_MODE_PLANAR, tried, &best_mode, &best_cost, pred_out);
+    hevc_eval_mode_candidate(left, top, corner, src16, lambda, mpm,
+                              HEVC_MODE_DC, tried, &best_mode, &best_cost, pred_out);
+
+    int best_angular = -1;
+    double best_angular_cost = 0.0;
+    for (int i = 0; i < 9; i++) {
+        int m = HEVC_COARSE_ANGULAR_MODES[i];
+        double cost_ = hevc_eval_mode_candidate(left, top, corner, src16, lambda, mpm,
+                                                 m, tried, &best_mode, &best_cost, pred_out);
+        if (best_angular < 0 || cost_ < best_angular_cost) {
+            best_angular = m;
+            best_angular_cost = cost_;
         }
+    }
+
+    /* Refine +/-1 and +/-2 around the coarse angular winner.
+     * HEVC_COARSE_ANGULAR_MODES has 9 distinct entries and the loop above
+     * always runs all 9, so best_angular is always set (>= 0) by this
+     * point regardless of whether an angular mode ended up beating
+     * Planar/DC overall. */
+    static const int HEVC_REFINE_DELTAS[4] = { -2, -1, 1, 2 };
+    for (int i = 0; i < 4; i++) {
+        int m = best_angular + HEVC_REFINE_DELTAS[i];
+        if (m >= 2 && m <= 34)
+            hevc_eval_mode_candidate(left, top, corner, src16, lambda, mpm,
+                                      m, tried, &best_mode, &best_cost, pred_out);
+    }
+
+    /* Always cost the PU's 3 real MPM candidates, per the task's own
+     * rationale: they are nearly free to signal (1-2 bypass bits versus the
+     * escape's 5) and are not guaranteed to already be sitting in the
+     * coarse grid or its refinement window. */
+    for (int i = 0; i < 3; i++) {
+        int m = mpm[i];
+        if (m >= 0 && m < HEVC_MODE_COUNT)
+            hevc_eval_mode_candidate(left, top, corner, src16, lambda, mpm,
+                                      m, tried, &best_mode, &best_cost, pred_out);
     }
 
     HEVC_PROF_LEAVE(best_mode, src_y, recon_y, stride, width, height, x0, y0, qp, mpm);
