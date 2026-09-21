@@ -58,15 +58,27 @@ HOST="${BC250_HOST:-user@10.0.0.104}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAB_REMOTE="/var/home/user/bc250-lab"
 
+# Keepalive is not optional. A `lab build work` here hung for 76 MINUTES on
+# `ssh ... mkdir -p`, of all things: the board had been power-cycled under a
+# previously-established TCP connection, so the socket was never reset and
+# ssh waited forever on a dead peer. A fresh ssh to the same board answered
+# instantly throughout. Without ServerAlive* there is no upper bound on that
+# wait, and the failure looks exactly like "the build is just slow" - the
+# stall is invisible because the output is still buffered behind a pipe.
+# 15s x 4 gives up after ~1 minute of silence from a peer that has gone away.
+# (A stale `ssh ... uname -a` from a session two DAYS earlier was still
+# parked in the process table when this was found.)
+KEEPALIVE=(-o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=10)
+
 if [ -n "${BC250_SSH:-}" ]; then
     SSH=(${BC250_SSH})
-    SCP=(scp)
+    SCP=(scp "${KEEPALIVE[@]}")
 elif [ -n "${BC250_PASS:-}" ]; then
-    SSH=(sshpass -p "$BC250_PASS" ssh -n -o StrictHostKeyChecking=no)
-    SCP=(sshpass -p "$BC250_PASS" scp -o StrictHostKeyChecking=no)
+    SSH=(sshpass -p "$BC250_PASS" ssh -n -o StrictHostKeyChecking=no "${KEEPALIVE[@]}")
+    SCP=(sshpass -p "$BC250_PASS" scp -o StrictHostKeyChecking=no "${KEEPALIVE[@]}")
 else
-    SSH=(ssh -n -o StrictHostKeyChecking=no)
-    SCP=(scp -o StrictHostKeyChecking=no)
+    SSH=(ssh -n -o StrictHostKeyChecking=no "${KEEPALIVE[@]}")
+    SCP=(scp -o StrictHostKeyChecking=no "${KEEPALIVE[@]}")
 fi
 
 # `ssh -n` is mandatory here: ssh inside a pipeline otherwise consumes stdin
