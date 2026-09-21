@@ -77,9 +77,18 @@ int hevc_scan_idx_for_mode(int mode);
  * prediction will see), then compared against the real SOURCE pixels at
  * (x0,y0) in `src_y` (both planes share `stride`/`width`/`height`) - the
  * comparison target for "which mode is best" is always the true picture
- * content, not the neighbor data used to build the candidate. */
+ * content, not the neighbor data used to build the candidate.
+ *
+ * It also HANDS BACK the winning mode's 16 predicted samples in pred_out,
+ * because the search has already built them and the caller's very next
+ * step is to subtract them from the source. That out-parameter is the
+ * whole reason this function has one: the encode path used to call
+ * hevc_predict_4x4() straight afterwards with the returned mode, which
+ * re-ran the neighbour gather and the prediction that had just been
+ * computed and thrown away. Output is unaffected - see hevc_intra.c. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0);
+                           int width, int height, int x0, int y0,
+                           uint8_t pred_out[16]);
 
 /* Derive the 3 most-probable-mode candidates for a 4x4 luma PU at (x0,y0)
  * from its already-decided left/above neighbor block modes, per 8.4.2.
