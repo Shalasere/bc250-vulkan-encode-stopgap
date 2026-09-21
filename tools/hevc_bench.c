@@ -48,6 +48,13 @@ extern int hevc_intra_prof_dup_mode_search;
 extern int hevc_intra_prof_timing;
 extern unsigned long long hevc_intra_prof_mode_cycles;
 extern unsigned long long hevc_intra_prof_mode_calls;
+/* A6 mode-search-perf: per-candidate breakdown within the mode search. */
+extern unsigned long long hevc_intra_prof_cyc_predict_planardc;
+extern unsigned long long hevc_intra_prof_cyc_predict_angular;
+extern unsigned long long hevc_intra_prof_cyc_sad;
+extern unsigned long long hevc_intra_prof_calls_predict_planardc;
+extern unsigned long long hevc_intra_prof_calls_predict_angular;
+extern unsigned long long hevc_intra_prof_calls_sad;
 #endif
 
 /* Same synthetic patterns as tools/hevc_host_repro.c, so a timing case and
@@ -287,9 +294,21 @@ int main(int argc, char **argv) {
         hevc_intra_prof_timing = 1;
         hevc_intra_prof_mode_cycles = 0;
         hevc_intra_prof_mode_calls = 0;
+        hevc_intra_prof_cyc_predict_planardc = 0;
+        hevc_intra_prof_cyc_predict_angular = 0;
+        hevc_intra_prof_cyc_sad = 0;
+        hevc_intra_prof_calls_predict_planardc = 0;
+        hevc_intra_prof_calls_predict_angular = 0;
+        hevc_intra_prof_calls_sad = 0;
         double tt = run_once(&c, &o, bs, cap, &sum, &bytes, NULL);
         unsigned long long cyc = hevc_intra_prof_mode_cycles;
         unsigned long long calls = hevc_intra_prof_mode_calls;
+        unsigned long long cyc_pdc = hevc_intra_prof_cyc_predict_planardc;
+        unsigned long long cyc_ang = hevc_intra_prof_cyc_predict_angular;
+        unsigned long long cyc_sad = hevc_intra_prof_cyc_sad;
+        unsigned long long calls_pdc = hevc_intra_prof_calls_predict_planardc;
+        unsigned long long calls_ang = hevc_intra_prof_calls_predict_angular;
+        unsigned long long calls_sad = hevc_intra_prof_calls_sad;
         hevc_intra_prof_timing = 0;
         double tsc_ghz = 0.0;
         {   /* calibrate rdtsc against CLOCK_MONOTONIC */
@@ -309,6 +328,28 @@ int main(int argc, char **argv) {
             printf("  instrumented total %.3f ms of a %.3f ms run = %.2f%% "
                    "(INCLUDES probe overhead, so an upper bound)\n",
                    ms, tt, 100.0 * ms / tt);
+
+            /* A6 mode-search-perf: per-candidate breakdown within the loop.
+             * Each row is separately rdtsc-bracketed (own probe overhead,
+             * so these three rows do not have to sum to the row above), and
+             * is comparable ACROSS builds because it brackets the identical
+             * call site in both the exhaustive and coarse-then-refine
+             * shapes - see hevc_intra.c's HEVC_PROF_BRACKET comment. */
+            double ms_pdc = (double)cyc_pdc / (tsc_ghz * 1e6);
+            double ms_ang = (double)cyc_ang / (tsc_ghz * 1e6);
+            double ms_sad = (double)cyc_sad / (tsc_ghz * 1e6);
+            printf("  within the loop (each row independently bracketed, "
+                   "own probe overhead, rows need not sum to the total):\n");
+            printf("    predict_block4 planar/dc: %llu calls, %.3f ms (%.2f%% of run)\n",
+                   calls_pdc, ms_pdc, 100.0 * ms_pdc / tt);
+            printf("    predict_block4 angular:   %llu calls, %.3f ms (%.2f%% of run)\n",
+                   calls_ang, ms_ang, 100.0 * ms_ang / tt);
+            printf("    sad_4x4:                  %llu calls, %.3f ms (%.2f%% of run)\n",
+                   calls_sad, ms_sad, 100.0 * ms_sad / tt);
+            printf("    remainder (RD cost arith, loop overhead, one-time "
+                   "gather+hoist): %.3f ms (%.2f%% of run)\n",
+                   ms - ms_pdc - ms_ang - ms_sad,
+                   100.0 * (ms - ms_pdc - ms_ang - ms_sad) / tt);
         }
         return 0;
     }
