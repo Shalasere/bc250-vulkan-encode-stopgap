@@ -362,6 +362,42 @@ if(BUILD_CAVLC_BENCH)
     endif()
 endif()
 
+# ----------------------------------------------------------------------------
+# hevc_cabac_bench - off-board CPU-HEVC harness (docs/backlog.md A4)
+# ----------------------------------------------------------------------------
+# Same rationale, same flag set and the same two-binary split as
+# cavlc_bench above: this exists to produce performance numbers, so it is a
+# CMake target inheriting the shipped -O3 -DNDEBUG rather than a hand-rolled
+# -O2 line, and the instrumented variant is a SEPARATE binary so the
+# uninstrumented numbers come from code with no hooks compiled into it.
+#
+# Unlike cavlc_bench it drives the real frame path
+# (hevc_encoder_encode_raw(), which is GPU-free), so it links the HEVC
+# encoder sources directly. gpu_compute.c comes along because encoder_h265.c
+# references gpu_compute_*() symbols from the GPU entry point this harness
+# never calls - the same reason tests/test_hevc_encode links the whole
+# driver library.
+if(BUILD_CAVLC_BENCH)
+    set(HEVC_BENCH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/hevc_cabac_bench.c)
+    if(EXISTS ${HEVC_BENCH_SRC})
+        set(HEVC_BENCH_DEPS src/encoder_h265.c src/hevc_intra.c src/hevc_cabac.c
+                            src/bitstream.c src/rate_control.c src/gpu_compute.c)
+
+        add_executable(hevc_cabac_bench ${HEVC_BENCH_SRC} ${HEVC_BENCH_DEPS})
+        target_include_directories(hevc_cabac_bench PRIVATE src ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(hevc_cabac_bench PRIVATE ${CAVLC_BENCH_FLAGS})
+        target_link_libraries(hevc_cabac_bench PRIVATE ${Vulkan_LIBRARIES} m)
+
+        add_executable(hevc_cabac_bench_prof ${HEVC_BENCH_SRC} ${HEVC_BENCH_DEPS})
+        target_include_directories(hevc_cabac_bench_prof PRIVATE src ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(hevc_cabac_bench_prof PRIVATE ${CAVLC_BENCH_FLAGS})
+        target_compile_definitions(hevc_cabac_bench_prof PRIVATE HEVC_CABAC_PROFILE)
+        target_link_libraries(hevc_cabac_bench_prof PRIVATE ${Vulkan_LIBRARIES} m)
+    else()
+        message(WARNING "BUILD_CAVLC_BENCH=ON but ${HEVC_BENCH_SRC} is missing")
+    endif()
+endif()
+
 # Tests
 #
 # enable_testing() MUST be called here, in the top-level CMakeLists.txt,

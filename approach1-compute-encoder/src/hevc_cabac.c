@@ -81,6 +81,18 @@ static const uint8_t g_hevc_sig_ctx4[16] = {
     7, 7, 8, 8
 };
 
+/* MEASURED AND REJECTED (2026-09-21, docs/notes/a4-cabac-residual.md):
+ * a copy of the table above pre-permuted by each scan
+ * (by_scan[scan_idx][sp] == g_hevc_sig_ctx4[g_hevc_scan4x4[scan_idx][sp]]),
+ * so the significance loop's context load is indexed by `sp` and no
+ * longer depends on the `scan[sp]` load that fetches the coefficient.
+ * Byte-identical, 48 bytes of rodata, and measured ZERO: -0.17%,
+ * +0.45%, +3.34%, +2.21% on four content points against a 2.30% A/A
+ * floor. Out-of-order execution already covers the dependent load -
+ * `sp` is a loop induction variable, so the address chain is known
+ * many iterations ahead and the loads are not on the critical path
+ * that the branchy encode_bin defines. Do not redo it. */
+
 #define COEF_REMAIN_BIN_REDUCTION 3
 #define C1FLAG_NUMBER             8
 
@@ -244,6 +256,18 @@ static inline void encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
     int num_bits = (int)(((uint32_t)(range - 256)) >> 31);
     uint32_t low = cb->low;
 
+    /* MEASURED AND REJECTED (2026-09-21, docs/notes/a4-cabac-residual.md):
+     * making this LPS/MPS selection branchless - computing both arms and
+     * picking with cmov, so the "did the bin go the way the context model
+     * expected" test cannot mispredict - measured ZERO. Byte-identical
+     * output, and against a 2.30% A/A floor it came in at +0.79%, +2.53%,
+     * +0.99% and -4.31% on four content points: inconsistent in sign and
+     * inside the floor. GCC does emit the cmovs. The branch is evidently
+     * predicted well enough at -O3 -march=znver2 that removing it only
+     * pays for the unconditional clz. Do not redo it off-board. It is
+     * still worth one BOARD run, since Zen 2 at BC-250 clocks has a
+     * different mispredict-to-ALU ratio, but nothing here justifies the
+     * change. */
     if ((bin ^ mstate) & 1u) {
         unsigned idx = 31u - (unsigned)__builtin_clz(lps);
         num_bits = (int)(8 - idx);
@@ -429,8 +453,65 @@ static void write_coef_remain_exp_golomb(hevc_cabac_t *cb, uint32_t code_number,
     }
 }
 
+#ifdef HEVC_CABAC_PROFILE
+/* ---- off-board profiling hook (tools/hevc_cabac_bench.c, docs/backlog.md A4)
+ *
+ * Compiled ONLY into the hevc_cabac_bench_prof target. The shipped driver
+ * never defines HEVC_CABAC_PROFILE, so every line between here and the
+ * function body below vanishes from its translation unit - verified by
+ * disassembly diff of hevc_cabac.c.o (byte-identical), the same way
+ * cavlc.c's CAVLC_PROFILE hooks are.
+ *
+ * Why a wrapper rather than counters inside the body: the body stays
+ * literally unmodified, so the thing being timed is the thing that ships.
+ * HEVC_RES4_MODE_STATS recomputes its own nonzero count from coeff[]
+ * instead of reading the body's num_nonzero, for the same reason.
+ *
+ * MODE_OFF is one predictable load+branch, so this binary's un-ablated
+ * baseline is close to the clean build's; the A/A row prices whatever
+ * remains. */
+int      g_hevc_res4_mode    = 0;   /* HEVC_RES4_MODE_* in hevc_cabac.h */
+uint64_t g_hevc_res4_cycles  = 0;
+uint64_t g_hevc_res4_calls   = 0;
+uint64_t g_hevc_res4_nonzero = 0;
+uint64_t g_hevc_res4_luma    = 0;
+
+static void hevc_res4_impl(hevc_cabac_t *cb, const int16_t coeff[16],
+                            int is_luma, int scan_idx) __attribute__((noinline));
+
 void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
                                    int is_luma, int scan_idx) {
+    switch (g_hevc_res4_mode) {
+    default:
+        hevc_res4_impl(cb, coeff, is_luma, scan_idx);
+        return;
+    case 1:                                     /* ABLATE: emit nothing */
+        return;
+    case 2: {                                   /* CYCLES */
+        uint64_t t0 = __builtin_ia32_rdtsc();
+        hevc_res4_impl(cb, coeff, is_luma, scan_idx);
+        g_hevc_res4_cycles += __builtin_ia32_rdtsc() - t0;
+        g_hevc_res4_calls++;
+        return;
+    }
+    case 3: {                                   /* STATS */
+        int nz = 0;
+        for (int i = 0; i < 16; i++) nz += (coeff[i] != 0);
+        g_hevc_res4_nonzero += (uint64_t)nz;
+        g_hevc_res4_luma    += (uint64_t)(is_luma != 0);
+        g_hevc_res4_calls++;
+        hevc_res4_impl(cb, coeff, is_luma, scan_idx);
+        return;
+    }
+    }
+}
+
+static void hevc_res4_impl(hevc_cabac_t *cb, const int16_t coeff[16],
+                            int is_luma, int scan_idx) {
+#else
+void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
+                                   int is_luma, int scan_idx) {
+#endif
     const uint8_t *scan = g_hevc_scan4x4[scan_idx];
 
     /* Find last significant scan position. */
@@ -458,12 +539,32 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
 
     /* Significance map + gather absolute levels (scan order, decreasing
      * from scan_pos_last down to 0 - absCoeff[0] is always the last-scan-
-     * position coefficient itself, inferred significant, never coded). */
+     * position coefficient itself, inferred significant, never coded).
+     *
+     * The signs accumulate into one MSB-first bitmask rather than an
+     * int16_t sign[16] array, so they can go out as a single
+     * encode_bypass_bins() below instead of num_nonzero separate
+     * encode_bypass() calls - see the sign-bit block. x265's
+     * codeCoeffNxN() carries them the same way. Measured -14.2% to
+     * -19.3% on this function at -O3 -march=znver2 across four content
+     * points, byte-identical (docs/notes/a4-cabac-residual.md).
+     *
+     * MEASURED AND REJECTED in the same session: making this loop's
+     * store branchless (store abs_coeff[num_nonzero] unconditionally,
+     * `num_nonzero += sig`, `sign_bits = (sign_bits << sig) | (val<0)`)
+     * on the theory that `if (sig)` is a coin flip the predictor cannot
+     * learn. It is byte-identical and it is SLOWER: +4.93%, +4.18%,
+     * +3.41%, -1.17% against a 2.30% A/A floor. The unconditional store
+     * costs a real store-queue slot on every scan position including
+     * the ~50% that are zero, and on this content the branch is
+     * evidently predictable enough that that does not pay. Do not redo
+     * it off-board. */
     int16_t abs_coeff[16];
-    int16_t sign[16];
+    uint32_t sign_bits;
     int num_nonzero = 1;
-    abs_coeff[0] = (int16_t)(coeff[pos_raster] < 0 ? -coeff[pos_raster] : coeff[pos_raster]);
-    sign[0] = (int16_t)(coeff[pos_raster] < 0 ? 1 : 0);
+    int last_val = coeff[pos_raster];
+    abs_coeff[0] = (int16_t)(last_val < 0 ? -last_val : last_val);
+    sign_bits = (uint32_t)(last_val < 0);
 
     int sig_base = is_luma ? 0 : 27;
     for (int sp = scan_pos_last - 1; sp >= 0; sp--) {
@@ -474,7 +575,7 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
         encode_bin(cb, HEVC_CTX_SIG_FLAG + sig_base + ctx_sig, (uint32_t)sig);
         if (sig) {
             abs_coeff[num_nonzero] = (int16_t)(val < 0 ? -val : val);
-            sign[num_nonzero] = (int16_t)(val < 0 ? 1 : 0);
+            sign_bits = (sign_bits << 1) | (uint32_t)(val < 0);
             num_nonzero++;
         }
     }
@@ -504,9 +605,20 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
     }
 
     /* Sign bits (bypass), decreasing-scan-position order, no sign hiding
-     * (this project's PPS sets sign_data_hiding_flag=0). */
-    for (int idx = 0; idx < num_nonzero; idx++)
-        encode_bypass(cb, (uint32_t)sign[idx]);
+     * (this project's PPS sets sign_data_hiding_flag=0).
+     *
+     * One batched call, not num_nonzero separate encode_bypass() calls.
+     * These are identical arithmetic, not an approximation: n successive
+     * encode_bypass() calls compute
+     * low = (((low<<1 + b0*range)<<1 + b1*range)<<1 ... )
+     *     = low<<n + range*(b0<<(n-1) | b1<<(n-2) | ...),
+     * which is exactly what encode_bypass_bins(value, n) computes, and
+     * the 8-bit chunking in encode_bypass_bins is what keeps `low` from
+     * overflowing 32 bits between byte emissions. This is also how x265
+     * codes them (Entropy::encodeBinsEP(signbits, numNonZero)). What it
+     * buys is num_nonzero-1 fewer bits_left tests and write-out branches
+     * per coded block. */
+    encode_bypass_bins(cb, sign_bits, num_nonzero);
 
     /* coeff_abs_level_remaining. */
     if (!c1 || num_nonzero > C1FLAG_NUMBER) {
