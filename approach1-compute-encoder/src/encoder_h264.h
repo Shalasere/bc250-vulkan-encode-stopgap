@@ -173,7 +173,9 @@ int h264_encoder_get_num_slices(const h264_encoder_t *encoder);
  * requested a genuine constant-bitrate contract (as opposed to VBR, where a
  * requested bitrate is a loose ceiling and using fewer bits than that
  * ceiling when content doesn't need them is correct, not a bug - see
- * docs/rate_control_audit.md).
+ * docs/DEVLOG.md §16-17 (rate_control_audit.md's content was folded into
+ * DEVLOG and into rate_control.c's own comments; the file itself no
+ * longer exists in this tree).
  *
  * Only when this is true, and only for the shortfall between what real
  * coded content used and rate_control.c's per-frame target, does the
@@ -191,11 +193,14 @@ int h264_encoder_get_num_slices(const h264_encoder_t *encoder);
  * invocation sends 50%) and honors
  * VAEncMiscParameterRateControl.rc_flags.bits.disable_bit_stuffing (the
  * VA-API's own explicit "don't pad" signal) when set. This is a narrower,
- * additive signal, not a fix for docs/rate_control_audit.md section 4
- * point 5 (this driver still hardcodes rate_control_t.mode to RC_CBR
- * everywhere and never actually negotiates VA_RC_VBR from the VAConfig) -
- * see that function's own comment for why target_percentage was chosen
- * over plumbing the VAConfig's negotiated rate-control mode through.
+ * additive signal, layered on top of - not a substitute for - actually
+ * negotiating the VAConfig's rate-control mode. That part is NOT still
+ * open: bc250_CreateContext() (va_backend.c) reads
+ * VAConfigAttribRateControl off the config and routes VA_RC_CQP/VA_RC_VBR/
+ * VA_RC_CBR to RC_CQP/RC_VBR/RC_LOW_LATENCY via *_encoder_set_rc_mode()
+ * (docs/DEVLOG.md §26.7, §28) - rate_control_t.mode is no longer
+ * hardcoded to one value regardless of what the client asked for, which
+ * an earlier version of this comment claimed was still true.
  */
 void h264_encoder_set_cbr_intent(h264_encoder_t *encoder, bool cbr_intent);
 

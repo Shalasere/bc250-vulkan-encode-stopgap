@@ -126,6 +126,12 @@ struct h264_encoder {
     h264_pps_t pps;
     rate_control_t rc;
     bool cbr_intent;             /* see h264_encoder_set_cbr_intent's doc comment */
+    /* Last QP explicitly handed to h264_encoder_set_qp(), or -1 if never
+     * called yet. See that function's doc comment (docs/backlog.md D1) -
+     * this is what lets it tell "the caller resent the same hint" from
+     * "the caller wants a new QP", instead of unconditionally resetting
+     * rate-control state on every call. */
+    int qp_hint_applied;
     uint64_t last_frame_sad;     /* Sum of macroblock motion SAD from previous frame */
     int num_slices;              /* Configured slices per frame (1..16) */
     uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
@@ -256,9 +262,9 @@ static size_t write_aud(uint8_t *buf, size_t buf_size, bool is_idr) {
  * NAL unit type 12) - but ONLY when the caller has signaled genuine CBR
  * intent (h264_encoder_set_cbr_intent()).
  *
- * This is the fix for the gap docs/rate_control_audit.md and the
- * fix(rate_control) commit before this one both documented and explicitly
- * left open: once rate_control.c's feedback loop drives QP down to its
+ * This is the fix for the gap docs/DEVLOG.md and the fix(rate_control)
+ * commit before this one both documented and explicitly left open: once
+ * rate_control.c's feedback loop drives QP down to its
  * floor (qp_min=12) and the content still doesn't need as many bits as a
  * high requested bitrate calls for, there was previously nothing to make
  * up the difference - the encoder just produced whatever bits the content
@@ -1714,6 +1720,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
      * reaction, not an opt-out of hitting the target the way real VBR is. */
     rc_init(&encoder->rc, RC_LOW_LATENCY, bitrate, (double)encoder->fps, width, height);
     encoder->last_frame_sad = 0;
+    encoder->qp_hint_applied = -1; /* no explicit QP hint applied yet - see h264_encoder_set_qp() */
 
     /* 4 bytes/pixel + slack. Was 2 bytes/pixel, which is ~50x more than
      * real 1440p desktop content needs at QP 12 (measured max 148,542
@@ -1787,12 +1794,20 @@ void h264_encoder_set_bitrate(h264_encoder_t *encoder, uint32_t bitrate_bps) {
      * base_qp, error_integral back to 0) - appropriate when the bitrate
      * genuinely changes, but this is called from bc250_RenderPicture()
      * (va_backend.c) for both VAEncSequenceParameterBufferType and
-     * VAEncMiscParameterTypeRateControl, and docs/rate_control_audit.md
-     * section 4 point 6 flags that it was never confirmed whether a real
-     * VA-API caller resends one of those buffers with an unchanged value
-     * every frame. If it does, resetting on every call would silently
-     * throw away the integral term's whole reason for existing (letting
-     * *sustained* error accumulate across frames) every single frame.
+     * VAEncMiscParameterTypeRateControl, and it was an open question for a
+     * long time (docs/DEVLOG.md, formerly tracked in the now-folded-in
+     * docs/rate_control_audit.md) whether a real VA-API caller resends one
+     * of those buffers with an unchanged value every frame. If it does,
+     * resetting on every call would silently throw away the integral
+     * term's whole reason for existing (letting *sustained* error
+     * accumulate across frames) every single frame. **Confirmed as part
+     * of docs/backlog.md D1** (docs/notes/d1-rate-control.md): a real
+     * caller does exactly this, at least for the sibling QP hint
+     * (VAEncPictureParameterBufferH264.pic_init_qp /
+     * VAEncMiscParameterRateControl.initial_qp) - h264_encoder_set_qp()
+     * below had no equivalent guard and was measured to flatten the
+     * encoder's response to a 2x bitrate change to near zero. This
+     * function's guard is why the bitrate path was never the mechanism.
      * Preserving the already-selected mode (rather than hardcoding RC_CBR
      * again here) is likewise just "don't reset state that didn't need to
      * change." */
@@ -1924,13 +1939,41 @@ void h264_encoder_set_qp(h264_encoder_t *encoder, int qp) {
          * bitstream reader correctly rejected as out of range, corrupting
          * the very first frame of the stream). This code path is only
          * reachable when a caller explicitly sets a nonzero pic_init_qp in
-         * VAEncPictureParameterBufferH264 - this project's own synthetic
-         * ffmpeg-testsrc testing never has, which is why this went
-         * uncaught all session until a real VA-API consumer (Sunshine)
-         * exercised it for the first time. */
+         * VAEncPictureParameterBufferH264.
+         *
+         * docs/backlog.md D1: this function used to stomp rc.base_qp AND
+         * rc.current_qp on EVERY call, unconditionally - unlike
+         * h264_encoder_set_bitrate() just above, which has always guarded
+         * against reinitializing when the value didn't actually change
+         * (see that function's own comment). VAEncPictureParameterBufferH264
+         * is a mandatory PER-FRAME VA-API buffer (it carries frame_num/poc/
+         * reference lists, so it cannot be reused across frames), and at
+         * least one real caller resends the same pic_init_qp/initial_qp
+         * hint on every frame of a session rather than only when it
+         * changes (see docs/notes/d1-rate-control.md). Applying that resend
+         * unconditionally meant rc_get_frame_qp()'s clamped +-2/3-per-frame
+         * QP walk was reset back to the hint before it ever accumulated
+         * more than one frame of movement - which is why the encoder's mean
+         * QP tracked va_backend.c's caller-supplied hint almost exactly and
+         * barely responded to a 2x bitrate change at all (measured
+         * off-board with tools/rc_bench.c: doubling the bitrate moved mean
+         * QP by -0.01 with this stomp simulated, vs -0.96 to -11+ without
+         * it, depending on codec/content - see docs/notes/d1-rate-control.md).
+         *
+         * Fixed the same way set_bitrate() already was: only actually reset
+         * rate-control state the first time this value is seen, or when it
+         * genuinely changes. A resend of the SAME hint is then a no-op, and
+         * rate_control.c's own feedback loop is left alone to keep walking
+         * frame to frame - exactly like set_bitrate() already treats a
+         * resent, unchanged bitrate. A genuinely new hint (the caller's
+         * dynamic QP change, or a real CQP session moving to a different
+         * fixed QP) still applies immediately. */
+        if (qp != encoder->qp_hint_applied) {
+            encoder->rc.base_qp = qp;
+            encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
+        }
         encoder->pps.pic_init_qp = qp - 26;
-        encoder->rc.base_qp = qp;
-        encoder->rc.current_qp = qp;
     }
 }
 
