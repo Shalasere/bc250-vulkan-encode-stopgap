@@ -200,6 +200,19 @@ LIBVA_DRIVER_NAME=bc250 vainfo     # lists H.264 & HEVC profiles + VAEntrypointE
 > [!WARNING]
 > **Turn off screen blanking on the host.** Sunshine re-initializes KMS capture on every app launch, and if the display has slept it reads the output as `0x0` and returns *"Failed to initialize video capture/encoding. Is a display connected and turned on?"* (Error 503) to the client — even though Sunshine itself started fine hours earlier. On KDE: System Settings → Power Management → turn off "Screen Energy Saving". Verify with `cat /sys/class/drm/card*-DP-1/enabled` (must read `enabled`, not `disabled`); `kscreen-doctor -o` is *not* a reliable check here. `docs/DEVLOG.md` §14.4.
 
+> [!TIP]
+> **Streaming a light game? Consider forcing GPU clocks up.** This encoder only occupies the GPU for roughly 25–30% of each frame, which is not enough load for a utilization-driven governor to raise clocks — so on a game that doesn't peg the GPU itself, the encoder can end up running at minimum clocks with nothing to blame. A heavy game raises clocks as a side effect and masks this; a light one doesn't.
+>
+> [filippor/cyan-skillfish-governor](https://github.com/filippor/cyan-skillfish-governor) provides `cyan-skillfish-performance-mode`, which wraps a command and restores the previous governor state when it exits. Add it to a game's Steam launch options:
+>
+> ```
+> cyan-skillfish-performance-mode %command%
+> ```
+>
+> It also takes `--fixed-frequency 1200` or `--range 500 1500` before `%command%`, and needs that project's `cyan-skillfish-governor-smu` service running with D-Bus enabled.
+>
+> **Not measured by this project.** It is a plausible mechanism and a third-party report, not a number we have taken — and note that DEVLOG §203 records forcing performance mode as *refuted*, though that test predates the fix that removed an 81 ms uncached-read stall, so it was measured when GPU clocks could not have mattered. Treat both as open. This is deliberately a user-side launch option rather than something the driver does: clock policy is a system-management concern, the same reasoning that removed `dynamic_governor.c` (see [Known Limitations](#known-limitations)).
+
 **OBS**: `LIBVA_DRIVER_NAME=bc250 obs` → Output → Advanced → Video Encoder: FFmpeg VAAPI, Device: `/dev/dri/renderD128`.
 
 **ffmpeg**:
@@ -209,8 +222,18 @@ export LIBVA_DRIVER_NAME=bc250
 # H.264 encode (GPU compute accelerated):
 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v h264_vaapi -b:v 8M output_h264.mp4
 
-# H.265/HEVC encode (GPU motion estimation, CABAC, IDR/P-frame):
+# H.265/HEVC encode. Opt-in: HEVC is NOT advertised by default, because
+# Sunshine probes it first and would otherwise silently negotiate the
+# ~5 fps CPU path over the 45-77 fps H.264 one. Without BC250_ENABLE_HEVC=1
+# this fails with "No usable encoding profile found".
+export BC250_ENABLE_HEVC=1
+
+# ...CPU path (~5 fps at 1080p), correct but not real-time:
 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc.mp4
+
+# ...GPU intra path (~92 fps at 1080p all-intra). All-intra only, and its
+# chroma is not yet bit-exact - see docs/hevc-gpu-intra.md before relying on it:
+BC250_HEVC_GPU=1 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc_gpu.mp4
 ```
 
 > [!NOTE]
