@@ -52,15 +52,25 @@
 extern "C" {
 #endif
 
-/* The only four HEVC intra modes this encoder ever chooses (mirroring the
- * four H.264 Intra16x16 modes the GPU shaders already know how to pick
- * between by SAD, conceptually - DC, Planar, Horizontal, Vertical), applied
- * per-4x4-block with real chained reconstruction rather than GPU-computed
- * whole-macroblock prediction. See hevc_intra.c's mode-decision comment. */
+/* Named constants for the four "axis" modes this file has always singled
+ * out (Planar, DC, and the two exactly-horizontal/exactly-vertical
+ * angular modes, which alone get 8.4.4.2.6's edge filter). Backlog A6
+ * (2026-09-21) widened hevc_choose_luma_mode()/hevc_predict_4x4() from
+ * choosing only among these four to the full HEVC_MODE_COUNT-mode range
+ * (0=Planar, 1=DC, 2-34=angular) - see hevc_intra.c's mode-decision
+ * comment and docs/notes/a6-cavlc-residual-port.md. These four constants
+ * remain because the code still needs to name them specifically (mode 10
+ * and 26's edge filter, the MPM substitution's Planar/DC/Vertical
+ * default), not because they are the only modes reachable. */
 #define HEVC_MODE_PLANAR      0
 #define HEVC_MODE_DC          1
 #define HEVC_MODE_HORIZONTAL 10
 #define HEVC_MODE_VERTICAL   26
+/* Rec. ITU-T H.265's full intra mode count (0=Planar, 1=DC, 2-34=angular).
+ * encoder_h265.c's GPU path (encode_core_gpu) already clamped against the
+ * literal 34 with a comment noting "no HEVC_MODE_COUNT constant" - this is
+ * that constant, added by A6 so both paths can name it. */
+#define HEVC_MODE_COUNT       35
 
 /* Rec. ITU-T H.265 Table 8-10 (scan derivation for intra 4x4/8x8 luma, and
  * 4:4:4 chroma - not applicable to our 4:2:0 chroma, which always scans
@@ -68,9 +78,8 @@ extern "C" {
  * else SCAN_DIAG(0). Matches hevc_cabac.c's scan_idx numbering. */
 int hevc_scan_idx_for_mode(int mode);
 
-/* Real intra mode decision (SAD-minimizing among the 4 supported modes,
- * the same "no rate-distortion, SAD-only" criterion the GPU's own I16x16
- * decision uses) for one 4x4 luma block at pixel position (x0,y0). Each
+/* Real intra mode decision for one 4x4 luma block at pixel position
+ * (x0,y0), among all HEVC_MODE_COUNT (35) modes as of backlog A6. Each
  * candidate mode's prediction is built from `recon_y` (real already-
  * reconstructed neighbor pixels, or the substituted default where
  * unavailable per 8.4.4.2.2 - the same values a real decoder's own
@@ -78,6 +87,21 @@ int hevc_scan_idx_for_mode(int mode);
  * (x0,y0) in `src_y` (both planes share `stride`/`width`/`height`) - the
  * comparison target for "which mode is best" is always the true picture
  * content, not the neighbor data used to build the candidate.
+ *
+ * A6 follow-up (2026-09-21, see docs/notes/a6-cavlc-residual-port.md): this
+ * is no longer SAD-only. It now minimizes `sad + lambda * rate_bits(mode)`,
+ * where rate_bits() is the EXACT extra bypass-bit cost of signaling that
+ * mode (1 bit if it's the first MPM candidate, 2 if it's the second/third,
+ * 5 for the fixed-length escape - see hevc_mode_rate_bits() in
+ * hevc_intra.c, which mirrors hevc_cabac_code_intra_luma_data()'s actual
+ * bin counts) and `lambda` is a QP-dependent RD weight (see
+ * hevc_luma_mode_lambda()). `mpm` (the caller's already-derived 3-entry
+ * MPM candidate list for this PU, per hevc_derive_mpm() below) and `qp`
+ * are required so this cost model can be computed; the caller MUST derive
+ * `mpm` with the exact same neighbor data it will later pass to
+ * hevc_cabac_code_intra_luma_flag()/_data() for this same PU, or the
+ * search's idea of what's cheap to signal will disagree with what
+ * actually gets signaled.
  *
  * It also HANDS BACK the winning mode's 16 predicted samples in pred_out,
  * because the search has already built them and the caller's very next
@@ -87,8 +111,8 @@ int hevc_scan_idx_for_mode(int mode);
  * re-ran the neighbour gather and the prediction that had just been
  * computed and thrown away. Output is unaffected - see hevc_intra.c. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0,
-                           uint8_t pred_out[16]);
+                           int width, int height, int x0, int y0, int qp,
+                           const int mpm[3], uint8_t pred_out[16]);
 
 /* Derive the 3 most-probable-mode candidates for a 4x4 luma PU at (x0,y0)
  * from its already-decided left/above neighbor block modes, per 8.4.2.
