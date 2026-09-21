@@ -147,6 +147,15 @@ layout(set = 0, binding = 3, rg8) uniform image2D reconUV;     /* read AND write
 layout(std430, set = 0, binding = 4) buffer ModeOut  { int  modes[];  };
 layout(std430, set = 0, binding = 5) buffer CoeffOut { int  coeffs[]; };
 layout(std430, set = 0, binding = 6) buffer CbfOut   { uint cbf[];    };
+/* binding 7 = per-CTU zero-motion-skip flag (docs/notes/c7-gpu-pframes.md),
+ * one uint per CTU, host-decided and host-uploaded before this dispatch.
+ * NULL/all-zero (every existing caller before this feature) makes this
+ * binding a no-op: skip_mask[i] is never nonzero, so the early return
+ * below is never taken and every CTU runs exactly the intra path this
+ * shader always has. Not read at all when the caller has no P-frame this
+ * dispatch (the host still uploads an all-zero buffer, since the binding
+ * must have SOMETHING valid to read). */
+layout(std430, set = 0, binding = 7) buffer SkipMask { uint skip_mask[]; };
 
 /* Rec. ITU-T H.265 8.6.4.2 transMatrix, left half of each row; the right
  * half is the mirror M[i][N-1-j] == (-1)^i * M[i][j] and every smaller
@@ -256,6 +265,7 @@ int chroma_mode_from_idx(int idx, int luma) {
 
 /* ---- shared state, one CTU's worth ---- */
 shared int  s_ctbx, s_ctby;
+shared bool s_skip;                /* zero-motion P-frame skip for this CTU */
 shared int  s_scan[4 * N + 1];     /* references in 8.4.4.2.2 scan order */
 /* Two reference sets, built once: [0] as gathered, [1] smoothed per
  * 8.4.4.2.3. filterFlag is binary, so a mode selects a set rather than
@@ -530,11 +540,28 @@ void main() {
         int y_lo = max(0, (s - Wc + 2) / 2);
         int yy = y_lo + int(gl_WorkGroupID.x);
         int xx = s - 2 * yy;
-        s_ctby = (yy < Hc && xx >= 0 && xx < Wc) ? yy : -1;
+        bool valid = (yy < Hc && xx >= 0 && xx < Wc);
+        s_ctby = valid ? yy : -1;
         s_ctbx = xx;
+        /* P-frame zero-motion skip (docs/notes/c7-gpu-pframes.md). A
+         * flagged CTU's reconstruction is the co-located block of the
+         * reference picture, decided entirely on the host before this
+         * dispatch was recorded. Returning here without touching reconY/
+         * reconUV is enough: each CTU is written at most once per frame by
+         * this shader, so a CTU that has not been visited yet still holds
+         * whatever was already in recon_image when this dispatch began -
+         * which, for the previous frame's *unskipped* pixels, is that
+         * frame's own finished reconstruction, i.e. exactly the zero-motion
+         * reference copy both this encoder and a real decoder need to use
+         * as this CTU's picture AND as the neighbour data any later-
+         * scheduled non-skip CTU on this same diagonal-wavefront schedule
+         * reads. skip_mask is all-zero on every call site that predates
+         * this feature, so this branch is never taken there. */
+        s_skip = valid && (skip_mask[uint(yy) * uint(Wc) + uint(xx)] != 0u);
     }
     barrier();
     if (s_ctby < 0) return;
+    if (s_skip) return;
 
     int bx = s_ctbx * N, by = s_ctby * N;
     int px = int(t) & (N - 1), py = int(t) >> LOG2N;

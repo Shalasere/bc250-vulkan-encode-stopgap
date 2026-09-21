@@ -421,6 +421,40 @@ struct hevc_encoder {
      * no inter/merge path at all, so it forces every frame to IDR. */
     bool use_gpu;
 
+    /* Second, independent opt-in on top of use_gpu (BC250_HEVC_GPU_PFRAME=1),
+     * latched at the same time and for the same reason (see use_gpu's
+     * comment - this changes what the SPS says about DPB/reordering, so it
+     * cannot toggle mid-stream either). Kept separate from use_gpu itself so
+     * that BC250_HEVC_GPU=1 alone reproduces the exact board-validated
+     * all-intra behaviour (docs/hevc-gpu-intra.md) with zero code-path
+     * change - this feature (docs/notes/c7-gpu-pframes.md) has not had a
+     * board run at all yet, and C5's decision to keep HEVC opt-in already
+     * establishes the precedent of not changing validated default behaviour
+     * for an unvalidated feature. */
+    bool use_gpu_pframe;
+
+    /* GPU-path P-frame zero-motion skip (docs/notes/c7-gpu-pframes.md).
+     * One uint32 per CTU (width_ctu * height_ctu entries), nonzero meaning
+     * "host decided this CTU is SKIP" - shared verbatim as the skip_mask
+     * gpu_compute_hevc_dispatch_intra() uploads to the shader AND as the
+     * host's own bookkeeping for cu_skip_flag ctxInc and the DC-for-skip-
+     * neighbour MPM rule (see encode_core_gpu()). Unlike the CPU path's
+     * cu_skip_map/cu_is_inter (per-8x8-CU, 4 per CTU), this path has
+     * exactly one CU per CTU, so one entry per CTU is enough - and every
+     * inter CU this path ever signals is a SKIP with motion (0,0) by
+     * construction (real motion compensation is out of scope, matching
+     * the CPU path's own "zero-motion skip plus intra fallback" - see
+     * docs/backlog.md C9's "still open after this"), so there is no
+     * separate is_inter/mv map to keep: is_inter == is_skip here. */
+    uint32_t *gpu_ctu_skip;
+
+    /* Scratch for de-interleaving ctx->recon_image's packed NV12 UV plane
+     * (read back via gpu_compute_hevc_download_recon_nv12()) into the
+     * planar prev_recon_cb/prev_recon_cr above, coded chroma dimensions -
+     * same role dl_uv plays for the source download, just for the
+     * reference instead. Only touched on a P-frame candidate. */
+    uint8_t *gpu_recon_uv_scratch;
+
     /* Set when this frame's QP has already been chosen, so the encode_core*
      * functions don't choose it a second time.
      *
@@ -551,13 +585,20 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
 
     size_t num_mbs = (size_t)enc->width_ctu * enc->height_ctu;
     enc->gpu_mvs = calloc(num_mbs, sizeof(gpu_mv_t));
+    enc->gpu_ctu_skip = calloc(num_mbs, sizeof(uint32_t));
+    /* Same sizing as dl_uv (interleaved NV12 UV, row stride = coded_width,
+     * height = coded_height/2), not width/height - this scratch is only
+     * ever filled from ctx->recon_image, which is allocated at coded
+     * dimensions. */
+    enc->gpu_recon_uv_scratch = malloc((size_t)enc->coded_width * (enc->coded_height / 2));
 
     if (!enc->src_y || !enc->src_cb || !enc->src_cr ||
         !enc->recon_y || !enc->recon_cb || !enc->recon_cr ||
         !enc->prev_recon_y || !enc->prev_recon_cb || !enc->prev_recon_cr ||
         !enc->cu_skip_map || !enc->cu_is_inter || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
-        !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs) {
+        !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs || !enc->gpu_ctu_skip ||
+        !enc->gpu_recon_uv_scratch) {
         hevc_encoder_destroy(enc);
         return NULL;
     }
@@ -567,9 +608,14 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     {
         const char *g = getenv("BC250_HEVC_GPU");
         enc->use_gpu = (g && strcmp(g, "1") == 0);
+        const char *gp = getenv("BC250_HEVC_GPU_PFRAME");
+        enc->use_gpu_pframe = enc->use_gpu && gp && strcmp(gp, "1") == 0;
         if (enc->use_gpu) {
             fprintf(stderr, "[bc250-hevc] BC250_HEVC_GPU=1: GPU intra path enabled "
-                            "(all-intra, 16x16 CU / 16x16 luma TU)\n");
+                            "(16x16 CU / 16x16 luma TU; P-frame zero-motion skip "
+                            "%s - see docs/notes/c7-gpu-pframes.md, UNVALIDATED ON "
+                            "HARDWARE)\n",
+                            enc->use_gpu_pframe ? "enabled" : "disabled, all-intra");
         }
     }
 
@@ -722,6 +768,8 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->slice_rbsp);
     free(encoder->scratch_out);
     free(encoder->gpu_mvs);
+    free(encoder->gpu_ctu_skip);
+    free(encoder->gpu_recon_uv_scratch);
     free(encoder);
 }
 
@@ -1558,6 +1606,98 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
  * GPU intra path (BC250_HEVC_GPU=1)
  * ==========================================================================*/
 
+/* GPU-path P-frame zero-motion-skip decision (BC250_HEVC_GPU_PFRAME=1,
+ * docs/notes/c7-gpu-pframes.md). Host-side only - nothing here touches the
+ * GPU. Requires encoder->src_y/cb/cr and encoder->prev_recon_y/cb/cr to
+ * already hold this frame's source and the previous frame's reconstruction
+ * (the caller's job: hevc_encoder_encode_frame() downloads both from the
+ * GPU before calling this; hevc_encoder_encode_gpu_raw() below takes them
+ * as host pointers directly, for off-board testing). */
+
+/* One CTU's zero-motion SAD is the sum of four 8x8-luma + 4x4-chroma
+ * zero-motion SADs - the exact same per-block primitives encode_cu() (CPU
+ * path) already uses for its own 8x8-CU skip decision, just called four
+ * times each to cover this path's 16x16 luma / 8x8 chroma CTU instead of
+ * once. No new SAD code, and nothing here uses the GPU's own SAD (this
+ * shader has no SAD output binding). */
+static uint32_t compute_sad_ctu_zero(const hevc_encoder_t *enc, int ctu_x, int ctu_y) {
+    uint32_t cw = enc->coded_width, ccw = cw / 2;
+    static const int off_x[4] = { 0, 8, 0, 8 };
+    static const int off_y[4] = { 0, 0, 8, 8 };
+    uint32_t sad = 0;
+    for (int i = 0; i < 4; i++) {
+        int lx = ctu_x + off_x[i], ly = ctu_y + off_y[i];
+        sad += compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, lx, ly, 0, 0);
+        int cx = ctu_x / 2 + off_x[i] / 2, cy = ctu_y / 2 + off_y[i] / 2;
+        sad += compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                      enc->prev_recon_cb, enc->prev_recon_cr,
+                                      ccw, cx, cy, 0, 0);
+    }
+    return sad;
+}
+
+/* Fills enc->gpu_ctu_skip[] (one uint32 per CTU, nonzero = skip) and
+ * enc->last_frame_sad (this frame's total zero-motion SAD, fed to
+ * pick_frame_qp() as the temporal-complexity estimate for the NEXT frame -
+ * same convention as encode_cu()'s enc->last_frame_sad accumulation on the
+ * CPU path). Also marks every skip CTU's luma_mode_map footprint DC, for
+ * MPM correctness if this decision is consumed before any later memset
+ * re-zeroes the map (encode_core_gpu() re-does this marking itself, from
+ * this same gpu_ctu_skip[], after its own memset - see there).
+ *
+ * The threshold below decides RATE/QUALITY, not CORRECTNESS: a CTU marked
+ * skip always reconstructs as an exact copy of the reference (see
+ * hevc_intra_wavefront.comp's early return), so no value of this threshold
+ * can make the bitstream non-conforming - only worse-compressed or worse-
+ * looking. That is deliberate slack: this heuristic has had no board
+ * measurement at all (see this file's top-level status note), so getting
+ * its exact value right is explicitly not a correctness requirement here,
+ * only a tuning one for later. */
+static void decide_gpu_ctu_skips(hevc_encoder_t *enc, int qp) {
+    /* CPU path's own per-8x8-CU threshold (encode_cu()) is
+     * 96 * (1 + qp/8). One CTU here is the SUM of four such CU-sized
+     * zero-motion SADs (compute_sad_ctu_zero() above), so scaling that same
+     * formula by 4 asks "would each of the four sub-blocks individually
+     * have passed the CPU path's own threshold" - a reasonable starting
+     * point, not a derived constant. BC250_HEVC_GPU_SKIP_THRESHOLD
+     * overrides it outright, same convention as the CPU path's
+     * BC250_HEVC_SKIP_THRESHOLD. */
+    uint32_t threshold = 4u * 96u * (1u + (uint32_t)(qp / 8));
+    static int s_override = -2;
+    if (s_override == -2) {
+        const char *env = getenv("BC250_HEVC_GPU_SKIP_THRESHOLD");
+        s_override = env ? atoi(env) : -1;
+    }
+    if (s_override >= 0) threshold = (uint32_t)s_override;
+
+    uint32_t total_sad = 0;
+    for (uint32_t row = 0; row < enc->height_ctu; row++) {
+        for (uint32_t col = 0; col < enc->width_ctu; col++) {
+            uint32_t idx = row * enc->width_ctu + col;
+            int ctu_x = (int)col * HEVC_CTU_SIZE, ctu_y = (int)row * HEVC_CTU_SIZE;
+            uint32_t sad = compute_sad_ctu_zero(enc, ctu_x, ctu_y);
+            total_sad += sad;
+            bool skip = sad <= threshold;
+            enc->gpu_ctu_skip[idx] = skip ? 1u : 0u;
+            if (skip) {
+                int mx = ctu_x / HEVC_PU_SIZE, my = ctu_y / HEVC_PU_SIZE;
+                for (int py = 0; py < HEVC_CTU_SIZE / HEVC_PU_SIZE; py++)
+                    for (int px = 0; px < HEVC_CTU_SIZE / HEVC_PU_SIZE; px++)
+                        enc->luma_mode_map[(my + py) * enc->mode_map_stride + (mx + px)] = HEVC_MODE_DC;
+            }
+        }
+    }
+    enc->last_frame_sad = total_sad;
+
+    if (getenv("BC250_HEVC_GPU_DEBUG_STATS")) {
+        size_t nctu = (size_t)enc->width_ctu * enc->height_ctu;
+        size_t n_skip = 0;
+        for (size_t i = 0; i < nctu; i++) n_skip += enc->gpu_ctu_skip[i] ? 1u : 0u;
+        fprintf(stderr, "[HEVC_GPU_STATS] frame=%u qp=%d threshold=%u total_sad=%u skip=%zu/%zu\n",
+                enc->frame_count, qp, threshold, total_sad, n_skip, nctu);
+    }
+}
+
 /* Entropy-code one frame from hevc_intra_wavefront.comp's output. The shader
  * has already done mode decision, transform, quantization and reconstruction
  * for every CTU; nothing here recomputes any of it, and nothing here touches
@@ -1582,35 +1722,72 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
  * transform_skip and cu_qp_delta all disabled, so transform_unit() carries
  * no syntax beyond the cbf flags and the residuals. */
 static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t output_size,
+                           bool is_idr,
                            const int32_t *gmodes, const int32_t *gcoeffs, const uint32_t *gcbf)
 {
-    /* All-intra: this path has no inter prediction, so every frame is an IDR
-     * regardless of gop_size. */
+    /* `is_idr` is the caller's decision, not this function's - see
+     * hevc_encoder_encode_frame() and docs/notes/c7-gpu-pframes.md. It is
+     * NOT simply "frame_count % gop_size == 0": the caller must also force
+     * it whenever gpu_compute_hevc_dispatch_intra() reports the reference
+     * image was just (re)created (out_recon_was_reset), since this
+     * function has no way to see that on its own. */
     encoder->force_idr = false;
-    encoder->poc = 0;
+    if (is_idr) {
+        encoder->poc = 0;
+        /* No CTU is a skip on an IDR. The dispatch that already ran ignored
+         * gpu_ctu_skip for this frame too (see gpu_compute_hevc_dispatch_
+         * intra()'s NULL/recon-reset handling) - this keeps the CPU-side
+         * skip bookkeeping in agreement with what was actually dispatched,
+         * which is exactly the kind of encoder/decoder disagreement this
+         * project's history says to take seriously (docs/hevc-gpu-intra.md's
+         * split_cu_flag ctxInc bug). */
+        memset(encoder->gpu_ctu_skip, 0,
+               (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(uint32_t));
+    }
 
     /* Already chosen before the dispatch - the shader quantized with it.
      * Re-deriving here would signal a QP the coefficients were not
      * quantized at. */
     pick_frame_qp(encoder, 0);
     encoder->qp_already_decided = false;
-    encoder->last_frame_sad = 0;
 
+    /* This memset zeroes luma_mode_map back to Planar (mode 0) for every
+     * position, including the ones decide_gpu_ctu_skips() already marked
+     * HEVC_MODE_DC before the dispatch that used it. Re-mark them below,
+     * from gpu_ctu_skip (the authoritative decision this function also
+     * signals from), rather than trusting whatever the pre-dispatch pass
+     * left behind. */
     memset(encoder->luma_mode_map, 0,
            (size_t)encoder->mode_map_stride * (encoder->coded_height / HEVC_PU_SIZE));
 
-    bool write_param_sets = true; /* every frame is an IDR here */
-    encoder->pps_init_qp = encoder->qp;
+    bool write_param_sets = is_idr;
+    if (write_param_sets) {
+        encoder->pps_init_qp = encoder->qp;
+    }
     int slice_qp_delta = encoder->qp - encoder->pps_init_qp;
 
     bitstream_t slice_bs;
     bs_init(&slice_bs, encoder->slice_rbsp, encoder->slice_rbsp_cap);
 
     bs_write1(&slice_bs, 1); /* first_slice_segment_in_pic_flag */
-    bs_write1(&slice_bs, 1); /* no_output_of_prior_pics_flag (IRAP) */
+    if (is_idr) {
+        bs_write1(&slice_bs, 1); /* no_output_of_prior_pics_flag (IRAP) */
+    }
     bs_write_ue(&slice_bs, 0); /* slice_pic_parameter_set_id */
-    bs_write_ue(&slice_bs, 2); /* slice_type = I */
-    bs_write_se(&slice_bs, slice_qp_delta);
+    bs_write_ue(&slice_bs, is_idr ? 2 : 1); /* slice_type: 2 = I, 1 = P */
+
+    if (!is_idr) {
+        /* Byte-for-byte the same P-slice header syntax as encode_core()'s
+         * (CPU path) - same SPS short-term RPS entry (DeltaPoc = -1), same
+         * PPS, so a decoder cannot tell which encoder path produced this
+         * from the header alone. */
+        bs_write_u(&slice_bs, 4, encoder->poc & 0xF);  /* slice_pic_order_cnt_lsb */
+        bs_write1(&slice_bs, 1);                        /* short_term_ref_pic_set_sps_flag = 1 */
+        bs_write1(&slice_bs, 0);                        /* num_ref_idx_active_override_flag = 0 */
+        bs_write_ue(&slice_bs, 0);                       /* five_minus_max_num_merge_cand = 0 */
+    }
+
+    bs_write_se(&slice_bs, slice_qp_delta); /* slice_qp_delta relative to active PPS */
     /* slice_loop_filter_across_slices_enabled_flag omitted - see the CPU
      * path's slice header and write_pps()'s comment. Both paths share one
      * PPS, so this bit's presence condition is false for both. */
@@ -1618,7 +1795,7 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
 
     hevc_cabac_t cab;
     hevc_cabac_init(&cab, &slice_bs);
-    hevc_cabac_reset_contexts(&cab, encoder->qp, 2);
+    hevc_cabac_reset_contexts(&cab, encoder->qp, is_idr ? 2 : 1);
     hevc_cabac_start(&cab);
 
     int16_t cl[256], ccb[64], ccr[64];
@@ -1629,6 +1806,90 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
         for (uint32_t col = 0; col < encoder->width_ctu; col++) {
             uint32_t ctu = row * encoder->width_ctu + col;
             int ctu_x = (int)col * HEVC_CTU_SIZE, ctu_y = (int)row * HEVC_CTU_SIZE;
+            int mx = ctu_x / HEVC_PU_SIZE, my = ctu_y / HEVC_PU_SIZE;
+
+            bool is_skip = (!is_idr) && (encoder->gpu_ctu_skip[ctu] != 0);
+
+            /* split_cu_flag is a coding_QUADTREE element, coded before
+             * coding_unit() is ever entered - i.e. before cu_skip_flag,
+             * unconditionally, for EVERY CTU regardless of slice type or
+             * what coding_unit() will turn out to contain. This was
+             * previously coded only on the non-skip path below (after an
+             * early `continue` for skip CTUs that never reached it at
+             * all) - a real bitstream bug found by this file's own
+             * off-board test harness (docs/notes/c7-gpu-pframes.md): every
+             * skip CTU was missing this bin entirely, and every non-skip
+             * P-slice CTU had cu_skip_flag/pred_mode_flag coded BEFORE it
+             * instead of after, densely reordering every following bin for
+             * the rest of the slice. All-intra frames never had this bug -
+             * is_idr never took the is_skip branch and pred_mode_flag is
+             * never coded on that path either, so split_cu_flag was already
+             * the first thing written per CTU there; it only broke once a
+             * P-slice (is_idr == false) existed to code cu_skip_flag/
+             * pred_mode_flag ahead of it. ctxInc is 0 always here - see the
+             * comment that used to sit directly above this call, kept
+             * below at its new call site's rationale. */
+            hevc_cabac_code_split_cu_flag(&cab, 0, 0);
+
+            if (!is_idr) {
+                /* cu_skip_flag ctxInc (9.3.4.2.2): condL + condA, condX = 1
+                 * iff that neighbour CTU exists and was ITSELF coded skip.
+                 * Same formula as the CPU path's encode_cu() - explicitly
+                 * checked and ruled out as a bug source there
+                 * (docs/hevc_scope_note.md's "what was ruled out") - just
+                 * indexed per-CTU instead of per-8x8-CU, since this path
+                 * has exactly one CU per CTU. Unlike split_cu_flag's ctxInc
+                 * just above (which IS 0 here, for a different, depth-based
+                 * reason - see its own comment), this one keeps the CPU
+                 * path's own left/above-existence formula because
+                 * cu_skip_flag's ctxInc really is about existence, not
+                 * depth (9.3.4.2.2 vs 9.3.4.2.1). */
+                int cond_l = (col > 0 && encoder->gpu_ctu_skip[ctu - 1]) ? 1 : 0;
+                int cond_a = (row > 0 && encoder->gpu_ctu_skip[ctu - encoder->width_ctu]) ? 1 : 0;
+                hevc_cabac_code_cu_skip_flag(&cab, is_skip ? 1 : 0, cond_l + cond_a);
+            }
+
+            if (is_skip) {
+                /* merge_idx = 0, unconditionally - not a shortcut around
+                 * building the real 8.5.3.2.2 candidate list, but exact,
+                 * because every one of that list's five entries is
+                 * provably (0,0) on this path: every spatial neighbour
+                 * this path can ever mark "inter" is itself a zero-motion
+                 * SKIP (real motion compensation is out of scope - see the
+                 * gpu_ctu_skip field comment and docs/backlog.md C9's
+                 * "still open after this"), sps_temporal_mvp_enabled_flag
+                 * is 0 (write_sps() - no temporal candidate), and a
+                 * P-slice's zero-candidate padding (8.5.3.2.1) is (0,0)/
+                 * refIdx 0 by construction. A list that can only ever
+                 * contain (0,0) in all five slots makes merge_idx's VALUE
+                 * unobservable in the reconstructed picture - any index a
+                 * decoder derives decodes to the same motion - so this
+                 * signals the cheapest legal one instead of deriving a
+                 * list whose content could never change the outcome. This
+                 * is NOT the CPU path's derive_merge_candidates(): that
+                 * function's z-scan/availability geometry is specific to
+                 * four 8x8 NxN CUs per CTU and does not describe this
+                 * path's one-CU-per-CTU structure - see this file's top
+                 * comment on why the two paths are different coders. */
+                hevc_cabac_code_merge_idx(&cab, 0);
+
+                /* DC for MPM purposes - ITU-T H.265 8.4.2, CuPredMode !=
+                 * MODE_INTRA forces candIntraPredModeX to INTRA_DC.
+                 * Re-marked here (decide_gpu_ctu_skips() already did this
+                 * once, before dispatch) because the luma_mode_map memset
+                 * above re-zeroed the whole map to Planar after that ran. */
+                for (int py = 0; py < HEVC_CTU_SIZE / HEVC_PU_SIZE; py++)
+                    for (int px = 0; px < HEVC_CTU_SIZE / HEVC_PU_SIZE; px++)
+                        encoder->luma_mode_map[(my + py) * encoder->mode_map_stride + (mx + px)] = HEVC_MODE_DC;
+
+                ctu_idx++;
+                hevc_cabac_encode_terminate(&cab, ctu_idx == total_ctus ? 1 : 0);
+                continue;
+            }
+
+            if (!is_idr) {
+                hevc_cabac_code_pred_mode_flag(&cab, 1 /* MODE_INTRA */);
+            }
 
             /* Clamp both GPU-supplied decisions. These cross a device->host
              * staging boundary, and a stale or partially-written buffer
@@ -1648,33 +1909,23 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
             int chroma_idx = (int)((flags >> 8) & 0xFFu);
             if (chroma_idx > 4) chroma_idx = 4;
 
-            /* ctxInc is 0, ALWAYS - not the neighbour-availability sum the
-             * CPU path uses. 9.3.4.2.2 derives it as condL + condA where
-             * condL = availableL && CtDepth[left] > cqtDepth (and likewise
-             * above): the test is whether the neighbour is DEEPER, not
-             * whether it exists. Every CU on this path is one undivided
-             * 16x16 at depth 0, so no neighbour is ever deeper and both
-             * terms are always 0.
-             *
-             * Copying encode_ctu()'s `cond_l + cond_a` here - correct there,
-             * because that path splits every CTU to depth 1 - was a real
-             * decoder-visible corruption: the encoder coded this bin against
-             * ctx 1 or 2 while the decoder used ctx 0, so their probability
-             * states diverged. The signature was diagnostic in hindsight -
-             * CTU (0,0) decoded EXACTLY right (col=0,row=0 gives ctx 0, which
-             * happens to match), CTU rows 1-3 degraded, and everything from
-             * row 4 down was solid black. Measured: 5.0 dB PSNR and a luma
-             * mean of 4.4 against the source's 126.0. It still decoded
-             * without a single ffmpeg error, which is why the decode-silence
-             * check alone did not catch it. */
-            hevc_cabac_code_split_cu_flag(&cab, 0, 0);
+            /* split_cu_flag for THIS CTU was already coded above, before
+             * cu_skip_flag - see that call site for both the ctxInc-is-
+             * always-0 rationale (a depth argument, 9.3.4.2.1) and the
+             * historical intra-only bug it documents (a DIFFERENT ctxInc
+             * mistake, 9.3.4.2.2, that a real board run caught: 5.0 dB PSNR,
+             * decoded without a single ffmpeg error). Nothing else in
+             * coding_quadtree() belongs between that flag and here. */
 
             /* MPM. candIntraPredModeB is unconditionally INTRA_DC here: this
              * CU starts at a CTU boundary, so yCb-1 always crosses into the
              * CTU row above, which 8.4.2 forces to DC as a normative rule
              * rather than an availability test (see the long comment on the
-             * CPU path's equivalent - getting this wrong was a real bug). */
-            int mx = ctu_x / HEVC_PU_SIZE, my = ctu_y / HEVC_PU_SIZE;
+             * CPU path's equivalent - getting this wrong was a real bug).
+             * candIntraPredModeA (left) now legitimately reads a SKIP
+             * neighbour's DC marking here too, when the left CTU is a
+             * P-frame skip - that is the same rule, applied to the new
+             * case this feature introduces. */
             int left_avail = ctu_x > 0;
             int left_mode = left_avail ? encoder->luma_mode_map[my * encoder->mode_map_stride + (mx - 1)] : 0;
             int mpm[3];
@@ -1736,7 +1987,7 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
     {
         bitstream_t out_bs;
         bs_init(&out_bs, encoder->scratch_out + total, encoder->scratch_out_cap - total);
-        bs_write_nal_header_hevc(&out_bs, NAL_UNIT_CODED_SLICE_IDR_W_RADL);
+        bs_write_nal_header_hevc(&out_bs, is_idr ? NAL_UNIT_CODED_SLICE_IDR_W_RADL : NAL_UNIT_CODED_SLICE_TRAIL_R);
         size_t off = bs_bytes_written(&out_bs);
         size_t rbsp = bs_bytes_written(&slice_bs);
         if (bs_overflowed(&out_bs) ||
@@ -1751,10 +2002,16 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
 
     if (total > 0 && encoder->rc.mode != RC_CQP) rc_update_stats(&encoder->rc, (int)(total * 8));
 
-    /* No reference-frame bookkeeping: this path never emits a P-slice, so
-     * prev_recon_* would never be read. has_ref stays false deliberately -
-     * if a caller ever falls back to the CPU path mid-stream, that forces an
-     * IDR rather than letting it predict from a reference it never built. */
+    /* This frame's own reconstruction (in ctx->recon_image - the CTUs the
+     * shader wrote fresh, plus the CTUs left untouched because
+     * decide_gpu_ctu_skips()/the shader's skip early-return copied last
+     * frame's forward instead - see docs/notes/c7-gpu-pframes.md) is now a
+     * complete, valid reference for the next P-frame, whether this frame
+     * was itself an IDR or a P. Unlike the all-intra version of this
+     * function, has_ref must become true here - the whole point of this
+     * feature is giving the next frame something to reference. */
+    encoder->has_ref = true;
+    encoder->poc++;
     encoder->frame_count++;
     return (int)total;
 }
@@ -1775,6 +2032,18 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
      * NULL because this is the first frame - falls through to the CPU path
      * rather than producing a broken frame. */
     if (encoder->use_gpu && gpu_ctx && input_surface.y_plane != VK_NULL_HANDLE) {
+        /* Same is_idr formula as encode_core() (CPU path) - EXCEPT this
+         * path only ever considers a P-frame at all when
+         * BC250_HEVC_GPU_PFRAME=1 was latched at create time
+         * (docs/notes/c7-gpu-pframes.md). With that flag unset, is_idr is
+         * unconditionally true here and every line below that touches
+         * gpu_ctu_skip, prev_recon buffers or decide_gpu_ctu_skips() is
+         * skipped, which reproduces this function's exact pre-existing
+         * (all-intra, board-validated) behaviour byte for byte - see
+         * use_gpu_pframe's field comment for why that matters. */
+        bool is_idr_candidate = !encoder->use_gpu_pframe ||
+            (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
+
         /* Decide the QP BEFORE dispatching: the shader quantizes with the
          * value handed to it here, and encode_core_gpu() then signals that
          * same value in the slice header. Deciding afterwards (as this
@@ -1785,17 +2054,91 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
          * requested bitrate was 1M or 8M - rate control could not move it
          * at all - and ffmpeg reported CABAC_MAX_BIN errors once the two
          * QPs diverged far enough that the coded levels no longer matched
-         * the signalled step. */
-        pick_frame_qp(encoder, 0);
+         * the signalled step. Same is_idr-gated estimate encode_core() uses
+         * for the same reason (rate control's temporal-complexity ratio). */
+        pick_frame_qp(encoder, is_idr_candidate ? 0 : encoder->last_frame_sad);
+
+        /* P-frame candidate: decide zero-motion skips BEFORE dispatch, since
+         * the decision has to be uploaded as this dispatch's skip_mask, not
+         * applied after the fact (docs/notes/c7-gpu-pframes.md explains why
+         * post-hoc host-side overriding cannot work here - the shader must
+         * see the mask itself, before it decides which CTUs to touch).
+         * Needs this frame's source AND last frame's reconstruction on the
+         * host - both real downloads, unlike the pure-intra fast path above
+         * which never touches the host at all for pixel data. */
+        if (!is_idr_candidate) {
+            gpu_compute_dmabuf_sync_start(gpu_ctx, input_memory);
+            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
+                                      encoder->dl_y, (int)encoder->width,
+                                      encoder->dl_uv, (int)encoder->width,
+                                      (int)encoder->width, (int)encoder->height);
+            gpu_compute_dmabuf_sync_end(gpu_ctx, input_memory);
+            pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
+                          encoder->dl_y, encoder->width, encoder->width, encoder->height);
+            {
+                uint32_t cw2 = encoder->width / 2, ch2 = encoder->height / 2;
+                uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
+                for (uint32_t y = 0; y < ch2; y++) {
+                    const uint8_t *uvrow = encoder->dl_uv + (size_t)y * encoder->width;
+                    for (uint32_t x = 0; x < cw2; x++) {
+                        encoder->src_cb[y * ccw + x] = uvrow[x * 2 + 0];
+                        encoder->src_cr[y * ccw + x] = uvrow[x * 2 + 1];
+                    }
+                }
+                pad_replicate(encoder->src_cb, ccw, cch, encoder->src_cb, ccw, cw2, ch2);
+                pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
+            }
+
+            /* Reference = ctx->recon_image, still holding the PREVIOUS
+             * frame's finished reconstruction (this frame's dispatch has
+             * not run yet). Coded dimensions, and no pad_replicate needed
+             * unlike the source above - every pixel in the coded area was
+             * written by a real CTU last frame, none of it is edge-
+             * replicated filler. */
+            if (gpu_compute_hevc_download_recon_nv12(gpu_ctx,
+                    encoder->prev_recon_y, (int)encoder->coded_width,
+                    encoder->gpu_recon_uv_scratch, (int)encoder->coded_width,
+                    (int)encoder->coded_width, (int)encoder->coded_height) == 0) {
+                uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
+                for (uint32_t y = 0; y < cch; y++) {
+                    const uint8_t *uvrow = encoder->gpu_recon_uv_scratch + (size_t)y * encoder->coded_width;
+                    for (uint32_t x = 0; x < ccw; x++) {
+                        encoder->prev_recon_cb[y * ccw + x] = uvrow[x * 2 + 0];
+                        encoder->prev_recon_cr[y * ccw + x] = uvrow[x * 2 + 1];
+                    }
+                }
+                decide_gpu_ctu_skips(encoder, encoder->qp);
+            } else {
+                /* No usable reference readback (first HEVC frame ever, or a
+                 * transient failure) - fall back to "no CTU skips this
+                 * frame" rather than skip against garbage. has_ref being
+                 * true is what made is_idr_candidate false in the first
+                 * place, so this should not happen in practice; treated
+                 * defensively rather than assumed unreachable. */
+                memset(encoder->gpu_ctu_skip, 0,
+                       (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(uint32_t));
+                encoder->last_frame_sad = 0;
+            }
+        }
 
         gpu_compute_begin_picture(gpu_ctx, input_surface);
+        int recon_was_reset = 0;
         int rc = gpu_compute_hevc_dispatch_intra(gpu_ctx, input_surface,
                                                  (int)encoder->coded_width, (int)encoder->coded_height,
                                                  (int)encoder->width, (int)encoder->height,
-                                                 encoder->qp);
+                                                 encoder->qp,
+                                                 is_idr_candidate ? NULL : encoder->gpu_ctu_skip,
+                                                 &recon_was_reset);
         gpu_compute_end_picture(gpu_ctx);
         int slot = gpu_compute_submitted_slot(gpu_ctx);
         gpu_compute_sync_slot(gpu_ctx, slot);
+
+        /* A reset recon_image means gpu_compute_hevc_dispatch_intra() ignored
+         * whatever skip_mask it was given (see that function's doc comment)
+         * and coded every CTU intra regardless - encode_core_gpu() must be
+         * told the same thing, or its entropy loop would signal cu_skip_flag
+         * for CTUs the shader never actually skipped. */
+        bool is_idr_final = is_idr_candidate || (recon_was_reset != 0);
 
         /* BC250_DUMP_RECON_FRAMES=1: the encoder's OWN reconstruction, as the
          * shader left it. The drift oracle - decode the resulting bitstream
@@ -1824,7 +2167,7 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
                 if (ms >= nctu * sizeof(int32_t) &&
                     cs >= nctu * 384 * sizeof(int32_t) &&
                     bs_sz >= nctu * sizeof(uint32_t)) {
-                    return encode_core_gpu(encoder, output_buf, output_size,
+                    return encode_core_gpu(encoder, output_buf, output_size, is_idr_final,
                                            (const int32_t *)md, (const int32_t *)cd,
                                            (const uint32_t *)bd);
                 }
@@ -1951,4 +2294,131 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
         memcpy(encoder->dl_uv + (size_t)y * encoder->width, uv_plane + (size_t)y * uv_pitch, encoder->width);
 
     return encode_core(encoder, output_buf, output_size);
+}
+
+/* Off-board exercise of the GPU path's P-frame logic (docs/notes/
+ * c7-gpu-pframes.md), with the same "stand in for the GPU readback" role
+ * BC250_HEVC_FAKE_GPU_MV plays for the CPU path above. There is no board
+ * and no working Vulkan device available in this environment - this is the
+ * only way the new encode_core_gpu() P-slice code (RPS/slice-header
+ * signalling, cu_skip_flag ctxInc, merge_idx, the DC-for-skip-neighbour MPM
+ * rule) runs at all in this pass, or ever ran before a board picks it up.
+ *
+ * Unlike hevc_encoder_encode_raw() above, the "reference picture" is an
+ * explicit argument (`ref_y_plane`/`ref_uv_plane`) rather than carried-over
+ * encoder state, because there is no real shader run here to produce one:
+ * the real GPU path's reference is whatever hevc_intra_wavefront.comp left
+ * in ctx->recon_image last frame, and this function has no such image to
+ * read forward from. Passing the SAME content as both `y_plane`/`uv_plane`
+ * (this frame's source) and the reference is how to force a deterministic,
+ * fully-skipped P-frame for the strongest check this function can do
+ * off-board (see below); passing a genuinely different reference exercises
+ * the skip-decision threshold and a real mix of skip/non-skip CTUs, but at
+ * that point `synth_modes`/`synth_coeffs`/`synth_cbf` for the non-skip CTUs
+ * are still not a claim about real intra coding - see below.
+ *
+ * What this DOES verify, when driven through tools/hevc_host_drift.sh-style
+ * decode: the bitstream syntax (RPS, POC, P-slice header, skip signalling)
+ * parses and decodes silently, and - critically, since a skip CTU's
+ * decoded picture is byte-determined regardless of what "shader" produced
+ * the non-skip CTUs - that a fully-skipped P-frame decodes to a bit-exact
+ * copy of the reference frame. That is a real, spec-grounded correctness
+ * check on the part of this feature that is pure CPU-side signalling.
+ *
+ * What this does NOT verify: anything about hevc_intra_wavefront.comp
+ * itself (the skip_mask early return, the recon_image reuse, the
+ * descriptor/buffer plumbing in gpu_compute.c). `synth_modes`/
+ * `synth_coeffs`/`synth_cbf` (any may be NULL for an all-DC/all-zero-
+ * residual default) are NOT a claim about what the real shader would
+ * produce for a non-skip CTU - they only need to be A valid, decodable
+ * intra CTU so the surrounding P-slice signalling can be exercised on a
+ * realistic mix of skip and non-skip CTUs. Treat any PSNR/quality number
+ * out of this function as meaningless; only decode-silence and skip-region
+ * byte-exactness are real signal. */
+int hevc_encoder_encode_gpu_raw(hevc_encoder_t *encoder,
+                                const uint8_t *y_plane, int y_pitch,
+                                const uint8_t *uv_plane, int uv_pitch,
+                                const uint8_t *ref_y_plane, int ref_y_pitch,
+                                const uint8_t *ref_uv_plane, int ref_uv_pitch,
+                                const int32_t *synth_modes,
+                                const int32_t *synth_coeffs,
+                                const uint32_t *synth_cbf,
+                                uint8_t *output_buf, size_t output_size)
+{
+    if (!encoder || !output_buf || !y_plane || !uv_plane) return -1;
+    /* This path's SPS (MaxTb=16, one CU per CTU) only exists when use_gpu
+     * was latched at create time - see that field's comment. */
+    if (!encoder->use_gpu) return -1;
+
+    for (uint32_t y = 0; y < encoder->height; y++)
+        memcpy(encoder->dl_y + (size_t)y * encoder->width, y_plane + (size_t)y * y_pitch, encoder->width);
+    for (uint32_t y = 0; y < encoder->height / 2; y++)
+        memcpy(encoder->dl_uv + (size_t)y * encoder->width, uv_plane + (size_t)y * uv_pitch, encoder->width);
+    pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
+                  encoder->dl_y, encoder->width, encoder->width, encoder->height);
+    {
+        uint32_t cw2 = encoder->width / 2, ch2 = encoder->height / 2;
+        uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
+        for (uint32_t y = 0; y < ch2; y++) {
+            const uint8_t *uvrow = encoder->dl_uv + (size_t)y * encoder->width;
+            for (uint32_t x = 0; x < cw2; x++) {
+                encoder->src_cb[y * ccw + x] = uvrow[x * 2 + 0];
+                encoder->src_cr[y * ccw + x] = uvrow[x * 2 + 1];
+            }
+        }
+        pad_replicate(encoder->src_cb, ccw, cch, encoder->src_cb, ccw, cw2, ch2);
+        pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
+    }
+
+    bool is_idr = !encoder->use_gpu_pframe ||
+        (encoder->frame_count % encoder->gop_size == 0) || encoder->force_idr || !encoder->has_ref;
+
+    if (!is_idr && ref_y_plane && ref_uv_plane) {
+        /* Reference goes straight into prev_recon_y/cb/cr at CODED
+         * dimensions - the caller is expected to already hand this at
+         * coded_width x coded_height (e.g. a previous call's own `src_y`-
+         * shaped buffer), so no pad_replicate step is needed or done here,
+         * matching how the real GPU path's recon_image readback (coded
+         * dims, no replication - see hevc_encoder_encode_frame()) behaves. */
+        for (uint32_t y = 0; y < encoder->coded_height; y++)
+            memcpy(encoder->prev_recon_y + (size_t)y * encoder->coded_width,
+                   ref_y_plane + (size_t)y * ref_y_pitch, encoder->coded_width);
+        uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
+        for (uint32_t y = 0; y < cch; y++) {
+            const uint8_t *uvrow = ref_uv_plane + (size_t)y * ref_uv_pitch;
+            for (uint32_t x = 0; x < ccw; x++) {
+                encoder->prev_recon_cb[y * ccw + x] = uvrow[x * 2 + 0];
+                encoder->prev_recon_cr[y * ccw + x] = uvrow[x * 2 + 1];
+            }
+        }
+    }
+
+    pick_frame_qp(encoder, is_idr ? 0 : encoder->last_frame_sad);
+
+    if (!is_idr) {
+        decide_gpu_ctu_skips(encoder, encoder->qp);
+    } else {
+        memset(encoder->gpu_ctu_skip, 0,
+               (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(uint32_t));
+        encoder->last_frame_sad = 0;
+    }
+
+    size_t nctu = (size_t)encoder->width_ctu * encoder->height_ctu;
+    int32_t *modes = malloc(nctu * sizeof(int32_t));
+    int32_t *coeffs = calloc(nctu * 384, sizeof(int32_t));
+    uint32_t *cbf = calloc(nctu, sizeof(uint32_t));
+    int ret = -1;
+    if (modes && coeffs && cbf) {
+        for (size_t i = 0; i < nctu; i++)
+            modes[i] = synth_modes ? synth_modes[i] : HEVC_MODE_DC;
+        if (synth_coeffs) memcpy(coeffs, synth_coeffs, nctu * 384 * sizeof(int32_t));
+        for (size_t i = 0; i < nctu; i++)
+            cbf[i] = synth_cbf ? synth_cbf[i] : 0u; /* cbf=0 -> no residual bits, flat DC block */
+
+        ret = encode_core_gpu(encoder, output_buf, output_size, is_idr, modes, coeffs, cbf);
+    }
+    free(modes);
+    free(coeffs);
+    free(cbf);
+    return ret;
 }

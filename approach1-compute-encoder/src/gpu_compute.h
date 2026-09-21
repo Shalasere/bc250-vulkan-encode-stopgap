@@ -281,6 +281,21 @@ typedef struct bc250_gpu_context {
     uint32_t hevc_alloc_width;
     uint32_t hevc_alloc_height;
 
+    /* Per-CTU P-frame zero-motion-skip flags (docs/notes/c7-gpu-pframes.md),
+     * one uint32 per CTU. Unlike the mode/coeff/cbf buffers above this is an
+     * INPUT the host writes and the shader only reads, so - unlike those -
+     * it needs no separate device-local + staging-copy pair: a single
+     * HOST_VISIBLE|HOST_COHERENT buffer the shader binds directly is enough
+     * for something this small (nctu * 4 bytes) and written once per
+     * dispatch. Double-buffered by ctx->current_buf, the same slot the
+     * command buffer being recorded into uses - NOT gpu_compute_submitted_
+     * slot(), which is the readback-side convention for a buffer the HOST
+     * reads after the GPU finishes; this one is the opposite direction. */
+    VkBuffer hevc_skip_buffers[2];
+    VkDeviceMemory hevc_skip_memories[2];
+    void *hevc_skip_mapped[2];
+    VkDeviceSize hevc_skip_size;
+
     /* Reconstructed frame for DPB */
     gpu_image_t recon_image;
     gpu_memory_t recon_memory;
@@ -528,10 +543,34 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
  * gpu_compute_get_hevc_*_slot() getters after a sync. Returns 0 on success,
  * -1 if the HEVC pipeline is unavailable (shader missing, allocation failed)
  * - in which case the caller must fall back to the CPU path, as
- * encoder_h265.c does. */
+ * encoder_h265.c does.
+ *
+ * `skip_mask` (docs/notes/c7-gpu-pframes.md): NULL, or one uint32 per CTU
+ * (row-major, width_ctu*height_ctu entries) where nonzero means "the host
+ * has already decided this CTU is a P-frame zero-motion SKIP - do not
+ * touch its reconstruction, its mode, its coefficients or its cbf". NULL is
+ * treated as all-zero (every CTU intra, byte-identical to this function's
+ * behaviour before this parameter existed) and is what every all-intra
+ * caller should keep passing. The caller must have already decided, before
+ * this call, whether it is safe to skip anything at all - this function
+ * does not check has_ref/gop/etc., it only honours whatever mask it is given.
+ *
+ * `out_recon_was_reset`, if non-NULL, is set to 1 when this call (re)created
+ * recon_image (first HEVC frame ever, or a coded-dimension change) and to 0
+ * otherwise. A freshly created image's contents are undefined, NOT "the
+ * previous frame's reconstruction" - a caller that requested any skip CTUs
+ * on a call that comes back with this set to 1 got an intra-only frame
+ * regardless of what skip_mask asked for (this function clears its OWN
+ * copy of the mask before dispatch when it detects the reset, so the
+ * bitstream this frame produces is unaffected either way, but the caller
+ * still must not believe this frame is a valid future skip reference - i.e.
+ * it must treat this frame as if it forced an IDR, has_ref semantics and
+ * all). */
 int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
                                     int width, int height,
-                                    int src_width, int src_height, int qp);
+                                    int src_width, int src_height, int qp,
+                                    const uint32_t *skip_mask,
+                                    int *out_recon_was_reset);
 
 /* HEVC readback, same slot contract as the gpu_compute_get_*_staging_data_slot
  * family below. mode = one int32 per CTU (the chosen luma intra mode), coeff =
@@ -579,6 +618,21 @@ int gpu_compute_get_mv_staging_data(gpu_context_t *ctx, void **data, size_t *siz
 /* TEMPORARY debug instrumentation for Part A (reconstruction) verification -
  * see gpu_compute.c for details. No-op unless BC250_DUMP_RECON_FRAMES=1. */
 void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height);
+
+/* Same readback gpu_compute_debug_dump_recon() does (ctx->recon_image ->
+ * host NV12), made available as a real (non-debug, always-on) API instead
+ * of a file dump. docs/notes/c7-gpu-pframes.md's P-frame zero-motion-skip
+ * decision needs the previous frame's reconstruction on the host, to
+ * compare against this frame's source before deciding which CTUs to skip.
+ * `width`/`height` should be the CODED dimensions, matching how recon_image
+ * is allocated - see gpu_compute_hevc_dispatch_intra(). Call after this
+ * context's most recent dispatch has been synced (gpu_compute_sync[_slot]())
+ * so the read observes that dispatch's writes. Returns 0 on success, -1 if
+ * there is no recon_image yet (e.g. the very first HEVC frame). */
+int gpu_compute_hevc_download_recon_nv12(gpu_context_t *ctx,
+                                         uint8_t *y_plane, int y_pitch,
+                                         uint8_t *uv_plane, int uv_pitch,
+                                         int width, int height);
 
 /* Real-content investigation instrumentation: dumps the ACTUAL surface Y/UV
  * pixel data at encode-dispatch time, reading it back from the Vulkan image

@@ -73,6 +73,40 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
                             const uint8_t *uv_plane, int uv_pitch,
                             uint8_t *output_buf, size_t output_size);
 
+/**
+ * hevc_encoder_encode_gpu_raw - Off-board exercise of the GPU (BC250_HEVC_
+ * GPU=1) path's P-frame zero-motion-skip logic (docs/notes/
+ * c7-gpu-pframes.md), with no GPU/Vulkan device involved at all - the
+ * GPU-path analogue of hevc_encoder_encode_raw() above, for the same
+ * reason: a deterministic, GPU-free way to exercise code that would
+ * otherwise need a board. See encoder_h265.c's doc comment on this
+ * function for exactly what it does and does not verify - short version:
+ * real bitstream-syntax and skip-region-reconstruction correctness, NOT
+ * anything about the real intra shader.
+ *
+ * `y_plane`/`uv_plane` (with pitches) are this frame's source, real
+ * width x height, same convention as hevc_encoder_encode_raw()'s.
+ * `ref_y_plane`/`ref_uv_plane` (with pitches), if non-NULL, become this
+ * frame's reference (prev_recon_y/cb/cr) - CODED width x height, since
+ * there is no real GPU recon_image to read back from here. Pass NULL for
+ * an IDR-only test. `synth_modes` (one int32 per CTU, 0..34), `synth_
+ * coeffs` (384 int32 per CTU: 256 luma + 64 Cb + 64 Cr) and `synth_cbf`
+ * (one uint32 per CTU, bit0/1/2 = cbf_luma/cb/cr, bits 8+ = chroma pred
+ * mode index) stand in for what hevc_intra_wavefront.comp would have
+ * produced for this frame's non-skip CTUs; any may be NULL for an all-DC/
+ * all-zero-residual default (a flat, decodable, but NOT quality-
+ * representative CTU).
+ */
+int hevc_encoder_encode_gpu_raw(hevc_encoder_t *encoder,
+                                const uint8_t *y_plane, int y_pitch,
+                                const uint8_t *uv_plane, int uv_pitch,
+                                const uint8_t *ref_y_plane, int ref_y_pitch,
+                                const uint8_t *ref_uv_plane, int ref_uv_pitch,
+                                const int32_t *synth_modes,
+                                const int32_t *synth_coeffs,
+                                const uint32_t *synth_cbf,
+                                uint8_t *output_buf, size_t output_size);
+
 void hevc_encoder_destroy(hevc_encoder_t *encoder);
 
 #ifdef __cplusplus
