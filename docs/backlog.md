@@ -124,47 +124,65 @@ step asserts on the case count so `BC250_DRIFT_CASES` cannot quietly gut it.
 
 ---
 
-## C. Needs the board
+## C. Board items — status as of 2026-09-20 evening
 
-**C1. Validate the HEVC fixes at 1080p on hardware.** `lab drift`,
-`lab gate`, `lab scoreboard`. Four correctness fixes landed against
-off-board evidence: split_cu_flag ctxInc, QP-before-dispatch, chroma QP
-(both paths), and the below-left reference sample.
+**C1. DONE.** All four HEVC correctness fixes validated on hardware at
+1080p: byte-exact on both planes, both paths (GPU and CPU), at QP 27 and
+QP 51. Full `lab gate` passes — units 5/5, PSNR 48.49 / SSIM 0.996,
+dims, drift 3/3.
 
-**C2. Re-measure the CPU HEVC speedup on hardware.** On this dev machine,
-at the settings the driver actually ships (`-O3 -march=znver2`): the
-zorder/gather/CABAC batch is **+44.5%** (8.37 -> 12.09 fps at 1080p) and
-the transform batch a further **+2.1%**. Board silicon will differ — it is
-the same microarchitecture but a slower part with a different memory
-system. This run also decides B2: if `bs_rbsp_to_ebsp` measures zero
-there too, revert it.
+**C2. DONE, and much larger than the dev machine suggested.** The CPU
+HEVC batch is **+132% on board silicon** (4.25 -> 9.85 fps at 1080p,
+noise floor 0.30%), against +44.5% on the dev machine. The board's
+slower core pays proportionally more for the integer divisions and call
+overhead those changes removed — so a dev-machine figure understates
+this class of win, just as it overstated the butterfly.
 
-**C3. H.264 chroma drift, max delta 241-252, unexplained.** Needs the GPU
-path, which cannot run off-board. Note the luma part of that same
-measurement is confounded: `lab drift` disables the decoder's loop
-filter, but this encoder does luma-only deblocking, so the comparison is
-mismatched by construction for H.264. **Design a deblocking-aware drift
-mode before trusting any H.264 drift number.**
+**C3. STILL OPEN.** H.264 chroma drift, max delta 241–252. Needs a
+deblocking-aware comparison first: `lab drift` disables the decoder's
+loop filter, but this encoder does **luma-only** deblocking, so the
+comparison is mismatched by construction for H.264 and the current
+number cannot be interpreted. Design that before trusting any H.264
+drift figure.
 
-**C4. Re-take the retracted PSNR figures.** 9.66 dB (H.264) and 10.48 dB
-were a frame-misalignment artifact of an ad-hoc comparison; the real
-H.264 number through `lab qsweep` is 42.55 dB. The GPU HEVC 35.26 dB
-figure came through the same bad method and needs re-taking once B3
-lands.
+**C4. DONE — and it found a live bug.** Re-taking the retracted PSNR
+figures through `lab qsweep --codec=hevc` gave HEVC GPU **42.71–42.94
+dB** (replacing the ad-hoc 35.26). It also surfaced that H.264 at
+**1920x1080 scored 13.66 dB** where aligned heights scored 44.4 — the
+SPS crop bug now fixed in `b2b7fef`. 1080p is now **44.30 dB**.
 
-**C5. Decide whether `BC250_ENABLE_HEVC` should default on.** Only
-together with `BC250_HEVC_GPU`, never alone — advertising the ~5 fps CPU
-path would let Sunshine negotiate it over the 45-77 fps H.264 one. See
-the note in `va_backend.c`'s `hevc_advertised()`.
+Note the CPU HEVC path scores **24.93 dB** at qsweep's default gop=120,
+i.e. with P-frames, versus 42.9 for the all-intra GPU path. That gap is
+unexplained and is a **new open item** — the inter path has had far less
+scrutiny than intra.
 
-**C6. Settle the performance-mode governor question properly.** The
-attempt so far is inconclusive, not negative: `pp_dpm_sclk` still read
-7 MHz after a `--fixed-frequency 2000` pin, so the request never visibly
-took (the script drives the governor over D-Bus and wants root; it was
-run unprivileged and reported success anyway). Needs root, and needs the
-*light game* load it is actually about — an idle board does not
-reproduce the case. `lab bench` now records `sclk_mhz` so the next
-attempt can confirm the clock moved before believing the result.
+**C5. DECIDED: keep `BC250_ENABLE_HEVC` opt-in.** The GPU path now
+clears every correctness bar (byte-exact, 42.9 dB, ~94 fps at 1080p),
+but it is **all-intra only**, so at streaming bitrates it spends them
+far less efficiently than H.264 with P-frames. Defaulting HEVC on would
+let Sunshine negotiate an all-intra encoder for a live session. Revisit
+when C7 lands, not before.
 
-**C7. P-frames for the GPU HEVC path.** It is all-intra only, which is
-the real gap for live streaming.
+**C6. STILL OPEN.** The performance-mode governor question is
+inconclusive, not negative: `pp_dpm_sclk` still read 7 MHz after a
+`--fixed-frequency 2000` pin, so the request never visibly took (the
+script drives the governor over D-Bus and wants root; it was run
+unprivileged and reported success anyway). Needs root, and needs the
+*light game* load it is actually about. `lab bench` records `sclk_mhz`
+now, so the next attempt can confirm the clock moved first.
+
+**C7. STILL OPEN, and now the highest-value HEVC item.** P-frames for
+the GPU intra path. It is all-intra only, which is what blocks C5 and
+what keeps HEVC from being a real alternative to H.264 for streaming.
+
+**C8. NEW — HEVC rounds odd frame sizes up to a multiple of 8.**
+854x480 encodes as 856x480. Not fixable as the driver stands: ffmpeg
+rounds up before `vaCreateContext` and
+`VAEncSequenceParameterBufferHEVC` has no conformance-window fields, so
+the true size never arrives. Fixing it means **accepting packed
+headers**, which would let ffmpeg's own SPS through — a real change with
+its own risks. `lab dims` reports these as LIMIT rather than failing.
+H.264 is exact at every resolution tested.
+
+**C9. NEW — CPU HEVC inter/P-frame quality.** See C4: 24.93 dB at
+gop=120 against 42.9 all-intra. Unexplained.
