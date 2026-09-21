@@ -1822,6 +1822,19 @@ void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size) {
     }
 }
 
+/* See the doc comment in encoder_h264.h for why the crop has to arrive this
+ * way rather than being derived from the context dimensions. */
+void h264_encoder_set_cropping(h264_encoder_t *encoder, int enable,
+                               uint32_t left, uint32_t right,
+                               uint32_t top, uint32_t bottom) {
+    if (!encoder) return;
+    encoder->sps.frame_cropping = enable ? true : false;
+    encoder->sps.crop_left   = enable ? left   : 0;
+    encoder->sps.crop_right  = enable ? right  : 0;
+    encoder->sps.crop_top    = enable ? top    : 0;
+    encoder->sps.crop_bottom = enable ? bottom : 0;
+}
+
 void h264_encoder_set_num_slices(h264_encoder_t *encoder, int num_slices) {
     if (encoder && num_slices >= 1 && num_slices <= 16) {
         encoder->num_slices = num_slices;

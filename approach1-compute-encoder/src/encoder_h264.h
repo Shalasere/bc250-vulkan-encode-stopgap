@@ -130,6 +130,31 @@ void h264_encoder_set_rc_mode(h264_encoder_t *encoder, rc_mode_t mode);
  */
 void h264_encoder_set_gop_size(h264_encoder_t *encoder, uint32_t gop_size);
 
+/* Apply the SPS frame-cropping window the client asked for.
+ *
+ * This exists because vaCreateContext() does NOT carry the display size for
+ * H.264. ffmpeg aligns the context dimensions to a macroblock before calling
+ * it - a 1920x1080 encode arrives here as picture=1920x1088 - so the driver
+ * cannot derive the crop from the geometry it was handed. It CAN read it from
+ * VAEncSequenceParameterBufferH264, which carries frame_cropping_flag and the
+ * four offsets, and which ffmpeg fills in correctly; the driver simply was not
+ * looking at those fields.
+ *
+ * That matters here more than in a normal VA-API driver because this one
+ * does not advertise packed headers, so it writes its own SPS. ffmpeg's crop
+ * therefore has no other route into the bitstream: unfixed, a 1080p request
+ * produces a stream that decodes as 1920x1088.
+ *
+ * Offsets are in the bitstream's own units (CropUnitX/CropUnitY - for 4:2:0
+ * frame-only that is 2 luma samples each), i.e. exactly as the syntax element
+ * is coded, so they are passed through unscaled.
+ *
+ * Note HEVC is unaffected: ffmpeg passes it the true 1920x1080 and the HEVC
+ * SPS writer derives its conformance window from coded-vs-real dimensions. */
+void h264_encoder_set_cropping(h264_encoder_t *encoder, int enable,
+                               uint32_t left, uint32_t right,
+                               uint32_t top, uint32_t bottom);
+
 /**
  * h264_encoder_set_num_slices - Configure number of slices per frame (1..16)
  *

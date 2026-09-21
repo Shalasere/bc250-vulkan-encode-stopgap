@@ -786,6 +786,35 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
                     if (seq->intra_period > 0) {
                         h264_encoder_set_gop_size(c->h264_enc, seq->intra_period);
                     }
+                    /* The SPS frame-cropping window. This is the ONLY route it
+                     * has into the bitstream: ffmpeg aligns the H.264 context
+                     * dimensions to a macroblock before vaCreateContext(), so a
+                     * 1920x1080 encode reaches this driver as 1920x1088 and the
+                     * geometry alone cannot say how much to crop. Measured
+                     * before this was wired up - the driver emitted
+                     * frame_cropping_flag=0 and a 1080p request decoded as
+                     * 1920x1088, scoring 13.7 dB against the source where
+                     * macroblock-aligned heights scored 44.4 dB.
+                     *
+                     * It matters here specifically because this driver does not
+                     * advertise packed headers and writes its own SPS, so
+                     * ffmpeg's own correctly-cropped SPS is never used.
+                     *
+                     * HEVC needs no equivalent: ffmpeg hands it the true
+                     * 1920x1080 and write_sps() derives the conformance window
+                     * from coded-vs-real dimensions. */
+                    h264_encoder_set_cropping(c->h264_enc,
+                                              seq->frame_cropping_flag,
+                                              seq->frame_crop_left_offset,
+                                              seq->frame_crop_right_offset,
+                                              seq->frame_crop_top_offset,
+                                              seq->frame_crop_bottom_offset);
+                    if (getenv("BC250_DEBUG_RC")) {
+                        fprintf(stderr, "[bc250-rc] SeqParam H264: cropping=%u l=%u r=%u t=%u b=%u\n",
+                                (unsigned)seq->frame_cropping_flag,
+                                seq->frame_crop_left_offset, seq->frame_crop_right_offset,
+                                seq->frame_crop_top_offset, seq->frame_crop_bottom_offset);
+                    }
                     if (seq->bits_per_second > 0) {
                         unsigned int pct = c->h264_state.rc_target_percentage;
                         if (pct == 0 || pct > 100) pct = 100;
