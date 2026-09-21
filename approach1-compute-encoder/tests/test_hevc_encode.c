@@ -51,6 +51,117 @@ static void test_transform_round_trip(void) {
     printf("[test_hevc_encode] Transform round-trip OK.\n");
 }
 
+/* The transform/quant path in src/hevc_intra.c is a partial-butterfly
+ * factorisation plus a reciprocal-multiply quantizer, both of which
+ * REPLACED literal transcriptions of ITU-T H.265 8.6.3/8.6.4 for speed.
+ * Both claim to be bit-identical to what they replaced, not merely
+ * equivalent in intent, and the literal versions are still compiled in
+ * (hevc_*_ref) purely so that claim can be checked here rather than
+ * asserted in a comment.
+ *
+ * This is the test that has to fail if someone "simplifies" a butterfly
+ * or widens a bound - a wrong transform still produces a structurally
+ * valid bitstream that decodes to a plausible picture, which is exactly
+ * how this encoder's earlier bugs survived. */
+static uint32_t trng_state = 0x9E3779B9u;
+static uint32_t trng(void) {
+    trng_state ^= trng_state << 13;
+    trng_state ^= trng_state >> 17;
+    trng_state ^= trng_state << 5;
+    return trng_state;
+}
+
+static void test_transform_butterfly_equivalence(void) {
+    printf("[test_hevc_encode] Butterfly transforms == literal 8.6.4 matrix product...\n");
+
+    /* Basis vectors. The transform is an exact integer linear map (its
+     * only nonlinearity, the rounding shift, is identical in both
+     * versions), so agreeing on e_k at every amplitude proves agreement
+     * on every input in range. */
+    for (int use_dst = 0; use_dst <= 1; use_dst++) {
+        for (int k = 0; k < 16; k++) {
+            for (int amp = -32768; amp <= 32767; amp += 97) {
+                int16_t in[16] = { 0 };
+                in[k] = (int16_t)amp;
+
+                int32_t fa[16], fb[16];
+                hevc_forward_transform_4x4(in, use_dst, fa);
+                hevc_forward_transform_4x4_ref(in, use_dst, fb);
+                assert(memcmp(fa, fb, sizeof fa) == 0 &&
+                       "forward butterfly diverged from the 8.6.4.1 matrix product");
+
+                int16_t ia[16], ib[16];
+                hevc_inverse_transform_4x4(in, use_dst, ia);
+                hevc_inverse_transform_4x4_ref(in, use_dst, ib);
+                assert(memcmp(ia, ib, sizeof ia) == 0 &&
+                       "inverse butterfly diverged from the 8.6.4.2 matrix product");
+            }
+        }
+    }
+
+    /* Random blocks. `kind == 2` saturates every coefficient to +-32768,
+     * which is the only way to drive the inverse stage-2 accumulator to
+     * its maximum - that bound is what makes the spec's stage-2 clip dead
+     * code, and the reference still performs that clip, so a wrong bound
+     * shows up here as a mismatch. */
+    for (int it = 0; it < 200000; it++) {
+        int use_dst = (int)(trng() & 1);
+        int kind = (int)(trng() % 3);
+        int16_t res[16], coeff[16];
+        for (int i = 0; i < 16; i++) {
+            res[i] = (int16_t)((int)(trng() % 511) - 255);
+            coeff[i] = kind == 0 ? (int16_t)((int)(trng() % 2001) - 1000)
+                     : kind == 1 ? (int16_t)(trng() & 0xFFFF)
+                                 : (int16_t)((trng() & 1) ? 32767 : -32768);
+        }
+        int32_t fa[16], fb[16];
+        hevc_forward_transform_4x4(res, use_dst, fa);
+        hevc_forward_transform_4x4_ref(res, use_dst, fb);
+        assert(memcmp(fa, fb, sizeof fa) == 0 && "forward butterfly diverged (random block)");
+
+        int16_t ia[16], ib[16];
+        hevc_inverse_transform_4x4(coeff, use_dst, ia);
+        hevc_inverse_transform_4x4_ref(coeff, use_dst, ib);
+        assert(memcmp(ia, ib, sizeof ia) == 0 && "inverse butterfly diverged (random block)");
+    }
+    printf("[test_hevc_encode] Butterfly transforms OK.\n");
+}
+
+static void test_quantizer_reciprocal_equivalence(void) {
+    printf("[test_hevc_encode] Reciprocal quantizer == literal 8.6.3 division...\n");
+    /* Every QP the encoder can use, against every raw magnitude a real
+     * 8-bit residual can produce (|raw| <= 32640, so 0..65535 covers it
+     * with room), plus a sparse sweep out to the proved worst-case bound
+     * of 2^22 for a synthetic full-range int16 residual. Both signs, via
+     * raw[0] = +m and raw[1] = -m. */
+    for (int qp = 0; qp <= 51; qp++) {
+        for (int32_t m = 0; m <= 65535; m++) {
+            int32_t raw[16] = { 0 };
+            int16_t a[16], b[16];
+            raw[0] = m; raw[1] = -m;
+            hevc_quantize_4x4(raw, qp, a);
+            hevc_quantize_4x4_ref(raw, qp, b);
+            assert(a[0] == b[0] && a[1] == b[1] &&
+                   "reciprocal quantizer diverged from the 8.6.3 division");
+        }
+        /* Straddle the quotient boundaries out at the top of the range,
+         * where a magic-number scheme fails first if the shift is wrong. */
+        for (int32_t m = 65536; m <= (1 << 22); m += 4093) {
+            int32_t raw[16] = { 0 };
+            int16_t a[16], b[16];
+            for (int d = -2; d <= 2; d++) {
+                int32_t v = m + d;
+                raw[0] = v; raw[1] = -v;
+                hevc_quantize_4x4(raw, qp, a);
+                hevc_quantize_4x4_ref(raw, qp, b);
+                assert(a[0] == b[0] && a[1] == b[1] &&
+                       "reciprocal quantizer diverged at a high magnitude");
+            }
+        }
+    }
+    printf("[test_hevc_encode] Reciprocal quantizer OK.\n");
+}
+
 static void test_mpm_derivation(void) {
     printf("[test_hevc_encode] MPM derivation sanity...\n");
     int mpm[3];
@@ -254,6 +365,8 @@ static void test_dynamic_qp_and_rate_control(void) {
 
 int main(void) {
     test_transform_round_trip();
+    test_transform_butterfly_equivalence();
+    test_quantizer_reciprocal_equivalence();
     test_mpm_derivation();
     test_multi_frame_gop();
     test_dynamic_qp_and_rate_control();

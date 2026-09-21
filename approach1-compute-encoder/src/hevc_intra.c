@@ -364,7 +364,118 @@ static inline int32_t clip_coeff(int32_t v) {
  * including the real x265/HM ones - see this file's header comment), only
  * well-scaled - forward quantization error is what's supposed to make the
  * picture lossy, not a transform bug. */
-static void forward_transform_4x4(const int16_t residual[16], const int16_t M[4][4], int32_t out[16]) {
+/* The four kernels below are partial-butterfly factorisations of the two
+ * matrices above - the same ones HM/x265 use (HM's partialButterfly4 /
+ * fastForwardDst / fastInverseDst). They are not an approximation and not
+ * a reordering of a floating-point sum: each output is the *same integer*
+ * the 4-term dot product produces, reassociated using exact integer
+ * add/sub, so the value handed to the (unchanged) rounding shift is
+ * bit-identical by construction. The saving is arithmetic count - 16
+ * multiplies and 12 adds per 4-point transform becomes 4-6 multiplies and
+ * 8-10 add/subs.
+ *
+ * DCT-II exploits the matrix's even/odd symmetry: rows 0 and 2 depend only
+ * on the sums x0+x3, x1+x2, rows 1 and 3 only on the differences. The
+ * DST-VII matrix has no such symmetry, but its four distinct magnitudes
+ * (29, 55, 74, 84 = 29+55) let three of the four outputs share the
+ * sub-expressions below anyway.
+ *
+ * Equivalence is checked, not asserted: because the transform is an exact
+ * integer linear map, agreeing with the naive matrix product on the four
+ * basis vectors proves agreement on every input. tests/test_hevc_encode.c
+ * (test_transform_butterfly_equivalence) does exactly that, over the full
+ * 2D transform and both matrices, plus random blocks.
+ *
+ * Every kernel snapshots its four inputs into locals before writing any
+ * output, so an in-place call - KERNEL(a, b, c, d, a, b, c, d) - is safe;
+ * the stage-2 invocations below rely on that. */
+#define FWD_DCT4(x0, x1, x2, x3, y0, y1, y2, y3) do {              \
+    const int32_t i0_ = (x0), i1_ = (x1), i2_ = (x2), i3_ = (x3);  \
+    const int32_t s03_ = i0_ + i3_, s12_ = i1_ + i2_;              \
+    const int32_t d03_ = i0_ - i3_, d12_ = i1_ - i2_;              \
+    (y0) = 64 * (s03_ + s12_);                                     \
+    (y1) = 83 * d03_ + 36 * d12_;                                  \
+    (y2) = 64 * (s03_ - s12_);                                     \
+    (y3) = 36 * d03_ - 83 * d12_;                                  \
+} while (0)
+
+#define FWD_DST4(x0, x1, x2, x3, y0, y1, y2, y3) do {              \
+    const int32_t i0_ = (x0), i1_ = (x1), i2_ = (x2), i3_ = (x3);  \
+    const int32_t c0_ = i0_ + i3_, c1_ = i1_ + i3_;                \
+    const int32_t c2_ = i0_ - i1_, c3_ = 74 * i2_;                 \
+    (y0) = 29 * c0_ + 55 * c1_ + c3_;                              \
+    (y1) = 74 * (i0_ + i1_ - i3_);                                 \
+    (y2) = 29 * c2_ + 55 * c0_ - c3_;                              \
+    (y3) = 55 * c2_ - 29 * c1_ + c3_;                              \
+} while (0)
+
+/* Transposed (inverse-direction) forms: y[r] = sum_k M[k][r] * x[k]. */
+#define INV_DCT4(x0, x1, x2, x3, y0, y1, y2, y3) do {              \
+    const int32_t i0_ = (x0), i1_ = (x1), i2_ = (x2), i3_ = (x3);  \
+    const int32_t e0_ = 64 * (i0_ + i2_), e1_ = 64 * (i0_ - i2_);  \
+    const int32_t o0_ = 83 * i1_ + 36 * i3_;                       \
+    const int32_t o1_ = 36 * i1_ - 83 * i3_;                       \
+    (y0) = e0_ + o0_;                                              \
+    (y1) = e1_ + o1_;                                              \
+    (y2) = e1_ - o1_;                                              \
+    (y3) = e0_ - o0_;                                              \
+} while (0)
+
+#define INV_DST4(x0, x1, x2, x3, y0, y1, y2, y3) do {              \
+    const int32_t i0_ = (x0), i1_ = (x1), i2_ = (x2), i3_ = (x3);  \
+    const int32_t c0_ = i0_ + i2_, c1_ = i2_ + i3_;                \
+    const int32_t c2_ = i0_ - i3_, c3_ = 74 * i1_;                 \
+    (y0) = 29 * c0_ + 55 * c1_ + c3_;                              \
+    (y1) = 55 * c2_ - 29 * c1_ + c3_;                              \
+    (y2) = 74 * (i0_ - i2_ + i3_);                                 \
+    (y3) = 55 * c0_ + 29 * c2_ - c3_;                              \
+} while (0)
+
+/* Both forward stages apply M in the same (non-transposed) orientation, so
+ * one kernel serves both: stage 1 walks the four columns of the residual
+ * (stride 4) producing tmp[i][c] = tNN with NN = i*4+c, stage 2 walks the
+ * four rows of tmp in place.
+ *
+ * The two 4-iteration loops are left as loops on purpose. Spelling all 16
+ * tmp values out as named scalars (so they could live in registers and the
+ * function would own no array, dropping Ubuntu's default
+ * -fstack-protector-strong canary) was tried and is WORSE: 16 live int32s
+ * plus the kernel's own temporaries exceed the 15 allocatable GPRs, and
+ * GCC 13 -O2 spilled the difference - inverse_transform_4x4_dct went from
+ * 139 instructions / 31 memory operands to 370 / 127. The array form's
+ * stack slots are cheaper than the spill code that replaces them. */
+#define FWD_BODY(KERNEL)                                                    \
+    int32_t t[16];                                                          \
+    for (int c = 0; c < 4; c++) {                                           \
+        int32_t y0, y1, y2, y3;                                             \
+        KERNEL(residual[c], residual[4 + c], residual[8 + c],               \
+               residual[12 + c], y0, y1, y2, y3);                           \
+        t[c] = (y0 + 1) >> 1;      t[4 + c] = (y1 + 1) >> 1;                \
+        t[8 + c] = (y2 + 1) >> 1;  t[12 + c] = (y3 + 1) >> 1;               \
+    }                                                                       \
+    for (int i = 0; i < 4; i++) {                                           \
+        int32_t y0, y1, y2, y3;                                             \
+        KERNEL(t[i * 4], t[i * 4 + 1], t[i * 4 + 2], t[i * 4 + 3],          \
+               y0, y1, y2, y3);                                             \
+        out[i * 4]     = (y0 + 128) >> 8;                                   \
+        out[i * 4 + 1] = (y1 + 128) >> 8;                                   \
+        out[i * 4 + 2] = (y2 + 128) >> 8;                                   \
+        out[i * 4 + 3] = (y3 + 128) >> 8;                                   \
+    }
+
+static void forward_transform_4x4_dct(const int16_t residual[16], int32_t out[16]) {
+    FWD_BODY(FWD_DCT4)
+}
+
+static void forward_transform_4x4_dst(const int16_t residual[16], int32_t out[16]) {
+    FWD_BODY(FWD_DST4)
+}
+
+/* Reference implementation kept for the equivalence test only - the
+ * literal transcription of 8.6.4.1's matrix product that the butterflies
+ * above replaced. Nothing on the encode path calls it. */
+void hevc_forward_transform_4x4_ref(const int16_t residual[16], int use_dst, int32_t out[16]) {
+    const int16_t (*M)[4] = use_dst ? DST4 : DCT4;
     int32_t tmp[4][4];
     for (int c = 0; c < 4; c++) {
         for (int i = 0; i < 4; i++) {
@@ -389,7 +500,74 @@ static void forward_transform_4x4(const int16_t residual[16], const int16_t M[4]
  * This exact process is what a real HEVC decoder performs, and this
  * encoder uses the SAME code for its own reconstruction chaining, so the
  * two are trivially identical by construction. */
-static void inverse_transform_4x4(const int16_t coeff[16], const int16_t M[4][4], int16_t out[16]) {
+/* Same shape as FWD_BODY, plus 8.6.4.2's stage-1 clip.
+ *
+ * The stage-2 clip the spec's text also carries is NOT dropped for speed
+ * on a hunch - it is unreachable arithmetic. Stage 1 has just clipped
+ * every tmp value into [-32768, 32767], and the largest column sum of
+ * |M| is 247 for DCT-II (64+83+64+36) and 242 for DST-VII, so the stage-2
+ * accumulator is bounded by 247 * 32768 = 8093696; (8093696 + 2048) >> 12
+ * = 1976, and the negative side floors at -1976. A stage-2 result can
+ * therefore never leave int16 range for ANY 16 input coefficients, and
+ * the clip is dead code on every path. tests/test_hevc_encode.c still
+ * compares this against the clip-carrying reference, including blocks of
+ * saturated +-32768 coefficients, so the bound is checked and not just
+ * argued. */
+/* LOAD(i) supplies input coefficient i. Stage 1 reads each of the 16
+ * exactly once, which is what lets the dequantization step (8.6.3) be
+ * folded straight into it: dequant_itransform_4x4_dct()/_dst() below pass
+ * a LOAD that dequantizes on the fly, so the encode path no longer writes
+ * a 16-entry dq[] buffer and reads it straight back. */
+#define INV_BODY(KERNEL, LOAD)                                              \
+    int32_t t[16];                                                          \
+    for (int c = 0; c < 4; c++) {                                           \
+        int32_t y0, y1, y2, y3;                                             \
+        KERNEL(LOAD(c), LOAD(4 + c), LOAD(8 + c), LOAD(12 + c),             \
+               y0, y1, y2, y3);                                             \
+        t[c] = clip_coeff((y0 + 64) >> 7);                                  \
+        t[4 + c] = clip_coeff((y1 + 64) >> 7);                              \
+        t[8 + c] = clip_coeff((y2 + 64) >> 7);                              \
+        t[12 + c] = clip_coeff((y3 + 64) >> 7);                             \
+    }                                                                       \
+    for (int r = 0; r < 4; r++) {                                           \
+        int32_t y0, y1, y2, y3;                                             \
+        KERNEL(t[r * 4], t[r * 4 + 1], t[r * 4 + 2], t[r * 4 + 3],          \
+               y0, y1, y2, y3);                                             \
+        out[r * 4]     = (int16_t)((y0 + 2048) >> 12);                      \
+        out[r * 4 + 1] = (int16_t)((y1 + 2048) >> 12);                      \
+        out[r * 4 + 2] = (int16_t)((y2 + 2048) >> 12);                      \
+        out[r * 4 + 3] = (int16_t)((y3 + 2048) >> 12);                      \
+    }
+
+#define INV_LOAD_PLAIN(i) ((int32_t)coeff[i])
+
+static void inverse_transform_4x4_dct(const int16_t coeff[16], int16_t out[16]) {
+    INV_BODY(INV_DCT4, INV_LOAD_PLAIN)
+}
+
+static void inverse_transform_4x4_dst(const int16_t coeff[16], int16_t out[16]) {
+    INV_BODY(INV_DST4, INV_LOAD_PLAIN)
+}
+
+/* The dequantizing variants live further down, past HEVC_BDSHIFT's
+ * definition in the quantization section. */
+
+/* Thin wrappers over the butterfly kernels, so the equivalence test can
+ * reach the transform stage on its own (the encode path calls the
+ * specialized functions directly and never pays this dispatch). */
+void hevc_forward_transform_4x4(const int16_t residual[16], int use_dst, int32_t out[16]) {
+    if (use_dst) forward_transform_4x4_dst(residual, out);
+    else         forward_transform_4x4_dct(residual, out);
+}
+
+void hevc_inverse_transform_4x4(const int16_t coeff[16], int use_dst, int16_t out[16]) {
+    if (use_dst) inverse_transform_4x4_dst(coeff, out);
+    else         inverse_transform_4x4_dct(coeff, out);
+}
+
+/* Reference implementation, test-only - see hevc_forward_transform_4x4_ref. */
+void hevc_inverse_transform_4x4_ref(const int16_t coeff[16], int use_dst, int16_t out[16]) {
+    const int16_t (*M)[4] = use_dst ? DST4 : DCT4;
     int32_t tmp[4][4];
     for (int c = 0; c < 4; c++) {
         for (int r = 0; r < 4; r++) {
@@ -423,6 +601,54 @@ static const int levelScale[6] = { 40, 45, 51, 57, 64, 72 };
 #define HEVC_BDSHIFT 5
 #define HEVC_FLAT_M  16
 
+/* Division-free forward quantization.
+ *
+ * The normative quotient is level = (|raw|<<5 + denom/2) / denom with
+ * denom = (16 * levelScale[rem]) << per. Because floor(n / (a*b)) ==
+ * floor(floor(n/a) / b) for positive integers, the variable `per` factors
+ * out of the division entirely: the only divisor is d0 = 16 *
+ * levelScale[rem], which has exactly SIX possible values. So there is no
+ * runtime divisor at all - a table of six compile-time reciprocals does
+ * the whole job, and even the one-per-block division that a classic
+ * magic-number scheme would still need disappears.
+ *
+ * QUANT_MAGIC[rem] = ceil(2^42 / d0). For n >= 0 this gives exactly
+ * floor(n / d0) whenever n * e < 2^42, where e = magic*d0 - 2^42 < d0.
+ * Both factors are bounded here and the bound is not close:
+ *
+ *   - |raw| <= 2^22. residual is int16 so |residual| <= 32768; the largest
+ *     row sum of |M| is 256 (DCT-II row 0), so forward stage 1 is bounded
+ *     by (256*32768 + 1) >> 1 = 2^22 and stage 2 by (256*2^22 + 128) >> 8
+ *     = 2^22. Hence n = (|raw| << 5) + denom/2 <= 2^27 + 147456 < 2^28.
+ *   - e <= 848 < 2^10 across the six entries.
+ *
+ * so n*e < 2^38, versus the 2^42 required - four bits of margin. The
+ * widest product n*magic is 2^60, comfortably inside uint64.
+ *
+ * This is verified by exhaustion, not argued. Offline, the reciprocal was
+ * checked against the literal division for all 2^22+1 magnitudes at each
+ * of the 52 QPs - 218 million pairs, zero mismatches.
+ * tests/test_hevc_encode.c keeps the part of that which is cheap enough
+ * to run every build: every magnitude 0..65535 (a real 8-bit residual
+ * cannot exceed |raw| = 32640, so that range is already exhaustive for
+ * the encoder) at all 52 QPs, plus a boundary-straddling sweep out to
+ * 2^22.
+ *
+ * NOT to be confused with the change this replaced a measurement of: doing
+ * the same division in 32 bits instead of 64 was tried and measured
+ * SLIGHTLY SLOWER (median 1019ms vs 1011ms over 12 interleaved samples),
+ * because Zen 4's divider costs about the same either width. Removing the
+ * division is a different thing from narrowing it. */
+#define QUANT_RECIP_SHIFT 42
+static const uint64_t QUANT_MAGIC[6] = {
+    6871947674ull,  /* d0 =  640 */
+    6108397933ull,  /* d0 =  720 */
+    5389762882ull,  /* d0 =  816 */
+    4822419421ull,  /* d0 =  912 */
+    4294967296ull,  /* d0 = 1024 */
+    3817748708ull   /* d0 = 1152 */
+};
+
 int hevc_chroma_qp_from_luma(int qp_luma) {
     /* qPiCb = Clip3(-QpBdOffsetC, 57, QpY + pps_cb_qp_offset +
      * slice_cb_qp_offset). Both PPS chroma offsets are written as 0 and
@@ -436,10 +662,32 @@ int hevc_chroma_qp_from_luma(int qp_luma) {
     return qpc_30_43[qpi - 30];
 }
 
-void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
-                               int16_t coeff_out[16]) {
-    int32_t raw[16];
-    forward_transform_4x4(residual, use_dst ? DST4 : DCT4, raw);
+static inline void quantize_levels(const int32_t raw[16], int qp, int16_t coeff_out[16]) {
+    int per = qp / 6, rem = qp % 6;
+    uint64_t half_denom = ((uint64_t)HEVC_FLAT_M * (uint64_t)levelScale[rem] << per) >> 1;
+    uint64_t magic = QUANT_MAGIC[rem];
+    int shift = QUANT_RECIP_SHIFT + per;
+    for (int i = 0; i < 16; i++) {
+        int32_t coeff_raw = raw[i];
+        int neg = coeff_raw < 0;
+        uint64_t mag = neg ? -(uint64_t)(int64_t)coeff_raw : (uint64_t)(int64_t)coeff_raw;
+        uint64_t num = mag << HEVC_BDSHIFT;
+        int64_t level = (int64_t)(((num + half_denom) * magic) >> shift);
+        int32_t res = (int32_t)(neg ? -level : level);
+        if (res > 32767) res = 32767;
+        if (res < -32768) res = -32768;
+        coeff_out[i] = (int16_t)res;
+    }
+}
+
+/* Test hooks: the shipping quantizer and the literal-division original it
+ * replaced, so tests/test_hevc_encode.c can feed them raw coefficients
+ * directly instead of trying to steer a residual to a particular value. */
+void hevc_quantize_4x4(const int32_t raw[16], int qp, int16_t coeff_out[16]) {
+    quantize_levels(raw, qp, coeff_out);
+}
+
+void hevc_quantize_4x4_ref(const int32_t raw[16], int qp, int16_t coeff_out[16]) {
     int per = qp / 6, rem = qp % 6;
     int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
     int64_t half_denom = denom / 2;
@@ -456,16 +704,59 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
     }
 }
 
+void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
+                               int16_t coeff_out[16]) {
+    int32_t raw[16];
+    if (use_dst) forward_transform_4x4_dst(residual, raw);
+    else         forward_transform_4x4_dct(residual, raw);
+    quantize_levels(raw, qp, coeff_out);
+}
+
+/* One coefficient's worth of 8.6.3 dequantization, expression for
+ * expression what the standalone dq[] loop used to do: the int64 product,
+ * the +16 rounding shift, the narrowing to int32 and then the clip. The
+ * (int32_t) cast before clip_coeff() cannot actually truncate (the shifted
+ * value is at most 32768*233472/32 = 2^27.8), but the order is preserved
+ * anyway so the two versions are the same expression and not merely the
+ * same intent. */
+static inline int32_t dequant_one(int16_t level, int64_t scale, int64_t half_scale) {
+    int64_t val = (int64_t)level * scale;
+    val = (val + half_scale) >> HEVC_BDSHIFT;
+    return clip_coeff((int32_t)val);
+}
+
+#define INV_LOAD_DQ(i) dequant_one(coeff[i], scale, half_scale)
+
+static void dequant_itransform_4x4_dct(const int16_t coeff[16], int64_t scale,
+                                       int64_t half_scale, int16_t out[16]) {
+    INV_BODY(INV_DCT4, INV_LOAD_DQ)
+}
+
+static void dequant_itransform_4x4_dst(const int16_t coeff[16], int64_t scale,
+                                       int64_t half_scale, int16_t out[16]) {
+    INV_BODY(INV_DST4, INV_LOAD_DQ)
+}
+
 void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
                                   int16_t residual_out[16]) {
-    int16_t dq[16];
+    /* MEASURED AND REJECTED: an all-zero-coefficient early-out here (four
+     * 64-bit ORs over coeff[], then memset the output) is a valid
+     * identity - zeros dequantize to zeros and both stages then produce
+     * (0+64)>>7 == 0 and (0+2048)>>12 == 0 - and it fires often: 12.8% of
+     * the 195840 blocks in a 1080p frame have cbf == 0 at QP 27, 8.7% at
+     * QP 20, 13.9% at QP 51. It is still not worth it. Interleaved A/B,
+     * byte-identical output both ways: +1.53% (9 samples, -O2), +1.39%
+     * (9 samples, -O3 -march=znver2), and +0.71% on the largest and so
+     * most trustworthy run (15 samples, -O2: best 812.6 -> 805.6 ms,
+     * median 819.6 -> 813.7 ms). The effect shrinks as the sample grows,
+     * which is what a noise artifact does. That is inside this project's
+     * stated ~2.5% significance floor, and it is
+     * the only candidate in this area that ADDS a branch rather than
+     * removing work, so it was reverted. Don't re-add it without a
+     * significance-tested number above the floor. */
     int per = qp / 6, rem = qp % 6;
     int64_t scale = ((int64_t)HEVC_FLAT_M * levelScale[rem]) << per;
     int64_t half_scale = 1 << (HEVC_BDSHIFT - 1);
-    for (int i = 0; i < 16; i++) {
-        int64_t val = (int64_t)coeff[i] * scale;
-        val = (val + half_scale) >> HEVC_BDSHIFT;
-        dq[i] = (int16_t)clip_coeff((int32_t)val);
-    }
-    inverse_transform_4x4(dq, use_dst ? DST4 : DCT4, residual_out);
+    if (use_dst) dequant_itransform_4x4_dst(coeff, scale, half_scale, residual_out);
+    else         dequant_itransform_4x4_dct(coeff, scale, half_scale, residual_out);
 }

@@ -130,6 +130,23 @@ void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
 void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
                                   int16_t residual_out[16]);
 
+/* Literal 8.6.4 matrix-product transforms, exported for ONE purpose: so
+ * tests/test_hevc_encode.c can prove the partial-butterfly factorisations
+ * that replaced them on the encode path produce bit-identical output.
+ * Nothing else may call these - they are the slow reference. */
+void hevc_forward_transform_4x4_ref(const int16_t residual[16], int use_dst, int32_t out[16]);
+void hevc_inverse_transform_4x4_ref(const int16_t coeff[16], int use_dst, int16_t out[16]);
+
+/* Exposed for the same equivalence test: the butterfly forward transform
+ * without the quantization step that normally follows it. */
+void hevc_forward_transform_4x4(const int16_t residual[16], int use_dst, int32_t out[16]);
+void hevc_inverse_transform_4x4(const int16_t coeff[16], int use_dst, int16_t out[16]);
+
+/* The quantization step on its own, shipping version and literal-division
+ * reference, so the test can sweep raw coefficient values directly. */
+void hevc_quantize_4x4(const int32_t raw[16], int qp, int16_t coeff_out[16]);
+void hevc_quantize_4x4_ref(const int32_t raw[16], int qp, int16_t coeff_out[16]);
+
 #ifdef __cplusplus
 }
 #endif
