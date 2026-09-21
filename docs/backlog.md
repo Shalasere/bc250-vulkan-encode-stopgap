@@ -97,14 +97,24 @@ and mode search are invisible to *every* oracle here. The items still
 need running on the board — start with the mode histogram plus
 `drift --content=testsrc2`.
 
-**A4. `hevc_cabac_code_residual_4x4` (~5.9% of profile).** Entropy coding
-of the CPU path.
+**A4. DONE (2026-09-21).** `hevc_cabac_code_residual_4x4` was really
+6.5–11.5% of frame time on detailed content (not the 5.9% a gprof
+sample suggested — content-dependent, spans 0.65–41.7% across synthetic
+patterns). Residual sign bits batched into one bitmask write instead of
+N separate bypass calls: **-14 to -19% on the function, byte-identical**.
+Board-priced together with the two items below: -12.4% combined encode
+time, significance-tested.
 
-**A5. `hevc_choose_luma_mode` (~7.8%).** Tries all four candidates with a
-full prediction + SAD each. A cheaper first-pass metric or early
-termination may cut it, but it changes mode decisions unless done
-carefully — if output changes, this becomes a compression change and
-needs BD-rate on the board, not a byte comparison.
+**A5. SUPERSEDED by A6.** The original 4-candidate search this item
+described no longer exists — A6 replaced `hevc_choose_luma_mode()`
+wholesale with a 35-mode RD-biased search. Before that: gather-once +
+hoisted-source-block + per-candidate compile-time unrolling landed
+**+12.9% to +14.9%, byte-identical**, and this function turned out to be
+~24% of frame time, not the 7.8% a gprof sample suggested (gprof's
+fourth misattribution in this codebase, and its first that read low).
+A6's board review found the *replacement* search costs +52% frame time
+(see A6) — the win recorded here was real at the time but no longer
+describes the shipped code.
 
 **A6. PIECE (1) DONE (2026-09-21) — angular modes ported and RD-biased.
 Pieces (2)/(3) still open.** All 35 HEVC intra modes now searched (was
@@ -367,13 +377,18 @@ for the board run.
    supplies a non-zero one — (2,0) failed 17271/24576 luma samples before
    the fix, 0 after, and six such cases are permanent oracle cases.
 
-**Consequence to be aware of:** with the GPU vector gone, the merge list
-is a fixpoint at zero, so every P-frame MV is (0,0) and both
-`hevc_motion_search_diamond_8x8()` and the P-frame GPU ME dispatch are
-now pure cost with no effect on the bitstream (the search still feeds
-`last_frame_sad` for rate control). Not a regression — the encoder could
-never legally signal a non-zero vector — but it is dead weight, and
-removing it is a free CPU win for whoever picks up C2's thread.
+**Consequence, and it's DONE (2026-09-21), not still-open weight.** With
+the GPU vector gone, the merge list is a fixpoint at zero, so
+`hevc_motion_search_diamond_8x8()` had no effect on the bitstream — but
+verified, not assumed, first: its SAD *did* still reach `cu_skip_flag`
+via a shortcut, so the claim as originally written was half wrong.
+Removed, with the skip decision now computed directly and shared with
+rate control. **-20.7% at 720p gop10, -7.6% at two other configs, -0.6%
+on an all-intra control**, 37/38 bitstreams byte-identical (one VBR case
+moves by 103 bytes — rate control now gets the honest zero-MV SAD
+instead of a search result the bitstream could never ask for). The GPU
+ME dispatch itself was left in place (shared code path with H.264;
+removing it is separate, larger work) — see `docs/notes/dead-motion-search.md`.
 
 **Still open after this:** real inter coding. The P path is zero-motion
 SKIP plus intra fallback, with no motion compensation and no inter
