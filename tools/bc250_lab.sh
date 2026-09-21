@@ -51,12 +51,15 @@
 #                                            vs libx264, per load condition
 #                                            (--content, --res, --frames,
 #                                             --repeat, --quality)
+#   ./bc250_lab.sh dims <key> [opts]         does the stream decode at the
+#                                            size asked for? catches SPS crop
+#                                            bugs nothing else here sees
 #   ./bc250_lab.sh drift <key> [opts]        encoder reconstruction vs a REAL
 #                                            decoder, byte-exact - the only
 #                                            oracle here that shares none of
 #                                            our own code (--codec, --res,
 #                                            --frames, --bitrate, --env)
-#   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + drift
+#   ./bc250_lab.sh gate <key> [<baseKey>]    audit + units + quality + dims + drift
 #                                            + exact
 #   ./bc250_lab.sh health                    is the live Sunshine healthy?
 #   ./bc250_lab.sh deploy <key>              install + health-check + rollback
@@ -923,6 +926,124 @@ qsweep() {
 }
 
 # ---------------------------------------------------------------------------
+# DIMS - does the stream decode at the size that was asked for?
+#
+# Trivial-sounding, and it caught a live bug on the shipping path that
+# every other check here missed: H.264 at 1920x1080 produced a stream
+# decoding as 1920x1088, scoring 13.66 dB against the source where
+# macroblock-aligned heights scored 44.4 dB. 1080p is the most common
+# streaming resolution on this driver's only real client.
+#
+# Nothing else catches it. The stream is perfectly valid and decodes
+# silently, so the decode oracle passes. `drift` compares the encoder's
+# own reconstruction at CODED dimensions, so it passes too. Only asking
+# "is the picture the size I asked for" fails.
+#
+# It needs the board because it is specific to the VA-API path: ffmpeg
+# aligns H.264 context dimensions to a macroblock before vaCreateContext(),
+# so the driver is handed 1088 and must recover the crop from
+# VAEncSequenceParameterBufferH264. The raw/CPU entry point gets the true
+# height and was never affected, which is why no host-side test saw it.
+#
+# Resolutions are chosen to exercise each crop axis: a non-multiple-of-16
+# HEIGHT (1080), a non-multiple-of-16 WIDTH (854, 1366), both at once, and
+# aligned controls that must not regress.
+# ---------------------------------------------------------------------------
+dims() {
+    local key="${1:?dims <key> [opts]}"; shift
+    local codecs="h264 hevc" envs=""
+    local res_list="1920x1080 1920x1088 2560x1440 1280x720 854x480 1366x768 1918x1078"
+    for a in "$@"; do
+        case "$a" in
+            --codec=*)  codecs="${a#*=}";;
+            --res=*)    res_list="${a#*=}";;
+            --env=*)    envs="${a#*=}";;
+            *) die "dims: unknown option '$a'";;
+        esac
+    done
+    local bd; bd=$(art_dir "$key")
+    [ -f "$bd/bc250_drv_video.so" ] || die "dims: no driver in $bd (run build first)"
+    local d="$RUNS/dims-$(date +%Y%m%d-%H%M%S)-$key"; mkdir -p "$d"
+
+    local fail=0 n=0 lim=0
+    for codec in $codecs; do
+        local venc=h264_vaapi fmt=h264
+        [ "$codec" = hevc ] && { venc=hevc_vaapi; fmt=hevc; }
+        local -a envv=()
+        [ "$codec" = hevc ] && envv+=(BC250_ENABLE_HEVC=1)
+        if [ -n "$envs" ]; then
+            local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
+        fi
+        for res in $res_list; do
+            local out="$d/${codec}_${res}.$fmt"
+            env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
+                BC250_SHADER_DIR="$bd" "${envv[@]}" \
+                ffmpeg -v error -y -f lavfi -i "testsrc2=size=${res}:rate=60" \
+                -frames:v 3 -vaapi_device "$RENDER" -vf 'format=nv12,hwupload' \
+                -c:v "$venc" -b:v 10M -f "$fmt" "$out" >/dev/null 2>&1
+            local got
+            got=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+                          -of csv=p=0:s=x "$out" 2>/dev/null)
+            n=$((n+1))
+
+            # What the driver can actually be held to. ffmpeg aligns the
+            # dimensions it hands us before we ever see them, and the two
+            # codecs differ in whether the real size survives that:
+            #
+            #   H.264 - ffmpeg aligns the CONTEXT to a macroblock (1080 ->
+            #     1088) but passes the true crop in
+            #     VAEncSequenceParameterBufferH264's frame_crop_* fields. The
+            #     driver can and must reproduce the exact size. Held strictly.
+            #
+            #   HEVC - ffmpeg rounds UP TO 8 before we see anything, and
+            #     VAEncSequenceParameterBufferHEVC has NO conformance window
+            #     fields, so the real size is never communicated at all.
+            #     Measured by instrumenting both vaCreateContext and the
+            #     sequence parameter buffer: an 854x480 request already
+            #     arrives as 856x480 in BOTH. Likewise 1366->1368,
+            #     1918x1078->1920x1080. Unfixable in the driver while we do
+            #     not accept packed headers, so landing exactly on the
+            #     round-up-to-8 size is reported as a LIMIT rather than
+            #     scored as a driver failure. Anything else still fails.
+            #
+            #     (The alignment really is 8, not 2 - 854 is already even yet
+            #     still becomes 856. Assuming 2 made this check report a
+            #     false MISMATCH on its first run.)
+            local expect="$res"
+            if [ "$codec" = hevc ]; then
+                local rw="${res%x*}" rh="${res#*x}"
+                expect="$(( (rw + 7) / 8 * 8 ))x$(( (rh + 7) / 8 * 8 ))"
+            fi
+
+            if [ "$got" = "$res" ]; then
+                printf '  %-5s %-11s OK\n' "$codec" "$res"
+            elif [ "$got" = "$expect" ]; then
+                printf '  %-5s %-11s LIMIT - decodes as %s (ffmpeg rounds HEVC up to 8; the real size never reaches the driver)\n' \
+                       "$codec" "$res" "$got"
+                lim=$((lim+1))
+            else
+                printf '  %-5s %-11s MISMATCH - decodes as %s, expected %s\n' \
+                       "$codec" "$res" "${got:-nothing}" "$expect"
+                fail=1
+            fi
+            rm -f "$out"
+        done
+    done
+    echo
+    if [ "$fail" = 0 ]; then
+        if [ "$lim" -gt 0 ]; then
+            echo "DIMS PASS ($((n - lim))/$n exact; $lim at the documented HEVC alignment limit)"
+        else
+            echo "DIMS PASS ($n encodes decode at the requested size)"
+        fi
+    else
+        echo "DIMS FAIL"
+    fi
+    note "artifacts: $d"
+    return $fail
+}
+
+# ---------------------------------------------------------------------------
 # DRIFT - does a real decoder reproduce the encoder's own reconstruction?
 #
 # The strongest correctness oracle here, and the only one that cannot be
@@ -1080,6 +1201,8 @@ gate() {
     echo "=== units ==="   ; units "$key"   || rc=1
     echo "=== audit ==="   ; audit "$key"   || rc=1
     echo "=== quality ===" ; quality "$key" || rc=1
+    echo "=== dims (stream decodes at the requested size) ==="
+    dims "$key" || rc=1
     echo "=== drift (HEVC GPU: recon vs decoder) ==="
     drift "$key" --codec=hevc --env=BC250_HEVC_GPU=1 || rc=1
     if [ -n "$base" ]; then
@@ -1180,6 +1303,7 @@ case "$cmd" in
     units)    units "$@";;
     quality)  quality "$@";;
     qsweep)   qsweep "$@";;
+    dims)     dims "$@";;
     drift)    drift "$@";;
     gate)     gate "$@";;
     scoreboard) scoreboard "$@";;
