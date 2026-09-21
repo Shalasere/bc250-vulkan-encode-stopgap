@@ -6,9 +6,11 @@ leaving the CPU with entropy coding only. It is **off by default** and is
 a second, structurally different coder alongside the CPU HEVC encoder in
 `encoder_h265.c` — not a fast mode of it.
 
-Read `docs/hevc_scope_note.md` first. Every caveat there about HEVC not
-being verified correct on generic content applies to this path too, and
-this path has *less* validation on this tree than the CPU one, not more.
+Read `docs/hevc_scope_note.md` first for the shared HEVC context. Note
+that its historical warning about HEVC not being verified correct on
+generic content has since been resolved for **both** paths — see that
+file's header. As of 2026-09-20 this path and the CPU one are each
+byte-exact against ffmpeg's own decode.
 
 ## Validation status on this tree
 
@@ -39,7 +41,7 @@ the ad-hoc numbers. Until someone runs that on the board, the byte-exact
 the PSNR.
 
 Three real bugs were found and fixed during that validation, all worth
-knowing about because neither was visible to a silent decode:
+knowing about because none of them was visible to a silent decode:
 
 - **`split_cu_flag` ctxInc.** Coded as `(col>0)+(row>0)`; 9.3.4.2.2 tests
   whether the neighbour is *deeper*, which on this all-depth-0 path is
