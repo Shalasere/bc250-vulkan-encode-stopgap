@@ -155,6 +155,70 @@ jobs:
           echo "WARNING: bc250_test_stream.hevc was not produced."
         fi
 
+    - name: HEVC Host Drift Oracle (encoder recon vs ffmpeg, no GPU, no board)
+      # The strongest correctness check in this tree, and it needs neither a
+      # GPU nor the board: hevc_encoder_encode_raw() is the GPU-free entry
+      # point, so encode -> dump the encoder's OWN reconstruction -> decode
+      # the bitstream with ffmpeg -> compare byte for byte all run on the
+      # runner.
+      #
+      # This catches a whole class the decode oracle above structurally
+      # cannot. That oracle asks "will ffmpeg decode this quietly?", and a
+      # drifting encoder emits a perfectly legal bitstream - ffmpeg decodes
+      # it in silence, to a different picture than the encoder believes it
+      # sent. In two days this check found a near-black 5 dB picture, a
+      # QP-ordering bug, the Table 8-10 chroma-QP defect in BOTH encoders,
+      # and the below-left luma reference bug that docs/hevc_scope_note.md
+      # had recorded as "not yet root-caused". None were caught by ctest or
+      # by the decode oracle.
+      #
+      # Deliberately NOT pinning a BC250_DRIFT_CASES subset. Measured: the
+      # full run is ~3.3 s, of which ~2.0 s is the one-off gcc build of the
+      # host repro and ~1.3 s is all 11 cases; 1920x1080 - the expensive one
+      # - is ~0.43 s of that. Dropping it would save under half a second on
+      # a ~40 s job while removing the only case at the resolution this
+      # driver ships at and the only one with enough CTU rows for a
+      # raster-order bug to appear. Pinning a subset would also freeze CI
+      # coverage silently every time a case is added to the script.
+      #
+      # No new apt packages needed - checked against the install step above:
+      # gcc from build-essential, vulkan/vulkan.h and -lvulkan from
+      # libvulkan-dev (gpu_compute.c is in the link set, but nothing calls
+      # into Vulkan on this path at runtime), ffmpeg already installed for
+      # the decode oracle, python3 preinstalled on ubuntu-22.04.
+      #
+      # Invoked as `bash tools/...` rather than executed directly: this
+      # script is mode 100644 in git, unlike its siblings in tools/.
+      run: |
+        # `run:` defaults to `bash -e` WITHOUT pipefail, so without this the
+        # tee below would report tee's exit status and swallow a drift
+        # failure - the same shape of bug as the "ZERO errors!" echo that
+        # the step above exists to correct.
+        set -o pipefail
+        bash tools/hevc_host_drift.sh "$RUNNER_TEMP/bc250_host_drift" 2>&1 \
+          | tee "$RUNNER_TEMP/drift.log"
+
+        # Belt and braces on top of the exit code, because two paths through
+        # that script end in a technically-successful run that compared
+        # nothing: a malformed BC250_DRIFT_CASES leaves the loop with n=0 and
+        # still prints "HOST DRIFT PASS (0 cases byte-exact)", and a per-case
+        # "no output" line means there was no recon or no decoded YUV to
+        # compare. Assert on what ran, not just on the exit status.
+        if grep -q 'no output' "$RUNNER_TEMP/drift.log"; then
+          echo "ERROR: a drift case produced no reconstruction or no decoded YUV -"
+          echo "       that case compared nothing. Treating as a failure."
+          exit 1
+        fi
+        CASES_RUN=$(sed -n 's/^HOST DRIFT PASS (\([0-9]*\) cases byte-exact)$/\1/p' \
+                    "$RUNNER_TEMP/drift.log")
+        if [ -z "$CASES_RUN" ] || [ "$CASES_RUN" -lt 11 ]; then
+          echo "ERROR: expected at least 11 byte-exact drift cases, got '${CASES_RUN:-none}'."
+          echo "       If a case was removed on purpose, lower this floor in the same commit."
+          exit 1
+        fi
+        echo "✓ HOST DRIFT GATE PASSED: $CASES_RUN cases, the encoder's own reconstruction"
+        echo "  is byte-identical to ffmpeg's decode of the bitstream it produced."
+
     - name: Package Release Bundle
       run: |
         mkdir -p dist/bc250-driver/shaders
