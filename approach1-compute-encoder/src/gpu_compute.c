@@ -1130,14 +1130,20 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
         {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
-        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
+        {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL},
+        /* binding 7 = per-CTU P-frame skip mask (docs/notes/c7-gpu-pframes.md).
+         * Host-written, shader-read only - see hevc_skip_buffers' comment in
+         * gpu_compute.h for why this is a plain HOST_VISIBLE buffer rather
+         * than a device-local + staging pair like bindings 4-6. */
+        {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, NULL}
     };
-    VkDescriptorSetLayoutCreateInfo hevc_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 7, .pBindings = hevc_wavefront_bindings };
+    VkDescriptorSetLayoutCreateInfo hevc_wavefront_layout_info = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 8, .pBindings = hevc_wavefront_bindings };
     vkCreateDescriptorSetLayout(ctx->device, &hevc_wavefront_layout_info, NULL, &ctx->hevc_wavefront_desc_layout);
 
     /* Descriptor Pool */
-    /* Headroom, not a tight fit. The nine layouts above bind 24 storage
-     * buffers and 14 storage images today; adding the nonzero mask and the
+    /* Headroom, not a tight fit. The nine layouts above bind 25 storage
+     * buffers (24 plus the P-frame skip mask, binding 7 of hevc_wavefront)
+     * and 14 storage images today; adding the nonzero mask and the
      * compact DC buffer used 3 of the old 32-descriptor margin in one sitting.
      * vkAllocateDescriptorSets()'s result is not checked at its call sites, so
      * exhausting this pool would fail the same silent way an exhausted memory
@@ -2064,6 +2070,15 @@ static void hevc_free_buffers(gpu_context_t *ctx) {
             vkFreeMemory(ctx->device, ctx->hevc_cbf_staging_memories[i], NULL);
             ctx->hevc_cbf_staging_buffers[i] = VK_NULL_HANDLE;
         }
+        if (ctx->hevc_skip_mapped[i]) {
+            vkUnmapMemory(ctx->device, ctx->hevc_skip_memories[i]);
+            ctx->hevc_skip_mapped[i] = NULL;
+        }
+        if (ctx->hevc_skip_buffers[i]) {
+            vkDestroyBuffer(ctx->device, ctx->hevc_skip_buffers[i], NULL);
+            vkFreeMemory(ctx->device, ctx->hevc_skip_memories[i], NULL);
+            ctx->hevc_skip_buffers[i] = VK_NULL_HANDLE;
+        }
     }
     if (ctx->hevc_mode_buffer) {
         vkDestroyBuffer(ctx->device, ctx->hevc_mode_buffer, NULL);
@@ -2102,6 +2117,7 @@ static int hevc_alloc_buffers(gpu_context_t *ctx, uint32_t width, uint32_t heigh
     VkDeviceSize mode_size  = (VkDeviceSize)nctu * sizeof(int32_t);
     VkDeviceSize coeff_size = (VkDeviceSize)nctu * 384u * sizeof(int32_t);
     VkDeviceSize cbf_size   = (VkDeviceSize)nctu * sizeof(uint32_t);
+    VkDeviceSize skip_size  = (VkDeviceSize)nctu * sizeof(uint32_t);
 
     /* Same HOST_CACHED preference the other staging buffers use - reads off
      * an uncached mapping on this APU are slow enough to dominate the frame
@@ -2123,10 +2139,15 @@ static int hevc_alloc_buffers(gpu_context_t *ctx, uint32_t width, uint32_t heigh
         rc |= create_buffer_with_memory_preferred(ctx, mode_size,  VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->hevc_mode_staging_buffers[i],  &ctx->hevc_mode_staging_memories[i]);
         rc |= create_buffer_with_memory_preferred(ctx, coeff_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->hevc_coeff_staging_buffers[i], &ctx->hevc_coeff_staging_memories[i]);
         rc |= create_buffer_with_memory_preferred(ctx, cbf_size,   VK_BUFFER_USAGE_TRANSFER_DST_BIT, cached_pref, visible_req, &ctx->hevc_cbf_staging_buffers[i],   &ctx->hevc_cbf_staging_memories[i]);
+        /* Skip mask is an INPUT (host writes, shader reads), so it is
+         * created host-visible directly - no TRANSFER_DST/staging copy, and
+         * it must be VK_BUFFER_USAGE_STORAGE_BUFFER_BIT since the shader
+         * binds it directly rather than a device-local mirror. */
+        rc |= create_buffer_with_memory_preferred(ctx, skip_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, cached_pref, visible_req, &ctx->hevc_skip_buffers[i], &ctx->hevc_skip_memories[i]);
     }
     if (rc != 0) {
         fprintf(stderr, "[bc250-gpu] HEVC buffer allocation failed at %ux%u (%.1f MB requested) - falling back to the CPU encoder\n",
-                width, height, (double)(mode_size + coeff_size + cbf_size) * 3.0 / (1024.0 * 1024.0));
+                width, height, (double)(mode_size + coeff_size + cbf_size + skip_size) * 3.0 / (1024.0 * 1024.0));
         hevc_free_buffers(ctx);
         return -1;
     }
@@ -2135,28 +2156,43 @@ static int hevc_alloc_buffers(gpu_context_t *ctx, uint32_t width, uint32_t heigh
         vkMapMemory(ctx->device, ctx->hevc_mode_staging_memories[i],  0, mode_size,  0, &ctx->hevc_mode_staging_mapped[i]);
         vkMapMemory(ctx->device, ctx->hevc_coeff_staging_memories[i], 0, coeff_size, 0, &ctx->hevc_coeff_staging_mapped[i]);
         vkMapMemory(ctx->device, ctx->hevc_cbf_staging_memories[i],   0, cbf_size,   0, &ctx->hevc_cbf_staging_mapped[i]);
-        if (!ctx->hevc_mode_staging_mapped[i] || !ctx->hevc_coeff_staging_mapped[i] || !ctx->hevc_cbf_staging_mapped[i]) {
+        vkMapMemory(ctx->device, ctx->hevc_skip_memories[i],          0, skip_size,  0, &ctx->hevc_skip_mapped[i]);
+        if (!ctx->hevc_mode_staging_mapped[i] || !ctx->hevc_coeff_staging_mapped[i] ||
+            !ctx->hevc_cbf_staging_mapped[i] || !ctx->hevc_skip_mapped[i]) {
             fprintf(stderr, "[bc250-gpu] HEVC staging vkMapMemory failed - falling back to the CPU encoder\n");
             hevc_free_buffers(ctx);
             return -1;
         }
+        /* All-intra (no skip) until the first real dispatch writes a real
+         * decision - matters on the very first frame after a (re)allocation,
+         * where gpu_compute_hevc_dispatch_intra() also forces this via
+         * out_recon_was_reset, but this keeps the buffer itself never
+         * observably uninitialized either. */
+        memset(ctx->hevc_skip_mapped[i], 0, (size_t)skip_size);
     }
 
     ctx->hevc_mode_staging_size  = mode_size;
     ctx->hevc_coeff_staging_size = coeff_size;
     ctx->hevc_cbf_staging_size   = cbf_size;
+    ctx->hevc_skip_size          = skip_size;
     ctx->hevc_alloc_width  = width;
     ctx->hevc_alloc_height = height;
 
     update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 4, ctx->hevc_mode_buffer,  mode_size);
     update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 5, ctx->hevc_coeff_buffer, coeff_size);
     update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 6, ctx->hevc_cbf_buffer,   cbf_size);
+    /* Binding 7 (skip mask) is NOT set here, unlike 4-6: it is double-
+     * buffered by current_buf (see the field comment in gpu_compute.h), so
+     * gpu_compute_hevc_dispatch_intra() re-points it at the right slot's
+     * buffer on every call instead of once here at a fixed buffer. */
     return 0;
 }
 
 int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
                                     int width, int height,
-                                    int src_width, int src_height, int qp) {
+                                    int src_width, int src_height, int qp,
+                                    const uint32_t *skip_mask,
+                                    int *out_recon_was_reset) {
     if (!ctx || !ctx->hevc_wavefront_pipeline) return -1;
     if (width <= 0 || height <= 0) return -1;
     if (src.y_view == VK_NULL_HANDLE) return -1;
@@ -2168,7 +2204,13 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
     }
 
     /* The recon image is shared with the H.264 path; create it on the same
-     * terms gpu_compute_dispatch_encode() does if this is the first frame. */
+     * terms gpu_compute_dispatch_encode() does if this is the first frame.
+     * `recon_was_reset` is the docs/notes/c7-gpu-pframes.md safety net: a
+     * freshly (re)created image has undefined content, not "last frame's
+     * reconstruction", so any skip_mask the caller passed on THIS call is
+     * not honoured below regardless of what it asked for - see this
+     * function's doc comment in gpu_compute.h. */
+    bool recon_was_reset = false;
     if (ctx->recon_image.y_plane == VK_NULL_HANDLE ||
         ctx->recon_image.width != (uint32_t)width ||
         ctx->recon_image.height != (uint32_t)height) {
@@ -2176,8 +2218,10 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
             gpu_compute_destroy_image(ctx, ctx->recon_image, ctx->recon_memory);
         gpu_compute_create_image(ctx, width, height, 0, &ctx->recon_image, &ctx->recon_memory);
         ctx->has_recon_frame = false;
+        recon_was_reset = true;
     }
     if (ctx->recon_image.y_view == VK_NULL_HANDLE) return -1;
+    if (out_recon_was_reset) *out_recon_was_reset = recon_was_reset ? 1 : 0;
 
     VkCommandBuffer cmd_buf = ctx->cmd_bufs[ctx->current_buf];
 
@@ -2187,6 +2231,31 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
     update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 2, ctx->recon_image.y_view);
     update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 3,
                                     ctx->recon_image.uv_view ? ctx->recon_image.uv_view : ctx->recon_image.y_view);
+
+    /* Skip mask upload (docs/notes/c7-gpu-pframes.md). Written directly into
+     * this slot's host-visible mapping - HOST_COHERENT, so no explicit flush
+     * - and the descriptor re-pointed at this slot's buffer every call,
+     * because unlike bindings 0-3 (images, not double-buffered themselves)
+     * this input IS double-buffered by current_buf. A reset recon image or
+     * a NULL skip_mask both collapse to "no CTU skips this frame", so every
+     * caller from before this feature (which never passes skip_mask at all)
+     * gets byte-identical behaviour to before it existed. */
+    {
+        uint32_t wc0 = ((uint32_t)width  + 15u) / 16u;
+        uint32_t hc0 = ((uint32_t)height + 15u) / 16u;
+        size_t nctu0 = (size_t)wc0 * hc0;
+        void *dst = ctx->hevc_skip_mapped[ctx->current_buf];
+        if (dst) {
+            if (skip_mask && !recon_was_reset) {
+                memcpy(dst, skip_mask, nctu0 * sizeof(uint32_t));
+            } else {
+                memset(dst, 0, nctu0 * sizeof(uint32_t));
+            }
+        }
+        update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 7,
+                                         ctx->hevc_skip_buffers[ctx->current_buf],
+                                         ctx->hevc_skip_size);
+    }
 
     vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hevc_wavefront_pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3002,6 +3071,18 @@ void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height) {
     free(y_buf);
     free(uv_buf);
     dump_frame_index++;
+}
+
+/* docs/notes/c7-gpu-pframes.md: same readback as gpu_compute_debug_dump_
+ * recon() just above, minus the file I/O and the env-var gate - a real API
+ * for the P-frame skip decision rather than a permanent diagnostic. */
+int gpu_compute_hevc_download_recon_nv12(gpu_context_t *ctx,
+                                         uint8_t *y_plane, int y_pitch,
+                                         uint8_t *uv_plane, int uv_pitch,
+                                         int width, int height) {
+    if (!ctx || ctx->recon_image.y_plane == VK_NULL_HANDLE || width <= 0 || height <= 0) return -1;
+    return gpu_compute_download_nv12(ctx, &ctx->recon_image, ctx->recon_memory,
+                                     y_plane, y_pitch, uv_plane, uv_pitch, width, height);
 }
 
 /* See gpu_compute.h's doc comment: reads back whatever is ACTUALLY in the
