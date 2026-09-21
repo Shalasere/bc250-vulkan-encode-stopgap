@@ -68,6 +68,24 @@ unmodified binary against itself and getting four different md5s (§26.5).
 `lab exact` keys this to a per-content determinism registry and refuses
 invalid comparisons instead of trusting you to remember.
 
+**There is a second, CPU-only way to lose byte-exactness, and it has
+nothing to do with the GPU.** In every non-CQP rate-control mode,
+`rc_update_stats()` drains its leaky bucket by `target_bitrate × real
+elapsed seconds` from `CLOCK_MONOTONIC`, so the bitstream becomes a
+function of how fast the machine ran. `tests/test_encode` was silently
+non-deterministic for this reason — `h264_encoder_create()` uses
+`RC_LOW_LATENCY`, while `hevc_encoder_create()` uses `RC_CQP` and hits
+the early return, which is the whole reason `test_hevc_encode` was
+reproducible and `test_encode` was not.
+
+The scale is worth internalising: **one byte in 350,979**, a
+`slice_qp_delta` whose `se(v)` kept the same code length, so the file
+size, the per-frame byte counts and the stdout logs were all identical.
+Only a full md5 showed it. It is fixed in the test (via the existing
+`BC250_RC_NOMINAL_DRAIN=1` hook), but the mechanism is still live in any
+harness that encodes at a real bitrate target — if you build one, pin
+CQP or set that hook before trusting a byte comparison.
+
 **Name the load condition, every time.** Every throughput figure
 published before the harness existed was taken on an idle GPU. Under
 `--load=gpu` (ffmpeg `nlmeans_vulkan`) 1440p goes **66.2 → 1.48 fps** —
