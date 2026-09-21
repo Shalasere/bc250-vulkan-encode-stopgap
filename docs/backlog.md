@@ -78,7 +78,21 @@ core HEVC source).
 
 **B1. `test_encode` determinism.** Blocks every byte-exactness claim
 about H.264.
-**B2. `bs_rbsp_to_ebsp` (~5.9%).** Emulation-prevention byte insertion.
+**B2. DONE — with a caveat that needs the board.** `bs_rbsp_to_ebsp` is
+3.9x faster in situ and byte-identical, but **end-to-end it measured
+zero** (median -0.64%, inside a 5.9% sd). It was kept anyway because the
+function moved from compute-bound to memory-bound and that share is
+unmeasured on the board's slower CPU, and because reverting would make
+the new differential fuzz test vacuous. **If C2's board run also shows
+zero, revert it** — 111 lines of pointer arithmetic in the bitstream
+writer is not worth 0%.
+
+Also: the 5.9% figure that motivated this task was wrong. gprof's
+resolution here is a single 10 ms bucket out of ~0.6 s, so one sample
+lands as ~1.7% and a shorter run inflates the same bucket to 5.9%.
+Direct instrumentation put the function at 0.93%. **Do not size a task
+off a sub-2% gprof number on this codebase** — instrument the function
+directly first.
 **B3. `--codec` for `lab qsweep`.** Blocks proper HEVC quality numbers;
 `docs/hevc-gpu-intra.md` currently has to mark its PSNR "indicative".
 **B4. 4x4 transform/quant pair (~31% combined).** Note the recorded

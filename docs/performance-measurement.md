@@ -53,6 +53,27 @@ gets a stable, cached key.
 These are the expensive ones. They are listed here because knowing *why*
 the harness refuses something is what stops you from working around it.
 
+**Do not size a task off a small gprof percentage.** gprof on this
+codebase has misattributed three times in one session. Its sample bucket
+here is 10 ms against a ~0.6 s run, so a *single* sample reads as ~1.7%
+and the same bucket on a shorter run inflates to 5.9% — which is exactly
+how `bs_rbsp_to_ebsp` got scoped as a 5.9% hotspot when direct
+`clock_gettime` instrumentation puts it at 0.93%. It also reported
+`hevc_sbac_init_state` at 7.9M calls (reachable ~810 times — symbol
+misattribution under `-O2`), and put 17.7% on a function whose most
+expensive-looking instruction turned out to be free. Treat gprof as a
+pointer to *where to instrument*, then instrument the function directly
+before committing to the work.
+
+**Validate the A/B rig before believing the A/B.** A benchmark harness
+that cannot report 1.00x when both sides are the same code cannot report
+anything else either. One rig here was wrong twice on identical code —
+0.74x because GCC cloned and constant-propagated an in-translation-unit
+reference while the real call stayed opaque, then 1.30x the other way
+from pure hot-loop alignment luck (`-falign-functions=64
+-falign-loops=32` settled it). Both errors were ~30%, larger than most
+wins you would be trying to measure.
+
 **No delta under ~2.5% of wall time is a result** from a single run.
 Measure the floor first — at 1440p it is `p_wall` sd 1.2%, `cavlc` 1.6%,
 `shadow` 3.1%, `gpu_total` 0.09%. `lab compare` marks anything inside the
