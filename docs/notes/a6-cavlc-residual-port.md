@@ -1,10 +1,29 @@
 # A6 — porting the compression work from `cavlc-residual-coding`
 
-Status: **piece (1), the 33 angular intra modes, done and byte-exact.**
-Pieces (2) (all-TU-size transforms) and (3) (undivided 16x16 CUs) **not
-attempted** — see "Why (2)/(3) were not attempted" below. This is a
-deliberate stop, per the task's own prioritization rule ("only attempt
-(2) if (1) is solid, only (3) if (1) and (2) are solid").
+Status: **piece (1), the 33 angular intra modes, done and byte-exact; the
+RD/MPM-cost gap this file's first pass flagged is now closed with an
+RD-biased mode search (see "Follow-up" below) — genuinely improved, but
+still not a clean, unconditional win.** Pieces (2) (all-TU-size
+transforms) and (3) (undivided 16x16 CUs) **not attempted** — see "Why
+(2)/(3) were not attempted" below. This is a deliberate stop, per the
+task's own prioritization rule ("only attempt (2) if (1) is solid, only
+(3) if (1) and (2) are solid").
+
+**2026-09-21 follow-up, read this first if you're deciding whether to
+merge piece (1):** the original pass below (byte-exact, done) shipped a
+SAD-only mode search that this file's own measurement section caught
+making a genuine RD regression on 2 of 5 sample points (smaller AND
+lower-PSNR at fixed QP - a worse operating point, not a Pareto
+improvement). `hevc_choose_luma_mode()` now minimizes `sad + lambda *
+rate_bits(mode)` instead of raw SAD, using the real bypass-bit cost of
+MPM-hit vs escape signaling and a QP-dependent lambda. Re-measuring the
+same 5 points plus the pseudo-random set: **the same 2 of 5 points remain
+a "smaller and worse" trade (not zero), but measurably less severe on
+both, and the other 3 of 5 flip from "bigger, better" to genuine Pareto
+improvements (smaller AND better).** See "Follow-up: RD-biased mode
+search" below for the full numbers, why "zero smaller-and-worse cases" may
+not be an achievable bar for a real lambda-weighted RD search on this
+content, and what's still open.
 
 ## What backlog A6 actually asked for, and what this delivers
 
@@ -287,6 +306,180 @@ simultaneously at fixed QP.
    claiming a real number (`docs/performance-measurement.md`'s standing
    rule).
 
+## Follow-up (2026-09-21): RD-biased mode search
+
+Item 1 above, done in this pass. `hevc_choose_luma_mode()`
+(`approach1-compute-encoder/src/hevc_intra.c`) no longer minimizes raw
+SAD; it minimizes `sad + lambda * rate_bits(mode)`.
+
+**`rate_bits(mode)`** is not an estimate — it's the exact number of
+bypass bits `hevc_cabac_code_intra_luma_data()` emits for that candidate,
+read directly off that function's binarization: 1 bit if `mode` is the
+first MPM candidate (mpm_idx TR(cMax=2), pred_idx 0 → one bypass bin),
+2 bits if it's the second or third (pred_idx 1 or 2 → two bypass bins),
+5 bits for the fixed-length `rem_intra_luma_pred_mode` escape otherwise.
+The one context-coded bin (`prev_intra_luma_pred_flag`) is deliberately
+excluded from the model — it's coded for every candidate regardless of
+hit/miss, and its real arithmetic-coded length depends on CABAC's
+probability state, which a fast SAD-domain search has no way to know.
+Bypass bins have no such ambiguity: they cost exactly 1 raw bit each by
+construction, so this term is exact about what it counts.
+
+**`lambda`** (`hevc_luma_mode_lambda()`) is QP-dependent: shape from the
+field's standard SSD-domain lambda (`lambda_SSD = k * 2^((QP-12)/3)`,
+because HEVC's quantization step doubles every 6 QP and SSD scales as
+step²), square-rooted because this search's distortion metric is SAD
+(scales as step¹, not step²) — same relationship x264 uses between its
+SATD/SAD-domain lambda table and its SSD-domain one.
+
+**The scale constant `k` needed real tuning, and the textbook value was
+wrong for this search.** `k=0.85` (the commonly-cited x264/HM constant)
+was tried first and is calibrated for SATD/SSD costs aggregated over a
+whole 8x8–32x32 transform block. Applied to a single 4x4 SAD (16
+samples), it over-committed to the cheap-to-signal candidate on
+near-perfectly-predictable content — exactly this test's diagonal-ramp
+pattern, where the true best angular mode's SAD can be near zero, so
+even a "small" absolute lambda swamps a large *relative* SAD gap. Measured
+effect at `k=0.85`: 4 of the 5 primary sample points became a
+smaller-and-worse trade (up from 2), even though the two original bad
+points did get a better byte/dB ratio. A sweep over
+`k ∈ {0.05, 0.10, 0.15, 0.20, 0.30, 0.85}` against the same 5 points
+found **`k=0.15`** gives the best result of those tried — see the table
+below. This is an empirically-tuned constant, not a purely analytic one;
+it is tuned against this project's synthetic diagonal-ramp/pseudo-random
+test content specifically, and a real board/`qsweep` session against
+natural video could call for a different value. That further tuning is
+explicitly not done here — see "still open" below.
+
+### Measurement: old (pre-A6, `47c74c9`) vs new (RD-biased, `k=0.15`)
+
+Same procedure as the first pass's table: `tools/hevc_host_repro.c`
+(patterns 2/3), decode both bitstreams to raw YUV, compare against an
+independently-generated true source frame (never a raw stream against a
+fresh `-f lavfi` source directly, per `CLAUDE.md`), `ffmpeg -lavfi psnr`.
+"old" here is the actual pre-A6 4-mode baseline (`47c74c9`, `HEAD~1`
+before A6's own commit `f484edb`) — not the intermediate SAD-only 35-mode
+build the first pass compared against — so this table answers "is piece
+(1) plus this follow-up better than what shipped before A6 touched this
+code at all," which is the question that actually matters for merging.
+
+| size/QP/pattern | old: bytes / PSNR-Y | new (RD, k=0.15): bytes / PSNR-Y | delta | reading |
+|---|---|---|---|---|
+| 256x256 q12 diag | 9368 B / 53.28 dB | 7408 B / 52.64 dB | -20.9% / -0.64 dB | smaller, worse |
+| 256x256 q27 diag | 4881 B / 44.96 dB | 3364 B / 44.54 dB | -31.1% / -0.42 dB | smaller, worse |
+| 128x128 q20 diag | 1078 B / 50.57 dB | 1039 B / 50.97 dB | -3.6% / **+0.40 dB** | **smaller AND better** |
+| 64x64 q20 diag | 355 B / 50.39 dB | 339 B / 50.83 dB | -4.5% / **+0.44 dB** | **smaller AND better** |
+| 128x128 q34 diag | 778 B / 39.30 dB | 764 B / 39.49 dB | -1.8% / **+0.20 dB** | **smaller AND better** |
+| 256x256 q12 rand | 68210 B / 49.80 dB | 68806 B / 49.80 dB | +0.87% / +0.00 dB | ~flat |
+| 256x256 q20 rand | 54208 B / 42.40 dB | 54593 B / 42.70 dB | +0.71% / +0.30 dB | bigger, slightly better |
+| 256x256 q27 rand | 41921 B / 36.04 dB | 42572 B / 35.72 dB | +1.55% / -0.32 dB | bigger, slightly worse |
+| 256x256 q34 rand | 31072 B / 28.99 dB | 31914 B / 29.10 dB | +2.71% / +0.11 dB | bigger, ~flat |
+
+**Reading this against the bar this follow-up was asked to clear
+("fewer/zero smaller-and-worse cases"):** the count of smaller-and-worse
+points did NOT drop to zero — it's still 2 of 5 primary points, exactly
+the same 2 (256x256, QP 12 and 27, diagonal ramp) the first pass flagged.
+What changed is severity and the other 3 points:
+
+- Both remaining bad points got a **better** byte/quality ratio than the
+  SAD-only version: QP 12 went from -11.5%/-0.82 dB (SAD-only 35-mode vs
+  old) to -20.9%/-0.64 dB (more bytes saved, less quality lost); QP 27
+  went from -5.3%/-1.74 dB to -31.1%/-0.42 dB (a much better trade on both
+  axes at once).
+- The other 3 of 5 points, which were "bigger, better" under the
+  SAD-only version (a real quality gain, but not obviously a good
+  trade — paid for in full or more, per the first pass's own words), are
+  now genuine Pareto improvements: smaller AND better, not a trade at
+  all.
+- Pseudo-random content (no clean angular structure, no near-zero-SAD
+  ties to be swayed by a rate term) is close to unaffected by this
+  follow-up either way — consistent with the mechanism above: lambda
+  only matters when the SAD gap between candidates is already small.
+
+**Why "zero smaller-and-worse cases" may not be the right bar for a real
+RD search, and this is not a case of aiming low:** a lambda-weighted RD
+search is *supposed* to sometimes trade distortion for rate when that
+trade is favorable — that's the entire point of adding a rate term. Two
+points remaining "smaller and worse" at a *fixed* QP does not by itself
+mean the trade is bad; it would only be a genuine regression if the same
+byte count could buy better PSNR some other way, or the same PSNR could
+be had in fewer bytes — a question only a real BD-rate curve (multiple QP
+points, interpolated) can answer, not a single-QP byte/PSNR pair. That
+caveat was true of the first pass's table and is equally true of this
+one; it is not resolved by this follow-up and needs its own pass (see
+below).
+
+### Is piece (1) + this follow-up now a real, mergeable win?
+
+**Better than the first pass shipped, still not a clean, unconditional
+win — this is the same kind of honest "not there yet" result the first
+pass reported, not a false "fixed."**
+
+What's solid:
+- Byte-exactness is unchanged and re-verified: `tools/hevc_host_drift.sh`
+  still prints `HOST DRIFT PASS` on all 53 cases, and
+  `ctest -R HevcEncodeBitstreamTest` still passes, both at the final
+  `k=0.15` build. This change is mode-decision-only (which mode SAD+rate
+  picks), so the drift oracle's invariant here is "does whatever mode
+  gets picked still decode byte-exact," not "does the same mode get
+  picked as before" — confirmed understood, and it is what was checked.
+- Full `ctest`: still 6/7, same single pre-existing failure
+  (`VaApiDriverTest`, `Vulkan error -2` under WSL's software `llvmpipe`
+  Vulkan) — reproduced on the unmodified pre-A6 baseline too in this same
+  environment, so it is not a regression from this change or from A6.
+- The two `docs/backlog.md`-flagged-worthy regressions this follow-up
+  targeted did shrink in severity on both axes, and the mechanism
+  (`rate_bits()` costed the actual bypass-bin counts) and the fix
+  direction (QP-dependent lambda, larger bias at higher QP) both work as
+  designed — case-by-case behavior matches the intended shape, not
+  coincidence: the highest-QP primary point (q34) is the cleanest Pareto
+  win among the five.
+- Chroma QP, below-left-reference availability, deblocking-off PPS
+  signalling, and the dead-motion-search inter path are all unaffected —
+  this follow-up touches only `hevc_choose_luma_mode()`'s cost function
+  and hoists (does not change the logic of) the MPM derivation in
+  `encoder_h265.c`'s `encode_cu()` from Step 2 to Step 1; nothing else in
+  either file changed. Re-verified via the same 53-case drift suite,
+  which includes chroma, inter/P-frame, and VBR-rate-control cases.
+
+What's still open, honestly:
+1. **The remaining 2 of 5 "smaller and worse" points are not resolved,
+   only improved.** Whether they represent a real BD-rate regression or
+   a favorable trade this single-QP table can't see is still an open
+   question — needs a real BD-rate curve (see below).
+2. **`k=0.15` is empirically tuned on this project's synthetic test
+   content** (diagonal ramps and pseudo-random noise), not derived from
+   first principles or validated against natural video. It is very
+   plausibly not the right constant for real content, where SAD values
+   are rarely as close to zero as a perfect gradient's. A board/`qsweep`
+   session against real footage is the next step before trusting this
+   constant for anything beyond this dev-machine measurement.
+3. **Real BD-rate** (multiple QP points, interpolated, per `lab
+   qsweep`/the board's BD-rate machinery) is still not done — this
+   remains a two-point byte/PSNR table, suggestive but not a BD-rate
+   figure, exactly as before.
+4. Matching this file's own earlier hypothesis: the claimed -34.8%
+   BD-rate from `cavlc-residual-coding` almost certainly still depends on
+   pieces (2) (all-TU-size transforms) and (3) (undivided 16x16 CUs)
+   alongside RD-aware mode search, not on any one piece alone. This
+   follow-up closes the specific "SAD-only ignores signaling cost" gap
+   piece (1) had, but does not by itself establish that piece (1) is
+   worth shipping in isolation for a compression win — only that it is no
+   longer *actively* undermined by an uncounted rate term the way it was.
+
+**What I'd try next, in order:** (1) a real board `qsweep`/BD-rate run
+against natural content to see whether `k=0.15` (or some other value)
+actually improves BD-rate over the pre-A6 baseline, since this dev-
+machine synthetic-pattern table cannot settle that; (2) if BD-rate is
+still not clean, revisit whether the lambda shape itself (not just the
+scale) is right for a single 4x4 SAD rather than an aggregated
+transform-block cost — the mismatch identified above (near-zero-SAD ties
+on smooth content) may need a different-shaped term, not just a smaller
+constant; (3) attempting pieces (2)/(3) alongside this, per this file's
+own earlier hypothesis that they may be where most of the real
+compression win actually lives, with RD-aware mode search as a
+supporting piece rather than the main lever.
+
 ## What was preserved (re-verified, not assumed)
 
 - **Chroma QP (Table 8-10)**: untouched. Chroma stays DC-only
@@ -344,6 +537,7 @@ of compounded, hard-to-attribute change this project's `CLAUDE.md`/
 
 ## Files changed
 
+First pass (commit `f484edb`):
 - `approach1-compute-encoder/src/hevc_intra.c` — the port itself.
 - `approach1-compute-encoder/src/hevc_intra.h` — `HEVC_MODE_COUNT`, doc
   updates.
@@ -354,5 +548,26 @@ of compounded, hard-to-attribute change this project's `CLAUDE.md`/
   updates.
 - `docs/notes/a6-cavlc-residual-port.md` — this file.
 
+RD-biased mode search follow-up (this commit, 2026-09-21):
+- `approach1-compute-encoder/src/hevc_intra.c` — `hevc_choose_luma_mode()`
+  now takes `qp` and the PU's already-derived `mpm[3]`, and minimizes
+  `sad + lambda * rate_bits(mode)` instead of raw SAD; added
+  `hevc_mode_rate_bits()` and `hevc_luma_mode_lambda()`.
+- `approach1-compute-encoder/src/hevc_intra.h` — signature/doc update for
+  the above.
+- `approach1-compute-encoder/src/encoder_h265.c` — `encode_cu()`'s MPM
+  derivation moved from Step 2 (CABAC signaling) up into Step 1 (mode
+  decision), since the search now needs it; logic unchanged, only
+  relocated (see the comment at its new call site for why that's
+  neighbor-data-safe). No other structural change.
+- `docs/notes/a6-cavlc-residual-port.md` — this file, the "Follow-up"
+  section.
+
 No changes to `docs/DEVLOG.md` or `docs/backlog.md` (parallel-agent
-constraint) or to any other worktree.
+constraint) or to any other worktree. Scratch measurement scripts used to
+produce the follow-up's table (`gen_source.c`, `measure_rd.sh`,
+`build_old_new.sh`, `extract_old.sh`) were dev-machine-only and removed
+before committing — they are reproducible from this file's description if
+needed again (`git show 47c74c9:<path>` for the old-baseline sources,
+`tools/hevc_host_repro.c` unmodified for `hostrepro`, `ffmpeg -lavfi psnr`
+between two forced-framing raw YUV decodes per `CLAUDE.md`'s PSNR rule).

@@ -1129,12 +1129,55 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     int pu_modes[4];
     int16_t luma_coeff[4][16];
     int cbf_luma[4];
+    /* Derived once per PU, here in Step 1, and reused verbatim by Step 2
+     * below (moved up from Step 2 by the A6 RD-mode-search follow-up -
+     * see hevc_choose_luma_mode()'s comment in hevc_intra.h/.c). The mode
+     * SEARCH now needs to know each PU's MPM candidates to cost
+     * MPM-vs-escape signaling correctly, and by the time each PU's mode is
+     * decided in z-order here, its left/above neighbor data in
+     * enc->luma_mode_map is exactly what it will still be when Step 2
+     * signals this same PU - no PU outside this CU changes in between, and
+     * within this CU, earlier PUs (which alone can be this PU's left/above
+     * neighbor) are already decided and already written to the map by the
+     * time a later PU's turn comes. So this is the same neighbor data
+     * Step 2 used to (re)compute independently - hoisting it here removes
+     * a duplicate hevc_derive_mpm() call, it does not change what either
+     * call site sees. */
+    int mpm[4][3];
 
     /* Step 1: decide + reconstruct all 4 luma PUs in z-order (needed so
      * each later PU's neighbor gathering sees real reconstructed samples
      * from the earlier PUs of the SAME CU, exactly like a real decoder). */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
+        int mx = px / 4, my = py / 4;
+        int left_avail = px > 0;
+        /* ITU-T H.265 8.4.2's candIntraPredModeB derivation: forced to
+         * INTRA_DC whenever yCb-1 crosses into the CTU row above the
+         * current one ("yCb - 1 is less than
+         * ((yCb >> CtbLog2SizeY) << CtbLog2SizeY)"), UNCONDITIONALLY - this
+         * is a normative rule for bitstream interoperability, not an
+         * availability check, so it applies even though this single-
+         * threaded in-order encoder has that row's real reconstructed data
+         * sitting right there in enc->luma_mode_map. Using the real mode
+         * instead of forcing DC here computes a candModeList the decoder
+         * never derives, silently corrupting which intra mode
+         * intra_luma_pred_mode's bins are interpreted as from that PU
+         * onward - a structurally valid bitstream that decodes to a
+         * different picture, not a parse error. Missing this was root-
+         * caused 2026-09-19 as the cause of near-total corruption
+         * (PSNR ~6-7dB) on busy/directional content: such content has
+         * non-DC neighbor modes at every CTU-row boundary constantly,
+         * where simple/flat content's neighbors are often DC anyway,
+         * masking the missing rule. This computation moved here (Step 1,
+         * A6 RD-mode-search follow-up) from what used to be Step 2 below -
+         * see the mpm[4][3] declaration's comment above for why that move
+         * is neighbor-data-safe. */
+        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
+        int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
+        int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
+        hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);
+
         /* One call, not two: the mode search already builds the winning
          * mode's prediction, and nothing writes recon_y between here and
          * the hevc_predict_4x4() this replaced, so re-gathering the
@@ -1142,7 +1185,8 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
          * - see hevc_choose_luma_mode_pred()'s comment. */
         uint8_t pred[16];
         int mode = hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw,
-                                         (int)cw, (int)ch, px, py, pred);
+                                         (int)cw, (int)ch, px, py, qp,
+                                         mpm[pu], pred);
         pu_modes[pu] = mode;
 
         int16_t residual[16];
@@ -1218,36 +1262,12 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
      * didn't: a CABAC bit-order mistake still produces a structurally
      * valid, crash-free bitstream, just one that decodes to noise from
      * that point on). */
-    int mpm[4][3];
+    /* mpm[4][3] was already derived per-PU up in Step 1 (needed there now,
+     * for the RD-aware mode search - see its declaration/comment above);
+     * re-derive nothing here, just consume it, exactly as it was computed. */
     int pred_idx[4];
-    for (int pu = 0; pu < 4; pu++) {
-        int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mx = px / 4, my = py / 4;
-        int left_avail = px > 0;
-        /* ITU-T H.265 8.4.2's candIntraPredModeB derivation: forced to
-         * INTRA_DC whenever yCb-1 crosses into the CTU row above the
-         * current one ("yCb - 1 is less than
-         * ((yCb >> CtbLog2SizeY) << CtbLog2SizeY)"), UNCONDITIONALLY - this
-         * is a normative rule for bitstream interoperability, not an
-         * availability check, so it applies even though this single-
-         * threaded in-order encoder has that row's real reconstructed data
-         * sitting right there in enc->luma_mode_map. Using the real mode
-         * instead of forcing DC here computes a candModeList the decoder
-         * never derives, silently corrupting which intra mode
-         * intra_luma_pred_mode's bins are interpreted as from that PU
-         * onward - a structurally valid bitstream that decodes to a
-         * different picture, not a parse error. Missing this was root-
-         * caused 2026-09-19 as the cause of near-total corruption
-         * (PSNR ~6-7dB) on busy/directional content: such content has
-         * non-DC neighbor modes at every CTU-row boundary constantly,
-         * where simple/flat content's neighbors are often DC anyway,
-         * masking the missing rule. */
-        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
-        int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
-        int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
-        hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);
+    for (int pu = 0; pu < 4; pu++)
         pred_idx[pu] = hevc_cabac_code_intra_luma_flag(cab, pu_modes[pu], mpm[pu]);
-    }
     for (int pu = 0; pu < 4; pu++)
         hevc_cabac_code_intra_luma_data(cab, pu_modes[pu], pred_idx[pu], mpm[pu]);
 

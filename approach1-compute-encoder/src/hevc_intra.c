@@ -16,6 +16,7 @@
 #include "hevc_intra.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* ===================== off-board profiling hook ===================== */
 /*
@@ -464,6 +465,81 @@ static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
     return sad;
 }
 
+/* Extra bit cost of SIGNALING candidate `mode` for this PU, given its
+ * already-derived 3-entry MPM list `mpm` (hevc_derive_mpm()'s output).
+ * This mirrors hevc_cabac_code_intra_luma_data()'s ACTUAL bypass-bin
+ * counts exactly, not an estimate of them:
+ *
+ *   - mode == mpm[0]: mpm_idx's TR(cMax=2) binarization emits pred_idx=0
+ *     as a single bypass bin ("0") -> 1 bit.
+ *   - mode == mpm[1] or mpm[2]: pred_idx 1 or 2 -> two bypass bins
+ *     ("10"/"11") -> 2 bits.
+ *   - otherwise: rem_intra_luma_pred_mode, a fixed-length 5-bit bypass
+ *     escape -> 5 bits.
+ *
+ * Deliberately excluded: the one context-coded prev_intra_luma_pred_flag
+ * bin. It is coded for EVERY candidate regardless of hit or miss (only
+ * its value, 1 or 0, differs), so it is not a per-candidate differential
+ * cost, and its real arithmetic-coded bit length depends on the coder's
+ * current probability state, which this fast mode-decision pass has no
+ * way to know without actually running CABAC. The three bypass costs
+ * above have no such uncertainty - a bypass bin costs exactly 1 raw bit
+ * by construction - so this function is exact about what it counts,
+ * rather than a guess dressed up as a formula. */
+static inline int hevc_mode_rate_bits(int mode, const int mpm[3]) {
+    if (mode == mpm[0]) return 1;
+    if (mode == mpm[1] || mode == mpm[2]) return 2;
+    return 5;
+}
+
+/* QP-dependent RD lambda for the SAD-domain mode-decision cost below.
+ *
+ * SHAPE: standard practice (x264/x265/HM) derives an SSD-domain lambda as
+ * lambda_SSD = k * 2^((QP-12)/3): HEVC/H.264's quantization step size
+ * doubles every 6 QP, and SSD (squared error) therefore scales as
+ * step^2 = 2^(QP/3) up to a constant - so a fixed lambda_SSD keeps
+ * D_SSD + lambda_SSD*R roughly QP-invariant in shape. This search's
+ * distortion metric is SAD (sum of ABSOLUTE, not squared, differences),
+ * which scales as step^1, not step^2 - so the matching lambda for a
+ * SAD-domain cost is the square root of the SSD-domain one. This is the
+ * same relationship x264 uses between its SATD/SAD-domain lambda table
+ * and its SSD-domain one (SATD and SAD are the same order in QP as each
+ * other, both linear in step, unlike SSD). The QP-dependence itself is
+ * why this isn't a flat constant: at low QP (fine quantization) a small
+ * SAD difference between candidates still buys real reconstructed
+ * quality, so the search should stay close to SAD-only (lambda small);
+ * at high QP (coarse quantization) that same SAD difference is mostly
+ * swallowed by the quantizer anyway, so the cheap-to-signal candidate
+ * should win unless the SAD gap is large (lambda large).
+ *
+ * SCALE (the constant k below): the textbook k=0.85 was tried first and
+ * measured too aggressive for this specific search. x264/HM calibrate
+ * that constant for SATD/SSD costs aggregated over a whole 8x8-32x32
+ * transform block; this search applies it to a single 4x4 SAD (16
+ * samples), where near-perfectly-predictable content (e.g. a smooth
+ * gradient - exactly this project's diagonal-ramp drift-test pattern)
+ * can drive the best candidate's SAD to near zero, so even a "small"
+ * absolute lambda swamps a genuine, large *relative* SAD gap and
+ * over-commits to the cheap-to-signal candidate. Measured effect at
+ * k=0.85 on docs/notes/a6-cavlc-residual-port.md's 5 sample points: the
+ * two points that were already a bad SAD-only trade (256x256, QP
+ * 12/27, diagonal ramp) got WORSE (-34.7%/-0.61dB vs SAD-only's
+ * -5.3%/-1.74dB direction was better, but severity of the *other* 3
+ * points flipped from "bigger, better" to "smaller, worse" too - 4 of 5
+ * sample points regressed instead of 2). A sweep over k in
+ * {0.05,0.10,0.15,0.20,0.30,0.85} found k=0.15 gives the best result of
+ * those tried: the same 2 of 5 points remain a smaller-and-worse trade
+ * as under plain SAD (not more), with LESS severe quality loss on both
+ * than the SAD-only baseline, and the other 3 of 5 become genuine
+ * Pareto improvements (smaller AND better) rather than merely "bigger,
+ * better". See that file's measurement section for the full table and
+ * the honest caveat that a single-QP byte/PSNR pair is not a BD-rate
+ * curve. */
+static inline double hevc_luma_mode_lambda(int qp) {
+    double lambda_ssd = 0.15 * pow(2.0, (double)(qp - 12) / 3.0);
+    return sqrt(lambda_ssd);
+}
+
 /* PERF: the mode search and the winning mode's prediction are ONE function,
  * because the caller needs both and the second was being recomputed from
  * scratch.
@@ -481,14 +557,21 @@ static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
  * - widened this from a 4-candidate unrolled search to a 35-candidate loop.
  * Only piece (1), the angular modes, is done here; see
  * docs/notes/a6-cavlc-residual-port.md for why (2) and (3) were not
- * attempted and what would be needed. The old A5 comment about this being
- * "four modes... unrolled... a compile-time constant in each" no longer
- * applies - a runtime loop is the only shape that makes sense over 35
- * candidates, and this is now an ordinary SAD-only, no-RDO exhaustive
- * search (still no rate term, matching this encoder's existing "SAD only"
- * convention, just over more candidates). Ties go to the lowest-numbered
- * mode (strict `<`), which is this encoder's own convention, not a spec
- * requirement - HEVC does not mandate a tie-break.
+ * attempted and what would be needed.
+ *
+ * A6 follow-up (2026-09-21): the widened search shipped SAD-only, which
+ * measurably regressed rate-distortion on some content - a mode outside
+ * the 3-entry MPM list costs up to 4 more raw bits than an MPM hit
+ * (hevc_mode_rate_bits() above), and a SAD-only criterion never counted
+ * that against it, so a marginally-lower-SAD non-MPM mode could win while
+ * making the actual bitstream both bigger AND, at fixed QP, lower-PSNR -
+ * see docs/notes/a6-cavlc-residual-port.md's measurement. This is now
+ * `sad + lambda * rate_bits(mode)`, an ordinary RD-biased exhaustive
+ * search, not a "prefer MPM always" special case - a candidate with a
+ * large enough real SAD advantage still wins regardless of MPM membership,
+ * exactly as before this follow-up. Ties go to the lowest-numbered mode
+ * (strict `<`), now on RD cost rather than raw SAD - same tie-break
+ * convention, extended the same way.
  *
  * This is exhaustive, NOT coarse-to-fine, unlike
  * hevc_intra_wavefront.comp's 11-of-35 coarse grid search (that shader's
@@ -497,8 +580,8 @@ static inline int sad_4x4(const uint8_t a[16], const uint8_t b[16]) {
  * now against a 35-entry candidate set, and is explicitly NOT attempted -
  * see docs/notes/a6-cavlc-residual-port.md. */
 int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stride,
-                           int width, int height, int x0, int y0,
-                           uint8_t pred_out[16]) {
+                           int width, int height, int x0, int y0, int qp,
+                           const int mpm[3], uint8_t pred_out[16]) {
     HEVC_PROF_ENTER();
 
     /* Gather ONCE for all 35 candidates - the reference set does not
@@ -516,26 +599,30 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
     memcpy(src16 + 8,  srow + 2 * (size_t)stride, 4);
     memcpy(src16 + 12, srow + 3 * (size_t)stride, 4);
 
+    double lambda = hevc_luma_mode_lambda(qp);
+
     /* Mode 0 (Planar) evaluated straight into pred_out, same as before -
      * it is always tried first, so this is the same "first candidate wins
      * ties by default" initialisation as the old code, one 16-byte copy
-     * cheaper than a sentinel `best_sad < 0` scheme. */
+     * cheaper than a sentinel `best_cost < 0` scheme. */
     predict_block4(left, top, corner, HEVC_MODE_PLANAR, 1 /* luma */, pred_out);
     int best_mode = HEVC_MODE_PLANAR;
-    int best_sad = sad_4x4(src16, pred_out);
+    double best_cost = (double)sad_4x4(src16, pred_out) +
+                        lambda * hevc_mode_rate_bits(HEVC_MODE_PLANAR, mpm);
 
     for (int m = 1; m < HEVC_MODE_COUNT; m++) {
         uint8_t pred_[16];
         predict_block4(left, top, corner, m, 1 /* luma */, pred_);
         int sad_ = sad_4x4(src16, pred_);
-        if (sad_ < best_sad) {
-            best_sad = sad_;
+        double cost_ = (double)sad_ + lambda * hevc_mode_rate_bits(m, mpm);
+        if (cost_ < best_cost) {
+            best_cost = cost_;
             best_mode = m;
             memcpy(pred_out, pred_, 16);
         }
     }
 
-    HEVC_PROF_LEAVE(best_mode, src_y, recon_y, stride, width, height, x0, y0);
+    HEVC_PROF_LEAVE(best_mode, src_y, recon_y, stride, width, height, x0, y0, qp, mpm);
     return best_mode;
 }
 
