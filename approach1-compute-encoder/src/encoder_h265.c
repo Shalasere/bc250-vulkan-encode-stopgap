@@ -1476,8 +1476,22 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
      * math (this dump would ALSO look wrong) or in CABAC/bitstream framing
      * (this dump looks right, but a real decoder's output doesn't). */
     if (getenv("BC250_HEVC_DEBUG_RECON")) {
+        size_t ysz = (size_t)encoder->coded_width * encoder->coded_height;
+        size_t csz = (size_t)(encoder->coded_width / 2) * (encoder->coded_height / 2);
         FILE *fy = fopen("bc250_hevc_debug_recon_y.raw", "wb");
-        if (fy) { fwrite(encoder->recon_y, 1, (size_t)encoder->coded_width * encoder->coded_height, fy); fclose(fy); }
+        if (fy) { fwrite(encoder->recon_y, 1, ysz, fy); fclose(fy); }
+        /* Chroma too, as planar I420 alongside the luma, appended per frame.
+         * Luma alone cannot answer the question this dump exists for once a
+         * defect is chroma-only - which is exactly what the GPU path turned
+         * out to have (docs/hevc-gpu-intra.md, chroma QP and Table 8-10).
+         * One file per plane, frames appended, so frame N is at N*plane_size. */
+        FILE *fa = fopen("bc250_hevc_debug_recon_i420.raw", "ab");
+        if (fa) {
+            fwrite(encoder->recon_y,  1, ysz, fa);
+            fwrite(encoder->recon_cb, 1, csz, fa);
+            fwrite(encoder->recon_cr, 1, csz, fa);
+            fclose(fa);
+        }
     }
 
     encoder->frame_count++;
