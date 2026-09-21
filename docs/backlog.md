@@ -221,9 +221,11 @@ dB** (replacing the ad-hoc 35.26). It also surfaced that H.264 at
 SPS crop bug now fixed in `b2b7fef`. 1080p is now **44.30 dB**.
 
 Note the CPU HEVC path scores **24.93 dB** at qsweep's default gop=120,
-i.e. with P-frames, versus 42.9 for the all-intra GPU path. That gap is
-unexplained and is a **new open item** — the inter path has had far less
-scrutiny than intra.
+i.e. with P-frames, versus 42.9 for the all-intra GPU path. ~~That gap is
+unexplained and is a **new open item**.~~ **RESOLVED by C9** — it was the
+unmodelled in-loop deblocking filter compounding across P-frames. The
+CPU path measures **44.56 dB** on the board after the fix, i.e. it now
+beats the all-intra GPU path, which is the ordering you would expect.
 
 **C5. DECIDED: keep `BC250_ENABLE_HEVC` opt-in.** The GPU path now
 clears every correctness bar (byte-exact, 42.9 dB, ~94 fps at 1080p),
@@ -253,9 +255,35 @@ headers**, which would let ffmpeg's own SPS through — a real change with
 its own risks. `lab dims` reports these as LIMIT rather than failing.
 H.264 is exact at every resolution tested.
 
-**C9. ROOT-CAUSED — two real bugs, both fixed off-board, needs a board
-re-measure.** The gap was not tuning. See `docs/hevc_scope_note.md` for
-the full writeup and the measurements.
+**C9. DONE — board-validated 2026-09-21. +19.6 dB.** The gap was not
+tuning. See `docs/hevc_scope_note.md` for the full writeup and DEVLOG §35
+for the board run.
+
+> **Board result, and it was a real risk.** This same deblocking edit is
+> recorded as collapsing PSNR to 4.85–9.78 dB on hardware on 2026-09-19
+> (a genuine syntax error then — two bits missing). The prediction
+> written down *before* the run was: CPU HEVC at qsweep's gop=120 was
+> **24.93 dB**; if the fix is real it lands in the low 40s, and if the
+> September failure has recurred it comes back under 10. Measured on the
+> board at 2560x1440, `testsrc2`, 150 frames, gop 120:
+>
+> | path | before | after |
+> |---|---|---|
+> | HEVC **CPU** | 24.93 dB | **44.56 / 44.59 dB** (15M / 31M) |
+> | HEVC **GPU** intra | 42.71–42.94 dB | **42.81 / 43.27 dB** |
+>
+> The CPU path now *exceeds* the GPU intra path, which is the expected
+> ordering: the CPU path has P-frames and the GPU path is all-intra, so
+> at a fixed bitrate the CPU path should win once its reference chain
+> stops diverging from the decoder's. It was losing by 18 dB purely
+> because of the unmodelled loop filter. The GPU path's slice header
+> changed symmetrically and is unharmed — that had had no hardware run
+> at all before this.
+>
+> Full `lab gate` PASS alongside: units 5/5, mask EXACT on 400 audited
+> frames, H.264 quality 48.48 dB / SSIM 0.9963, `dims` 11/14 exact with
+> the 3 documented HEVC alignment LIMITs, drift 3/3 byte-exact on both
+> planes. HEVC drift byte-exact on **both** the CPU and GPU paths.
 
 1. **The PPS left deblocking enabled and the encoder never modelled it.**
    Harmless all-intra (0.02 dB), compounding on P-frames: the encoder's
@@ -291,8 +319,47 @@ residual. Doing it properly means `merge_flag`=0 + AMVP + `mvd_coding` +
 `rqt_root_cbf`. That is the item that would make HEVC a real streaming
 alternative, alongside C7.
 
-**Not yet re-measured on hardware.** Everything above is off-board
-(`hevc_encoder_encode_raw()` is GPU-free). Re-run `lab qsweep
---codec=hevc` and `lab gate` on the board to confirm, and note the GPU
-intra path's slice header changed too (symmetrically, same PPS) and has
-had no hardware run at all.
+**Re-measured on hardware 2026-09-21 — confirmed.** See the box at the
+top of this item.
+
+---
+
+## D. Opened by the 2026-09-21 board run
+
+**D1. Rate control does not spend a higher bitrate.** In the same run,
+across 15M → 31M at 1440p `testsrc2`:
+
+| encoder | 15M | 31M | delta |
+|---|---|---|---|
+| ours, H.264 | 42.61 dB (qp_avg 27.9) | 43.09 dB (qp_avg 27.5) | **+0.48** |
+| libx264 | 41.60 dB | 47.91 dB | **+6.31** |
+| ours, HEVC CPU | 44.56 dB | 44.59 dB | **+0.03** |
+| ours, HEVC GPU | 42.81 dB | 43.27 dB | **+0.46** |
+
+So we **beat libx264 by 1.0 dB at 15M and lose to it by 4.8 dB at 31M**,
+entirely because doubling the budget moves our QP by 0.4 while libx264
+converts it into 6.3 dB. Every one of this encoder's paths shows the
+same flat response, which points at rate control rather than at any
+codec-specific issue.
+
+Do NOT reflexively blame `qp_min = 12` — lowering that was measured as
++14% bits for −22% throughput and no visible change (§18), and qp_avg
+here is ~27, nowhere near the clamp. The question is why the controller
+does not *drive* QP down when the bucket has room. Related in shape, but
+not the same finding, as the HEVC "when frame size barely responds to QP
+the lever is block count" result.
+
+This matters for the only real client: Sunshine sessions commonly run
+15–50 Mbps, so the upper half of that range is where we are weakest.
+
+**D2. Publish a load-condition figure that is not synthetic.** The board
+was running a live Steam/gamescope session during this run (`gamescope`,
+`Xwayland`, two `steamwebhelper` at ~25% and ~14% CPU). Both our encoder
+and libx264 came in below their recorded idle figures, and *both* fell
+by a similar proportion — which is the signature of CPU contention, not
+the GPU contention the synthetic `nlmeans_vulkan` generator produces.
+This is the closest thing to a real-session number this project has, and
+it is still not a controlled measurement: the content and bitrate differ
+from the idle runs it would be compared against. Worth one deliberate
+paired run (same content, same bitrate, Steam up vs Steam down) to
+replace the unsourced "60 → 11 fps" claim §24.6 has been carrying.

@@ -4380,3 +4380,117 @@ runs), +1.5 s on a ~44 s job. The ten new cases are ~1.6 s of that; extending
 the comparison to chroma gave ~0.1 s back, because `hevc_host_diff.py` now
 tests each plane in bulk and only walks it pixel by pixel to explain a
 failure.
+
+## 35. The HEVC deblocking fix on hardware: +19.6 dB, and two harness defects that nearly reported it wrong
+
+§34 and `hevc_scope_note.md` root-caused the HEVC inter-quality gap
+off-board. This section is the board run that decided whether any of it
+was real, plus the two defects in `tools/lab` that the same run exposed.
+
+### 35.1 Why this needed a prediction written down first
+
+The deblocking edit here is the *same* edit recorded on 2026-09-19 as
+collapsing PSNR to 4.85–9.78 dB on hardware. That attempt really was
+broken — two bits missing from the PPS — but "the bit layout is correct
+now" is exactly the kind of claim this project has been wrong about
+before, and 38 host drift cases passing is not a hardware run.
+
+So the falsifiable prediction went in the scratch plan before the board
+was touched: the CPU HEVC path measured **24.93 dB** at qsweep's
+gop=120; a real fix lands it in the low 40s, a recurrence of the
+September failure lands it under 10. There is no third reading that
+lets the change survive.
+
+### 35.2 The result
+
+`lab qsweep`, board, 2560x1440 `testsrc2`, 150 frames, gop 120:
+
+| path | before | 15M | 31M |
+|---|---|---|---|
+| HEVC **CPU** (P-frames) | 24.93 dB | **44.56** | **44.59** |
+| HEVC **GPU** intra (all-intra) | 42.71–42.94 | **42.81** | **43.27** |
+| H.264 | — | 42.61 | 43.09 |
+| libx264 (reference) | — | 41.60 | 47.91 |
+
+**+19.6 dB on the CPU path.** It now exceeds the GPU intra path, which
+is the ordering the codec implies: the CPU path has P-frames and the GPU
+path does not, so at a fixed bitrate the CPU path should win once its
+reference chain stops diverging from the decoder's. It had been losing
+by 18 dB purely because the encoder predicted from its own *unfiltered*
+reconstruction while the decoder filtered.
+
+The GPU path's slice header changed symmetrically (same PPS) and had had
+**no** hardware run before this. It is unharmed: 42.81/43.27 against a
+recorded 42.71–42.94.
+
+`lab gate` passes alongside — units 5/5, nonzero-mask EXACT on 400
+audited frames, H.264 quality 48.48 dB / SSIM 0.9963, `dims` 11/14 exact
+with the three documented HEVC alignment LIMITs, drift 3/3 byte-exact on
+both planes. HEVC drift is byte-exact on **both** paths.
+
+### 35.3 Two harness defects, found because a caller mis-parsed a key
+
+The first attempt at this run extracted the build key with a naive hex
+grep, turning `work-d3ef3481710b` into `d3ef3481710b`. Every command
+then ran against a key that does not exist. What the harness did with it
+is the finding:
+
+```
+lab: unknown build key 'd3ef3481710b' (run build first)
+  run1 PSNR=48.484461   SSIM=0.996257   PASS
+  run2 PSNR=48.480432   SSIM=0.996267   PASS
+```
+
+`art_dir()` called `die()` from inside a command substitution, so the
+`exit` killed the **subshell** and every caller continued with `bd=""`.
+The harness then measured whatever driver libva loaded — the one already
+installed on the system — and printed PASS for a binary that was never
+in the picture. Those numbers are real measurements of the wrong thing,
+and they are within noise of the correct answer (48.48), so nothing
+about them looks wrong.
+
+That is the same shape as the deleted `tools/benchmark.sh`, which
+reported two fast timings for two encodes that never ran, and the same
+shape as §19.4's mask audit. Fixed: `art_dir()` returns non-zero and all
+seven call sites take `|| exit 1`.
+
+Second, `qsweep` returned **rc=0** after printing ENCODE FAILED for
+every bitrate — and because the libx264 reference column still printed,
+the output looked populated. It now counts our own encoder's encodes and
+returns non-zero, distinguishing none-ran from partial.
+
+The re-run therefore begins with a **guard test**: `quality` and
+`qsweep` against a deliberately bogus key, both required to exit
+non-zero and to print no PASS, before any real measurement is read.
+Both fired.
+
+### 35.4 A third defect, in the transport
+
+Before either of the above, a `lab build work` hung for **76 minutes**
+on `ssh ... mkdir -p`. The board answered fresh ssh connections
+instantly throughout; the socket belonged to a connection established
+before a power cycle, so it was never reset and ssh waited on a dead
+peer with no upper bound. A stale `ssh ... uname -a` from a session two
+*days* earlier was still parked in the process table next to it.
+
+`tools/lab` had no `ServerAlive*` at all. It now uses
+`ServerAliveInterval=15 ServerAliveCountMax=4` (~1 minute to give up)
+and `ConnectTimeout=10`, on both ssh and scp.
+
+The stall was invisible for a separate reason worth recording on its
+own: the caller piped `lab` through `tail`, so nothing printed until the
+command finished and a wedge was indistinguishable from a slow build.
+Long board jobs should write unbuffered to a log.
+
+### 35.5 What the run opened
+
+Backlog D1 and D2. In short: rate control does not spend a higher
+bitrate — 15M → 31M moves our QP by 0.4 and our PSNR by 0.48 dB while
+libx264 converts the same budget into 6.31 dB, so we beat libx264 by
+1.0 dB at 15M and lose by 4.8 dB at 31M, on every path we have. And the
+board was running a live Steam/gamescope session throughout, in which
+both our encoder and libx264 fell below their idle figures by similar
+proportions — the signature of CPU contention, not the GPU contention
+the synthetic `nlmeans_vulkan` load generator produces. That is the
+closest this project has come to a real-session number, and it is still
+not a controlled one.
