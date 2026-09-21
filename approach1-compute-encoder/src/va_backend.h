@@ -131,9 +131,8 @@ struct bc250_context {
          * in BOTH buffers, and the sequence-parameter path used to apply the
          * raw 2X - re-initializing rate control at double the real target
          * and undoing the misc path's correct scaling, since whichever
-         * buffer arrives last wins. See docs/DEVLOG.md §15 and
-         * docs/rate_control_audit.md §2. 0 means "none seen yet"; treated
-         * as 100% (no scaling). */
+         * buffer arrives last wins. See docs/DEVLOG.md §15.5. 0 means
+         * "none seen yet"; treated as 100% (no scaling). */
         unsigned int rc_target_percentage;
     } h264_state;
 

@@ -755,7 +755,7 @@ VAStatus bc250_RenderPicture(VADriverContextP ctx, VAContextID context, VABuffer
      * buffers, and whichever is handled last previously won - so with
      * SeqParam last, rate control was re-initialized at 2X the real target.
      * Making this order-independent is the actual fix; see docs/DEVLOG.md
-     * §15 and docs/rate_control_audit.md §2. */
+     * §15.5. */
     for (int i = 0; i < num_buffers; i++) {
         VABufferID pid = buffers[i];
         if (!VALID_ID(pid, MAX_BUFFERS) || !data->buffers[pid].allocated) continue;

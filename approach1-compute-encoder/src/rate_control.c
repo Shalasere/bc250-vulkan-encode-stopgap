@@ -17,8 +17,10 @@
  * rc_estimate_base_qp - derive a starting QP from the requested bitrate and
  * resolution instead of a hardcoded constant.
  *
- * See docs/rate_control_audit.md sections 1 and 4 point 1: the old code set
- * base_qp = 26 unconditionally, so every QP the feedback loop could ever
+ * Historical note (see docs/DEVLOG.md §15 for the full investigation;
+ * the standalone rate_control_audit.md this used to cite was folded into
+ * DEVLOG and into this file's own comments and no longer exists): the old
+ * code set base_qp = 26 unconditionally, so every QP the feedback loop could ever
  * reach (base_qp +- a handful of steps) was completely independent of what
  * bitrate was requested. This uses the standard, well-understood
  * bits-per-pixel <-> QP relationship real encoders (x264/x265's first-pass
@@ -28,11 +30,11 @@
  *
  * The curve needs one calibration point to anchor it. Rather than invent
  * one, this reuses a real board measurement already on record
- * (docs/rate_control_audit.md SS3 Part C): a genuine CBR encode of 1280x720
+ * (docs/DEVLOG.md §15): a genuine CBR encode of 1280x720
  * @30fps synthetic "testsrc" content targeting 1 Mbps, under the OLD
  * hardcoded base_qp=26, converged to within -8.1% of that target - i.e.
  * QP ~26 empirically was already about right for ~0.036 bits/pixel of this
- * kind of content (see audit section 3, Part C). Anchoring here means the
+ * kind of content. Anchoring here means the
  * one combination that was already known-good is left unchanged, and every
  * other resolution/bitrate combination scales off of a real measurement
  * instead of a guess.
@@ -132,8 +134,8 @@ void rc_init(rate_control_t *rc, rc_mode_t mode, uint32_t bitrate, double fps,
  * Integral-term time constant and gain. This file's header comment has
  * always described a "Proportional-Integral" controller, and the struct
  * has always carried an error_integral field - but no code ever wrote or
- * read it, so in practice the loop was proportional-only, and (per
- * docs/rate_control_audit.md sections 1 and 4 point 2) p_term's normalized
+ * read it, so in practice the loop was proportional-only, and (see
+ * docs/DEVLOG.md §15-§17) p_term's normalized
  * error/target_level ratio is mathematically bounded to +-1, capping
  * qp_adjust to a fixed +-6 around base_qp no matter how large or
  * persistent the buffer error is.

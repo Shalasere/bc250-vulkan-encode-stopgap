@@ -503,6 +503,50 @@ if(BUILD_HEVC_BENCH)
     endif()
 endif()
 
+# ----------------------------------------------------------------------------
+# rc_bench - off-board rate-control response harness (docs/backlog.md D1)
+# ----------------------------------------------------------------------------
+# D1: on the board, doubling the requested bitrate barely moves this
+# encoder's mean QP on any path, while libx264 spends it. This drives
+# h264_encoder_encode_raw()/hevc_encoder_encode_raw() directly - same
+# rationale as hevc_host_repro/hevc_bench above (real frame path, no VA-API,
+# no ffmpeg, no GPU) - so the rate controller's actual response to a 2x
+# bitrate change can be measured and compared against a simulated per-frame
+# QP override (see tools/rc_bench.c's top comment) without the board.
+#
+# Links both codecs' real sources (everything bc250_drv_video builds except
+# va_backend.c, which this harness never calls and which would otherwise
+# drag in the full libva/DRM dependency for no reason) - same CMake-target-
+# not-hand-rolled-gcc reasoning and the same alignment/-march pins as
+# cavlc_bench, because this tool measures behaviour under the shipped
+# rate_control.c, not just correctness, and a byte count depends on real
+# codegen too (bits/frame is a function of what quantize/transform actually
+# computed).
+option(BUILD_RC_BENCH "Build the off-board rate-control harness (tools/rc_bench.c)" ON)
+if(BUILD_RC_BENCH)
+    set(RC_BENCH_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rc_bench.c)
+    if(EXISTS ${RC_BENCH_SRC})
+        set(RC_BENCH_CORE
+            src/gpu_compute.c src/bitstream.c src/cavlc.c src/cabac.c
+            src/rate_control.c src/encoder_h264.c src/encoder_h265.c
+            src/hevc_cabac.c src/hevc_intra.c)
+        set(RC_BENCH_FLAGS -falign-functions=64 -falign-loops=32)
+        if(NOT CAVLC_BENCH_MARCH STREQUAL "off")
+            check_c_compiler_flag("-march=${CAVLC_BENCH_MARCH}" COMPILER_SUPPORTS_BENCH_MARCH)
+            if(COMPILER_SUPPORTS_BENCH_MARCH)
+                list(APPEND RC_BENCH_FLAGS -march=${CAVLC_BENCH_MARCH} -mtune=${CAVLC_BENCH_MARCH})
+            endif()
+        endif()
+
+        add_executable(rc_bench ${RC_BENCH_SRC} ${RC_BENCH_CORE})
+        target_include_directories(rc_bench PRIVATE src ${Vulkan_INCLUDE_DIRS})
+        target_compile_options(rc_bench PRIVATE ${RC_BENCH_FLAGS})
+        target_link_libraries(rc_bench PRIVATE ${Vulkan_LIBRARIES} ${BC250_EXTRA_LIBS} m)
+    else()
+        message(WARNING "BUILD_RC_BENCH=ON but ${RC_BENCH_SRC} is missing")
+    endif()
+endif()
+
 # Tests
 #
 # enable_testing() MUST be called here, in the top-level CMakeLists.txt,

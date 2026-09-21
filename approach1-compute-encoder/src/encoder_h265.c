@@ -361,6 +361,11 @@ struct hevc_encoder {
     bool     has_ref;
     int qp;
     int pps_init_qp;
+    /* Last QP explicitly handed to hevc_encoder_set_qp(), or -1 if never
+     * called yet. Distinct from `qp` above, which pick_frame_qp() also
+     * overwrites every frame with the rate controller's own decision - see
+     * hevc_encoder_set_qp()'s doc comment (docs/backlog.md D1). */
+    int qp_hint_applied;
     rate_control_t rc;
     uint32_t quality_level;      /* 1..7 (1 = Quality, 4 = Balanced, 7 = Speed) */
     uint32_t max_frame_bits;     /* Maximum frame size in bits (0 = unlimited) */
@@ -465,6 +470,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
         }
     }
     enc->pps_init_qp = enc->qp;
+    enc->qp_hint_applied = -1; /* no explicit QP hint applied yet - see hevc_encoder_set_qp() */
     rc_init(&enc->rc, RC_CQP, bitrate, (double)enc->fps, width, height);
     enc->rc.current_qp = enc->qp;
     enc->rc.base_qp = enc->qp;
@@ -590,9 +596,28 @@ void hevc_encoder_set_qp(hevc_encoder_t *encoder, int qp)
     if (encoder) {
         if (qp < 0) qp = 0;
         if (qp > 51) qp = 51;
+        /* docs/backlog.md D1: this used to stomp rc.base_qp AND
+         * rc.current_qp on EVERY call, unconditionally - see
+         * h264_encoder_set_qp()'s matching fix and doc comment
+         * (encoder_h264.c) for the full mechanism and off-board
+         * measurement (tools/rc_bench.c, docs/notes/d1-rate-control.md).
+         * Short version: va_backend.c's bc250_RenderPicture() routes
+         * VAEncPictureParameterBufferHEVC.pic_init_qp and
+         * VAEncMiscParameterRateControl.initial_qp straight into this
+         * function, PicParam is a mandatory PER-FRAME VA-API buffer, and
+         * at least one real caller resends the same hint every frame - so
+         * unconditionally reapplying it here reset rc_get_frame_qp()'s
+         * clamped per-frame QP walk back to the hint before it ever had
+         * more than one frame to move, regardless of what bitrate was
+         * actually requested. Only reset rate-control state when the hint
+         * genuinely changes, exactly like hevc_encoder_set_bitrate()
+         * already treats a resent, unchanged bitrate. */
+        if (qp != encoder->qp_hint_applied) {
+            encoder->rc.base_qp = qp;
+            encoder->rc.current_qp = qp;
+            encoder->qp_hint_applied = qp;
+        }
         encoder->qp = qp;
-        encoder->rc.base_qp = qp;
-        encoder->rc.current_qp = qp;
     }
 }
 
