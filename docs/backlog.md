@@ -207,12 +207,29 @@ slower core pays proportionally more for the integer divisions and call
 overhead those changes removed — so a dev-machine figure understates
 this class of win, just as it overstated the butterfly.
 
-**C3. STILL OPEN.** H.264 chroma drift, max delta 241–252. Needs a
-deblocking-aware comparison first: `lab drift` disables the decoder's
-loop filter, but this encoder does **luma-only** deblocking, so the
-comparison is mismatched by construction for H.264 and the current
-number cannot be interpreted. Design that before trusting any H.264
-drift figure.
+**C3. RE-OPENED WORSE — the methodology is built, and it rules out
+deblocking entirely.** 241–252 is not explainable by the luma-only-
+deblocking gap under *any* decode configuration: `deblock_filter.comp`'s
+own `tc0` clamp (ITU-T 8.7.2.4) bounds a single deblocking-caused pixel
+change to at most 27 across the whole QP range, and `lab drift` always
+uses `-g 1` (every frame an independent IDR), so it can't be C9's
+compounding-P-frame shape either. Under the harness's own default
+(`-skip_loop_filter all`), chroma should already be **exact** — the
+encoder never filters chroma and the decoder isn't filtering anything —
+so a large chroma delta there is doubly unexplained.
+
+`lab drift --real-decode` (real PPS-signalled filtering) plus per-plane
+annotation against the theoretical bound is now in `tools/bc250_lab.sh`.
+`h264_encoder_encode_raw()` cannot serve as an off-board oracle here —
+it transmits a hardcoded all-zero residual, never touching
+`residual_predict.comp`/`reconstruct.comp`/`deblock_filter.comp` where
+this actually lives — so **this genuinely needs the board**, confirming
+what the item already said.
+
+Leading candidate, not yet checked: `residual_predict.comp` predicts
+intra chroma *and luma* from **source** neighbours rather than
+**reconstructed** ones — live in exactly the `-g 1` config `drift` uses.
+Full analysis + exact next board commands: `docs/notes/c3-h264-chroma-drift.md`.
 
 **C4. DONE — and it found a live bug.** Re-taking the retracted PSNR
 figures through `lab qsweep --codec=hevc` gave HEVC GPU **42.71–42.94
