@@ -265,6 +265,28 @@ static void test_multislice_parallel_encoding(void) {
     printf("[test_encode] Multi-threaded multi-slice parallel encoding verified.\n");
 }
 
+/*
+ * Synthetic animated test pattern: moving gradient bar and cross-hatch.
+ * Factored out of main()'s encode loop so the determinism verification pass
+ * below encodes provably the same input as the primary pass - a second,
+ * hand-copied loop could drift from this one and turn the memcmp into a
+ * test of nothing.
+ */
+static void fill_test_pattern(uint8_t *y_plane, uint8_t *uv_plane, int i,
+                              uint32_t width, uint32_t height) {
+    int shift = (i * 32) % (int)width;
+    for (uint32_t r = 0; r < height; r++) {
+        for (uint32_t c = 0; c < width; c++) {
+            y_plane[r * width + c] = (uint8_t)(((c + shift) * 255 / width) ^ ((r * 128) / height));
+        }
+    }
+    for (uint32_t r = 0; r < height / 2; r++) {
+        for (uint32_t c = 0; c < width; c++) {
+            uv_plane[r * width + c] = (uint8_t)(128 + ((r * 64) / (height / 2)));
+        }
+    }
+}
+
 int main(void) {
     /* Isolate test execution from host environment variables */
     const char *orig_slices = getenv("BC250_SLICES_PER_FRAME");
@@ -273,9 +295,54 @@ int main(void) {
     const char *orig_cabac = getenv("BC250_USE_CABAC");
     char saved_cabac[64] = {0};
     if (orig_cabac) strncpy(saved_cabac, orig_cabac, sizeof(saved_cabac) - 1);
+    const char *orig_drain = getenv("BC250_RC_NOMINAL_DRAIN");
+    char saved_drain[64] = {0};
+    if (orig_drain) strncpy(saved_drain, orig_drain, sizeof(saved_drain) - 1);
 
     test_setenv("BC250_SLICES_PER_FRAME", NULL);
     test_setenv("BC250_USE_CABAC", NULL);
+
+    /*
+     * Make this test's output a function of its input only, not of how fast
+     * the machine ran it.
+     *
+     * Measured before this line existed: the same unmodified binary emitted
+     * two different bc250_test_stream.h264 files, alternating between md5
+     * b84f6db790a208944c9ebdb521fbbcc9 and f055271bb46929a68a122a0d3c30d9d4
+     * over 8 consecutive runs (5x / 3x, same 350979-byte length both times).
+     * Exactly one byte differed, at offset 172946, inside the slice header of
+     * frame 15's P-slice NAL; `ffmpeg -bsf:v trace_headers` localized it to
+     * slice_qp_delta, and showed the whole QP ramp shifted by one frame (one
+     * run spent three frames at delta 8, the other four).
+     *
+     * Mechanism: h264_encoder_create() calls rc_init(..., RC_LOW_LATENCY, ...)
+     * (encoder_h264.c), and in every non-CQP mode rc_update_stats() drains its
+     * leaky bucket by target_bitrate * REAL elapsed wall-clock seconds, read
+     * from clock_gettime(CLOCK_MONOTONIC) (rate_control.c). That is correct and
+     * deliberate for live streaming - see the comment there and DEVLOG.md §16 -
+     * but it makes the bitstream depend on execution speed, so the buffer
+     * crosses a QP-step threshold a frame earlier or later depending on
+     * scheduling noise.
+     *
+     * This is also precisely why test_hevc_encode IS deterministic:
+     * hevc_encoder_create() calls rc_init(..., RC_CQP, ...) (encoder_h265.c),
+     * and rc_update_stats() returns at its `mode == RC_CQP` early-return
+     * without ever reading the clock.
+     *
+     * Fixed here in the TEST rather than in rate_control.c, which ships. The
+     * production code already exposes the documented, test-only escape hatch
+     * used below; it pins the drain to the fixed per-frame quota by taking the
+     * existing "no clock available" fallback path. Preferred over forcing the
+     * encoder to RC_CQP because CQP would make rc_update_stats() and
+     * rc_get_frame_qp() both return immediately, deleting this test's coverage
+     * of the PI feedback loop, the buffer accounting and the QP ramp. With the
+     * nominal drain those all still run - they just run off frame counts
+     * instead of off the clock.
+     *
+     * Must be set before the first encode: rate_control.c latches this into a
+     * static on the first non-CQP rc_update_stats() call in the process.
+     */
+    test_setenv("BC250_RC_NOMINAL_DRAIN", "1");
 
     test_intra16_dc_transpose();
     test_rate_control_cqp_and_vbr();
@@ -312,19 +379,14 @@ int main(void) {
     const int num_frames = 30;
     size_t total_bytes = 0;
 
+    /* Full copy of pass 1's bitstream, for the determinism check after the
+     * loop. Grown by realloc rather than preallocated at num_frames * out_cap,
+     * which would be 124 MB for a stream that is ~350 KB. */
+    uint8_t *pass1 = NULL;
+    size_t pass1_len = 0;
+
     for (int i = 0; i < num_frames; i++) {
-        /* Generate synthetic animated test pattern: moving gradient bar and cross-hatch */
-        int shift = (i * 32) % (int)width;
-        for (uint32_t r = 0; r < height; r++) {
-            for (uint32_t c = 0; c < width; c++) {
-                y_plane[r * width + c] = (uint8_t)(((c + shift) * 255 / width) ^ ((r * 128) / height));
-            }
-        }
-        for (uint32_t r = 0; r < height / 2; r++) {
-            for (uint32_t c = 0; c < width; c++) {
-                uv_plane[r * width + c] = (uint8_t)(128 + ((r * 64) / (height / 2)));
-            }
-        }
+        fill_test_pattern(y_plane, uv_plane, i, width, height);
 
         int written = h264_encoder_encode_raw(enc, y_plane, width, uv_plane, width, out_buf, out_cap);
         if (written <= 0) {
@@ -384,20 +446,97 @@ int main(void) {
         if (f_stream) {
             fwrite(out_buf, 1, (size_t)written, f_stream);
         }
+        uint8_t *grown = realloc(pass1, pass1_len + (size_t)written);
+        assert(grown != NULL);
+        pass1 = grown;
+        memcpy(pass1 + pass1_len, out_buf, (size_t)written);
+        pass1_len += (size_t)written;
         total_bytes += (size_t)written;
     }
 
     if (f_stream) {
         fclose(f_stream);
     }
+    h264_encoder_destroy(enc);
+
+    /*
+     * Determinism check. Re-encode the identical 30 frames with a fresh
+     * encoder and require the two bitstreams to be byte-identical.
+     *
+     * This is a regression guard for the wall-clock rate-control drain
+     * documented at the top of main(), and it is deliberately an in-process
+     * assertion rather than a convention someone has to remember: the drain
+     * hook is a test-only affordance in shipping code, and if it is ever
+     * removed or renamed, the setenv above silently stops working and this
+     * test's output silently goes back to being a coin flip. That matters
+     * beyond this file - a byte-exactness A/B built on a non-deterministic
+     * binary is not evidence, and it has already produced one false
+     * "byte-identical to origin/main" conclusion on this project.
+     *
+     * Non-vacuous by measurement, not by argument: with the setenv above
+     * removed and nothing else changed, this assert fired on 7 of 10 runs,
+     * reporting the same offset 172946 that cross-run md5 diffing had already
+     * identified. The two passes' inter-frame gaps land inside the drain's
+     * 1 ms .. 250 ms clamp window, so they are genuinely free to disagree -
+     * they do not merely saturate at the same clamp bound.
+     *
+     * Note the 7/10, not 10/10: two passes in one process sometimes run
+     * closely enough in step to agree by luck. So this is a high-probability
+     * alarm, not a proof of determinism, and it is deliberately the weaker
+     * half of the check - the primary evidence is that the emitted
+     * bc250_test_stream.h264 is md5-stable across repeated runs of the
+     * binary (12/12 at d3faabec059a62cb690d7d03b42149a5 when this landed).
+     * If you are re-verifying determinism after a change, compare that md5
+     * across separate process invocations; do not just trust a green run.
+     */
+    printf("[test_encode] Verifying encode determinism (re-encode and compare)...\n");
+    h264_encoder_t *enc2 = h264_encoder_create(NULL, width, height, fps, bitrate, PROFILE_BASELINE);
+    assert(enc2 != NULL);
+
+    uint8_t *pass2 = NULL;
+    size_t pass2_len = 0;
+    for (int i = 0; i < num_frames; i++) {
+        fill_test_pattern(y_plane, uv_plane, i, width, height);
+        int written = h264_encoder_encode_raw(enc2, y_plane, width, uv_plane, width, out_buf, out_cap);
+        assert(written > 0);
+        uint8_t *grown = realloc(pass2, pass2_len + (size_t)written);
+        assert(grown != NULL);
+        pass2 = grown;
+        memcpy(pass2 + pass2_len, out_buf, (size_t)written);
+        pass2_len += (size_t)written;
+    }
+    h264_encoder_destroy(enc2);
+
+    if (pass1_len != pass2_len) {
+        fprintf(stderr, "[test_encode] ERROR: non-deterministic encode: pass1 %zu bytes, pass2 %zu bytes\n",
+                pass1_len, pass2_len);
+    }
+    assert(pass1_len == pass2_len && "encoder output length is not deterministic");
+
+    size_t first_diff = pass1_len;
+    for (size_t p = 0; p < pass1_len; p++) {
+        if (pass1[p] != pass2[p]) { first_diff = p; break; }
+    }
+    if (first_diff != pass1_len) {
+        fprintf(stderr, "[test_encode] ERROR: non-deterministic encode: first differing byte at "
+                        "offset %zu (0x%02x vs 0x%02x) of %zu\n",
+                first_diff, pass1[first_diff], pass2[first_diff], pass1_len);
+    }
+    assert(first_diff == pass1_len && "encoder output is not byte-deterministic across runs");
+    printf("[test_encode] Determinism verified: two independent encodes agree on all %zu bytes.\n",
+           pass1_len);
+
+    free(pass1);
+    free(pass2);
     free(y_plane);
     free(uv_plane);
     free(out_buf);
-    h264_encoder_destroy(enc);
 
     /* Restore host environment variables */
     if (orig_slices) test_setenv("BC250_SLICES_PER_FRAME", saved_slices);
     if (orig_cabac) test_setenv("BC250_USE_CABAC", saved_cabac);
+    if (orig_drain) test_setenv("BC250_RC_NOMINAL_DRAIN", saved_drain);
+    else test_setenv("BC250_RC_NOMINAL_DRAIN", NULL);
 
     printf("[test_encode] Successfully encoded %d frames (%zu total bytes) to bc250_test_stream.h264!\n",
            num_frames, total_bytes);
