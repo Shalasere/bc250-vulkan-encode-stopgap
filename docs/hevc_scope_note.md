@@ -1,5 +1,120 @@
 # H.265/HEVC — Architecture & Scope Note
 
+> ## 2026-09-20: the inter/P-frame quality gap (backlog C9), root-caused
+>
+> `lab qsweep` scored the CPU HEVC path at **24.93 dB** at its default
+> gop=120 against **42.9 dB** for the all-intra GPU path. Two defects, both
+> found and fixed off-board, both invisible to every oracle in the repo at
+> the time, and one of them invisible *because of* how the oracle was run.
+>
+> ### 1. The PPS said deblocking was on; the encoder never modelled it
+>
+> `deblocking_filter_control_present_flag = 0` means "defaults apply", and
+> HEVC's default is deblocking **enabled** (7.4.3.3.1). This encoder does
+> not simulate the in-loop filter. All-intra that costs essentially
+> nothing — one filter pass over an otherwise-correct picture, 0.02 dB.
+> On P-frames it **compounds**: the encoder's reference for frame N+1 is
+> its own *unfiltered* reconstruction of frame N, the decoder's is the
+> *filtered* one, so the two reference chains diverge a little more with
+> every P-frame and only an IDR resets them.
+>
+> Measured off-board, `testsrc2` 640x480, CQP 27, 60 frames:
+>
+> | | own reconstruction | real decode | loss |
+> |---|---|---|---|
+> | gop 1 (all intra) | 45.91 dB | 45.93 dB | ~0 |
+> | gop 120 | 43.64 dB | **38.07 dB** | 5.6 dB |
+> | gop 120, skip disabled | 46.35 dB | **37.23 dB** | 9.1 dB |
+>
+> The encoder was reconstructing *fine*. The bitstream was describing that
+> reconstruction *exactly*. The decoder was then told to filter it.
+>
+> `tools/hevc_host_drift.sh` could not see this, by construction: it
+> decoded with `-skip_loop_filter all`, precisely to paper over this
+> mismatch. It printed byte-exact PASS over a 9 dB loss for as long as it
+> existed. **Whenever a check needs a flag to pass, ask what that flag is
+> switching off.**
+>
+> Fixed by signalling deblocking off, which makes the bitstream honest
+> about what the encoder models. gop 120 goes **38.07 → 43.64 dB** for the
+> same bytes (592146 → 592145); all-intra pays 0.02 dB.
+>
+> This was tried once before (2026-09-19) and reverted after PSNR collapsed
+> to 4.85–9.78 dB on hardware. That attempt was a real syntax error and it
+> was missing two bits, both now present and both documented at the edit
+> site: `deblocking_filter_override_enabled_flag` in the PPS, and the
+> removal of `slice_loop_filter_across_slices_enabled_flag` from the slice
+> header (7.3.6.1 makes it absent once SAO and deblocking are both off).
+> Getting either wrong shifts every following bit. The difference this time
+> is not care, it is the oracle: the drift script now decodes **without**
+> `-skip_loop_filter all` and is byte-exact, which is only possible if the
+> decoder really did parse "deblocking off".
+>
+> ### 2. The GPU's motion vector was injected into the merge candidate list
+>
+> `derive_merge_candidates()` appended `motion_estimation.comp`'s vector to
+> the list after the spatial candidates. That is not a merge candidate in
+> any HEVC profile. Only `merge_idx` is transmitted — an index into a list
+> the decoder builds for itself — and with `sps_temporal_mvp_enabled_flag`
+> = 0 there is no temporal candidate either, so the slot the GPU vector
+> occupied is one the decoder fills with **zero motion**. Every CU that
+> picked it: encoder builds a motion-compensated block, decoder builds a
+> co-located copy, no residual to correct it (these are SKIP CUs), error
+> straight into the reference picture for every later P-frame.
+>
+> This is on-board-only, which is why no dev-machine oracle had a chance:
+> with no GPU there is no MV readback, so every candidate was (0,0) and
+> every index selected the same vector. **A path with only one possible
+> answer is not being tested.** `BC250_HEVC_FAKE_GPU_MV="dx,dy"` (see
+> `hevc_encoder_encode_raw()`) supplies one, and at 64x64 / QP 27 / gop 6 a
+> vector of (2,0) put **17271 of 24576 luma samples** wrong against ffmpeg
+> from the first P-frame. Six such cases are now permanent in the drift
+> list.
+>
+> Fixed by removing the injection. **Say the consequence out loud**: the
+> spatial candidates are read from `mv_x_map`/`mv_y_map`, which only SKIP
+> CUs write, and a SKIP CU can only write a vector it took from this list.
+> The list is therefore a fixpoint at zero — every P-frame motion vector is
+> (0,0), and `hevc_motion_search_diamond_8x8()` plus the P-frame GPU ME
+> dispatch can no longer affect the bitstream at all. They are pure cost;
+> the search survives only as the source of `last_frame_sad` for rate
+> control. **This is not a regression** — the encoder was never able to
+> *legally* signal a non-zero vector, so the choice was between zero motion
+> and corruption. Real motion needs explicit MVD signalling (`merge_flag`
+> = 0 + AMVP + `mvd_coding` + `rqt_root_cbf`), which is a genuine piece of
+> work and a separate backlog item, not a sixth entry in a list.
+>
+> ### What was ruled out
+>
+> Checked against the spec and/or measured, and **not** the problem:
+> merge candidate positions and pruning (A1/B1/B0/A0/B2, including the
+> z-scan availability that makes B0 unavailable for the bottom-right CU of
+> a CTU and A0 available only for the top-left); `cu_skip_flag` ctxInc;
+> the P-slice CABAC context initialisers (checked value by value against
+> x265's tables — note x265 indexes them B/P/I, not by initType);
+> `merge_idx` TR binarisation; the P-slice header field order and the
+> absence of TMVP/SAO/long-term fields; POC LSB and the SPS short-term
+> RPS. The rate-control path (VBR, so QP moves per frame and
+> `slice_qp_delta` is non-zero on P-frames) was never covered by any drift
+> case and now is — it was already exact.
+>
+> ### Still open, and honest about it
+>
+> After both fixes, gop 120 sits 0–5 dB below all-intra at half the bytes
+> or less (`testsrc2` 640x480: 47.48/43.64/38.42/35.05/32.08 dB at QP
+> 20/27/34/40/46 against 52.38/45.91/39.76/35.93/32.07 all-intra). That is
+> ordinary rate-distortion, not a defect. What remains is that the inter
+> path is only zero-motion SKIP plus intra fallback — no motion
+> compensation and no inter residual coding — so on genuinely moving
+> content it leans on intra CUs for everything. The skip threshold
+> (`96 * (1 + qp/8)`) also accepts a block with no residual at all and no
+> way to correct it before the next IDR; forcing every CU to skip collapses
+> the same clip to 22.70 dB, which is the shape of that risk.
+>
+> Reproduce any of the above with `tools/hevc_host_drift.sh` (byte
+> exactness) and `tools/hevc_host_repro.c` with `BC250_HOSTREPRO_INPUT`
+> (quality, on real content, no board).
+
 > ## ⚠️ 2026-09-20: the "busy content mismatches the decoder" defect, narrowed
 >
 > This file previously recorded that busy, multi-directional luma content

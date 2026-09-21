@@ -1059,9 +1059,22 @@ dims() {
 # passed the whole time. This check failed it immediately.
 #
 # The in-loop filter is disabled on the decode side (-skip_loop_filter
-# all) because neither encoder simulates deblocking while the PPS leaves
-# it enabled; SAO is already off in our SPS. Without that flag the
-# comparison is guaranteed to differ and tells you nothing.
+# all) because neither encoder simulates deblocking; SAO is already off in
+# our SPS. Without that flag the comparison is guaranteed to differ and
+# tells you nothing - for H.264, which still leaves deblocking enabled in
+# its PPS. For HEVC the flag is now a no-op: encoder_h265.c's PPS signals
+# deblocking off outright, so the decoder is not filtering anyway.
+#
+# That is not cosmetic. While the HEVC PPS said "deblocking on" and the
+# encoder did not model it, this flag was hiding a compounding error:
+# the encoder's reference for frame N+1 was its own UNFILTERED
+# reconstruction of frame N, the decoder's was the FILTERED one, and the
+# two chains drifted apart a little more with every P-frame. Measured
+# off-board at testsrc2 640x480 CQP 27 gop 120: 46.35 dB of encoder
+# reconstruction arriving as 37.23 dB of decoded picture. An oracle that
+# turns the filter off cannot see that by construction - which is why
+# `qsweep` (a real decode) and `drift` (a filtered-off one) disagreed for
+# as long as they did.
 #
 # Found, in two days: a near-black picture at 5 dB (split_cu_flag ctxInc),
 # a QP-before-dispatch ordering bug, the chroma QP defect above, and a

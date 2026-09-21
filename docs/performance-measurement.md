@@ -170,9 +170,34 @@ passed the entire time. `lab drift` compares the encoder's own
 reconstruction against **ffmpeg's**, with the in-loop filter disabled
 (`-skip_loop_filter all`; SAO is off in our SPS). In two days it found a
 near-black picture at 5 dB, a QP-ordering bug, the chroma QP defect, and
-a ~33 dB luma divergence in the CPU HEVC path that is still open. Run it
-on anything that touches prediction, transform, quantization or entropy
-coding.
+a ~33 dB luma divergence in the CPU HEVC path. Run it on anything that
+touches prediction, transform, quantization or entropy coding.
+
+**Off-board, `tools/hevc_host_drift.sh` runs the same check with no GPU
+and no board** — `hevc_encoder_encode_raw()` is GPU-free. 28 cases,
+intra and inter, byte-exact against ffmpeg on both planes.
+
+Two things that oracle teaches, both learned by it being *wrong* rather
+than failing:
+
+- **An oracle that disables the thing under test cannot test it.**
+  `-skip_loop_filter all` was there because the HEVC encoder never
+  simulated deblocking while its PPS left deblocking enabled. That
+  turned the strongest check in the project blind to exactly the defect
+  that mattered: the encoder's reference for frame N+1 was its own
+  *unfiltered* reconstruction, the decoder's was the *filtered* one, and
+  the two walked apart a little more with every P-frame. 46.35 dB of
+  encoder reconstruction was arriving as 37.23 dB of picture, and a
+  byte-exact "PASS" was printed over it the whole time. The HEVC PPS now
+  signals deblocking off, so the flag is a no-op there and the oracle
+  checks the real decode path. Whenever a check needs a flag to pass,
+  ask what that flag is switching off.
+- **A path with only one possible answer is not being tested.** Every
+  inter case was byte-exact for a reason that had nothing to do with
+  being correct: with no GPU there is no motion-estimation readback, so
+  every merge candidate was (0,0) and every `merge_idx` selected the
+  same vector. `BC250_HEVC_FAKE_GPU_MV` supplies a non-zero one, and the
+  first case that used it failed 17271 of 24576 luma samples.
 
 And one that no harness can enforce for you: **an exact oracle is only
 exact about what it compares.** The mask audit reported EXACT across 401
