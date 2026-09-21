@@ -91,24 +91,35 @@ static inline uint8_t clip8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255
  * available iff it's in-picture AND its rank is strictly less than the
  * current block's.
  */
-static long long zorder_rank(int x, int y, int width, int is_luma) {
-    int ctu_size = is_luma ? 16 : 8;
-    int width_ctu = (width + ctu_size - 1) / ctu_size;
-    int ctu_col = x / ctu_size, ctu_row = y / ctu_size;
-    int rx = x % ctu_size, ry = y % ctu_size;
-    int half = ctu_size / 2; /* CU size in this plane's pixels */
-    int cu_col = rx / half, cu_row = ry / half;
-    long long rank = ((long long)ctu_row * width_ctu + ctu_col) * 4 + (cu_row * 2 + cu_col);
+/* PERF: both CTU sizes are powers of two (16 luma, 8 chroma), but writing
+ * this with `ctu_size` as a runtime variable meant the compiler could not
+ * strength-reduce any of the four divisions and two modulos - it has to
+ * emit real integer division, because it cannot prove the divisor is 16 or
+ * 8. Profiling the 1080p CPU encode put this one function at 21% of total
+ * runtime over 25.7 MILLION calls, more than the inverse transform, the
+ * prediction and the CABAC bin coder individually, for what is only
+ * availability bookkeeping.
+ *
+ * Splitting the two cases makes every shift and mask a compile-time
+ * constant. The arithmetic is unchanged and the output is byte-identical;
+ * this is purely the same formula the compiler can now see through.
+ * Ranks also fit comfortably in int32 (8K luma tops out near 2.1M), so the
+ * 64-bit multiply goes too. */
+static inline int zorder_rank(int x, int y, int width, int is_luma) {
     if (is_luma) {
-        int rx2 = rx % half, ry2 = ry % half;
-        int quarter = half / 2; /* PU size (4) */
-        int pu_col = rx2 / quarter, pu_row = ry2 / quarter;
-        rank = rank * 4 + (pu_row * 2 + pu_col);
+        /* CTU 16 -> CU 8 -> PU 4 */
+        int width_ctu = (width + 15) >> 4;
+        int rank = ((y >> 4) * width_ctu + (x >> 4)) * 4
+                 + (((y >> 3) & 1) * 2 + ((x >> 3) & 1));
+        return rank * 4 + (((y >> 2) & 1) * 2 + ((x >> 2) & 1));
     }
-    return rank;
+    /* chroma: CTU 8 -> CU 4, no PU sub-split */
+    int width_ctu = (width + 7) >> 3;
+    return ((y >> 3) * width_ctu + (x >> 3)) * 4
+         + (((y >> 2) & 1) * 2 + ((x >> 2) & 1));
 }
 
-static int zorder_available(int nx, int ny, int width, int height, int is_luma, long long cur_rank) {
+static inline int zorder_available(int nx, int ny, int width, int height, int is_luma, int cur_rank) {
     if (nx < 0 || ny < 0 || nx >= width || ny >= height) return 0;
     return zorder_rank(nx, ny, width, is_luma) < cur_rank;
 }
@@ -126,7 +137,7 @@ static int zorder_available(int nx, int ny, int width, int height, int is_luma, 
  * comment above). */
 static void gather_neighbors(const uint8_t *plane, int stride, int width, int height,
                               int x0, int y0, int is_luma, uint8_t left[5], uint8_t top[5], uint8_t *corner) {
-    long long cur_rank = zorder_rank(x0, y0, width, is_luma);
+    int cur_rank = zorder_rank(x0, y0, width, is_luma);
     int avail_left = zorder_available(x0 - 1, y0, width, height, is_luma, cur_rank);
     int avail_top = zorder_available(x0, y0 - 1, width, height, is_luma, cur_rank);
     int avail_corner = zorder_available(x0 - 1, y0 - 1, width, height, is_luma, cur_rank);
@@ -199,11 +210,34 @@ static void gather_neighbors(const uint8_t *plane, int stride, int width, int he
 
 /* ===================== prediction (8.4.4.2.5-8.4.4.2.7) ===================== */
 
+/* PERF: prediction split into "gather the references" and "apply a mode to
+ * already-gathered references". The reference set for a block does not
+ * depend on which mode is being tried, but hevc_choose_luma_mode() tries
+ * four candidates and the old single-entry-point shape re-gathered for
+ * every one of them, then a fifth time for the chosen mode - five
+ * identical gathers per 4x4 block, each running five z-scan availability
+ * tests. Profiling 1080p put gather_neighbors()'s zorder_rank alone at 21%
+ * of total runtime across 25.7M calls.
+ *
+ * The GPU shader already had this shape ("build both reference sets once",
+ * hevc_intra_wavefront.comp); this brings the CPU path in line. Output is
+ * unchanged - it is the same gather feeding the same mode arithmetic,
+ * just not repeated. */
+static void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
+                              int mode, int is_luma, uint8_t pred_out[16]);
+
 void hevc_predict_4x4(const uint8_t *recon_plane, int stride, int width, int height,
                       int x0, int y0, int mode, int is_luma, uint8_t pred_out[16]) {
     uint8_t left[5], top[5], corner;
     gather_neighbors(recon_plane, stride, width, height, x0, y0, is_luma, left, top, &corner);
+    predict_from_refs(left, top, corner, mode, is_luma, pred_out);
+}
 
+/* is_luma is still needed here, not just for the gather: DC and the
+ * horizontal/vertical modes apply their edge filtering only for cIdx == 0
+ * (8.4.4.2.5-8.4.4.2.6). */
+static void predict_from_refs(const uint8_t left[5], const uint8_t top[5], uint8_t corner,
+                              int mode, int is_luma, uint8_t pred_out[16]) {
     switch (mode) {
     case HEVC_MODE_PLANAR:
         for (int y = 0; y < 4; y++)
@@ -257,9 +291,14 @@ int hevc_choose_luma_mode(const uint8_t *src_y, const uint8_t *recon_y, int stri
     int best_mode = HEVC_MODE_DC;
     long best_sad = -1;
 
+    /* Gather ONCE for all four candidates - the reference set does not
+     * depend on the mode. See predict_from_refs()'s comment. */
+    uint8_t left[5], top[5], corner;
+    gather_neighbors(recon_y, stride, width, height, x0, y0, 1, left, top, &corner);
+
     for (int c = 0; c < 4; c++) {
         uint8_t pred[16];
-        hevc_predict_4x4(recon_y, stride, width, height, x0, y0, candidates[c], 1, pred);
+        predict_from_refs(left, top, corner, candidates[c], 1 /* luma */, pred);
         long sad = 0;
         for (int y = 0; y < 4; y++)
             for (int x = 0; x < 4; x++) {

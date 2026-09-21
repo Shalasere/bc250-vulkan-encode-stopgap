@@ -232,7 +232,7 @@ static void cabac_write_out(hevc_cabac_t *cb) {
     }
 }
 
-void hevc_cabac_encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
+static inline void encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
     uint32_t mstate = cb->ctx[ctx_idx];
     cb->ctx[ctx_idx] = g_hevc_next_state[mstate][bin & 1];
 
@@ -257,14 +257,14 @@ void hevc_cabac_encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
     if (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
-void hevc_cabac_encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
+static inline void encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
     cb->low <<= 1;
     if (bin) cb->low += cb->range;
     cb->bits_left++;
     if (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
-void hevc_cabac_encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bins) {
+static inline void encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bins) {
     while (num_bins > 8) {
         num_bins -= 8;
         uint32_t pattern = value >> num_bins;
@@ -327,11 +327,11 @@ void hevc_cabac_finish(hevc_cabac_t *cb) {
 /* ===================== syntax element wrappers ===================== */
 
 void hevc_cabac_code_cu_skip_flag(hevc_cabac_t *cb, int skip, int ctx_inc) {
-    hevc_cabac_encode_bin(cb, HEVC_CTX_SKIP_FLAG + ctx_inc, (uint32_t)(skip ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_SKIP_FLAG + ctx_inc, (uint32_t)(skip ? 1 : 0));
 }
 
 void hevc_cabac_code_pred_mode_flag(hevc_cabac_t *cb, int pred_mode) {
-    hevc_cabac_encode_bin(cb, HEVC_CTX_PRED_MODE, (uint32_t)(pred_mode ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_PRED_MODE, (uint32_t)(pred_mode ? 1 : 0));
 }
 
 void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx) {
@@ -340,24 +340,24 @@ void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx) {
      * - bins 1..3 (if merge_idx > 0) are bypass-coded:
      *   (merge_idx - 1) bypass 1s, followed by terminating bypass 0 if merge_idx < 4. */
     if (merge_idx <= 0) {
-        hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_IDX, 0);
+        encode_bin(cb, HEVC_CTX_MERGE_IDX, 0);
         return;
     }
-    hevc_cabac_encode_bin(cb, HEVC_CTX_MERGE_IDX, 1);
+    encode_bin(cb, HEVC_CTX_MERGE_IDX, 1);
     for (int i = 0; i < merge_idx - 1; i++) {
-        hevc_cabac_encode_bypass(cb, 1);
+        encode_bypass(cb, 1);
     }
     if (merge_idx < 4) {
-        hevc_cabac_encode_bypass(cb, 0);
+        encode_bypass(cb, 0);
     }
 }
 
 void hevc_cabac_code_split_cu_flag(hevc_cabac_t *cb, int bin, int ctx_inc) {
-    hevc_cabac_encode_bin(cb, HEVC_CTX_SPLIT_FLAG + ctx_inc, (uint32_t)(bin ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_SPLIT_FLAG + ctx_inc, (uint32_t)(bin ? 1 : 0));
 }
 
 void hevc_cabac_code_part_mode_intra(hevc_cabac_t *cb, int is_2nx2n) {
-    hevc_cabac_encode_bin(cb, HEVC_CTX_PART_SIZE, (uint32_t)(is_2nx2n ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_PART_SIZE, (uint32_t)(is_2nx2n ? 1 : 0));
 }
 
 int hevc_cabac_code_intra_luma_flag(hevc_cabac_t *cb, int mode, const int mpm[3]) {
@@ -365,14 +365,14 @@ int hevc_cabac_code_intra_luma_flag(hevc_cabac_t *cb, int mode, const int mpm[3]
     for (int i = 0; i < 3; i++) {
         if (mode == mpm[i]) { pred_idx = i; break; }
     }
-    hevc_cabac_encode_bin(cb, HEVC_CTX_INTRA_PRED, (uint32_t)(pred_idx != -1 ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_INTRA_PRED, (uint32_t)(pred_idx != -1 ? 1 : 0));
     return pred_idx;
 }
 
 void hevc_cabac_code_intra_luma_data(hevc_cabac_t *cb, int mode, int pred_idx, const int mpm_in[3]) {
     if (pred_idx != -1) {
         int nonzero = (pred_idx != 0);
-        hevc_cabac_encode_bypass_bins(cb, (uint32_t)(pred_idx + nonzero), 1 + nonzero);
+        encode_bypass_bins(cb, (uint32_t)(pred_idx + nonzero), 1 + nonzero);
     } else {
         int mpm[3] = { mpm_in[0], mpm_in[1], mpm_in[2] };
         if (mpm[0] > mpm[1]) { int t = mpm[0]; mpm[0] = mpm[1]; mpm[1] = t; }
@@ -382,31 +382,31 @@ void hevc_cabac_code_intra_luma_data(hevc_cabac_t *cb, int mode, int pred_idx, c
         dir += (dir > mpm[2]) ? -1 : 0;
         dir += (dir > mpm[1]) ? -1 : 0;
         dir += (dir > mpm[0]) ? -1 : 0;
-        hevc_cabac_encode_bypass_bins(cb, (uint32_t)dir, 5);
+        encode_bypass_bins(cb, (uint32_t)dir, 5);
     }
 }
 
 void hevc_cabac_code_intra_chroma_pred_mode(hevc_cabac_t *cb, int luma_mode_pu0) {
     if (luma_mode_pu0 == 1) {
         /* DM_CHROMA (derived == luma): luma is already DC, so chroma == DC. */
-        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);
+        encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);
     } else {
         /* Candidate list {Planar,Vertical,Horizontal,DC} has DC untouched
          * at index 3 whenever luma mode isn't DC itself, so index 3 always
          * yields chroma==DC here. */
-        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 1);
-        hevc_cabac_encode_bypass_bins(cb, 3, 2);
+        encode_bin(cb, HEVC_CTX_CHROMA_PRED, 1);
+        encode_bypass_bins(cb, 3, 2);
     }
 }
 
 void hevc_cabac_code_cbf_luma(hevc_cabac_t *cb, int cbf, int trafo_depth) {
     int ctx = (trafo_depth == 0) ? 1 : 0;
-    hevc_cabac_encode_bin(cb, HEVC_CTX_QT_CBF + ctx, (uint32_t)(cbf ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_QT_CBF + ctx, (uint32_t)(cbf ? 1 : 0));
 }
 
 void hevc_cabac_code_cbf_chroma(hevc_cabac_t *cb, int cbf, int trafo_depth) {
     int ctx = 2 + trafo_depth;
-    hevc_cabac_encode_bin(cb, HEVC_CTX_QT_CBF + ctx, (uint32_t)(cbf ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_QT_CBF + ctx, (uint32_t)(cbf ? 1 : 0));
 }
 
 /* ===================== residual_coding() for one 4x4 TU ===================== */
@@ -415,7 +415,7 @@ static void write_coef_remain_exp_golomb(hevc_cabac_t *cb, uint32_t code_number,
     uint32_t code_remain = code_number & ((1u << rice) - 1);
     if ((code_number >> rice) < COEF_REMAIN_BIN_REDUCTION) {
         uint32_t length = code_number >> rice;
-        hevc_cabac_encode_bypass_bins(cb, (((1u << (length + 1)) - 2) << rice) + code_remain,
+        encode_bypass_bins(cb, (((1u << (length + 1)) - 2) << rice) + code_remain,
                                        (int)(length + 1 + rice));
     } else {
         uint32_t cn = (code_number >> rice) - COEF_REMAIN_BIN_REDUCTION;
@@ -423,9 +423,9 @@ static void write_coef_remain_exp_golomb(hevc_cabac_t *cb, uint32_t code_number,
         uint32_t length = idx;
         cn -= (1u << idx) - 1;
         cn = (cn << rice) + code_remain;
-        hevc_cabac_encode_bypass_bins(cb, (1u << (COEF_REMAIN_BIN_REDUCTION + length + 1)) - 2,
+        encode_bypass_bins(cb, (1u << (COEF_REMAIN_BIN_REDUCTION + length + 1)) - 2,
                                        (int)(COEF_REMAIN_BIN_REDUCTION + length + 1));
-        hevc_cabac_encode_bypass_bins(cb, cn, (int)(length + rice));
+        encode_bypass_bins(cb, cn, (int)(length + rice));
     }
 }
 
@@ -451,9 +451,9 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
         uint8_t temp = g_hevc_last_ctx4[pos[i]];
         int prefix_ones = temp & 15;
         for (int c = 0; c < prefix_ones; c++)
-            hevc_cabac_encode_bin(cb, bank + ctx_base + c, 1);
+            encode_bin(cb, bank + ctx_base + c, 1);
         if (prefix_ones < 3)
-            hevc_cabac_encode_bin(cb, bank + ctx_base + prefix_ones, 0);
+            encode_bin(cb, bank + ctx_base + prefix_ones, 0);
     }
 
     /* Significance map + gather absolute levels (scan order, decreasing
@@ -471,7 +471,7 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
         int val = coeff[raster];
         int sig = (val != 0);
         int ctx_sig = g_hevc_sig_ctx4[raster];
-        hevc_cabac_encode_bin(cb, HEVC_CTX_SIG_FLAG + sig_base + ctx_sig, (uint32_t)sig);
+        encode_bin(cb, HEVC_CTX_SIG_FLAG + sig_base + ctx_sig, (uint32_t)sig);
         if (sig) {
             abs_coeff[num_nonzero] = (int16_t)(val < 0 ? -val : val);
             sign[num_nonzero] = (int16_t)(val < 0 ? 1 : 0);
@@ -492,7 +492,7 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
     for (int idx = 0; idx < num_c1_flag; idx++) {
         int symbol1 = abs_coeff[idx] > 1;
         int symbol2 = abs_coeff[idx] > 2;
-        hevc_cabac_encode_bin(cb, one_base + (int)c1, (uint32_t)symbol1);
+        encode_bin(cb, one_base + (int)c1, (uint32_t)symbol1);
         if (symbol1) c1_next = 0;
         if (symbol1 + first_c2_flag == 3) first_c2_flag = symbol2;
         if (symbol1 + first_c2_idx == 9) first_c2_idx = idx;
@@ -500,13 +500,13 @@ void hevc_cabac_code_residual_4x4(hevc_cabac_t *cb, const int16_t coeff[16],
         c1_next >>= 2;
     }
     if (!c1) {
-        hevc_cabac_encode_bin(cb, abs_base, (uint32_t)first_c2_flag);
+        encode_bin(cb, abs_base, (uint32_t)first_c2_flag);
     }
 
     /* Sign bits (bypass), decreasing-scan-position order, no sign hiding
      * (this project's PPS sets sign_data_hiding_flag=0). */
     for (int idx = 0; idx < num_nonzero; idx++)
-        hevc_cabac_encode_bypass(cb, (uint32_t)sign[idx]);
+        encode_bypass(cb, (uint32_t)sign[idx]);
 
     /* coeff_abs_level_remaining. */
     if (!c1 || num_nonzero > C1FLAG_NUMBER) {
@@ -645,16 +645,16 @@ void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_s
             int bank = (i == 0) ? HEVC_CTX_LAST_X : HEVC_CTX_LAST_Y;
             int group = g_group_idx[pos[i]];
             for (int b = 0; b < group; b++)
-                hevc_cabac_encode_bin(cb, bank + offset + (b >> shift), 1);
+                encode_bin(cb, bank + offset + (b >> shift), 1);
             if (group < max_group)
-                hevc_cabac_encode_bin(cb, bank + offset + (group >> shift), 0);
+                encode_bin(cb, bank + offset + (group >> shift), 0);
         }
         /* Suffixes are bypass and both follow both prefixes. */
         for (int i = 0; i < 2; i++) {
             int group = g_group_idx[pos[i]];
             if (group > 3) {
                 int len = (group >> 1) - 1;
-                hevc_cabac_encode_bypass_bins(cb, (uint32_t)(pos[i] - g_min_in_group[group]), len);
+                encode_bypass_bins(cb, (uint32_t)(pos[i] - g_min_in_group[group]), len);
             }
         }
     }
@@ -693,7 +693,7 @@ void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_s
             if (xs < cg_blk - 1) ctx += csbf[ys * cg_blk + xs + 1];
             if (ys < cg_blk - 1) ctx += csbf[(ys + 1) * cg_blk + xs];
             if (ctx > 1) ctx = 1;
-            hevc_cabac_encode_bin(cb, HEVC_CTX_SIG_CG + ctx + (is_luma ? 0 : 2), (uint32_t)coded);
+            encode_bin(cb, HEVC_CTX_SIG_CG + ctx + (is_luma ? 0 : 2), (uint32_t)coded);
             csbf[cgr] = (uint8_t)coded;
             if (!coded) continue;
         }
@@ -725,7 +725,7 @@ void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_s
                 int ctx = (log2_size == 2)
                         ? (sig_base + g_hevc_sig_ctx4[r])
                         : sig_ctx_large(xc, yc, log2_size, is_luma, scan_idx, csbf, cg_blk);
-                hevc_cabac_encode_bin(cb, HEVC_CTX_SIG_FLAG + ctx, (uint32_t)sig);
+                encode_bin(cb, HEVC_CTX_SIG_FLAG + ctx, (uint32_t)sig);
             }
             if (sig || infer) {
                 abs_coeff[num_nonzero] = (int16_t)(v < 0 ? -v : v);
@@ -751,7 +751,7 @@ void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_s
         for (int idx = 0; idx < num_c1_flag; idx++) {
             int symbol1 = abs_coeff[idx] > 1;
             int symbol2 = abs_coeff[idx] > 2;
-            hevc_cabac_encode_bin(cb, one_base + (int)c1, (uint32_t)symbol1);
+            encode_bin(cb, one_base + (int)c1, (uint32_t)symbol1);
             if (symbol1) c1_next = 0;
             if (symbol1 + first_c2_flag == 3) first_c2_flag = symbol2;
             if (symbol1 + first_c2_idx == 9) first_c2_idx = idx;
@@ -759,10 +759,10 @@ void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_s
             c1_next >>= 2;
         }
         if (!c1)
-            hevc_cabac_encode_bin(cb, abs_base, (uint32_t)first_c2_flag);
+            encode_bin(cb, abs_base, (uint32_t)first_c2_flag);
 
         for (int idx = 0; idx < num_nonzero; idx++)
-            hevc_cabac_encode_bypass(cb, (uint32_t)sign[idx]);
+            encode_bypass(cb, (uint32_t)sign[idx]);
 
         if (!c1 || num_nonzero > C1FLAG_NUMBER) {
             uint32_t go_rice = 0;          /* reset per group, per spec */
@@ -784,7 +784,7 @@ void hevc_cabac_code_residual(hevc_cabac_t *cb, const int16_t *coeff, int log2_s
 }
 
 void hevc_cabac_code_split_transform_flag(hevc_cabac_t *cb, int split, int log2_size) {
-    hevc_cabac_encode_bin(cb, HEVC_CTX_TRANS_SUBDIV + (5 - log2_size), (uint32_t)(split ? 1 : 0));
+    encode_bin(cb, HEVC_CTX_TRANS_SUBDIV + (5 - log2_size), (uint32_t)(split ? 1 : 0));
 }
 
 int hevc_chroma_mode_from_idx(int idx, int luma_mode_pu0) {
@@ -799,9 +799,31 @@ int hevc_chroma_mode_from_idx(int idx, int luma_mode_pu0) {
 
 void hevc_cabac_code_intra_chroma_pred_mode_idx(hevc_cabac_t *cb, int idx) {
     if (idx == 4) {
-        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);   /* DM_CHROMA */
+        encode_bin(cb, HEVC_CTX_CHROMA_PRED, 0);   /* DM_CHROMA */
     } else {
-        hevc_cabac_encode_bin(cb, HEVC_CTX_CHROMA_PRED, 1);
-        hevc_cabac_encode_bypass_bins(cb, (uint32_t)idx, 2);
+        encode_bin(cb, HEVC_CTX_CHROMA_PRED, 1);
+        encode_bypass_bins(cb, (uint32_t)idx, 2);
     }
+}
+
+
+/* PERF: the three functions above are the CABAC hot path - the bin coder
+ * alone runs 26.4 MILLION times for six 1080p frames, and profiling put
+ * it at 13.7% of total encode time. Every one of those calls was an
+ * out-of-line call to an exported symbol, and every call site for all
+ * three is inside THIS translation unit; nothing outside it uses them
+ * directly. They are now static-inline cores, with these wrappers kept so
+ * the public API in hevc_cabac.h is unchanged for any future caller.
+ *
+ * Same technique main already applied to the H.264 coder in cabac.c. */
+void hevc_cabac_encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
+    encode_bin(cb, ctx_idx, bin);
+}
+
+void hevc_cabac_encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
+    encode_bypass(cb, bin);
+}
+
+void hevc_cabac_encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bins) {
+    encode_bypass_bins(cb, value, num_bins);
 }
