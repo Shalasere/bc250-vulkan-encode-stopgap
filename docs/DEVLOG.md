@@ -4250,3 +4250,133 @@ a nonzero bitmask instead of walking every scan position, or narrowing
   execute it, so the codegen matches what ships.
 - The `CAVLC_PROFILE` build's own instrumentation branches cost ~5%; run
   `bench` on both binaries to re-check rather than assuming.
+
+## 34. Odd resolutions in the host drift oracle: the padding was fine, the buffers were not
+
+Backlog A1 asked for non-multiple-of-16 coverage in
+`tools/hevc_host_drift.sh`, on the theory that padding and conformance-window
+cropping were the untested bug class — the same class that had just produced
+the live H.264 SPS-crop defect fixed in `b2b7fef`, where 1920x1080 was emitted
+with a crop window that decoded as 1920x1088 and scored 13.66 dB against 44.4
+for aligned heights.
+
+The premise was wrong and the exercise was worth it anyway. Padding and crop
+are correct at every size tried. Two other defects fell out, one of them
+capable of corrupting a live stream.
+
+### 34.1 The oracle could not see a wrong crop window at all
+
+`hevc_host_diff.py` compared `dec[:W*H]`. For a stream that decodes *taller*
+than requested, the first `W*H` bytes of the decoded frame are still the
+correct top `H` rows, so an H.264-style 1080-decodes-as-1088 bug scores zero
+drift. The oracle was structurally blind to exactly the defect that motivated
+the task. It now asserts the decoded file is `W*H + 2*(W/2)*(H/2)` bytes —
+one frame, planar 4:2:0, at the size the case asked for — before comparing
+anything, and it compares the **chroma** planes too, which it never did.
+Chroma is where the padding and crop arithmetic is done a second time, in
+chroma units at half resolution.
+
+(This is worth separating from backlog C8. On the board, ffmpeg rounds HEVC
+dimensions up to a multiple of 8 *before* `vaCreateContext`, so a request for
+854x480 arrives as 856x480 and the decoder emits 856-wide frames. That is a
+VA-API-path effect. This harness calls `hevc_encoder_encode_raw()` directly
+and does get the true dimensions: `ffprobe` on the generated streams reports
+exactly 854x480, 1918x1078, 1366x768 and so on, with `coded_width`/
+`coded_height` at the 16-aligned size and the conformance window resolving
+the difference. Verified before concluding anything about the encoder.)
+
+### 34.2 A silently truncated slice, and it is not about resolution
+
+The first run of the extended set failed at QP 4 on pseudo-random content:
+every size from 640x360 up was byte-exact down to one particular row and
+garbage below it. The tell that this was not the padding path: **1280x720,
+with both axes already 16-aligned, failed identically.**
+
+`slice_rbsp_cap` was `coded_luma + 64 KiB`, about 1.03 bytes per luma sample.
+An 8-bit 4:2:0 picture is 1.5 bytes per luma sample *uncompressed*, and an
+entropy coder is not bounded by its own input: measured worst case out of
+this encoder is 1.53 bytes/luma-sample (noise at QP 0) and 1.10 at QP 10.
+`bitstream_t` fails soft — it sets `overflow` and stops writing — and nothing
+checked the flag, so `hevc_encoder_encode_raw()` returned a **truncated
+slice as a success**. The coded file size gave it away exactly: 987214 bytes
+at 1280x720 against a 987136-byte cap, plus 78 bytes of parameter sets.
+
+This is reachable in production, not just on synthetic noise. `qp_min` is 12
+and the QP-10 measurement is already 1.10 bytes/luma-sample, above the old
+cap.
+
+Fixed three ways, because the sizing alone would only move the cliff:
+- `slice_rbsp_cap` is now 2.0 bytes/luma-sample (above the uncompressed
+  bound, ~30% over the measured worst case) and `scratch_out_cap` is derived
+  from it with room for worst-case RBSP→EBSP expansion (4/3) plus parameter
+  sets, rather than being an independent guess.
+- `encode_core()` and `encode_core_gpu()` now fail the frame if the slice
+  overflowed. A short frame can never again be reported as a good one.
+- `bs_rbsp_to_ebsp()` stops at the end of its destination and returns only
+  how much it wrote, so a caller cannot tell truncation from success after
+  the fact. Both call sites now check `ebsp_worst_case(rbsp)` against the
+  remaining capacity up front.
+
+Output impact: 230 of 240 encodes (10 sizes x 6 QPs x 4 patterns) are
+byte-identical to `HEAD`. The 10 that differ are exactly the QP 0 / QP 4
+pseudo-random cases that `HEAD` truncated — i.e. only frames that were
+already wrong. `test_hevc_encode`'s stream md5 is **unchanged**
+(`a588c0de1b7b836a483a1055d8069b06`, 4355 bytes, verified against a clean
+`HEAD` build), so nothing needed re-baselining.
+
+### 34.3 ASan/UBSan across odd sizes — and the overrun this tree had inherited
+
+Built at `-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined`
+and run over the 21 committed cases plus 18 deliberately hostile ones (odd
+widths and heights, 1x1, 2x1, 2x2, 6x6, QP 0 on noise at several sizes):
+**zero reports on the current tree.**
+
+On `HEAD` the same odd-width cases are a `heap-buffer-overflow` in
+`hevc_encoder_encode_raw()`'s chroma `memcpy` (1919x1079, 17x17, 855x481 all
+report; 1918x1078 is clean). `dl_uv` was allocated `(width/2)*(height/2)*2`
+while both of its writers use a row stride of `width`, so an odd width was
+one byte short per row and the last row ran off the allocation. This is the
+"buffer boundary overrun on non-16-multiple resolutions" class the backlog
+item predicted — it just needed an *odd* dimension, not merely an unaligned
+one, and it is a memory-safety bug rather than a correctness one. Allocation
+is now sized from the stride that is actually used.
+
+The other ASan finding was a SEGV at 1x1: with `height < 2` the chroma plane
+is empty, and `pad_replicate()` computes `src_h - 1` on a `uint32_t`, which
+wraps to 4294967295 rather than clamping. UBSan does *not* see this — unsigned
+wraparound is well-defined. `hevc_encoder_create()` now refuses width or
+height below 2 (there is no 4:2:0 chroma sample below that), and
+`pad_replicate()` returns early on an empty source as a second line of
+defence.
+
+### 34.4 The case set, and what is deliberately excluded
+
+21 cases: the original 11, plus 1918x1080 / 1920x1078 / 1918x1078 (each axis
+alone, then both), 1366x768 and 854x480 (sizes a user actually asks for),
+640x358 at QP 0 (the regression guard for §34.2 — not a resolution case),
+100x60, 20x12 (one CTU row tall), 18x18 (the maximum 14-pixel pad on both
+axes) and 4x4 (smaller than one CTU: coded at 16x16, entirely cropped away).
+1918, 1366, 854, 1078 and 358 are all 2 mod 4 and 6 mod 8, which is the most
+misaligned an even dimension can be.
+
+**Odd dimensions are excluded on purpose.** 4:2:0 has one chroma sample per
+2x2 luma block, so an odd dimension has no representation in the format, and
+HEVC's conformance window is specified in chroma units (SubWidthC = 2), so
+the crop can only ever remove an even number of luma samples. The oracle
+proves this rather than assuming it: a 9999x9999 case fails loudly with
+"the stream does not decode at the size it was asked for". They are still
+covered by the ASan sweep, where they must not corrupt memory even though
+they cannot be encoded correctly.
+
+**Sizes below one CTU are not excluded** — they work, and 2x2 is byte-exact
+as well; 4x4 is the representative in the committed set.
+
+With both fixes in, a 600-case sweep (30 sizes x 5 QPs x 4 patterns) is
+byte-exact on luma *and* chroma. No padding or conformance-window defect was
+found.
+
+CI cost: the drift step goes from ~3.3 s to ~4.8 s (median of 5, alternating
+runs), +1.5 s on a ~44 s job. The ten new cases are ~1.6 s of that; extending
+the comparison to chroma gave ~0.1 s back, because `hevc_host_diff.py` now
+tests each plane in bulk and only walks it pixel by pixel to explain a
+failure.

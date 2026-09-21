@@ -90,6 +90,19 @@
 6. **External Oracle Conformance**:
    - Verified 100% clean in automated CI: external FFmpeg reference decoder decodes 30/30 frames of test streams with zero bitstream errors.
    - Note on streaming advice: because transform and CABAC entropy coding currently execute on the CPU, H.264 remains recommended for high-framerate real-time game streaming on lower-end host CPUs.
+7. **Resolution coverage (2026-09-21)**: the host drift oracle now runs 21
+   cases including non-multiple-of-16 widths, heights and both together
+   (1918x1080 / 1920x1078 / 1918x1078, 1366x768, 854x480, 100x60, 20x12,
+   18x18, 4x4). **Padding and the conformance window are correct at every
+   size tried**, on luma and chroma. Odd dimensions are excluded — 4:2:0
+   has no representation for them and HEVC's conformance window is
+   specified in chroma units, so it can only crop an even number of luma
+   samples. Sizes below one CTU do work (coded at 16x16, cropped away).
+   The exercise did find, and fix, a **silently truncated slice** at high
+   bitrates: the slice buffer was ~1.03 bytes/luma-sample against a
+   measured worst case of 1.53, and nothing checked `bitstream_t`'s
+   `overflow` flag, so a short slice was returned as a success. That was
+   resolution-independent — 1280x720 hit it too. DEVLOG §33.
 
 ---
 
