@@ -151,6 +151,20 @@ setup() {
     if [ ! -d "$REPO/.git" ]; then
         note "cloning $REPO_URL"
         git clone --quiet "$REPO_URL" "$REPO" || die "clone failed"
+    else
+        # build() only ever moves $REPO's remote-tracking refs (git fetch),
+        # never the local branch a bare ref name like "main" resolves
+        # against - `git fetch` does not fast-forward local branches. Left
+        # alone, $REPO's checked-out "main" silently goes stale forever
+        # after the first clone, and everything downstream that reads from
+        # it (this gpu_contention build included) keeps building whatever
+        # commit happened to be checked out the day $REPO was created.
+        # Found this the hard way: `build main` produced a pre-B6 driver
+        # (crop bug back, no gpu_contention) despite today's commits being
+        # pushed and gate/dims failing accordingly.
+        git -C "$REPO" fetch --quiet --all --tags 2>/dev/null
+        git -C "$REPO" checkout --quiet main 2>/dev/null
+        git -C "$REPO" reset --quiet --hard origin/main 2>/dev/null
     fi
     # The parser lives next to this script in-tree; copy it where the board
     # can always find it regardless of which build tree is being tested.
@@ -214,7 +228,14 @@ build() {
     else
         [ -d "$REPO/.git" ] || die "run 'setup' first"
         git -C "$REPO" fetch --quiet --all --tags 2>/dev/null
-        local sha; sha=$(git -C "$REPO" rev-parse --short=12 "$ref^{commit}" 2>/dev/null) \
+        # A bare branch name like "main" resolves against $REPO's LOCAL
+        # branch pointer, which `git fetch` never moves - only the
+        # remote-tracking ref does. Prefer origin/<ref> when one exists
+        # (branches), falling back to the bare ref (shas/tags, which have
+        # no origin/ prefix) - see setup()'s longer comment on the same bug.
+        local sha
+        sha=$(git -C "$REPO" rev-parse --short=12 "origin/$ref^{commit}" 2>/dev/null) \
+            || sha=$(git -C "$REPO" rev-parse --short=12 "$ref^{commit}" 2>/dev/null) \
             || die "cannot resolve ref '$ref'"
         key="$sha"
         src="$WORK/$key"
