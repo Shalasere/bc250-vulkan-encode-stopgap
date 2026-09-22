@@ -1246,3 +1246,427 @@ void hevc_dequant_itransform_4x4(const int16_t coeff[16], int qp, int use_dst,
     if (use_dst) dequant_itransform_4x4_dst(coeff, scale, half_scale, residual_out);
     else         dequant_itransform_4x4_dct(coeff, scale, half_scale, residual_out);
 }
+
+/* ===================== A6 piece (2): all-TU-size transforms ===============
+ *
+ * Everything below generalizes the 4x4-only prediction/transform/quant
+ * machinery above to log2_size in {3,4,5} (8x8/16x16/32x32). See
+ * hevc_intra.h's comment on why log2_size==2 keeps using the dedicated
+ * functions above rather than being folded into this generic path.
+ *
+ * docs/notes/a6-cu-tu-structure.md has the full design writeup; the short
+ * version of what's cross-checked where:
+ *   - the transform matrix and its per-size derivation, the forward-
+ *     transform shift pair, and the quantizer's bdShift formula are all
+ *     read off hevc_intra_wavefront.comp (this tree's other, independently
+ *     written HEVC transform/quant implementation, board-verified via
+ *     `lab drift` for the sizes IT reaches), then cross-checked against
+ *     Rec. ITU-T H.265 8.6.3/8.6.4's own text - not copied on trust, per
+ *     this project's standing rule to verify a lead against the spec
+ *     rather than the tree that suggested it.
+ *   - the reference-sample filter (8.4.4.2.3) is genuinely new relative to
+ *     hevc_predict_4x4() (nTbS==4 never filters - see that function's own
+ *     comment), so it is checked the same way: formula read off the same
+ *     shader, then verified against the spec text directly.
+ */
+
+/* Rec. ITU-T H.265 8.6.4.2's 32-point transMatrix, left half only - the
+ * right half is the spec's own defined mirror (M[i][31-j] ==
+ * (-1)^i * M[i][j], applied by hevc_tmat() below), and every smaller
+ * transform's matrix is the decimated submatrix M32[i*32/N][j] for
+ * N = 1<<log2_size - again the spec's own construction, not an
+ * approximation. Identical to the copy in hevc_intra_wavefront.comp
+ * (cross-checked row by row against it) and spot-checked against the
+ * well-known published values (row 0 flat 64s, row 8 the familiar 4-point
+ * DCT-II pattern {83,36,-36,-83} repeated, row 16 alternating +-64) that
+ * every independent HEVC implementation (HM, x265, ffmpeg, libde265)
+ * reproduces identically, since this is a normative constant, not an
+ * implementation choice. */
+static const int16_t DCT32_LEFT[32][16] = {
+    { 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64},
+    { 90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13,  4},
+    { 90, 87, 80, 70, 57, 43, 25,  9, -9,-25,-43,-57,-70,-80,-87,-90},
+    { 90, 82, 67, 46, 22, -4,-31,-54,-73,-85,-90,-88,-78,-61,-38,-13},
+    { 89, 75, 50, 18,-18,-50,-75,-89,-89,-75,-50,-18, 18, 50, 75, 89},
+    { 88, 67, 31,-13,-54,-82,-90,-78,-46, -4, 38, 73, 90, 85, 61, 22},
+    { 87, 57,  9,-43,-80,-90,-70,-25, 25, 70, 90, 80, 43, -9,-57,-87},
+    { 85, 46,-13,-67,-90,-73,-22, 38, 82, 88, 54, -4,-61,-90,-78,-31},
+    { 83, 36,-36,-83,-83,-36, 36, 83, 83, 36,-36,-83,-83,-36, 36, 83},
+    { 82, 22,-54,-90,-61, 13, 78, 85, 31,-46,-90,-67,  4, 73, 88, 38},
+    { 80,  9,-70,-87,-25, 57, 90, 43,-43,-90,-57, 25, 87, 70, -9,-80},
+    { 78, -4,-82,-73, 13, 85, 67,-22,-88,-61, 31, 90, 54,-38,-90,-46},
+    { 75,-18,-89,-50, 50, 89, 18,-75,-75, 18, 89, 50,-50,-89,-18, 75},
+    { 73,-31,-90,-22, 78, 67,-38,-90,-13, 82, 61,-46,-88, -4, 85, 54},
+    { 70,-43,-87,  9, 90, 25,-80,-57, 57, 80,-25,-90, -9, 87, 43,-70},
+    { 67,-54,-78, 38, 85,-22,-90,  4, 90, 13,-88,-31, 82, 46,-73,-61},
+    { 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64, 64,-64,-64, 64},
+    { 61,-73,-46, 82, 31,-88,-13, 90, -4,-90, 22, 85,-38,-78, 54, 67},
+    { 57,-80,-25, 90, -9,-87, 43, 70,-70,-43, 87,  9,-90, 25, 80,-57},
+    { 54,-85, -4, 88,-46,-61, 82, 13,-90, 38, 67,-78,-22, 90,-31,-73},
+    { 50,-89, 18, 75,-75,-18, 89,-50,-50, 89,-18,-75, 75, 18,-89, 50},
+    { 46,-90, 38, 54,-90, 31, 61,-88, 22, 67,-85, 13, 73,-82,  4, 78},
+    { 43,-90, 57, 25,-87, 70,  9,-80, 80, -9,-70, 87,-25,-57, 90,-43},
+    { 38,-88, 73, -4,-67, 90,-46,-31, 85,-78, 13, 61,-90, 54, 22,-82},
+    { 36,-83, 83,-36,-36, 83,-83, 36, 36,-83, 83,-36,-36, 83,-83, 36},
+    { 31,-78, 90,-61,  4, 54,-88, 82,-38,-22, 73,-90, 67,-13,-46, 85},
+    { 25,-70, 90,-80, 43,  9,-57, 87,-87, 57, -9,-43, 80,-90, 70,-25},
+    { 22,-61, 85,-90, 73,-38, -4, 46,-78, 90,-82, 54,-13,-31, 67,-88},
+    { 18,-50, 75,-89, 89,-75, 50,-18,-18, 50,-75, 89,-89, 75,-50, 18},
+    { 13,-38, 61,-78, 88,-90, 85,-73, 54,-31,  4, 22,-46, 67,-82, 90},
+    {  9,-25, 43,-57, 70,-80, 87,-90, 90,-87, 80,-70, 57,-43, 25, -9},
+    {  4,-13, 22,-31, 38,-46, 54,-61, 67,-73, 78,-82, 85,-88, 90,-90}
+};
+
+/* M_N[i][j] for N == 1<<log2n - the spec's decimate-and-mirror
+ * construction of every smaller transform from the 32-point one. Same
+ * formula as hevc_intra_wavefront.comp's tmat(). */
+static inline int hevc_tmat(int log2n, int i, int j) {
+    int row = i << (5 - log2n);
+    int nn = 1 << log2n;
+    if (j < 16) return DCT32_LEFT[row][j];
+    int v = DCT32_LEFT[row][nn - 1 - j];
+    return (row & 1) ? -v : v;
+}
+
+enum { HEVC_NXN_MAX_SIDE = 2 * HEVC_NXN_MAX_N };   /* 2*nTbS, largest case */
+
+/* 8.4.4.2.2 gather + substitution, generalized to side = 2*n (n =
+ * 1<<log2_size), PLUS 8.4.4.2.3's reference-sample filtering, built
+ * unconditionally alongside the raw set - LUMA ONLY (this codebase's
+ * chroma stays 4x4/DC-only and is untouched by piece (2), matching
+ * hevc_intra_wavefront.comp's own "chroma is never smoothed" choice for
+ * cIdx != 0). zorder_rank()/zorder_available() are reused completely
+ * unchanged: they are a pure function of pixel position under this
+ * encoder's fixed CTU/CU/PU coding order, which piece (2) does not touch
+ * (still raster CTUs, still one z-order pass per CTU) - see
+ * docs/notes/a6-cu-tu-structure.md for why an 8x8 2Nx2N CU's single PU can
+ * safely reuse the same rank formula the four-4x4-PU case used. */
+static void gather_wide_n(const uint8_t *plane, int stride, int width, int height,
+                           int x0, int y0, int n,
+                           uint8_t *left, uint8_t *top,
+                           uint8_t *corner,
+                           uint8_t *left_f, uint8_t *top_f,
+                           uint8_t *corner_f) {
+    int side = 2 * n;
+    int cur_rank = zorder_rank(x0, y0, width, 1 /* luma */);
+    int total = 4 * n + 1;
+    uint8_t sv[4 * HEVC_NXN_MAX_N + 1];
+    uint8_t sa[4 * HEVC_NXN_MAX_N + 1];
+
+    for (int i = 0; i < side; i++) {
+        int y = side - 1 - i;
+        int avail = zorder_available(x0 - 1, y0 + y, width, height, 1, cur_rank);
+        sa[i] = (uint8_t)avail;
+        if (avail) sv[i] = plane[(y0 + y) * stride + (x0 - 1)];
+    }
+    sa[side] = (uint8_t)zorder_available(x0 - 1, y0 - 1, width, height, 1, cur_rank);
+    if (sa[side]) sv[side] = plane[(y0 - 1) * stride + (x0 - 1)];
+    for (int i = side + 1; i < total; i++) {
+        int x = i - side - 1;
+        int avail = zorder_available(x0 + x, y0 - 1, width, height, 1, cur_rank);
+        sa[i] = (uint8_t)avail;
+        if (avail) sv[i] = plane[(y0 - 1) * stride + (x0 + x)];
+    }
+
+    int first = -1;
+    for (int i = 0; i < total; i++) { if (sa[i]) { first = i; break; } }
+    if (first < 0) {
+        for (int i = 0; i < total; i++) sv[i] = 128;
+    } else {
+        for (int i = 0; i < first; i++) sv[i] = sv[first];
+        for (int i = first + 1; i < total; i++) if (!sa[i]) sv[i] = sv[i - 1];
+    }
+
+    for (int y = 0; y < side; y++) left[y] = sv[side - 1 - y];
+    *corner = sv[side];
+    for (int x = 0; x < side; x++) top[x] = sv[side + 1 + x];
+
+    /* 8.4.4.2.3 smoothing: 3-tap [1,2,1]/4, corner-adjacent samples use the
+     * true corner in place of a missing third tap, the far end of each
+     * array is unfiltered (no sample beyond it to average in) - same
+     * formula as hevc_intra_wavefront.comp's gather(), generalized from
+     * its fixed SIDE to this function's `side`. */
+    left_f[0] = (uint8_t)((*corner + 2 * left[0] + left[1] + 2) >> 2);
+    top_f[0]  = (uint8_t)((*corner + 2 * top[0]  + top[1]  + 2) >> 2);
+    for (int i = 1; i < side - 1; i++) {
+        left_f[i] = (uint8_t)((left[i - 1] + 2 * left[i] + left[i + 1] + 2) >> 2);
+        top_f[i]  = (uint8_t)((top[i - 1]  + 2 * top[i]  + top[i + 1]  + 2) >> 2);
+    }
+    left_f[side - 1] = left[side - 1];
+    top_f[side - 1]  = top[side - 1];
+    *corner_f = (uint8_t)((left[0] + 2 * (*corner) + top[0] + 2) >> 2);
+}
+
+int hevc_intra_filter_flag(int mode, int log2_size) {
+    if (log2_size < 3) return 0;              /* nTbS==4: Table 8-3 has no row */
+    if (mode == HEVC_MODE_DC) return 0;
+    if (mode == HEVC_MODE_PLANAR) return 1;
+    /* Table 8-3's intraHorVerDistThres[nTbS], nTbS = 8,16,32. */
+    static const int thres[3] = { 7, 1, 0 };
+    int d1 = mode - 26; if (d1 < 0) d1 = -d1;
+    int d2 = mode - 10; if (d2 < 0) d2 = -d2;
+    int min_dist = d1 < d2 ? d1 : d2;
+    return min_dist > thres[log2_size - 3];
+}
+
+/* Same formula as predict_angular_sample() above, generalized from the
+ * fixed 8-sample (nTbS=4) reference set to an arbitrary `side`. */
+static int predict_angular_sample_n(const uint8_t *left,
+                                     const uint8_t *top,
+                                     uint8_t corner, int side, int mode, int x, int y) {
+    int ang = HEVC_ANGLE_TABLE[mode];
+    int vert = (mode >= 18);
+    int i = vert ? x : y;
+    int j = vert ? y : x;
+    int idx = ((j + 1) * ang) >> 5;
+    int fact = ((j + 1) * ang) & 31;
+
+    int r[2];
+    for (int pass = 0; pass < 2; pass++) {
+        int k = i + idx + 1 + pass;
+        int v;
+        if (k == 0) {
+            v = corner;
+        } else if (k > 0) {
+            int kk = k - 1; if (kk > side - 1) kk = side - 1;
+            v = vert ? top[kk] : left[kk];
+        } else {
+            int inv_idx = mode - 11;
+            if (inv_idx < 0) inv_idx = 0;
+            if (inv_idx > 14) inv_idx = 14;
+            int m = -1 + ((k * HEVC_INVANGLE_TABLE[inv_idx] + 128) >> 8);
+            if (m < 0) v = corner;
+            else { if (m > side - 1) m = side - 1; v = vert ? left[m] : top[m]; }
+        }
+        r[pass] = v;
+    }
+    return (fact != 0) ? (((32 - fact) * r[0] + fact * r[1] + 16) >> 5) : r[0];
+}
+
+/* Predict one n x n luma block (n = 1<<log2_size) from an already-gathered
+ * reference set (caller has already picked the raw or filtered set per
+ * hevc_intra_filter_flag()). Same structural shape as predict_block4(),
+ * generalized: Planar/DC divide by (log2_size+1) instead of the fixed 3,
+ * DC's edge filter and the mode 10/26 edge filter are unconditional here
+ * because this function is LUMA ONLY (hevc_predict_4x4() gates them on
+ * is_luma because it also serves chroma; this one never does). */
+static void predict_blockN(const uint8_t *left, const uint8_t *top,
+                            uint8_t corner, int n, int log2_size, int mode, uint8_t *pred_out) {
+    if (mode == HEVC_MODE_PLANAR) {
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++) {
+                int v = (n - 1 - x) * left[y] + (x + 1) * top[n] +
+                        (n - 1 - y) * top[x]  + (y + 1) * left[n] + n;
+                pred_out[y * n + x] = (uint8_t)(v >> (log2_size + 1));
+            }
+        return;
+    }
+    if (mode == HEVC_MODE_DC) {
+        int sum = n;
+        for (int i = 0; i < n; i++) sum += left[i] + top[i];
+        int dc = sum >> (log2_size + 1);
+        for (int i = 0; i < n * n; i++) pred_out[i] = (uint8_t)dc;
+        pred_out[0] = (uint8_t)((left[0] + 2 * dc + top[0] + 2) >> 2);
+        for (int x = 1; x < n; x++) pred_out[x] = (uint8_t)((top[x] + 3 * dc + 2) >> 2);
+        for (int y = 1; y < n; y++) pred_out[y * n] = (uint8_t)((left[y] + 3 * dc + 2) >> 2);
+        return;
+    }
+
+    int side = 2 * n;
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++)
+            pred_out[y * n + x] = (uint8_t)predict_angular_sample_n(left, top, corner, side, mode, x, y);
+
+    /* exactly-vertical/horizontal edge filter, luma-only, nTbS < 32
+     * (8.4.4.2.6) - not reachable this session (only log2_size==3 is wired
+     * up), guarded anyway since this function is written to be correct at
+     * every log2_size it claims to support. */
+    if (n < 32) {
+        if (mode == HEVC_MODE_VERTICAL)
+            for (int y = 0; y < n; y++)
+                pred_out[y * n] = clip8(top[0] + ((left[y] - corner) >> 1));
+        else if (mode == HEVC_MODE_HORIZONTAL)
+            for (int x = 0; x < n; x++)
+                pred_out[x] = clip8(left[0] + ((top[x] - corner) >> 1));
+    }
+}
+
+void hevc_predict_nxn(const uint8_t *recon_plane, int stride, int width, int height,
+                       int x0, int y0, int mode, int log2_size, uint8_t *pred_out) {
+    int n = 1 << log2_size;
+    uint8_t left[HEVC_NXN_MAX_SIDE], top[HEVC_NXN_MAX_SIDE], corner;
+    uint8_t left_f[HEVC_NXN_MAX_SIDE], top_f[HEVC_NXN_MAX_SIDE], corner_f;
+    gather_wide_n(recon_plane, stride, width, height, x0, y0, n,
+                  left, top, &corner, left_f, top_f, &corner_f);
+    if (hevc_intra_filter_flag(mode, log2_size))
+        predict_blockN(left_f, top_f, corner_f, n, log2_size, mode, pred_out);
+    else
+        predict_blockN(left, top, corner, n, log2_size, mode, pred_out);
+}
+
+static int sad_nxn(const uint8_t *a, const uint8_t *b, int count) {
+    int sad = 0;
+    for (int i = 0; i < count; i++) {
+        int d = (int)a[i] - (int)b[i];
+        sad += d < 0 ? -d : d;
+    }
+    return sad;
+}
+
+int hevc_choose_luma_mode_nxn(const uint8_t *src_y, const uint8_t *recon_y, int stride,
+                               int width, int height, int x0, int y0, int log2_size,
+                               const int mpm[3], uint8_t *pred_out) {
+    (void)mpm; /* SAD-only first cut - see hevc_intra.h's comment above */
+    int n = 1 << log2_size;
+    uint8_t left[HEVC_NXN_MAX_SIDE], top[HEVC_NXN_MAX_SIDE], corner;
+    uint8_t left_f[HEVC_NXN_MAX_SIDE], top_f[HEVC_NXN_MAX_SIDE], corner_f;
+    gather_wide_n(recon_y, stride, width, height, x0, y0, n,
+                  left, top, &corner, left_f, top_f, &corner_f);
+
+    uint8_t src_block[HEVC_NXN_MAX_N * HEVC_NXN_MAX_N];
+    for (int y = 0; y < n; y++)
+        memcpy(src_block + y * n, src_y + (size_t)(y0 + y) * (size_t)stride + (size_t)x0, (size_t)n);
+
+    int best_mode = -1, best_sad = 0;
+    uint8_t pred_[HEVC_NXN_MAX_N * HEVC_NXN_MAX_N];
+    for (int m = 0; m < HEVC_MODE_COUNT; m++) {
+        if (hevc_intra_filter_flag(m, log2_size))
+            predict_blockN(left_f, top_f, corner_f, n, log2_size, m, pred_);
+        else
+            predict_blockN(left, top, corner, n, log2_size, m, pred_);
+        int sad = sad_nxn(src_block, pred_, n * n);
+        if (best_mode < 0 || sad < best_sad) {
+            best_sad = sad;
+            best_mode = m;
+            memcpy(pred_out, pred_, (size_t)(n * n));
+        }
+    }
+    return best_mode;
+}
+
+/* Forward transform, plain (non-butterfly) matrix product - deliberately
+ * NOT a partial-butterfly factorisation like the 4x4 path's FWD_DCT4/
+ * FWD_DST4: butterfly factorisations for 8/16/32-point DCT-II are real,
+ * size-specific derivations, and getting a NEW one right for each size
+ * this session, on top of everything else piece (2) touches, would trade
+ * exactly the kind of consistency-over-speed judgement the task asked
+ * for. This is the same "plain matrix product" hevc_intra_wavefront.comp
+ * already uses for its own 8x8/16x16 case (that shader's own comment: "the
+ * plain matrix product spreads across all 256 [threads] ... and is
+ * bit-identical - the same integer sums in a different association
+ * order"). Same two shifts as that shader: shift1 = log2_size-1,
+ * shift2 = log2_size+6 (confirmed to match the 4x4 path's hardcoded 1/8
+ * at log2_size==2, so this is one formula covering both, not a
+ * coincidence between two hand-picked constants). Partial-butterfly
+ * versions of these, if ever needed for speed, are future work - see
+ * docs/notes/a6-cu-tu-structure.md. */
+static void forward_transform_nxn(const int16_t *residual, int log2_size, int32_t *out) {
+    int n = 1 << log2_size;
+    int32_t tmp[HEVC_NXN_MAX_N * HEVC_NXN_MAX_N];
+    int shift1 = log2_size - 1, shift2 = log2_size + 6;
+    int32_t add1 = 1 << (shift1 - 1);
+    int32_t add2 = 1 << (shift2 - 1);
+
+    for (int trow = 0; trow < n; trow++)
+        for (int tcol = 0; tcol < n; tcol++) {
+            int32_t acc = 0;
+            for (int r = 0; r < n; r++) acc += hevc_tmat(log2_size, trow, r) * (int32_t)residual[r * n + tcol];
+            tmp[trow * n + tcol] = (acc + add1) >> shift1;
+        }
+    for (int trow = 0; trow < n; trow++)
+        for (int tcol = 0; tcol < n; tcol++) {
+            int32_t acc = 0;
+            for (int c = 0; c < n; c++) acc += hevc_tmat(log2_size, tcol, c) * tmp[trow * n + c];
+            out[trow * n + tcol] = (acc + add2) >> shift2;
+        }
+}
+
+/* Inverse transform, transposed matrix access (M[k][idx], k summed) - same
+ * shape as INV_DCT4/INV_DST4, generalized. The two shifts (7/64, then
+ * 12/2048) are the spec's stage-1/stage-2 constants for 8-bit content and
+ * do NOT depend on transform size (confirmed against
+ * hevc_intra_wavefront.comp, which uses the identical (+64)>>7 then
+ * (+2048)>>12 pair at both its N=16 and N=8 sizes) - only the matrix and
+ * the loop bound change with log2_size. */
+static void inverse_transform_nxn(const int16_t *coeff, int log2_size, int16_t *out) {
+    int n = 1 << log2_size;
+    int32_t tmp[HEVC_NXN_MAX_N * HEVC_NXN_MAX_N];
+
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++) {
+            int32_t acc = 0;
+            for (int k = 0; k < n; k++) acc += hevc_tmat(log2_size, k, r) * (int32_t)coeff[k * n + c];
+            tmp[r * n + c] = clip_coeff((acc + 64) >> 7);
+        }
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++) {
+            int32_t acc = 0;
+            for (int k = 0; k < n; k++) acc += hevc_tmat(log2_size, k, c) * tmp[r * n + k];
+            out[r * n + c] = (int16_t)clip_coeff((acc + 2048) >> 12);
+        }
+}
+
+/* Quantization/dequantization, generalized only in bdShift (log2_size+3,
+ * same formula as HEVC_BDSHIFT's own derivation for log2_size==2 - see
+ * that macro's comment) and loop extent. Deliberately the literal-division
+ * form (hevc_quantize_4x4_ref()'s shape), not the reciprocal-multiply
+ * trick hevc_quantize_4x4()/QUANT_MAGIC[] uses: that trick's validity was
+ * proven (by exhaustion, per its own comment) specifically for a 4x4
+ * transform's |raw| <= 2^22 bound, which does not hold as-is for larger
+ * transforms' larger row sums, and re-deriving+re-proving a new bound
+ * per size is real work this correctness-only pass does not need to take
+ * on. A reciprocal-multiply version of this, if ever needed for speed, is
+ * future work - see docs/notes/a6-cu-tu-structure.md. */
+static void quantize_nxn(const int32_t *raw, int qp, int log2_size, int16_t *coeff_out) {
+    int n = 1 << log2_size;
+    int per = qp / 6, rem = qp % 6;
+    int64_t denom = (int64_t)HEVC_FLAT_M * levelScale[rem] << per;
+    int64_t half_denom = denom / 2;
+    int bdshift = log2_size + 3;
+    for (int i = 0; i < n * n; i++) {
+        int32_t raw_v = raw[i];
+        int sign = raw_v < 0 ? -1 : 1;
+        int64_t mag = raw_v < 0 ? -(int64_t)raw_v : (int64_t)raw_v;
+        int64_t num = mag << bdshift;
+        int64_t level = (num + half_denom) / denom;
+        int32_t res = (int32_t)(sign * level);
+        if (res > 32767) res = 32767;
+        if (res < -32768) res = -32768;
+        coeff_out[i] = (int16_t)res;
+    }
+}
+
+static void dequant_nxn(const int16_t *coeff, int qp, int log2_size, int16_t *out) {
+    int n = 1 << log2_size;
+    int per = qp / 6, rem = qp % 6;
+    int64_t scale = ((int64_t)HEVC_FLAT_M * levelScale[rem]) << per;
+    int bdshift = log2_size + 3;
+    int64_t half_scale = (int64_t)1 << (bdshift - 1);
+    for (int i = 0; i < n * n; i++) {
+        int64_t val = (int64_t)coeff[i] * scale;
+        val = (val + half_scale) >> bdshift;
+        out[i] = (int16_t)clip_coeff((int32_t)val);
+    }
+}
+
+void hevc_transform_quant(const int16_t *residual, int qp, int log2_size, int use_dst,
+                           int16_t *coeff_out) {
+    if (log2_size == 2) {
+        hevc_transform_quant_4x4(residual, qp, use_dst, coeff_out);
+        return;
+    }
+    int32_t raw[HEVC_NXN_MAX_N * HEVC_NXN_MAX_N];
+    forward_transform_nxn(residual, log2_size, raw);
+    quantize_nxn(raw, qp, log2_size, coeff_out);
+}
+
+void hevc_dequant_itransform(const int16_t *coeff, int qp, int log2_size, int use_dst,
+                              int16_t *residual_out) {
+    if (log2_size == 2) {
+        hevc_dequant_itransform_4x4(coeff, qp, use_dst, residual_out);
+        return;
+    }
+    int16_t d[HEVC_NXN_MAX_N * HEVC_NXN_MAX_N];
+    dequant_nxn(coeff, qp, log2_size, d);
+    inverse_transform_nxn(d, log2_size, residual_out);
+}
