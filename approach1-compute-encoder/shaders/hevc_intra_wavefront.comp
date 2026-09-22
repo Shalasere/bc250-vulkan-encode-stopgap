@@ -592,6 +592,38 @@ void main() {
     }
     barrier();
 
+    /* A3 (docs/backlog.md): board-confirmed 2026-09-21 that this shader's
+     * mode search never left the coarse grid above - 80.2% Planar, the
+     * other candidates always exactly the 11 coarse-grid entries, no
+     * refinement, unlike the CPU path's post-A6 coarse-then-refine search.
+     * Add the same +/-1/+/-2 refinement around the coarse winner, angular
+     * candidates only (Planar/DC have no numeric neighbours to refine).
+     * Offsets of 1 or 2 from any coarse-grid member (step 4, {2,6,...,34})
+     * can never land back on another coarse-grid member or on 0/1, so no
+     * slot in s_sad[] is ever double-counted. Two extra barriers total for
+     * the whole stage, not per-candidate - the cost this file's own
+     * comment above already flagged as the thing to avoid. */
+    int coarse_best = s_best_mode;
+    const int REFINE_OFFSETS[4] = int[4](-2, -1, 1, 2);
+    if (coarse_best >= 2) {
+        for (int k = 0; k < 4; k++) {
+            int cand = coarse_best + REFINE_OFFSETS[k];
+            if (cand < 2 || cand > 34) continue;
+            atomicAdd(s_sad[cand], uint(abs(src - predict(refset_for(cand), cand, px, py))));
+        }
+    }
+    barrier();
+    if (t == 0u && coarse_best >= 2) {
+        int best = coarse_best; uint bc = s_sad[coarse_best];
+        for (int k = 0; k < 4; k++) {
+            int cand = coarse_best + REFINE_OFFSETS[k];
+            if (cand < 2 || cand > 34) continue;
+            if (s_sad[cand] < bc) { bc = s_sad[cand]; best = cand; }
+        }
+        s_best_mode = best;
+    }
+    barrier();
+
     int mode = s_best_mode;
     s_pred[t] = predict(refset_for(mode), mode, px, py);
     barrier();
