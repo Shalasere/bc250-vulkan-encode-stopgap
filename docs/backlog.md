@@ -190,6 +190,26 @@ a board `lab qsweep` BD-rate run before any number here is trusted.
 > which was never the goal. Compression unaffected, confirming the
 > off-board RD-quality accounting held on real hardware too.
 
+> **Piece (2) DONE (2026-09-21) — all-TU-size transform kernels, wired
+> in at 8x8 via `PART_2Nx2N`.** Generic DCT-II transform/quant/dequant
+> for log2_size {2,3,4,5} plus 8.4.4.2 prediction with real 8.4.4.2.3
+> reference-sample filtering (the 4x4 path has never filtered). Only
+> 8x8 is reachable this session — a structural fact, not a scope cut:
+> `PART_NxN` (this CU size's only option before this change) forces
+> `transform_tree()` to split to 4x4 regardless of anything the encoder
+> decides (7.3.8.8, `IntraSplitFlag==1 && trafoDepth==0`); the only way
+> to reach an 8x8 transform at 8x8-CU size is `PART_2Nx2N`, which
+> necessarily also changes the prediction structure to one 8x8 PU. 16x16
+> and 32x32 **cannot** be reached until piece (3) provides a bigger CU —
+> the kernels are generic and implemented, just have no caller yet.
+> `HOST DRIFT PASS`, all 53 cases, unconditionally (no old path left as
+> a fallback). Off-board RD: 5/7 points a real improvement, 2/7 small
+> regressions, needs a board qsweep before trusting the direction.
+> Piece (3) scoped concretely, not attempted — needs `split_cu_flag`'s
+> ctxInc to test neighbour *CtDepth* (9.3.4.2.2), the exact area a
+> previously-shipped bug already lived in, now a live risk for the
+> first time on this path. `docs/notes/a6-cu-tu-structure.md`.
+
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
 `cavlc-residual-coding`): `docs/notes/a6-cavlc-residual-port.md`.
