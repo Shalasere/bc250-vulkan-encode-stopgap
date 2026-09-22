@@ -74,13 +74,21 @@
 #   ./bc250_lab.sh rollback                  restore the previous driver
 #
 # BENCH/NOISE OPTIONS
-#   --content=testsrc|testsrc2   default testsrc
+#   --content=testsrc|testsrc2|bbb  default testsrc. bbb = a real 4K60
+#                                known-quantity clip (Big Buck Bunny),
+#                                scaled+cached per resolution - see
+#                                docs/notes/bbb-content.md
 #   --res=WxH                    default 2560x1440
 #   --frames=N                   default 300
 #   --gop=N                      default 120  (use 1 for all-intra)
 #   --bitrate=X                  default 31M
 #   --repeat=N                   default 1    (>1 gives real sd)
-#   --load=none|gpu|cpu|both     default none
+#   --load=none|gpu|cpu|both|game  default none. gpu=nlmeans_vulkan (an
+#                                uncalibrated synthetic worst case). game=
+#                                tools/gpu_contention at a tunable, self-
+#                                measured duty cycle (default 70%, override
+#                                with BC250_GAME_LOAD_DUTY) - see
+#                                start_load()'s own comment.
 #   --env=K=V,K=V                extra driver env (e.g. BC250_NZ_MASK=0)
 #   --codec=h264|hevc            default h264. hevc implies BC250_ENABLE_HEVC=1,
 #                                since HEVC is not advertised by default; add
@@ -152,6 +160,36 @@ setup() {
     fi
     [ -f "$PARSE" ] || die "bc250_lab_parse.py not found (looked in $here and $PARSE)"
     chmod +x "$PARSE"
+
+    # gpu_contention (the tunable --load=game generator) is harness
+    # infrastructure, not something under A/B test - same category as this
+    # script itself, so it is built ONCE here into a fixed path rather than
+    # per build-key like bc250_drv_video.so. Rebuilt only if the source in
+    # the repo checkout has moved on since the last build (md5 compare),
+    # so re-running setup is cheap once this has landed.
+    mkdir -p "$LAB/tools"
+    local gc_src="$REPO/tools/gpu_contention.c" gc_shader="$REPO/tools/shaders/gpu_contention.comp"
+    if [ -f "$gc_src" ] && [ -f "$gc_shader" ]; then
+        local gc_srcsum; gc_srcsum=$(cat "$gc_src" "$gc_shader" | md5sum | cut -c1-12)
+        if [ ! -f "$LAB/tools/gpu_contention" ] || [ "$(cat "$LAB/tools/.gpu_contention.srcsum" 2>/dev/null)" != "$gc_srcsum" ]; then
+            note "building gpu_contention"
+            local gcbdir="$WORK/gpu_contention_build"
+            rm -rf "$gcbdir"; mkdir -p "$gcbdir"
+            distrobox enter "$BOX" -- bash -lc \
+                "cd '$gcbdir' && cmake -DCMAKE_BUILD_TYPE=Release '$REPO/approach1-compute-encoder' >/dev/null 2>&1 && make -j4 gpu_contention >/dev/null 2>&1" \
+                >/dev/null 2>&1
+            if [ -f "$gcbdir/gpu_contention" ] && [ -f "$gcbdir/gpu_contention.comp.spv" ]; then
+                cp -f "$gcbdir/gpu_contention" "$LAB/tools/gpu_contention"
+                cp -f "$gcbdir/gpu_contention.comp.spv" "$LAB/tools/gpu_contention.comp.spv"
+                chmod +x "$LAB/tools/gpu_contention"
+                echo "$gc_srcsum" > "$LAB/tools/.gpu_contention.srcsum"
+                note "  gpu_contention: $LAB/tools/gpu_contention"
+            else
+                note "  gpu_contention: BUILD FAILED (--load=game will not work) - see $gcbdir"
+            fi
+        fi
+    fi
+
     note "lab ready at $LAB"
     note "  repo:      $REPO"
     note "  artifacts: $ART"
@@ -200,7 +238,14 @@ build() {
 
     mkdir -p "$ART/$key"
     cp -f "$bdir/bc250_drv_video.so" "$ART/$key/"
-    cp -f "$bdir"/*.comp.spv "$ART/$key/" 2>/dev/null
+    # gpu_contention.comp.spv also lands in $bdir (it's a sibling CMake
+    # target's output, not this driver's shader) - excluded here so it
+    # never gets cached as if it were one of the driver's own shaders and
+    # never inflates the count the sanity check below relies on.
+    for f in "$bdir"/*.comp.spv; do
+        [ "$(basename "$f")" = "gpu_contention.comp.spv" ] && continue
+        cp -f "$f" "$ART/$key/" 2>/dev/null
+    done
     mkdir -p "$ART/$key/tests"
     cp -f "$bdir"/tests/test_* "$ART/$key/tests/" 2>/dev/null
     echo "$key" > "$ART/$key/key"
@@ -291,7 +336,7 @@ scoreboard() {
     echo "# scoreboard: $key vs libx264 (${BC250_SW_PRESET:-veryfast}) @ $content $res, $frames frames, $reps runs"
     printf "%-6s %-8s %9s %9s %9s %9s\n" load encoder fps cpu_ms/f rss_mb hits60
     local out="$LAB/.scoreboard.$$"; : > "$out"
-    for load in none gpu cpu both; do
+    for load in none game gpu cpu both; do
         local ar br afps acpu arss bfps bcpu brss
         local keep=""; [ "$quality_check" = 1 ] && [ "$load" = none ] && keep="$LAB/.sb_none"
         ar=$(bench_e2e "$key"  "$content" "$res" "$frames" "$reps" "$load" "${keep:+${keep}_key.h264}")
@@ -340,7 +385,8 @@ scoreboard() {
     if [ "$quality_check" = 1 ] && [ -f "$LAB/.sb_none_key.h264" ] && [ -f "$LAB/.sb_none_libx264.h264" ]; then
         echo "# quality at matched bitrate (load=none condition, same clip/bitrate as above):"
         local qref="$LAB/.sb_none_ref.yuv"
-        ffmpeg -y -v error -f lavfi -i "${content}=size=${res}:rate=60" \
+        input_args "$content" "$res"
+        ffmpeg -y -v error "${INPUT_ARGS[@]}" \
             -frames:v "$frames" -pix_fmt yuv420p -f rawvideo "$qref"
         for f in key libx264; do
             local label="$key"; [ "$f" = libx264 ] && label="libx264"
@@ -404,12 +450,22 @@ bench_e2e() {
 #       because it loads the shader cores and memory system WITHOUT touching
 #       this VA-API driver and without doing any CPU entropy coding, so GPU
 #       contention can be separated from CPU/bandwidth contention. Nothing
-#       like vkmark/glmark2 is installed on this board.
+#       like vkmark/glmark2 is installed on this board. This is a
+#       deliberately uncalibrated synthetic WORST case, not a "what a game
+#       does" number - see game below for that.
+# game: tools/gpu_contention (docs/backlog.md's GPU-load-generator
+#       assessment) at a target 70% self-measured duty cycle - a tunable
+#       contention generator standing in for a game's GPU usage, instead of
+#       an arbitrary heavy filter. "70%" is this generator's own measured
+#       duty cycle (Vulkan timestamp queries), not an OS-reported figure -
+#       gpu_busy_percent is unsupported on this device (checked directly).
+#       BC250_GAME_LOAD_DUTY overrides the target percentage.
 # cpu:  busy loops, one per core-ish, no dependencies.
 #
-# Note gpu_busy_percent is NOT supported on this device, so there is no way
-# to confirm a target utilisation - the load is characterised by its own
-# achieved throughput instead, reported as load_fps.
+# For plain `gpu`, gpu_busy_percent is NOT supported on this device, so
+# there is no way to confirm a target utilisation there either - that load
+# is characterised by its own achieved throughput instead, reported as
+# load_fps.
 # ---------------------------------------------------------------------------
 LOAD_PIDS=()
 
@@ -424,6 +480,12 @@ start_load() {
                   -f lavfi -i testsrc2=size=1920x1080:rate=60 -frames:v 600 \
                   -vf 'format=nv12,hwupload,nlmeans_vulkan,hwdownload,format=nv12' \
                   -f null - 2>/dev/null
+              done ) & LOAD_PIDS+=($!)
+            ;;
+        game)
+            [ -x "$LAB/tools/gpu_contention" ] || die "start_load: --load=game needs tools/lab setup to have built gpu_contention (see $LAB/tools/)"
+            ( while :; do
+                "$LAB/tools/gpu_contention" --duty="${BC250_GAME_LOAD_DUTY:-70}" --duration=60 --report=999999 2>>"${outdir}.gameload.log"
               done ) & LOAD_PIDS+=($!)
             ;;
     esac
@@ -443,6 +505,51 @@ start_load() {
     [ "$kind" = none ] || { note "load=$kind started (pids ${LOAD_PIDS[*]})"; sleep 5; }
 }
 
+# ---------------------------------------------------------------------------
+# CONTENT SOURCES
+#
+# testsrc/testsrc2: ffmpeg lavfi generators, regenerated fresh every call at
+# exactly the requested size/rate - the existing synthetic sources.
+# bbb: a real, known-quantity 4K60 clip (Big Buck Bunny, CC BY 3.0, Blender
+# Foundation - docs/notes/bbb-content.md has full provenance/license/
+# sha256), standing in for "real content" the way BBB already does in codec
+# research generally (Xiph's derf collection, AV1/JVET CTC test sets).
+# Scaled down to whatever resolution a test point asks for and cached
+# per-resolution under $LAB/content/ - regenerated from the untouched
+# original every time the cache is (re)built, never from a previous
+# derivation, the same "always regenerate the true source, never trust a
+# cached intermediate" discipline the lavfi sources already get for free.
+# ---------------------------------------------------------------------------
+CONTENT_DIR="$LAB/content"
+BBB_SRC="$CONTENT_DIR/BigBuckBunny4k60fps.mp4"
+BBB_SEEK=30   # seconds - skips the opening Blender Foundation card
+
+# input_args <content> <res> -> fills the INPUT_ARGS array with the ffmpeg
+# "-f ... -i ..." arguments selecting that source at that resolution.
+declare -a INPUT_ARGS
+input_args() {
+    local content="$1" res="$2"
+    case "$content" in
+        bbb)
+            [ -f "$BBB_SRC" ] || die "content=bbb needs $BBB_SRC - see docs/notes/bbb-content.md to fetch it"
+            local cache="$CONTENT_DIR/bbb_${res}.mp4"
+            if [ ! -s "$cache" ]; then
+                note "preparing bbb content at $res (one-time, cached at $cache)"
+                # 3600 frames = 60s at 60fps - generous headroom over every
+                # --frames value this harness actually uses (widen if a
+                # future test needs a longer clip).
+                ffmpeg -y -v error -ss "$BBB_SEEK" -i "$BBB_SRC" -frames:v 3600 \
+                    -vf "scale=${res/x/:}" -an -sn -f mp4 "$cache" \
+                    || die "failed to prepare bbb content at $res"
+            fi
+            INPUT_ARGS=(-i "$cache")
+            ;;
+        *)
+            INPUT_ARGS=(-f lavfi -i "${content}=size=${res}:rate=60")
+            ;;
+    esac
+}
+
 stop_load() {
     [ "${#LOAD_PIDS[@]}" -eq 0 ] && return 0
     for p in "${LOAD_PIDS[@]}"; do
@@ -450,6 +557,7 @@ stop_load() {
         kill "$p" 2>/dev/null
     done
     pkill -f 'nlmeans_vulkan' 2>/dev/null
+    pkill -f 'tools/gpu_contention' 2>/dev/null
     LOAD_PIDS=()
     sleep 2
 }
@@ -519,7 +627,8 @@ run_encode() {
         # in a real session (52 fps) - a materially different, much stronger
         # number that was never run by this project's own encoder either.
         # BC250_SW_THREADS overrides the derived default for experimentation.
-        "${TIMER[@]}" ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
+        input_args "$content" "$res"
+        "${TIMER[@]}" ffmpeg -y -v info "${INPUT_ARGS[@]}" \
             -frames:v "$frames" -g "$gop" -vf 'format=nv12' \
             -c:v libx264 -preset "${BC250_SW_PRESET:-veryfast}" \
             -tune "${BC250_SW_TUNE:-zerolatency}" \
@@ -540,9 +649,10 @@ run_encode() {
         fi
         local venc=h264_vaapi fmt=h264
         [ "$codec" = hevc ] && { venc=hevc_vaapi; fmt=hevc; }
+        input_args "$content" "$res"
         "${TIMER[@]}" env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
             BC250_SHADER_DIR="$bd" "${envv[@]}" \
-            ffmpeg -y -v info -f lavfi -i "${content}=size=${res}:rate=60" \
+            ffmpeg -y -v info "${INPUT_ARGS[@]}" \
             -frames:v "$frames" -g "$gop" -vaapi_device "$RENDER" \
             -vf 'format=nv12,hwupload' -c:v "$venc" -b:v "$bitrate" \
             -f "$fmt" "${out}.${fmt}" > "${out}.log" 2>&1
@@ -928,8 +1038,11 @@ qsweep() {
             # this function's header comment for why the direct
             # raw-h264-vs-lavfi route is not a shortcut worth taking.
             local qref="$d/ref.yuv"
-            [ -f "$qref" ] || ffmpeg -y -v error -f lavfi -i "${content}=size=${res}:rate=60" \
-                -frames:v "$frames" -pix_fmt yuv420p -f rawvideo "$qref"
+            if [ ! -f "$qref" ]; then
+                input_args "$content" "$res"
+                ffmpeg -y -v error "${INPUT_ARGS[@]}" \
+                    -frames:v "$frames" -pix_fmt yuv420p -f rawvideo "$qref"
+            fi
             local dec="$base.dec.yuv" pstats="$base.psnr.txt"
             ffmpeg -y -v error -i "$base.$ext" -frames:v "$frames" \
                 -pix_fmt yuv420p -f rawvideo "$dec" 2>/dev/null
@@ -1220,9 +1333,10 @@ drift() {
         local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
     fi
 
+    input_args "$content" "$res"
     ( cd "$d" && env LIBVA_DRIVER_NAME=bc250 LIBVA_DRIVERS_PATH="$bd" \
         BC250_SHADER_DIR="$bd" "${envv[@]}" \
-        ffmpeg -v error -y -f lavfi -i "${content}=size=${res}:rate=60" \
+        ffmpeg -v error -y "${INPUT_ARGS[@]}" \
         -frames:v "$frames" -g 1 -vaapi_device "$RENDER" \
         -vf 'format=nv12,hwupload' -c:v "$venc" "${RCARGS[@]}" \
         -f "$fmt" "stream.$fmt" > enc.log 2>&1 )
