@@ -135,6 +135,23 @@ typedef struct bc250_gpu_context {
     VkPipelineLayout hevc_wavefront_layout;
     VkDescriptorSet hevc_wavefront_desc_set;
 
+    /* GPU-side P-frame zero-motion-skip decision (docs/notes/
+     * c7-pframe-throughput.md, hevc_pframe_skip.comp). Deliberately reuses
+     * hevc_wavefront_desc_set/hevc_wavefront_desc_layout rather than
+     * allocating its own descriptor set - that set's bindings 0-3 (source
+     * Y/UV, recon Y/UV) and 7 (skip mask) are exactly what this shader
+     * reads and writes, already updated every gpu_compute_hevc_dispatch_
+     * intra() call before this pipeline is bound, so a second descriptor
+     * set would just be two write-paths to keep in sync for no benefit.
+     * Needs its own VkPipelineLayout only because it has its own (smaller)
+     * push-constant contents - see hevc_pframe_skip.comp's PC block - but
+     * that layout is created from the SAME hevc_wavefront_desc_layout
+     * object, which is what makes binding the same VkDescriptorSet to
+     * either pipeline valid (descriptor set layout compatibility is by
+     * object identity, not just by-value equality of the bindings). */
+    VkPipeline hevc_skip_decide_pipeline;
+    VkPipelineLayout hevc_skip_decide_layout;
+
     /* Descriptor sets */
     VkDescriptorSet me_desc_set;
     VkDescriptorSet predict_desc_set;
@@ -281,16 +298,30 @@ typedef struct bc250_gpu_context {
     uint32_t hevc_alloc_width;
     uint32_t hevc_alloc_height;
 
-    /* Per-CTU P-frame zero-motion-skip flags (docs/notes/c7-gpu-pframes.md),
-     * one uint32 per CTU. Unlike the mode/coeff/cbf buffers above this is an
-     * INPUT the host writes and the shader only reads, so - unlike those -
-     * it needs no separate device-local + staging-copy pair: a single
-     * HOST_VISIBLE|HOST_COHERENT buffer the shader binds directly is enough
-     * for something this small (nctu * 4 bytes) and written once per
-     * dispatch. Double-buffered by ctx->current_buf, the same slot the
-     * command buffer being recorded into uses - NOT gpu_compute_submitted_
-     * slot(), which is the readback-side convention for a buffer the HOST
-     * reads after the GPU finishes; this one is the opposite direction. */
+    /* Per-CTU P-frame zero-motion-skip flags, one uint32 per CTU.
+     *
+     * docs/notes/c7-gpu-pframes.md's first cut had the HOST write this
+     * buffer (a decision computed on the CPU from two full-frame NV12
+     * downloads) and the shader only read it. docs/notes/
+     * c7-pframe-throughput.md moved the decision itself onto the GPU
+     * (hevc_pframe_skip.comp, ctx->hevc_skip_decide_pipeline): now the
+     * SHADER writes this buffer and the host only reads it back afterward,
+     * for the CPU CABAC stage's cu_skip_flag/merge_idx bookkeeping - the
+     * reverse of the original comment here. It is still a single
+     * HOST_VISIBLE|HOST_COHERENT buffer with no separate device-local +
+     * staging-copy pair (unlike mode/coeff/cbf below): unlike those, this
+     * is small enough (nctu * 4 bytes) that a GPU compute shader writing
+     * directly into host-visible memory, made visible to both the next
+     * compute stage's read and an eventual host read by one explicit
+     * VkMemoryBarrier (see gpu_compute_hevc_dispatch_intra()), is simpler
+     * than adding a third device-local + staging pair for something this
+     * size. Double-buffered by ctx->current_buf, the same slot the command
+     * buffer being recorded into uses - NOT gpu_compute_submitted_slot():
+     * the write happens in the SAME command buffer as the read that
+     * consumes it (the wavefront dispatch), both under current_buf, and
+     * the host read afterward uses gpu_compute_get_hevc_skip_data_slot()
+     * with the slot gpu_compute_submitted_slot() reports, exactly like the
+     * mode/coeff/cbf getters. */
     VkBuffer hevc_skip_buffers[2];
     VkDeviceMemory hevc_skip_memories[2];
     void *hevc_skip_mapped[2];
@@ -545,31 +576,40 @@ int gpu_compute_dispatch_encode(gpu_context_t *ctx, gpu_image_t render_target, i
  * - in which case the caller must fall back to the CPU path, as
  * encoder_h265.c does.
  *
- * `skip_mask` (docs/notes/c7-gpu-pframes.md): NULL, or one uint32 per CTU
- * (row-major, width_ctu*height_ctu entries) where nonzero means "the host
- * has already decided this CTU is a P-frame zero-motion SKIP - do not
- * touch its reconstruction, its mode, its coefficients or its cbf". NULL is
- * treated as all-zero (every CTU intra, byte-identical to this function's
- * behaviour before this parameter existed) and is what every all-intra
- * caller should keep passing. The caller must have already decided, before
- * this call, whether it is safe to skip anything at all - this function
- * does not check has_ref/gop/etc., it only honours whatever mask it is given.
+ * `want_pframe_skip`/`skip_threshold` (docs/notes/c7-pframe-throughput.md,
+ * superseding c7-gpu-pframes.md's original `skip_mask` host-computed-array
+ * parameter): `want_pframe_skip` false means every CTU is coded intra this
+ * frame, byte-identical to this function's behaviour before P-frame
+ * support existed - the skip_mask buffer is zeroed and hevc_pframe_skip.
+ * comp is never dispatched. `want_pframe_skip` true dispatches
+ * hevc_pframe_skip.comp first, which reads `src` and ctx->recon_image
+ * (both already GPU-resident - no host round trip of pixel data) and
+ * writes the per-CTU skip decision directly into the same skip_mask SSBO
+ * hevc_intra_wavefront.comp's binding 7 reads, using `skip_threshold` as
+ * the SAD cutoff (the caller computes this the same way decide_gpu_ctu_
+ * skips() in encoder_h265.c does - 4 * 96 * (1 + qp/8), or
+ * BC250_HEVC_GPU_SKIP_THRESHOLD - so that formula exists in exactly one
+ * place). The caller must have already decided, before this call, whether
+ * it is safe to skip anything at all (has_ref, gop position, etc.) - this
+ * function only honours want_pframe_skip, it does not re-derive that
+ * decision. After this call and a sync, the resulting mask is available to
+ * the CALLER (for the CPU CABAC stage's cu_skip_flag/merge_idx
+ * bookkeeping) via gpu_compute_get_hevc_skip_data_slot() below.
  *
  * `out_recon_was_reset`, if non-NULL, is set to 1 when this call (re)created
  * recon_image (first HEVC frame ever, or a coded-dimension change) and to 0
  * otherwise. A freshly created image's contents are undefined, NOT "the
- * previous frame's reconstruction" - a caller that requested any skip CTUs
+ * previous frame's reconstruction" - a caller that requested P-frame skip
  * on a call that comes back with this set to 1 got an intra-only frame
- * regardless of what skip_mask asked for (this function clears its OWN
- * copy of the mask before dispatch when it detects the reset, so the
- * bitstream this frame produces is unaffected either way, but the caller
- * still must not believe this frame is a valid future skip reference - i.e.
- * it must treat this frame as if it forced an IDR, has_ref semantics and
- * all). */
+ * regardless (this function forces want_pframe_skip off for this dispatch
+ * when it detects the reset, so the bitstream this frame produces is
+ * unaffected either way, but the caller still must not believe this frame
+ * is a valid future skip reference - i.e. it must treat this frame as if
+ * it forced an IDR, has_ref semantics and all). */
 int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
                                     int width, int height,
                                     int src_width, int src_height, int qp,
-                                    const uint32_t *skip_mask,
+                                    bool want_pframe_skip, uint32_t skip_threshold,
                                     int *out_recon_was_reset);
 
 /* HEVC readback, same slot contract as the gpu_compute_get_*_staging_data_slot
@@ -581,6 +621,17 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
 int gpu_compute_get_hevc_mode_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
 int gpu_compute_get_hevc_coeff_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
 int gpu_compute_get_hevc_cbf_staging_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
+
+/* One uint32 per CTU (row-major, width_ctu*height_ctu entries), nonzero
+ * meaning "hevc_pframe_skip.comp decided this CTU is a P-frame zero-motion
+ * SKIP". All-zero when the most recent gpu_compute_hevc_dispatch_intra()
+ * call had want_pframe_skip false, or when recon_was_reset forced it off.
+ * Same slot contract as the mode/coeff/cbf getters above - pass
+ * gpu_compute_submitted_slot()'s result, after a sync. Unlike those three,
+ * this is not a device-local-plus-staging-copy readback: it reads
+ * ctx->hevc_skip_mapped[slot] directly, the same host-visible buffer the
+ * shader wrote into (see that field's comment in this header). */
+int gpu_compute_get_hevc_skip_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size);
 
 int gpu_compute_end_picture(gpu_context_t *ctx);
 int gpu_compute_sync(gpu_context_t *ctx);

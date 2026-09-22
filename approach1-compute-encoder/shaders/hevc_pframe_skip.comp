@@ -1,0 +1,163 @@
+/* bc250-vulkan-encode-stopgap v0.4.0 - https://github.com/Shalasere/bc250-vulkan-encode-stopgap */
+#version 450
+/* GPU-side P-frame zero-motion-skip decision (docs/notes/c7-pframe-throughput.md)
+ *
+ * =====================================================================
+ * WHY THIS EXISTS
+ * =====================================================================
+ * docs/notes/c7-gpu-pframes.md's first cut decided this on the CPU, which
+ * meant downloading the full source NV12 AND the full recon_image NV12to
+ * the host every P-frame candidate (~1.66 MB each at 720p, two GPU-CPU
+ * sync points) before running compute_sad_ctu_zero() in a host loop.
+ * Board measurement found that cost roughly HALVES throughput (backlog.md
+ * C7: 68.6-73.1 fps intra-only vs 34.2-35.3 fps with P-frames at 720p).
+ *
+ * currentImage (srcY/srcUV) and referenceImage (reconY/reconUV) are both
+ * already GPU-resident - reconY/reconUV is ctx->recon_image, which
+ * hevc_intra_wavefront.comp already reads directly, and srcY/srcUV is the
+ * same surface that shader reads too. There is no reason to ever move
+ * either to the host just to compare them; this shader does the comparison
+ * where the data already lives and writes only a packed one-uint-per-CTU
+ * verdict (3600 bytes at 720p, vs. ~3.3 MB of raw pixels) into the exact
+ * same skip_mask SSBO (binding 7) hevc_intra_wavefront.comp already reads.
+ *
+ * Dispatched as (width_ctu, height_ctu, 1) - unlike the wavefront shader's
+ * diagonal schedule, every CTU's skip decision is fully independent of
+ * every other CTU's (it only ever compares this CTU's own source samples
+ * against this CTU's own co-located reference samples), so there is no
+ * same-frame ordering constraint here at all and the whole grid can run in
+ * one dispatch.
+ *
+ * =====================================================================
+ * WHAT THIS DOES NOT CHANGE
+ * =====================================================================
+ * This is where the decision runs, not what it decides: the threshold
+ * (4 * 96 * (1 + qp/8), or BC250_HEVC_GPU_SKIP_THRESHOLD) is computed on
+ * the host exactly as decide_gpu_ctu_skips() (encoder_h265.c, still used
+ * by the off-board hevc_encoder_encode_gpu_raw() test path) already does,
+ * and handed in as a push constant rather than recomputed here - no reason
+ * for two copies of that formula to exist. And per that function's own
+ * comment, no value of this threshold can make the resulting bitstream
+ * non-conforming: a CTU this shader marks skip always reconstructs as an
+ * exact copy of the reference, by construction, in
+ * hevc_intra_wavefront.comp's early return. Wrong only trades bitrate/
+ * quality, never correctness - moving the decision here does not touch
+ * that property.
+ *
+ * =====================================================================
+ * EQUIVALENCE TO THE CPU FORMULA IT REPLACES
+ * =====================================================================
+ * compute_sad_ctu_zero() (encoder_h265.c) sums compute_sad_8x8_luma() over
+ * four 8x8 luma tiles covering this CTU's 16x16 area, plus
+ * compute_sad_4x4_chroma() over four 4x4-per-plane tiles covering the
+ * corresponding 8x8 chroma area (each call already sums Cb+Cr together).
+ * Summing the same abs-difference terms over four disjoint tiles that
+ * exactly cover a region is the same total as summing them over the whole
+ * region directly - this shader does the latter (one 16x16 luma SAD, one
+ * 8x8 Cb SAD, one 8x8 Cr SAD) in a single cooperative pass instead of four
+ * separate calls, which is the same arithmetic in a different grouping,
+ * not an approximation.
+ *
+ * Source-edge clamping matches srcLuma()/srcUV's use in
+ * hevc_intra_wavefront.comp (clamp to src_width/src_height - 1), which
+ * that shader's own comment already establishes as equivalent to the CPU
+ * path's pad_replicate(): both replicate the edge sample past the real
+ * image bounds, one by clamping the read coordinate, the other by
+ * physically copying the edge into a padded buffer first. Reference
+ * (recon) reads are never clamped, on either side, because recon_image is
+ * always allocated at the full CTU-aligned coded size.
+ */
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    /* CODED dimensions, matching hevc_intra_wavefront.comp's pc.width/height. */
+    uint width;
+    uint height;
+    uint width_ctu;
+    uint height_ctu;
+    /* Precomputed on the host (decide_gpu_ctu_skips()'s own formula) -
+     * see this file's top comment for why it is not recomputed here. */
+    uint threshold;
+    /* SOURCE image's real (uncoded) dimensions, for edge-clamped reads -
+     * matches hevc_intra_wavefront.comp's pc.src_width/src_height. */
+    uint src_width;
+    uint src_height;
+} pc;
+
+layout(set = 0, binding = 0, r8)  uniform readonly image2D srcY;
+layout(set = 0, binding = 1, rg8) uniform readonly image2D srcUV;
+layout(set = 0, binding = 2, r8)  uniform readonly image2D reconY;
+layout(set = 0, binding = 3, rg8) uniform readonly image2D reconUV;
+/* Same binding, same buffer, same layout as hevc_intra_wavefront.comp's
+ * SkipMask (its binding 7 doc comment) - this shader is this binding's
+ * only writer; that shader is its only other reader. */
+layout(std430, set = 0, binding = 7) writeonly buffer SkipMask { uint skip_mask[]; };
+
+int srcLumaAt(int x, int y) {
+    ivec2 p = ivec2(min(x, int(pc.src_width) - 1), min(y, int(pc.src_height) - 1));
+    return int(imageLoad(srcY, p).r * 255.0 + 0.5);
+}
+int recLumaAt(int x, int y) { return int(imageLoad(reconY, ivec2(x, y)).r * 255.0 + 0.5); }
+
+shared uint s_sad[64];
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    int ctbx = int(gl_WorkGroupID.x);
+    int ctby = int(gl_WorkGroupID.y);
+    /* Dispatch is exactly (width_ctu, height_ctu, 1), so this is defensive
+     * only - matches the bounds check every other CTU-grid shader here
+     * keeps even though the dispatch size already implies it. */
+    if (ctbx >= int(pc.width_ctu) || ctby >= int(pc.height_ctu)) return;
+
+    int bx = ctbx * 16, by = ctby * 16;
+    int cx = bx / 2, cy = by / 2;
+    int src_cw = int(pc.src_width) / 2, src_chh = int(pc.src_height) / 2;
+
+    uint local_sad = 0u;
+
+    /* 16x16 luma: 256 samples / 64 threads = 4 per thread. */
+    for (int i = 0; i < 4; i++) {
+        uint p_idx = t * 4u + uint(i);
+        int px = int(p_idx) & 15, py = int(p_idx) >> 4;
+        int cur = srcLumaAt(bx + px, by + py);
+        int ref = recLumaAt(bx + px, by + py);
+        local_sad += uint(abs(cur - ref));
+    }
+
+    /* 8x8 Cb + 8x8 Cr: 128 samples / 64 threads = 2 per thread. p_idx < 64
+     * is Cb, >= 64 is Cr - same plane split hevc_intra_wavefront.comp's
+     * chroma stage uses (cpl = t >> 6), just over p_idx instead of t since
+     * this shader assigns 2 samples/thread rather than 1. */
+    for (int i = 0; i < 2; i++) {
+        uint p_idx = t * 2u + uint(i);
+        int plane = int(p_idx) >> 6;
+        int idxn = int(p_idx) & 63;
+        int ppx = idxn & 7, ppy = idxn >> 3;
+        ivec2 sp = ivec2(min(cx + ppx, src_cw - 1), min(cy + ppy, src_chh - 1));
+        ivec2 rp = ivec2(cx + ppx, cy + ppy);
+        vec2 suv = imageLoad(srcUV, sp).rg;
+        vec2 ruv = imageLoad(reconUV, rp).rg;
+        int cur = int((plane == 0 ? suv.r : suv.g) * 255.0 + 0.5);
+        int ref = int((plane == 0 ? ruv.r : ruv.g) * 255.0 + 0.5);
+        local_sad += uint(abs(cur - ref));
+    }
+
+    s_sad[t] = local_sad;
+    barrier();
+    if (t < 32u) s_sad[t] += s_sad[t + 32u];
+    barrier();
+    if (t < 16u) s_sad[t] += s_sad[t + 16u];
+    barrier();
+    if (t < 8u)  s_sad[t] += s_sad[t + 8u];
+    barrier();
+    if (t < 4u)  s_sad[t] += s_sad[t + 4u];
+    barrier();
+    if (t < 2u)  s_sad[t] += s_sad[t + 2u];
+    barrier();
+    if (t == 0u) {
+        uint total = s_sad[0] + s_sad[1];
+        uint idx = uint(ctby) * pc.width_ctu + uint(ctbx);
+        skip_mask[idx] = (total <= pc.threshold) ? 1u : 0u;
+    }
+}

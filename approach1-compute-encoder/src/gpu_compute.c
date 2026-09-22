@@ -1216,6 +1216,15 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
     layout_info.pSetLayouts = &ctx->hevc_wavefront_desc_layout;
     vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->hevc_wavefront_layout);
 
+    /* hevc_pframe_skip.comp (docs/notes/c7-pframe-throughput.md) declares 7
+     * push-constant words, also covered by the shared pc_range. Deliberately
+     * built from the SAME hevc_wavefront_desc_layout object as the pipeline
+     * layout above - see hevc_skip_decide_pipeline's field comment in
+     * gpu_compute.h for why that is what makes reusing
+     * ctx->hevc_wavefront_desc_set between the two pipelines valid. */
+    layout_info.pSetLayouts = &ctx->hevc_wavefront_desc_layout;
+    vkCreatePipelineLayout(ctx->device, &layout_info, NULL, &ctx->hevc_skip_decide_layout);
+
     /* Allocate Descriptor Sets */
     VkDescriptorSetAllocateInfo alloc_set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1322,6 +1331,20 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
             fprintf(stderr, "[bc250-gpu] FAILED to create hevc_wavefront_pipeline (shader loaded but pipeline creation failed)\n");
         }
     }
+    /* GPU-side P-frame skip decision (docs/notes/c7-pframe-throughput.md).
+     * Same "quiet unless it loaded and then failed" treatment as the HEVC
+     * wavefront shader above - a missing .spv here just means
+     * gpu_compute_hevc_dispatch_intra() cannot honour want_pframe_skip (see
+     * that function) and always codes intra, not that HEVC itself is
+     * unavailable. */
+    VkShaderModule hevc_skip_decide_shader = load_spirv_shader(ctx->device, "hevc_pframe_skip.comp.spv");
+    if (hevc_skip_decide_shader) {
+        ctx->hevc_skip_decide_pipeline = create_compute_pipeline(ctx->device, hevc_skip_decide_shader, ctx->hevc_skip_decide_layout);
+        vkDestroyShaderModule(ctx->device, hevc_skip_decide_shader, NULL);
+        if (!ctx->hevc_skip_decide_pipeline) {
+            fprintf(stderr, "[bc250-gpu] FAILED to create hevc_skip_decide_pipeline (shader loaded but pipeline creation failed)\n");
+        }
+    }
 
     /* Encoding buffers are allocated LAZILY, on the first
      * gpu_compute_dispatch_encode() at the real resolution (and again on any
@@ -1373,6 +1396,7 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->reconstruct_pipeline) vkDestroyPipeline(ctx->device, ctx->reconstruct_pipeline, NULL);
     if (ctx->intra_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->intra_wavefront_pipeline, NULL);
     if (ctx->hevc_wavefront_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_wavefront_pipeline, NULL);
+    if (ctx->hevc_skip_decide_pipeline) vkDestroyPipeline(ctx->device, ctx->hevc_skip_decide_pipeline, NULL);
 
     if (ctx->motion_est_layout) vkDestroyPipelineLayout(ctx->device, ctx->motion_est_layout, NULL);
     if (ctx->predict_layout) vkDestroyPipelineLayout(ctx->device, ctx->predict_layout, NULL);
@@ -1384,6 +1408,11 @@ void bc250_gpu_destroy(bc250_gpu_context_t *ctx) {
     if (ctx->reconstruct_layout) vkDestroyPipelineLayout(ctx->device, ctx->reconstruct_layout, NULL);
     if (ctx->intra_wavefront_layout) vkDestroyPipelineLayout(ctx->device, ctx->intra_wavefront_layout, NULL);
     if (ctx->hevc_wavefront_layout) vkDestroyPipelineLayout(ctx->device, ctx->hevc_wavefront_layout, NULL);
+    /* hevc_skip_decide_layout is a DISTINCT VkPipelineLayout object (its own
+     * push-constant range) even though it was built from the SAME
+     * hevc_wavefront_desc_layout set-layout object - destroy it too, but
+     * only destroy that shared set layout once (below). */
+    if (ctx->hevc_skip_decide_layout) vkDestroyPipelineLayout(ctx->device, ctx->hevc_skip_decide_layout, NULL);
 
     if (ctx->me_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->me_desc_layout, NULL);
     if (ctx->predict_desc_layout) vkDestroyDescriptorSetLayout(ctx->device, ctx->predict_desc_layout, NULL);
@@ -2191,7 +2220,7 @@ static int hevc_alloc_buffers(gpu_context_t *ctx, uint32_t width, uint32_t heigh
 int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
                                     int width, int height,
                                     int src_width, int src_height, int qp,
-                                    const uint32_t *skip_mask,
+                                    bool want_pframe_skip, uint32_t skip_threshold,
                                     int *out_recon_was_reset) {
     if (!ctx || !ctx->hevc_wavefront_pipeline) return -1;
     if (width <= 0 || height <= 0) return -1;
@@ -2207,9 +2236,9 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
      * terms gpu_compute_dispatch_encode() does if this is the first frame.
      * `recon_was_reset` is the docs/notes/c7-gpu-pframes.md safety net: a
      * freshly (re)created image has undefined content, not "last frame's
-     * reconstruction", so any skip_mask the caller passed on THIS call is
-     * not honoured below regardless of what it asked for - see this
-     * function's doc comment in gpu_compute.h. */
+     * reconstruction", so want_pframe_skip is not honoured below regardless
+     * of what the caller asked for - see this function's doc comment in
+     * gpu_compute.h. */
     bool recon_was_reset = false;
     if (ctx->recon_image.y_plane == VK_NULL_HANDLE ||
         ctx->recon_image.width != (uint32_t)width ||
@@ -2232,37 +2261,86 @@ int gpu_compute_hevc_dispatch_intra(gpu_context_t *ctx, gpu_image_t src,
     update_storage_image_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 3,
                                     ctx->recon_image.uv_view ? ctx->recon_image.uv_view : ctx->recon_image.y_view);
 
-    /* Skip mask upload (docs/notes/c7-gpu-pframes.md). Written directly into
-     * this slot's host-visible mapping - HOST_COHERENT, so no explicit flush
-     * - and the descriptor re-pointed at this slot's buffer every call,
-     * because unlike bindings 0-3 (images, not double-buffered themselves)
-     * this input IS double-buffered by current_buf. A reset recon image or
-     * a NULL skip_mask both collapse to "no CTU skips this frame", so every
-     * caller from before this feature (which never passes skip_mask at all)
-     * gets byte-identical behaviour to before it existed. */
-    {
-        uint32_t wc0 = ((uint32_t)width  + 15u) / 16u;
-        uint32_t hc0 = ((uint32_t)height + 15u) / 16u;
-        size_t nctu0 = (size_t)wc0 * hc0;
+    /* Skip mask (docs/notes/c7-pframe-throughput.md, superseding
+     * c7-gpu-pframes.md's host-computed version). The descriptor is
+     * re-pointed at this slot's buffer every call, same as before -
+     * unlike bindings 0-3 (images, not double-buffered themselves) this
+     * IS double-buffered by current_buf. A reset recon image or
+     * want_pframe_skip == false both collapse to "no CTU skips this
+     * frame", so every caller from before P-frame support existed (which
+     * never asks for it) gets byte-identical behaviour to before it
+     * existed. */
+    /* wc/hc (CTU grid dimensions) are used both here and by the wavefront
+     * dispatch loop below - computed once and shared rather than
+     * recomputing an identical value twice. */
+    uint32_t wc = ((uint32_t)width  + 15u) / 16u;
+    uint32_t hc = ((uint32_t)height + 15u) / 16u;
+    size_t nctu = (size_t)wc * hc;
+    bool do_pframe_decide = want_pframe_skip && !recon_was_reset && ctx->hevc_skip_decide_pipeline;
+
+    update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 7,
+                                     ctx->hevc_skip_buffers[ctx->current_buf],
+                                     ctx->hevc_skip_size);
+    if (!do_pframe_decide) {
+        /* All-intra this frame - no host round trip needed either, this
+         * is a plain host-side memset into the already-mapped buffer,
+         * exactly as it was before hevc_pframe_skip.comp existed. */
         void *dst = ctx->hevc_skip_mapped[ctx->current_buf];
-        if (dst) {
-            if (skip_mask && !recon_was_reset) {
-                memcpy(dst, skip_mask, nctu0 * sizeof(uint32_t));
-            } else {
-                memset(dst, 0, nctu0 * sizeof(uint32_t));
-            }
-        }
-        update_storage_buffer_descriptor(ctx->device, ctx->hevc_wavefront_desc_set, 7,
-                                         ctx->hevc_skip_buffers[ctx->current_buf],
-                                         ctx->hevc_skip_size);
+        if (dst) memset(dst, 0, nctu * sizeof(uint32_t));
+    } else {
+        /* GPU-side decision. srcY/srcUV/reconY/reconUV are already bound
+         * above at bindings 0-3 - hevc_pframe_skip.comp reads them
+         * directly and writes this same skip_mask buffer (binding 7),
+         * with no host round trip of pixel data at all. This is the
+         * fix for the cost docs/backlog.md's C7 entry measured: the
+         * previous version of this function relied on the CALLER having
+         * already downloaded both the source and ctx->recon_image to
+         * host memory and run the SAD decision there. */
+        vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hevc_skip_decide_pipeline);
+        vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                ctx->hevc_skip_decide_layout, 0, 1, &ctx->hevc_wavefront_desc_set, 0, NULL);
+        uint32_t spc[7] = { (uint32_t)width, (uint32_t)height, wc, hc,
+                            skip_threshold, (uint32_t)src_width, (uint32_t)src_height };
+        vkCmdPushConstants(cmd_buf, ctx->hevc_skip_decide_layout,
+                           VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(spc), spc);
+        vkCmdDispatch(cmd_buf, wc, hc, 1);
+
+        /* This dispatch's write to the skip_mask buffer has two
+         * consumers: hevc_intra_wavefront.comp's binding-7 read later
+         * in THIS SAME command buffer, and the CPU CABAC stage's read
+         * of ctx->hevc_skip_mapped[slot] after this frame's fence
+         * signals (gpu_compute_get_hevc_skip_data_slot(), called by the
+         * caller after gpu_compute_sync_slot()). One VkMemoryBarrier
+         * covers both: SHADER_READ orders it before the wavefront
+         * dispatch below (the same compute-to-compute form
+         * insert_compute_barrier() uses between every other pair of
+         * dependent compute stages in this file), and HOST_READ is the
+         * spec-documented way to make a shader write visible to a
+         * later host read of HOST_COHERENT memory - added explicitly
+         * here rather than assumed, because this is the first place in
+         * this file a compute shader writes directly into HOST_VISIBLE
+         * memory with no intervening vkCmdCopyBuffer (every other host
+         * readback here - mode/coeff/cbf below - copies a DEVICE_LOCAL
+         * buffer into a staging buffer first and relies on the fence
+         * wait alone; there's no existing precedent in this file to
+         * follow for a shader write going straight to host-visible
+         * memory, so this uses the general-purpose, unambiguous
+         * mechanism instead of extending that fence-only convention to
+         * a case it was never established for). */
+        VkMemoryBarrier skip_barrier = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT
+        };
+        vkCmdPipelineBarrier(cmd_buf,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                             0, 1, &skip_barrier, 0, NULL, 0, NULL);
     }
 
     vkCmdBindPipeline(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->hevc_wavefront_pipeline);
     vkCmdBindDescriptorSets(cmd_buf, VK_PIPELINE_BIND_POINT_COMPUTE,
                             ctx->hevc_wavefront_layout, 0, 1, &ctx->hevc_wavefront_desc_set, 0, NULL);
-
-    uint32_t wc = ((uint32_t)width  + 15u) / 16u;
-    uint32_t hc = ((uint32_t)height + 15u) / 16u;
 
     /* Wavefront steps. CTU (x,y) belongs to step s = 2*y + x, so the last
      * step is 2*(hc-1) + (wc-1) and there are 2*(hc-1) + wc of them. */
@@ -2319,6 +2397,17 @@ int gpu_compute_get_hevc_coeff_staging_data_slot(gpu_context_t *ctx, int slot, v
     if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
     *size = ctx->hevc_coeff_staging_size;
     *data = ctx->hevc_coeff_staging_mapped[slot];
+    return (*data != NULL) ? 0 : -1;
+}
+
+int gpu_compute_get_hevc_skip_data_slot(gpu_context_t *ctx, int slot, void **data, size_t *size) {
+    /* Not a staging readback like the three above - hevc_skip_mapped[] is
+     * the same host-visible buffer hevc_pframe_skip.comp wrote directly
+     * (see that field's comment in gpu_compute.h), with no device-local
+     * buffer or vkCmdCopyBuffer in between. */
+    if (!ctx || !data || !size || slot < 0 || slot > 1) return -1;
+    *size = ctx->hevc_skip_size;
+    *data = ctx->hevc_skip_mapped[slot];
     return (*data != NULL) ? 0 : -1;
 }
 
