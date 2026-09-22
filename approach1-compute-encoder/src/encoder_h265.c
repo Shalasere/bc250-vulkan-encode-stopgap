@@ -1971,6 +1971,19 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
              * change. */
             int mode = gmodes[ctu];
             if (mode < 0 || mode >= HEVC_MODE_COUNT) mode = HEVC_MODE_DC;
+            /* BC250_HEVC_DEBUG_MODES=1: same diagnostic the CPU path already
+             * has (its own call site above logs one line per 4x4 luma PU) -
+             * this path has one PU per CTU (undivided 16x16), so one line
+             * per CTU is the equivalent granularity. Added for
+             * docs/hevc-shader-audit.md's "prove coverage first" experiment:
+             * the GPU path had gmodes[ctu] read here and never logged, so
+             * there was no way to confirm which of the 35 modes real content
+             * actually selects on this path, off the strength of a mode
+             * histogram, the way A5/A6's off-board mode-coverage tables
+             * already did for the CPU path. Diagnostic only. */
+            if (getenv("BC250_HEVC_DEBUG_MODES"))
+                fprintf(stderr, "[GPU_MODE] ctu=%u x=%u y=%u mode=%d\n",
+                        ctu, col * 16u, row * 16u, mode);
             uint32_t flags = gcbf[ctu];
             int cbf_luma = (int)(flags & 1u);
             int cbf_cb   = (int)((flags >> 1) & 1u);
