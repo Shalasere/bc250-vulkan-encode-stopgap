@@ -4861,6 +4861,26 @@ the next step is either identifying what's actually at those coordinates in
 `testsrc`'s known pattern, or switching to a flat/synthetic source that
 isolates position from content to separate the two hypotheses.
 
+### C3 follow-up (2026-09-22): identified, and it's a sharp internal edge every time
+
+Dumped raw frame 0 of `testsrc=size=1920x1080` (the exact `lab drift`
+source) and measured per-MB-row/column gradient energy directly with
+numpy on the raw pixels - no encoder involved. MB-rows 50-59: rows 51-58
+are a perfectly flat patch (std constant at 45.52, gradY=0.00) but rows
+50 and 59, the two boundary rows, spike to gradY 4.61/4.85 - a
+solid-color box bounded top and bottom by a hard step edge, not a
+gradient region. MB-col 15: sits immediately after a strong
+vertical-edge pair at MB-cols 13-14 (gradX 3.84/1.74) - on the tail of a
+step edge. MB-cols 96-111 (the secondary cluster): bracketed by two
+sharp vertical edges at col 97 (gradX=4.17) and col 106 (gradX=3.31),
+the same bounded-box shape column-wise. Every flagged cluster sits at
+or immediately adjacent to a sharp internal step edge in the test
+pattern - none in smooth gradient regions, none at frame/slice
+boundaries. This sharpens "content-correlated" into a specific,
+testable hypothesis (reference-sample filtering/availability at a
+discontinuity, or DCT ringing sensitivity to a step) rather than an
+open-ended one. Not yet tested against either mechanism.
+
 ## 39. Fresh release-candidate numbers, A6 piece (2) cleared, and a new HEVC P-frame quality finding
 
 Board session, 2026-09-22. Goal: real numbers to answer "is this ready for

@@ -74,11 +74,23 @@ full reasoning is in `cavlc.c`'s "MEASURED AND REJECTED" comment. It is
 still worth one *board* run, since Zen 2 at BC-250 clocks could shift
 the balance, but nothing off-board justifies the branch.
 
-Still open here: a cheaper `cavlc_scan_coeffs` (e.g. deriving `last_idx`
-and the zero runs from a nonzero bitmask instead of walking every scan
-position, or narrowing `scanned[]` to `int16_t` so the gather is a
-16-bit shuffle). Untried. Byte-identity is easy to check - `cavlc_bench
-emit` md5, the reference decoder, and ffmpeg.
+**DONE off-board (2026-09-22): the bitmask lever, byte-identical,
+~-41%.** `cavlc_scan_coeffs` now builds a nonzero bitmask over
+`scanned[]` once, then uses `__builtin_clz` to find `last_idx` and to
+jump directly between discovered coefficients - turning the old
+"walk every zero to count it" run/total_zeros derivation into
+O(total_coeff) instead of O(max_coeff). `cavlc_bench scan` (isolated
+gather+scan, no writes), 3 interleaved runs/side: baseline median
+1527-1540ms, new median 894-906ms. Byte-identical: `emit` md5 matches
+old vs new on the same seed, the profile build's sink matches exactly
+(631432800) across 6 runs, `cavlc_bench verify` round-trips both
+profiles through the reference decoder, full ctest 6/6 relevant suites
+pass (the 7th, `VaApiDriverTest`, fails off-board on a pre-existing
+llvmpipe/Vulkan memory limitation unrelated to this change).
+**Still needs a board run** - this is an off-board timing number and
+Zen 2 at BC-250 clocks could shift the balance, per this item's own
+standing caveat. The `int16_t scanned[]` half of the original lever is
+untried.
 
 **A3. Audit the GPU shader against the spec for more defects of the
 chroma-QP class.** `hevc_intra_wavefront.comp` quantised chroma at QpY
@@ -224,6 +236,27 @@ a board `lab qsweep` BD-rate run before any number here is trusted.
 > ~10.0-10.8 fps CPU HEVC qsweep figure (2026-09-22 fresh numbers, see
 > DEVLOG) is **not** piece (2)'s doing — it's what CPU HEVC costs at
 > 1440p/gop=120 regardless.
+
+> **Piece (3) prep, off-board (2026-09-22): the ctxInc landmine is
+> defused, no actual CU-size decision added.** `encode_ctu()`'s
+> `split_cu_flag` ctxInc was `cond_l+cond_a` - pure left/above CTU
+> existence, not 9.3.4.2.2's real test (whether the neighbour is
+> *deeper* than the current cqtDepth). It was accidentally correct only
+> because this path has exactly one CtDepth value today (every CTU
+> always splits to four 8x8 CUs) - the exact bug shape
+> `docs/hevc_scope_note.md` already records as real and shipped, once
+> depths stop being uniform. Added `enc->ctdepth[]` (one uint8/CTU,
+> same lifetime pattern as the existing `gpu_ctu_skip[]`) and switched
+> ctxInc to read it. Numerically identical today (CtDepth is always 1
+> wherever already coded, so `CtDepth[left]>0` and `cond_l` agree
+> everywhere) - `tools/hevc_host_drift.sh` 53/53 byte-exact, ctest 6/6
+> relevant suites pass. **No per-CTU split decision exists yet** - this
+> only makes the mechanism correct-by-construction for whichever future
+> pass adds one, rather than correct by uniform-depth coincidence. The
+> actual "should this CTU stay one 16x16 CU" decision, the SPS
+> `max_tb_log2` bump, and the rate-normalized RD comparison this needs
+> are all still real, separate, unattempted work - see the bullets
+> above.
 
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
@@ -391,6 +424,29 @@ Full analysis + exact next board commands: `docs/notes/c3-h264-chroma-drift.md`.
 > actually at those coordinates in `testsrc`'s known pattern, or switch
 > to flat/synthetic content that separates position from content.
 > DEVLOG §38.
+
+> **Off-board, 2026-09-22: identified, and it's a sharp internal edge
+> every time.** Dumped raw frame 0 of `testsrc=size=1920x1080` (the
+> exact `drift` source) and measured per-MB-row/column gradient energy
+> directly - no encoder involved, just the raw pixels. MB-rows 50-59:
+> rows 51-58 are a perfectly flat patch (std constant at 45.52,
+> gradY=0.00) but rows 50 and 59, the two boundary rows, spike to gradY
+> 4.61/4.85 - a solid-color box bounded top and bottom by a hard step
+> edge, not a gradient region. MB-col 15: sits immediately after a
+> strong vertical-edge pair at MB-cols 13-14 (gradX 3.84/1.74) - on the
+> tail of a step edge, not inside smooth content. MB-cols 96-111 (the
+> secondary cluster): bracketed by two sharp vertical edges at col 97
+> (gradX=4.17) and col 106 (gradX=3.31), same "bounded box" shape as the
+> row cluster, column-wise. **Every flagged cluster sits at or
+> immediately adjacent to a sharp internal step edge in the test
+> pattern - none are in smooth gradient regions, and none are frame or
+> slice boundaries.** Sharpens "content-correlated" into a specific,
+> testable hypothesis: intra prediction or the transform behaves
+> marginally differently from the reference right at a hard edge -
+> most plausibly reference-sample filtering/availability at a
+> discontinuity (8.4.4.2.3-class behavior) or DCT ringing sensitivity
+> to a step. Not yet tested against either specific mechanism - that's
+> the next step, now well-scoped instead of open-ended.
 
 **C4. DONE — and it found a live bug.** Re-taking the retracted PSNR
 figures through `lab qsweep --codec=hevc` gave HEVC GPU **42.71–42.94
@@ -560,8 +616,7 @@ CPU-fallback interaction, genuinely non-synthetic content, GOPs longer
 than 45 frames, and resolutions above 1280x720. `docs/notes/c7-gpu-pframes.md`
 and `docs/notes/c7-pframe-throughput.md` have the full design.
 
-**C8. INVESTIGATED AND DESIGNED (2026-09-21) — NOT implemented, needs a
-go/no-go decision, not more code.** 854x480 encodes as 856x480; not
+**C8. DECIDED (2026-09-22): NO-GO for now.** 854x480 encodes as 856x480; not
 fixable as the driver stands, since ffmpeg rounds up before
 `vaCreateContext` and `VAEncSequenceParameterBufferHEVC` has no
 conformance-window fields, so the true size never arrives through the
@@ -585,6 +640,19 @@ in_luma_samples` + the conformance-window fields out of ffmpeg's SPS,
 change nothing else) and the exact risk mechanism, read from the
 existing `VAConfigAttribEncPackedHeaders` comment rather than assumed:
 `docs/notes/c8-packed-headers.md`.
+
+**The decision: don't build it now.** The risk is scoped to file/muxed
+output, which is real but not this project's reason to exist (Sunshine/
+RTP streaming, where no container extradata is ever built from either
+SPS). Against that: the only user-visible symptom is `lab dims`'
+already-documented LIMIT case, three specific sizes, cosmetic (the
+decoded picture is correct, just not the exact odd size requested).
+Spending a `VAConfigAttribEncPackedHeaders` advertisement + SPS-parsing
+path to fix three cosmetic sizes, with a real spec-conformance risk on
+a use case this driver doesn't target, isn't worth it today. Revisit if
+a real user hits the LIMIT case on the file-output path specifically
+(not streaming) and asks for it — the design in this note is ready to
+implement at that point without re-deriving anything.
 
 **C9. DONE — board-validated 2026-09-21. +19.6 dB.** The gap was not
 tuning. See `docs/hevc_scope_note.md` for the full writeup and DEVLOG §35
@@ -710,6 +778,28 @@ H.264's raw path codes no residual by construction, so only the QP-walk
 *mechanism* is validated for H.264 off-board — the quality claim there
 still needs the GPU path or the board.
 
+**Board re-measure, closing this note (2026-09-22).** This session's own
+fresh release-candidate `qsweep` (`testsrc2`, 2560x1440, gop=120, real
+GPU H.264 path, not the off-board raw-residual simulation above) gives
+the full response curve on the actual shipped path:
+
+| bitrate | 8M | 15M | 20M | 25M | 31M |
+|---|---|---|---|---|---|
+| ours PSNR | 35.44 | 36.74 | 38.31 | 39.81 | 41.84 |
+
++6.40 dB from 8M to 31M, monotonic and libx264-shaped (libx264 over the
+same range: +9.00 dB, 38.91→47.91) — the flat-response bug this item
+fixed does not reappear on the real GPU path, and the "quality legitimately
+drops at a given bitrate once the controller stops ignoring it" effect
+predicted above is the correct read: this curve is the controller
+actually spending each budget, not the old ~flat curve pinned near the
+top of the range regardless of what was asked for. GPU-path quality
+claim now confirmed on the board, not just off-board — this closes the
+"needs a board re-measure" gap. The remaining gap versus libx264
+(3.5-6.1 dB, widening with bitrate) is real and tracked as its own
+finding in DEVLOG §39, not a rate-control defect — no B-frames/sub-pel
+ME/RDO here, disclosed and expected.
+
 Original finding, in the same board run, across 15M → 31M at 1440p
 `testsrc2`:
 
@@ -762,3 +852,32 @@ contention the synthetic `nlmeans_vulkan` generator produces.
 Worth one deliberate paired run (same content, same bitrate, Steam up
 vs Steam down, on the *current* build) to replace the unsourced
 "60 → 11 fps" claim §24.6 has been carrying.
+
+> **Board, 2026-09-22: still genuinely blocked on the paired comparison,
+> but one new corroborating data point.** Checked board session state
+> before assuming idle: `gamescope-session-plus`, both `Xwayland`
+> instances and `steamwebhelper` (25.7%/15.0% CPU on two processes) have
+> all been running continuously for **1 day 5h29m** - there is no
+> current idle window to baseline against, and stopping a session with
+> no physical console access remains the same real risk this item
+> already declined to take blind. Not attempted.
+>
+> What this does add: today's own release-candidate `scoreboard` run
+> (load=none, same 2560x1440/testsrc2 settings) landed at **67.29 fps**
+> - matching this session's separately-run `qsweep` figure (67.22 fps)
+> to within run-to-run noise, both taken with Steam/gamescope confirmed
+> live throughout. That stability across two independent runs, same
+> build, both with Steam up, is evidence (not proof) that an *idle
+> desktop* Steam/gamescope session (UI up, no game launched) is not a
+> strong perturber of this metric at these settings - unlike the
+> documented ~45x hit from an actual heavy GPU compute load. This
+> narrows, but does not close, the open question: the unsourced
+> "60 → 11 fps real game" claim this item exists to replace is
+> specifically about a *running game* (real GPU+CPU load), a materially
+> different condition from "Steam client idle, nothing launched" - which
+> is all today's data (or last session's 87.2/88.7/89.0 fps figure)
+> actually represents. The paired idle-vs-Steam-UI run stays the
+> concrete next step if a true idle window ever exists; a paired
+> Steam-UI-vs-real-game run is arguably the more useful one for what
+> this item was actually trying to answer, and needs someone at the
+> physical console to launch and hold open a real game.
