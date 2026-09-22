@@ -74,6 +74,16 @@ tools/lab deploy <key>                # health-checked, auto-rollback
 
 `tools/lab --help` lists every command without needing the board.
 
+Two options worth knowing about specifically: `--content=bbb` (a real,
+known-quantity clip - Big Buck Bunny, CC BY 3.0 - alongside the synthetic
+`testsrc`/`testsrc2`, see `docs/notes/bbb-content.md`) and `--load=game`
+(a tunable Vulkan contention generator calibrated to a target *self-
+measured* duty cycle, default 70% via `BC250_GAME_LOAD_DUTY` - not
+`gpu_busy_percent`, which this board doesn't support). `--load=gpu`
+(`nlmeans_vulkan`) is still there but is an uncalibrated synthetic worst
+case, not "what a game does" - prefer `--load=game` for anything meant to
+read as realistic. Both landed 2026-09-22, `docs/backlog.md` F1/F2.
+
 The harness encodes validity rules that were learned the hard way. Writing a
 one-off script bypasses them, and about a dozen such scripts are what produced
 the errors below. The cheapest illustration: `tools/benchmark.sh` (since

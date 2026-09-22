@@ -986,6 +986,51 @@ vs Steam down, on the *current* build) to replace the unsourced
 
 ## E. Opened by the 2026-09-22 board round
 
+**F1. DONE (2026-09-22) — `--content=bbb`, a known-quantity control clip.**
+Real, standard-practice codec-research content (Big Buck Bunny, CC BY 3.0,
+part of Xiph's derf collection - `docs/notes/bbb-content.md` has full
+provenance/license/sha256) alongside the existing synthetic `testsrc`/
+`testsrc2`. `input_args()` is now the one place all five ffmpeg-input call
+sites go through, so this is a drop-in wherever `--content=` is already
+accepted. Board-verified: `qsweep --content=bbb --codec=h264` at
+1920x1080 gives real, meaningfully different numbers from the synthetic
+sources at the same bitrates (15M: 69.44 fps/37.25 dB; 31M: 56.86 fps/
+39.79 dB, vs libx264's 54.66/40.52 and 47.85/44.22) - a real clip's actual
+motion/detail costs more quality per bit than `testsrc2`'s pattern did at
+comparable settings, exactly the gap this item exists to close.
+
+**F2. DONE (2026-09-22) — `--load=game`, a tunable, self-calibrated
+contention generator.** `tools/gpu_contention` (new Vulkan compute tool)
+replaces "pick an arbitrary heavy filter" with "calibrate a tunable
+workload against a measured target," matching the real-time-systems
+contention-generator literature. Targets a **self-measured duty cycle**
+(Vulkan timestamp queries around its own dispatches), not `gpu_busy_percent`
+- checked directly on this board and confirmed unsupported (`Operation not
+supported`, not a permissions issue), so there was no OS counter to
+calibrate against. Board-verified standalone: converges to **69.36%**
+against a 70% target over 15s/806 cycles on real BC-250 silicon (RADV
+GFX1013), stable dispatch timing (12.16-12.75ms) with no drift. Wired into
+`start_load()`/`stop_load()` and `scoreboard`'s default load sweep;
+`BC250_GAME_LOAD_DUTY` overrides the target. First real number: a `bench`
+run at the default 70% duty target dropped this encoder from its ~67 fps
+idle baseline to **37.03 fps** - a real, substantial cost, but far short of
+`nlmeans_vulkan`'s near-total collapse (1.1-1.48 fps) at the same nominal
+"gpu load" condition, which is exactly the point: that number was never
+calibrated against anything and this one now is.
+
+> **Process note: a real setup()/build() bug found and fixed on the way
+> here.** `tools/lab build main` (git-ref mode) silently built a stale,
+> pre-B6 commit - `git fetch` moves remote-tracking refs, never the local
+> branch a bare name like `main` resolves against, and nothing had ever
+> advanced `$REPO`'s checked-out branch since its first clone. Surfaced as
+> a real, alarming-looking regression (the 1080p-decodes-as-1088 crop bug
+> back, `gpu_contention.c` missing entirely) before it was traced to being
+> simply old, not broken. Fixed: `setup()` now fetches + hard-resets
+> `$REPO`'s `main` to `origin/main` every run; `build()` now prefers
+> resolving `origin/<ref>` over the bare ref name. `build work` (ships the
+> live local tree directly, used for every other measurement this session)
+> was never affected - this bug only existed on the `build <ref>` path.
+
 **E1. NEW, not yet investigated.** `lab compare`'s H.264 run this round
 (the A2 board check) surfaced two nonzero error counters it flags on
 sight: `err_alloc_failed=2` and `err_slice_overflow=41`, summed across

@@ -5135,3 +5135,82 @@ overflow and fail cleanly (B6's fix working as designed - failing rather
 than corrupting), but a 4.6% frame-failure rate at a bitrate within the
 range D1 flagged as realistic for real sessions (15-50 Mbps) is worth its
 own look. Not investigated this pass - filed as backlog E1.
+
+## 41. Augmenting the FPS/quality measurement strategy: a known-quantity content clip, and a calibrated game-like load generator
+
+Same day, following a look at how codec research and real-time-systems
+GPU scheduling literature actually do this (backlog F1/F2).
+
+### F1: `--content=bbb`
+
+Big Buck Bunny (`BigBuckBunny4k60fps.mp4`, 3840x2160@60, CC BY 3.0,
+fetched from the Internet Archive's mirror of the official Blender
+Foundation release, sha256 `35db9a00...80a8a36`) is part of Xiph's derf
+collection - the standard reference corpus behind VP9/AV1 development -
+so using it puts this harness's quality numbers on the same footing real
+codec teams use, instead of only ever measuring synthetic `lavfi` patterns.
+It's also, incidentally, a better game-content analogue than most "real
+video" would be (CG-rendered, not camera-captured) while still explicitly
+not being actual gameplay - documented as exactly that, not oversold.
+
+`input_args()` centralizes what was five separate copies of
+`-f lavfi -i "${content}=size=${res}:rate=60"` across `run_encode()` (x2),
+`drift()`, `qsweep()`, and `scoreboard`'s reference generation, so
+`--content=bbb` is a drop-in everywhere `--content=` already exists. First
+real numbers, `qsweep --content=bbb --codec=h264` @ 1920x1080: 15M -
+69.44 fps/37.25 dB (libx264: 54.66/40.52); 31M - 56.86 fps/39.79 dB
+(libx264: 47.85/44.22). A real clip's actual motion/detail costs
+meaningfully more quality per bit than `testsrc2` did at comparable
+settings - the exact gap synthetic-only content was hiding.
+
+### F2: `--load=game`
+
+The only GPU load generator before this was ffmpeg's `nlmeans_vulkan`,
+already flagged in this project's own docs as "almost certainly harsher
+than a game... a synthetic worst case" and never calibrated against
+anything real. The real-time-systems literature has a name and a method
+for this: a *contention generator* - a tunable synthetic workload
+calibrated against a measured target rather than picked arbitrarily.
+
+Checked first whether amdgpu's `gpu_busy_percent` could be that target:
+confirmed unsupported on this board (`Operation not supported`, checked
+directly - not a permissions issue), and no `radeontop`/debugfs
+`amdgpu_pm_info` alternative exists either. So `tools/gpu_contention` (new
+standalone Vulkan compute tool, `tools/shaders/gpu_contention.comp`)
+targets a **self-measured duty cycle** instead: Vulkan timestamp queries
+around its own ALU-bound dispatch (every invocation provably live via
+`atomicAdd`, so the shader compiler can't eliminate the work), with
+proportional feedback against the *cumulative* realized duty cycle (not
+just one cycle's own math - `nanosleep()` reliably oversleeps, which would
+otherwise bias the long-run average below target) and periodic
+recalibration of its own iteration count when a dispatch drifts outside a
+workable timing window (absorbs a DPM clock change mid-run, which this
+generator's own load is what would trigger).
+
+Board-verified standalone on real BC-250 silicon (RADV GFX1013): converges
+to **69.36%** against a 70% target over 15s/806 cycles, dispatch timing
+stable at 12.16-12.75ms throughout, no drift. Wired into
+`start_load()`/`stop_load()` and `scoreboard`'s default sweep;
+`BC250_GAME_LOAD_DUTY` overrides the target. First real number: `bench
+--load=game` (70% default) dropped this encoder from its ~67 fps idle
+baseline to 37.03 fps - substantial, but nowhere near `nlmeans_vulkan`'s
+near-total collapse (1.1-1.48 fps) at the same nominal condition, which is
+the whole point: that number was never calibrated against anything, and
+this one now is.
+
+### Process note: a real board-tooling bug found on the way, not swept past
+
+`tools/lab build main` (the git-ref build path, never used earlier this
+session - everything before now used `build work`) silently built a
+stale, pre-B6 commit: `git fetch` moves remote-tracking refs, never the
+local branch a bare name like `main` resolves against, and `$REPO` on the
+board had never been touched since its first clone. This looked, briefly,
+like a real and alarming regression - `gate` failing with the
+1080p-decodes-as-1088 crop bug back, `gpu_contention.c` missing from
+`$REPO` entirely - before being traced to simply being old, not broken.
+Fixed at the source: `setup()` now fetches + hard-resets `$REPO`'s `main`
+to `origin/main` every run, and `build()` now prefers `origin/<ref>` over
+the bare ref name. `build work` was never affected by this bug (it ships
+the live local tree directly and never reads `$REPO` for source), which is
+exactly why nothing caught it until the first `build <ref>` call all
+session.
