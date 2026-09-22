@@ -1203,96 +1203,75 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         hevc_cabac_code_pred_mode_flag(cab, 1 /* MODE_INTRA */);
     }
 
-    hevc_cabac_code_part_mode_intra(cab, 0 /* PART_NxN */);
+    /* A6 piece (2): PART_2Nx2N, one undivided 8x8 luma PU/TU per CU,
+     * replacing the old PART_NxN four-4x4-PU/TU structure - see this
+     * function's callers (write_sps()'s MaxTb comment) and
+     * docs/notes/a6-cu-tu-structure.md for the full reasoning on why this
+     * (not a bare "add bigger transforms alongside the old 4x4 structure")
+     * is what "all-TU-size transforms" needs at this fixed 8x8 CU size:
+     * with MinCbLog2SizeY == log2CbSize == 3, PART_NxN forces
+     * IntraSplitFlag=1, which per 7.3.8.8's transform_tree() FORCES the
+     * transform tree to split at depth 0 regardless of anything this
+     * encoder decides - there is no bitstream-legal way to reach an 8x8
+     * luma transform while keeping the old four-PU structure at this CU
+     * size. PART_2Nx2N (IntraSplitFlag=0) is what makes an undivided 8x8
+     * transform reachable at all. This is the correctness-only "always use
+     * the largest transform the CU size allows, never split" first cut the
+     * task asked for - here that largest transform is dictated by the CU
+     * size, which piece (3) (not attempted this session) is what would
+     * ever make bigger. */
+    hevc_cabac_code_part_mode_intra(cab, 1 /* PART_2Nx2N */);
 
-    int pu_modes[4];
-    int16_t luma_coeff[4][16];
-    int cbf_luma[4];
-    /* Derived once per PU, here in Step 1, and reused verbatim by Step 2
-     * below (moved up from Step 2 by the A6 RD-mode-search follow-up -
-     * see hevc_choose_luma_mode()'s comment in hevc_intra.h/.c). The mode
-     * SEARCH now needs to know each PU's MPM candidates to cost
-     * MPM-vs-escape signaling correctly, and by the time each PU's mode is
-     * decided in z-order here, its left/above neighbor data in
-     * enc->luma_mode_map is exactly what it will still be when Step 2
-     * signals this same PU - no PU outside this CU changes in between, and
-     * within this CU, earlier PUs (which alone can be this PU's left/above
-     * neighbor) are already decided and already written to the map by the
-     * time a later PU's turn comes. So this is the same neighbor data
-     * Step 2 used to (re)compute independently - hoisting it here removes
-     * a duplicate hevc_derive_mpm() call, it does not change what either
-     * call site sees. */
-    int mpm[4][3];
+    int mx = cu_x / 4, my = cu_y / 4;
+    int left_avail = cu_x > 0;
+    /* Same CtbLog2SizeY-crossing rule as before (8.4.2's candIntraPredModeB),
+     * now evaluated once at the CU's own top-left corner instead of once
+     * per PU - there is only one PU now, and it always starts at the CU's
+     * own corner. */
+    int above_avail = (cu_y > 0) && ((cu_y % HEVC_CTU_SIZE) != 0);
+    int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
+    int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
+    int mpm[3];
+    hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm);
 
-    /* Step 1: decide + reconstruct all 4 luma PUs in z-order (needed so
-     * each later PU's neighbor gathering sees real reconstructed samples
-     * from the earlier PUs of the SAME CU, exactly like a real decoder). */
+    uint8_t pred[HEVC_CU_SIZE * HEVC_CU_SIZE];
+    int mode = hevc_choose_luma_mode_nxn(enc->src_y, enc->recon_y, (int)cw,
+                                         (int)cw, (int)ch, cu_x, cu_y,
+                                         3 /* log2_size: 8x8 */, mpm, pred);
+
+    int16_t residual[HEVC_CU_SIZE * HEVC_CU_SIZE];
+    for (int y = 0; y < HEVC_CU_SIZE; y++)
+        for (int x = 0; x < HEVC_CU_SIZE; x++)
+            residual[y * HEVC_CU_SIZE + x] =
+                (int16_t)(enc->src_y[(cu_y + y) * cw + (cu_x + x)] - pred[y * HEVC_CU_SIZE + x]);
+
+    int16_t luma_coeff[HEVC_CU_SIZE * HEVC_CU_SIZE];
+    /* use_dst=0: DST-VII is the 4x4-luma-intra-only alternative transform
+     * (8.6.4.1) - an 8x8 luma TU is DCT-II unconditionally. */
+    hevc_transform_quant(residual, qp, 3, 0, luma_coeff);
+    int cbf_luma = 0;
+    for (int i = 0; i < HEVC_CU_SIZE * HEVC_CU_SIZE; i++) if (luma_coeff[i]) { cbf_luma = 1; break; }
+
+    int16_t recon_residual[HEVC_CU_SIZE * HEVC_CU_SIZE];
+    hevc_dequant_itransform(luma_coeff, qp, 3, 0, recon_residual);
+    for (int y = 0; y < HEVC_CU_SIZE; y++)
+        for (int x = 0; x < HEVC_CU_SIZE; x++)
+            enc->recon_y[(cu_y + y) * cw + (cu_x + x)] =
+                clip8i(pred[y * HEVC_CU_SIZE + x] + recon_residual[y * HEVC_CU_SIZE + x]);
+
+    /* One mode now covers the whole CU: mark all 4 of its 4x4 mode-map
+     * cells with it, same convention the skip-CU path already uses above
+     * for the same reason (future CUs' MPM derivation reads this map at
+     * 4x4 granularity regardless of how the mode that produced it was
+     * signaled). */
     for (int pu = 0; pu < 4; pu++) {
         int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
-        int mx = px / 4, my = py / 4;
-        int left_avail = px > 0;
-        /* ITU-T H.265 8.4.2's candIntraPredModeB derivation: forced to
-         * INTRA_DC whenever yCb-1 crosses into the CTU row above the
-         * current one ("yCb - 1 is less than
-         * ((yCb >> CtbLog2SizeY) << CtbLog2SizeY)"), UNCONDITIONALLY - this
-         * is a normative rule for bitstream interoperability, not an
-         * availability check, so it applies even though this single-
-         * threaded in-order encoder has that row's real reconstructed data
-         * sitting right there in enc->luma_mode_map. Using the real mode
-         * instead of forcing DC here computes a candModeList the decoder
-         * never derives, silently corrupting which intra mode
-         * intra_luma_pred_mode's bins are interpreted as from that PU
-         * onward - a structurally valid bitstream that decodes to a
-         * different picture, not a parse error. Missing this was root-
-         * caused 2026-09-19 as the cause of near-total corruption
-         * (PSNR ~6-7dB) on busy/directional content: such content has
-         * non-DC neighbor modes at every CTU-row boundary constantly,
-         * where simple/flat content's neighbors are often DC anyway,
-         * masking the missing rule. This computation moved here (Step 1,
-         * A6 RD-mode-search follow-up) from what used to be Step 2 below -
-         * see the mpm[4][3] declaration's comment above for why that move
-         * is neighbor-data-safe. */
-        int above_avail = (py > 0) && ((py % HEVC_CTU_SIZE) != 0);
-        int left_mode = left_avail ? enc->luma_mode_map[my * enc->mode_map_stride + (mx - 1)] : 0;
-        int above_mode = above_avail ? enc->luma_mode_map[(my - 1) * enc->mode_map_stride + mx] : 0;
-        hevc_derive_mpm(left_mode, left_avail, above_mode, above_avail, mpm[pu]);
-
-        /* One call, not two: the mode search already builds the winning
-         * mode's prediction, and nothing writes recon_y between here and
-         * the hevc_predict_4x4() this replaced, so re-gathering the
-         * neighbours and re-predicting was pure repetition. Byte-identical
-         * - see hevc_choose_luma_mode_pred()'s comment. */
-        uint8_t pred[16];
-        int mode = hevc_choose_luma_mode(enc->src_y, enc->recon_y, (int)cw,
-                                         (int)cw, (int)ch, px, py, qp,
-                                         mpm[pu], pred);
-        pu_modes[pu] = mode;
-
-        int16_t residual[16];
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                residual[y * 4 + x] = (int16_t)(enc->src_y[(py + y) * cw + (px + x)] - pred[y * 4 + x]);
-
-        int16_t coeff[16];
-        hevc_transform_quant_4x4(residual, qp, 1 /* DST for 4x4 luma intra */, coeff);
-        memcpy(luma_coeff[pu], coeff, sizeof(coeff));
-        cbf_luma[pu] = any_nonzero16(coeff);
-
-        int16_t recon_residual[16];
-        hevc_dequant_itransform_4x4(coeff, qp, 1, recon_residual);
-        for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++)
-                enc->recon_y[(py + y) * cw + (px + x)] = clip8i(pred[y * 4 + x] + recon_residual[y * 4 + x]);
-
         enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = (int8_t)mode;
-        /* BC250_HEVC_DEBUG_MODES=1: one line per 4x4 luma PU, so a block
-         * that a decoder reconstructs differently can be correlated with
-         * the mode it was predicted with. Diagnostic only - this path is
-         * the one docs/hevc_scope_note.md still has an open luma defect
-         * in, and "which of the four modes" is the first question. */
-        if (getenv("BC250_HEVC_DEBUG_MODES"))
-            fprintf(stderr, "[MODE] x=%d y=%d mode=%d\n", px, py, mode);
     }
+    /* BC250_HEVC_DEBUG_MODES=1: one line per luma CU now (was one per 4x4
+     * PU) - see the original comment on this hook, same diagnostic intent. */
+    if (getenv("BC250_HEVC_DEBUG_MODES"))
+        fprintf(stderr, "[MODE] x=%d y=%d mode=%d\n", cu_x, cu_y, mode);
 
     /* Chroma: one 4x4 Cb + one 4x4 Cr per CU, DC prediction only (matching
      * this codebase's existing H.264 "chroma directional modes not
@@ -1330,49 +1309,40 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
             enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
         }
 
-    /* Step 2: emit the 4 PUs' real intra_luma_pred_mode syntax. ITU-T
+    /* Step 2: emit intra_luma_pred_mode syntax for this CU's one PU. ITU-T
      * H.265 7.3.8.5's coding_unit() codes this as TWO separate passes over
-     * all 4 PUs - every prev_intra_luma_pred_flag first, THEN every
-     * mpm_idx/rem_intra_luma_pred_mode - not interleaved per PU (see
-     * hevc_cabac_code_intra_luma_flag()/_data()'s comment; getting this
-     * order wrong was this encoder's first real bug, caught by comparing
-     * this encoder's own reconstruction - which matched the source fine -
-     * against ffmpeg's actual decode of the resulting bitstream, which
-     * didn't: a CABAC bit-order mistake still produces a structurally
-     * valid, crash-free bitstream, just one that decodes to noise from
-     * that point on). */
-    /* mpm[4][3] was already derived per-PU up in Step 1 (needed there now,
-     * for the RD-aware mode search - see its declaration/comment above);
-     * re-derive nothing here, just consume it, exactly as it was computed. */
-    int pred_idx[4];
-    for (int pu = 0; pu < 4; pu++)
-        pred_idx[pu] = hevc_cabac_code_intra_luma_flag(cab, pu_modes[pu], mpm[pu]);
-    for (int pu = 0; pu < 4; pu++)
-        hevc_cabac_code_intra_luma_data(cab, pu_modes[pu], pred_idx[pu], mpm[pu]);
+     * all PUs in the CU - every prev_intra_luma_pred_flag first, THEN every
+     * mpm_idx/rem_intra_luma_pred_mode (see
+     * hevc_cabac_code_intra_luma_flag()/_data()'s comment for why getting
+     * that order wrong was this encoder's first real bug). With PART_2Nx2N
+     * there is exactly one PU, so the two "passes" are each one call - the
+     * two-pass STRUCTURE still matters for a decoder reading a general
+     * bitstream, it just has nothing left to interleave here. */
+    int pred_idx = hevc_cabac_code_intra_luma_flag(cab, mode, mpm);
+    hevc_cabac_code_intra_luma_data(cab, mode, pred_idx, mpm);
 
-    /* Step 3: chroma mode (always DC; luma_mode_pu0 decides whether that's
+    /* Step 3: chroma mode (always DC; the luma mode decides whether that's
      * signaled as index-3-of-candidate-list or as the derived/DM mode -
-     * see hevc_cabac_code_intra_chroma_pred_mode()'s comment). */
-    hevc_cabac_code_intra_chroma_pred_mode(cab, pu_modes[0]);
+     * see hevc_cabac_code_intra_chroma_pred_mode()'s comment). Only one
+     * luma mode exists per CU now, so this needs no "which PU" caveat. */
+    hevc_cabac_code_intra_chroma_pred_mode(cab, mode);
 
     /* Step 4: transform_tree - chroma cbf BITS first (trafoDepth=0, this
-     * CU's root), then the 4 luma leaves' cbf+residual, then finally the
-     * chroma RESIDUAL DATA (coded once per CU, after all 4 luma leaves -
-     * this specific ordering, bits-before-luma but data-after-luma, is
-     * exactly what ITU-T H.265's transform_tree()/transform_unit()
-     * recursion produces for a CU whose chroma has already hit the 4x4
-     * floor - see this file's top comment and x265's own
-     * Entropy::encodeTransform(), which this encoder's fixed two-level
-     * structure is a manually-unrolled special case of). */
+     * CU's root), then the luma leaf's cbf+residual, then finally the
+     * chroma RESIDUAL DATA - same ordering as before (chroma cbf bits
+     * ahead of luma, chroma residual data after it), now with ONE luma
+     * leaf coded at trafoDepth=0 (ctx 1, via hevc_cabac_code_cbf_luma()'s
+     * own trafo_depth==0 test) instead of four leaves at trafoDepth=1
+     * (ctx 0) - MaxTrafoDepth is 0 for a PART_2Nx2N CU (see write_sps()'s
+     * comment above), so trafoDepth=0 IS this CU's one and only transform
+     * leaf, not an approximation of "the root before splitting". */
     hevc_cabac_code_cbf_chroma(cab, cbf_cb, 0);
     hevc_cabac_code_cbf_chroma(cab, cbf_cr, 0);
 
-    for (int pu = 0; pu < 4; pu++) {
-        hevc_cabac_code_cbf_luma(cab, cbf_luma[pu], 1);
-        if (cbf_luma[pu]) {
-            int scan_idx = hevc_scan_idx_for_mode(pu_modes[pu]);
-            hevc_cabac_code_residual_4x4(cab, luma_coeff[pu], 1, scan_idx);
-        }
+    hevc_cabac_code_cbf_luma(cab, cbf_luma, 0);
+    if (cbf_luma) {
+        int scan_idx = hevc_scan_idx_for_mode(mode);
+        hevc_cabac_code_residual(cab, luma_coeff, 3 /* log2_size: 8x8 */, 1 /* luma */, scan_idx);
     }
     if (cbf_cb) hevc_cabac_code_residual_4x4(cab, coeff_cb, 0, 0 /* chroma always diagonal in 4:2:0 */);
     if (cbf_cr) hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, 0);
@@ -1543,7 +1513,21 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
                             encoder->coded_width, encoder->coded_height,
                             encoder->width, encoder->height,
                             hevc_pick_level_idc(encoder->coded_width, encoder->coded_height),
-                            2 /* MaxTb = 4: this path's transform tree is all-4x4 */);
+                            /* A6 piece (2): MaxTb = 8. encode_cu() now emits
+                             * PART_2Nx2N with one undivided 8x8 luma TU per
+                             * CU (see its own comment) instead of the old
+                             * PART_NxN four-4x4-TU structure, so MinCb(8)'s
+                             * own transform tree needs 8x8 to be SPS-legal.
+                             * max_transform_hierarchy_depth_intra stays 0
+                             * (write_sps()'s own comment on this parameter),
+                             * so with IntraSplitFlag now 0 too
+                             * (PART_2Nx2N), MaxTrafoDepth = 0: split_transform
+                             * _flag still isn't explicitly coded (same as
+                             * before, and same as the GPU path's own 2Nx2N
+                             * CU) - it is now inferred to "don't split" at
+                             * the CU's one 8x8 TU instead of the old
+                             * "forced split to four 4x4 TUs". */
+                            3);
         total += write_pps(encoder->scratch_out + total, encoder->scratch_out_cap - total, encoder->qp);
     }
 

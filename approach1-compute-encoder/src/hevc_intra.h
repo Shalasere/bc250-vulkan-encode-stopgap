@@ -156,6 +156,70 @@ int hevc_chroma_qp_from_luma(int qp_luma);
 void hevc_transform_quant_4x4(const int16_t residual[16], int qp, int use_dst,
                                int16_t coeff_out[16]);
 
+/* ===================== A6 piece (2): all-TU-size transforms ===============
+ *
+ * Generalizes the 4x4-only transform/quant/prediction machinery above to
+ * log2_size in {3,4,5} (8x8/16x16/32x32). Only log2_size==3 is reachable
+ * from any live encoder call site as of this change (encoder_h265.c's
+ * encode_cu() - see docs/notes/a6-cu-tu-structure.md for exactly why
+ * log2_size 4/5 need backlog A6 piece (3)'s larger CUs to ever be selected,
+ * even though the kernels below already support them uniformly). Use the
+ * 4x4-specific functions above for log2_size==2 - hevc_predict_4x4() has a
+ * narrower reference extent and no 8.4.4.2.3 filtering, which is correct
+ * ONLY at nTbS==4 (Table 8-3 has no row there), so it is not simply "this
+ * function at n=4" and is kept as its own path rather than folded in here. */
+
+/* Largest nTbS any function below is prepared for (32x32 - HEVC's largest
+ * transform size). Callers of hevc_predict_nxn()/hevc_choose_luma_mode_nxn()
+ * must size pred_out for (1<<log2_size)*(1<<log2_size) bytes, up to
+ * HEVC_NXN_MAX_N*HEVC_NXN_MAX_N. */
+#define HEVC_NXN_MAX_N 32
+
+/* Rec. ITU-T H.265 Table 8-3's intraHorVerDistThres[nTbS], as used by
+ * 8.4.4.2.3 to decide filterFlag: Planar always filters, DC and nTbS==4
+ * never do, everything else compares its angular distance from
+ * exactly-horizontal/vertical against this per-size threshold. Exposed
+ * mainly so tests can probe it directly. */
+int hevc_intra_filter_flag(int mode, int log2_size);
+
+/* Real HEVC intra prediction (8.4.4.2), LUMA ONLY, for a square block of
+ * side 1<<log2_size, log2_size in {3,4,5}. Unlike hevc_predict_4x4() this
+ * always performs 8.4.4.2.3's reference-sample filtering when filterFlag
+ * calls for it - genuinely new machinery (nTbS==4 skips it entirely, see
+ * that function's comment), cross-checked against
+ * hevc_intra_wavefront.comp's gather()/refset_for() (the only other place
+ * in this tree already doing this, board-verified for its own nTbS=16 via
+ * `lab drift`'s reconstruction check) and against Rec. ITU-T H.265
+ * 8.4.4.2.3's own text - see hevc_intra.c for the full derivation note.
+ * Writes (1<<log2_size)^2 samples, row-major. */
+void hevc_predict_nxn(const uint8_t *recon_plane, int stride, int width, int height,
+                       int x0, int y0, int mode, int log2_size, uint8_t *pred_out);
+
+/* Mode decision for one log2_size-sized luma block, SAD-only (no rate term
+ * yet - see docs/notes/a6-cu-tu-structure.md for why this intentionally
+ * does not reuse piece (1)'s k=0.15 lambda, which was tuned for a 4x4 SAD
+ * magnitude and would need its own re-measurement at this block size
+ * before being trusted here). `mpm` is accepted for interface symmetry
+ * with hevc_choose_luma_mode() and future use, not read by this first cut.
+ * Hands back the winning mode's prediction in pred_out, same rationale as
+ * hevc_choose_luma_mode(). */
+int hevc_choose_luma_mode_nxn(const uint8_t *src_y, const uint8_t *recon_y, int stride,
+                               int width, int height, int x0, int y0, int log2_size,
+                               const int mpm[3], uint8_t *pred_out);
+
+/* Generalizes hevc_transform_quant_4x4()/hevc_dequant_itransform_4x4() to
+ * log2_size in {2,3,4,5} - log2_size==2 simply dispatches to those
+ * functions unchanged (same code path, same output), so this is a strict
+ * superset, not a parallel implementation that could drift from the
+ * proven 4x4 one. `use_dst` is only meaningful at log2_size==2: DST-VII is
+ * the 4x4-luma-intra-only alternative transform (8.6.4.1); every larger
+ * size is DCT-II unconditionally per spec, so callers must pass 0 for
+ * log2_size > 2 (not enforced by an assert - see hevc_intra.c). */
+void hevc_transform_quant(const int16_t *residual, int qp, int log2_size, int use_dst,
+                           int16_t *coeff_out);
+void hevc_dequant_itransform(const int16_t *coeff, int qp, int log2_size, int use_dst,
+                              int16_t *residual_out);
+
 /* Real HEVC dequantization (8.6.3) + inverse transform (8.6.4) of 16
  * quantized levels (row-major) back to a pixel-domain residual - the exact
  * same computation a real decoder performs, used here for this encoder's
