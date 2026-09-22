@@ -4725,3 +4725,138 @@ Gated behind `BC250_HEVC_GPU_PFRAME=1` (default off, independent of
 something unvalidated, however carefully reasoned. **Do not enable
 this near real hardware or a real client without a board session
 first.**
+
+## 38. A full-backlog round: A3's mode coverage confirmed, C6 confirmed negative even with root, C7 threshold/GOP extended, C3 narrowed further
+
+One board session (plus one follow-up fix), five backlog items each getting
+real data rather than more analysis. `lab gate` PASS throughout, confirming
+nothing in this round's own additions (the new GPU-path mode histogram)
+changed default behaviour.
+
+### A3: the GPU path's mode search never leaves its own coarse grid, on real content
+
+Added the mode histogram `docs/hevc-shader-audit.md`'s own "prove coverage
+first" experiment asked for (mirroring the CPU path's existing
+`BC250_HEVC_DEBUG_MODES`, at CTU granularity since this path has one PU per
+CTU). On `testsrc2` 1920x1080 QP 27, one frame, 8160 CTUs:
+
+```
+6543  mode 0  (Planar, 80.2%)
+ 411  mode 34
+ 364  mode 1  (DC)
+ 283  mode 26
+ 216  mode 14
+ 200  mode 2
+  72  mode 30
+  28  mode 10
+  24  mode 18
+  11  mode 22
+   8  mode 6
+```
+
+**Exactly 11 distinct modes appear, and they are exactly {0, 1} plus the
+step-4 coarse angular grid {2, 6, 10, 14, 18, 22, 26, 30, 34}.** Not one
+refinement or off-grid mode was ever selected. This is board-measured
+confirmation of something A6's own work had already inferred from reading
+the shader (`hevc_intra_wavefront.comp`'s search has no ±1/±2 refinement
+stage, unlike the CPU path's post-A6-follow-up coarse-then-refine search) -
+real content now shows it's not just a theoretical gap, it measurably
+narrows the GPU path's achievable mode accuracy to whichever of 11
+candidates wins, never anything finer. Adding the same refinement stage to
+the GPU shader that `a6-mode-search-perf.md` added to the CPU path is now a
+board-measured, not just architecturally-implied, opportunity - flagged for
+whoever picks it up, not attempted here (out of this item's scope, which
+was proving coverage, not adding it).
+
+### C6: confirmed negative, now with real root
+
+Previous attempt ran the governor unprivileged and got a false "success."
+This time: passwordless `sudo` confirmed present, `cyan-skillfish-governor-
+smu.service` confirmed active with its D-Bus name registered, and
+`cyan-skillfish-performance-mode --fixed-frequency 2000` run via `sudo`
+directly - the documented, intended interface, exactly as the README
+describes it.
+
+```
+before:  1: 100Mhz *
+during:  1:  99Mhz *   (tool printed "Performance mode enabled with fixed frequency 2000 MHz")
+after:   1:  18Mhz *
+```
+
+The tool reports success and the clock does not move, at all, in either
+direction. This is now a real negative result, not an inconclusive one -
+root access was confirmed present and the request still had zero visible
+effect on `pp_dpm_sclk`. Whether the fault is in the governor tool, the
+D-Bus service, or this specific board's SMU firmware is not established;
+what's established is that the documented recipe for pinning this board's
+clock does not do so as observed, under real root, with the service
+confirmed running.
+
+### D2: an ambient figure, with an honest new confound disclosed
+
+H.264 2560x1440/gop=120/31M, 3 reps, Steam/gamescope confirmed running
+(`steamwebhelper` at 26.0%/15.2%/3.0% CPU): **87.2 / 88.7 / 89.0 fps**,
+tight spread (~2%).
+
+**Not compared against the project's older recorded idle figure (75.0
+fps)** - this session's own D1 fix changed H.264 rate control's QP-vs-
+bitrate response, which changes encode speed independently of any GPU/CPU
+contention effect (a different QP walks a different CAVLC/residual cost),
+so an old idle number and today's Steam-up number now differ for at least
+two reasons, not one, and cannot be cleanly attributed to Steam/gamescope
+contention alone. **Did not stop `gamescope-session-plus` for a true paired
+comparison** - this board has no physical console access, and a session
+that failed to restart cleanly would need someone at the machine to
+recover it; that risk was judged not worth taking without an explicit
+request to do so. The honest contribution here is the tight, reproducible
+ambient figure on today's build, not a resolved causal comparison.
+
+### C7: threshold knob confirmed to actually change the tradeoff, longer GOP still exact
+
+Skip-threshold sweep at 1280x720/QP27/gop=30 (the default formula gives
+1536 at this QP):
+
+| threshold | bytes |
+|---|---|
+| half (768, stricter) | 3,422,701 |
+| default (1536) | 3,178,793 |
+| double (3072, looser) | 2,269,616 |
+
+Monotonic in the right direction (stricter -> fewer skips -> more bits;
+looser -> more skips -> fewer bits) - the knob does what it's documented to
+do. PSNR extraction in this pass's own script failed (a stats-file parsing
+bug, not a hardware finding) and needs re-running before any quality number
+is trusted; the byte trend alone is real evidence the mechanism works, not
+evidence of where the right operating point is.
+
+Pixel-exactness re-confirmed at a longer GOP than previously tested:
+**135/135 frames exact at gop=45** (3 full GOPs), up from the previously-
+validated gop=30.
+
+### C3: narrowed with real spatial data, not yet closed
+
+Fixed a real bug in this pass's own test script first (the dump directory
+didn't exist yet when the encoder tried to write into it - a script defect,
+not a finding) before trusting "no dump" as a result.
+
+With the dump working: 37347/2,073,600 luma pixels differ (1.80%), max|d|=57
+- consistent with the earlier board review's 37405/2073600. Spatial
+distribution, measured for the first time:
+
+- Every one of 120 MB columns and all 68 MB rows has at least one
+  differing pixel somewhere - this is not confined to a single edge or
+  corner.
+- But concentration is sharply uneven, not uniform: MB-rows 50-59 (10
+  consecutive rows, y=800-959) carry roughly 3-4x the diff-pixel count of
+  the next-heaviest rows, and MB-column 15 alone (x=240-255) carries
+  roughly 3x its neighbours', with a secondary cluster at columns 96-111.
+
+This does not show an obvious slice-boundary signature (this encode used
+the default single slice, and the affected rows/columns don't line up with
+any slice count that would produce clean boundary artifacts) - it looks
+content-correlated rather than structural, which points toward the
+specific spatial-frequency content of `testsrc` at those coordinates rather
+than a fixed encoder-side boundary condition. Not chased further this pass;
+the next step is either identifying what's actually at those coordinates in
+`testsrc`'s known pattern, or switching to a flat/synthetic source that
+isolates position from content to separate the two hypotheses.

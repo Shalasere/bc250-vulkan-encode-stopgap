@@ -93,9 +93,20 @@ produce a list of *claims to test*, not conclusions.
 was checked against the spec and agrees (don't re-derive it). The two
 structural findings are that most of the shader has no second
 implementation in this tree, and that the forward transform, quantiser
-and mode search are invisible to *every* oracle here. The items still
-need running on the board — start with the mode histogram plus
-`drift --content=testsrc2`.
+and mode search are invisible to *every* oracle here.
+
+> **Board, 2026-09-21: the "prove coverage first" step, done.** Added
+> the GPU-path mode histogram (`BC250_HEVC_DEBUG_MODES`, mirroring the
+> CPU path's existing one). On `testsrc2` 1920x1080 QP 27: **exactly 11
+> distinct modes appear, and they are exactly the step-4 coarse angular
+> grid** (`{0,1,2,6,10,14,18,22,26,30,34}`) — not one refinement or
+> off-grid mode was ever selected, with Planar alone at 80.2%. This is
+> board-measured confirmation that the GPU shader's mode search has no
+> refinement stage at all (unlike the CPU path's post-A6 coarse-then-
+> refine search) — a real, measured accuracy ceiling, not just a
+> theoretical gap inferred from reading the shader. Adding the same
+> refinement stage the CPU path already has is now a board-confirmed
+> opportunity, not attempted here. DEVLOG §38.
 
 **A4. DONE (2026-09-21).** `hevc_cabac_code_residual_4x4` was really
 6.5–11.5% of frame time on detailed content (not the 5.9% a gprof
@@ -329,6 +340,23 @@ Full analysis + exact next board commands: `docs/notes/c3-h264-chroma-drift.md`.
 > interaction, CAVLC/entropy re-derivation) in
 > `docs/notes/c3-h264-chroma-drift.md`, needing a board run.
 
+> **Board, 2026-09-21: pixel-coordinate clustering done, narrowed
+> further, still open.** 37347/2,073,600 luma pixels differ (1.80%,
+> max|d|=57), consistent with the earlier 37405/2073600. Spatial
+> distribution, measured for the first time: every one of 120 MB
+> columns and all 68 MB rows has at least one differing pixel somewhere
+> - not confined to an edge or corner - but concentration is sharply
+> uneven: MB-rows 50-59 (10 consecutive rows, y=800-959) carry roughly
+> 3-4x the neighbouring rows' diff-pixel count, and MB-column 15
+> (x=240-255) alone carries roughly 3x its neighbours', with a
+> secondary cluster at columns 96-111. **Does not show an obvious
+> slice-boundary signature** (single slice used; the affected
+> rows/columns don't align with any slice-count boundary) - reads as
+> content-correlated, not structural. Next step: identify what's
+> actually at those coordinates in `testsrc`'s known pattern, or switch
+> to flat/synthetic content that separates position from content.
+> DEVLOG §38.
+
 **C4. DONE — and it found a live bug.** Re-taking the retracted PSNR
 figures through `lab qsweep --codec=hevc` gave HEVC GPU **42.71–42.94
 dB** (replacing the ad-hoc 35.26). It also surfaced that H.264 at
@@ -349,13 +377,18 @@ far less efficiently than H.264 with P-frames. Defaulting HEVC on would
 let Sunshine negotiate an all-intra encoder for a live session. Revisit
 when C7 lands, not before.
 
-**C6. STILL OPEN.** The performance-mode governor question is
-inconclusive, not negative: `pp_dpm_sclk` still read 7 MHz after a
-`--fixed-frequency 2000` pin, so the request never visibly took (the
-script drives the governor over D-Bus and wants root; it was run
-unprivileged and reported success anyway). Needs root, and needs the
-*light game* load it is actually about. `lab bench` records `sclk_mhz`
-now, so the next attempt can confirm the clock moved first.
+**C6. CONFIRMED NEGATIVE (2026-09-21), now with real root.** Passwordless
+`sudo` confirmed present, `cyan-skillfish-governor-smu.service` confirmed
+active with its D-Bus name registered, `cyan-skillfish-performance-mode
+--fixed-frequency 2000` run via `sudo` directly — the documented,
+intended interface. The tool printed "Performance mode enabled with
+fixed frequency 2000 MHz" and `pp_dpm_sclk`'s active entry stayed at
+~18–100 MHz throughout (before/during/after all near-idle). This is no
+longer "needs root" — root was confirmed present and the pin still had
+zero visible effect. Whether the fault is the governor tool, the D-Bus
+service, or this board's SMU firmware is not established. Still
+untested: the actual *light game* load condition this was originally
+about (only a synthetic idle probe was run). DEVLOG §38.
 
 **C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off — board-confirmed
 PIXEL-EXACT in every case tested so far.** Zero-motion-SKIP parity with
@@ -447,12 +480,23 @@ byte-identical to its reference at 7 sizes plus a non-CTU-aligned
 > C7 is no longer a throughput trade at all at these settings — it is a
 > straightforward win on both bitrate and fps together.
 
-**Still needed**: the skip threshold's rate/quality tradeoff (cannot
-affect conformance, only bitrate) — now the more pressing open question
-given throughput is no longer the constraint — the CPU-fallback
-interaction, real (non-synthetic) content, GOPs longer than 30 frames,
-and resolutions above 1280x720. `docs/notes/c7-gpu-pframes.md` and
-`docs/notes/c7-pframe-throughput.md` have the full design.
+> **Board, 2026-09-21: threshold knob confirmed to work, longer GOP
+> still exact.** Sweep at 1280x720/QP27/gop=30 (default formula gives
+> 1536 at this QP): half (768, stricter) → 3,422,701 bytes; default
+> (1536) → 3,178,793; double (3072, looser) → 2,269,616. Monotonic in
+> the right direction — the knob does what it's documented to do.
+> PSNR extraction in this pass had a script bug (stats-file parsing,
+> not a hardware issue) and needs re-running before any dB number is
+> trusted; the byte trend alone confirms the mechanism, not the right
+> operating point. Pixel-exactness re-confirmed at a longer GOP than
+> previously tested: **135/135 frames exact at gop=45** (3 full GOPs,
+> up from gop=30). DEVLOG §38.
+
+**Still needed**: the skip threshold's real rate/quality tradeoff in dB
+(byte trend confirmed, PSNR extraction needs re-running), the
+CPU-fallback interaction, genuinely non-synthetic content, GOPs longer
+than 45 frames, and resolutions above 1280x720. `docs/notes/c7-gpu-pframes.md`
+and `docs/notes/c7-pframe-throughput.md` have the full design.
 
 **C8. INVESTIGATED AND DESIGNED (2026-09-21) — NOT implemented, needs a
 go/no-go decision, not more code.** 854x480 encodes as 856x480; not
@@ -630,14 +674,29 @@ the lever is block count" result.
 This matters for the only real client: Sunshine sessions commonly run
 15–50 Mbps, so the upper half of that range is where we are weakest.
 
-**D2. Publish a load-condition figure that is not synthetic.** The board
-was running a live Steam/gamescope session during this run (`gamescope`,
-`Xwayland`, two `steamwebhelper` at ~25% and ~14% CPU). Both our encoder
-and libx264 came in below their recorded idle figures, and *both* fell
-by a similar proportion — which is the signature of CPU contention, not
-the GPU contention the synthetic `nlmeans_vulkan` generator produces.
-This is the closest thing to a real-session number this project has, and
-it is still not a controlled measurement: the content and bitrate differ
-from the idle runs it would be compared against. Worth one deliberate
-paired run (same content, same bitrate, Steam up vs Steam down) to
-replace the unsourced "60 → 11 fps" claim §24.6 has been carrying.
+**D2. STILL OPEN — an ambient figure recorded, deliberately not compared
+against the old idle baseline.** The board was running a live Steam/
+gamescope session during this run (`gamescope`, `Xwayland`, two
+`steamwebhelper` at ~25% and ~14% CPU). Both our encoder and libx264
+came in below their recorded idle figures, and *both* fell by a similar
+proportion — which is the signature of CPU contention, not the GPU
+contention the synthetic `nlmeans_vulkan` generator produces.
+
+> **Board, 2026-09-21: a fresh ambient figure, with a new confound
+> disclosed rather than papered over.** H.264 2560x1440/gop=120/31M,
+> Steam confirmed running (`steamwebhelper` 26.0%/15.2%/3.0% CPU):
+> **87.2 / 88.7 / 89.0 fps**, tight (~2%) spread. **Deliberately not
+> compared against the recorded 75.0 fps idle figure** — this session's
+> own D1 fix changed H.264 rate control's QP response, which changes
+> encode speed independently of any contention effect, so the two
+> numbers now differ for at least two reasons, not one, and a clean
+> attribution to Steam/gamescope needs a fresh idle baseline on
+> *today's* build, not the old one. Did not stop `gamescope-session-
+> plus` for a true paired comparison — no physical console access to
+> this board, and a session that failed to restart cleanly would need
+> someone at the machine to recover it. That remains the real next
+> step, on record rather than attempted blind. DEVLOG §38.
+
+Worth one deliberate paired run (same content, same bitrate, Steam up
+vs Steam down, on the *current* build) to replace the unsourced
+"60 → 11 fps" claim §24.6 has been carrying.
