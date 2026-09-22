@@ -357,58 +357,48 @@ unprivileged and reported success anyway). Needs root, and needs the
 *light game* load it is actually about. `lab bench` records `sclk_mhz`
 now, so the next attempt can confirm the clock moved first.
 
-**C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off.** First board
-execution attempt (same day): **survives contact with real hardware** —
-two bounded, `timeout`-wrapped encodes (128x128/20 frames/gop=5,
-256x256/64 frames/gop=8, both `BC250_HEVC_GPU_PFRAME=1`) both encoded
-rc=0 and **decoded cleanly through ffmpeg's independent HEVC decoder**,
-the 128x128 case producing exactly 491520 bytes (20 full YUV420p
-frames, no truncation) and the 256x256 case "decodes silently." No
-crash, no hang, no board wedge. Driver log confirms the path actually
-engaged: `P-frame zero-motion skip enabled ... UNVALIDATED ON
-HARDWARE`.
-
-**This confirms syntactic validity on real Vulkan, not pixel
-correctness** — a malformed P-slice can still decode cleanly while
-being pixel-wrong (the exact class of bug the off-board pass already
-caught once, invisible to ffmpeg the whole time). The planned
-`trace_headers` byte-level check came back empty (a grep-pattern
-mistake, not a finding) and needs re-running. **Still needed before
-trusting output on this path**: a pixel-level board `drift`-style
-check with real P-frames (the harness's `drift` command hardcodes
-`-g 1`, so it can't reach this — needs a small custom recon-dump
-comparison), the skip threshold's rate/quality tradeoff, and any
-throughput cost.
-Zero-motion-SKIP parity with the CPU path (not real motion
-compensation — that's a further step, "still open after this" for
-*both* paths now per C9's own wording). Design insight: `recon_image`
-already persists across frames untouched, so a SKIP CTU just needs a
-6-line shader early-return, not a new reference image; every merge
-candidate this path could ever derive is provably `(0,0)`, so
-`merge_idx` is always signalled as `0`, exact rather than a shortcut.
+**C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off — board-confirmed
+PIXEL-EXACT in every case tested so far.** Zero-motion-SKIP parity with
+the CPU path (not real motion compensation — that's a further step,
+"still open after this" for *both* paths now per C9's own wording).
+Design insight: `recon_image` already persists across frames untouched,
+so a SKIP CTU just needs a 6-line shader early-return, not a new
+reference image; every merge candidate this path could ever derive is
+provably `(0,0)`, so `merge_idx` is always signalled as `0`, exact
+rather than a shortcut.
 
 Off-board verification found and fixed a real bug: `split_cu_flag` was
-coded after `cu_skip_flag` / omitted entirely for skip CTUs, and
-ffmpeg reported **zero decode errors** the whole time — the same
-"decoder error names where it noticed, not the fault" shape this
-project has hit before. After the fix, a fully-skipped P-frame decodes
+coded after `cu_skip_flag` / omitted entirely for skip CTUs, and ffmpeg
+reported **zero decode errors** the whole time — the same "decoder
+error names where it noticed, not the fault" shape this project has
+hit before. After the fix, a fully-skipped P-frame decodes
 byte-identical to its reference at 7 sizes plus a non-CTU-aligned
 100x60, via a new GPU-free test entry point
 (`hevc_encoder_encode_gpu_raw()`).
 
-**Nothing about real GPU execution is verified** — the shader, the new
-buffer/descriptor plumbing, and the skip threshold have never run on
-any Vulkan implementation, software or real. Gated behind
-`BC250_HEVC_GPU_PFRAME=1` (default off, independent of
-`BC250_HEVC_GPU=1`) precisely so this cannot regress the already
-board-validated all-intra baseline while a board run is pending — same
-precedent C5 set for `BC250_HEVC_GPU` itself. **Do not enable near real
-hardware or a real client without a board session first.**
-`docs/notes/c7-gpu-pframes.md` has the full design and exactly what
-still needs the board: the skip threshold's rate/quality tradeoff, any
-throughput cost (a new per-P-frame download the all-intra path never
-had), the CPU-fallback interaction, and GOPs longer than one P after
-one I.
+> **Board, same day, two passes.** First: does it even survive real
+> Vulkan? Two bounded, `timeout`-wrapped encodes (128x128/20 frames/
+> gop=5, 256x256/64 frames/gop=8) both encoded rc=0 and decoded cleanly
+> through ffmpeg's independent decoder — no crash, no hang, no board
+> wedge, driver log confirms the path engaged. That only proves
+> syntactic validity, not pixel correctness (a malformed P-slice can
+> decode cleanly while wrong, per the bug above).
+>
+> Second, the real test: a custom `drift`-style comparison (the
+> harness's own `drift` command hardcodes `-g 1` and can't reach a
+> P-frame at all) — encoder's own recon dump vs a real independent
+> decode, frame by frame, real GOP structure. Two cases: static content
+> (should skip nearly every CTU after frame 0) and `testsrc2` (real
+> motion, forcing a mix of skip and intra-fallback CTUs). **16/16 and
+> 24/24 frames byte-exact, both cases, across two full GOPs each.**
+
+**Still needed before broader trust**: the skip threshold's rate/quality
+tradeoff (cannot affect conformance, only bitrate — still unmeasured),
+any throughput cost (a new per-P-frame download the all-intra path
+never had), the CPU-fallback interaction, and GOPs longer than the ones
+tested (8 frames) — plus larger/real-content resolutions than the
+64x64/128x128 tested so far. `docs/notes/c7-gpu-pframes.md` has the
+full design.
 
 **C8. NEW — HEVC rounds odd frame sizes up to a multiple of 8.**
 854x480 encodes as 856x480. Not fixable as the driver stands: ffmpeg
