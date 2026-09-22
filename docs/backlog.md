@@ -454,14 +454,31 @@ interaction, real (non-synthetic) content, GOPs longer than 30 frames,
 and resolutions above 1280x720. `docs/notes/c7-gpu-pframes.md` and
 `docs/notes/c7-pframe-throughput.md` have the full design.
 
-**C8. NEW — HEVC rounds odd frame sizes up to a multiple of 8.**
-854x480 encodes as 856x480. Not fixable as the driver stands: ffmpeg
-rounds up before `vaCreateContext` and
-`VAEncSequenceParameterBufferHEVC` has no conformance-window fields, so
-the true size never arrives. Fixing it means **accepting packed
-headers**, which would let ffmpeg's own SPS through — a real change with
-its own risks. `lab dims` reports these as LIMIT rather than failing.
-H.264 is exact at every resolution tested.
+**C8. INVESTIGATED AND DESIGNED (2026-09-21) — NOT implemented, needs a
+go/no-go decision, not more code.** 854x480 encodes as 856x480; not
+fixable as the driver stands, since ffmpeg rounds up before
+`vaCreateContext` and `VAEncSequenceParameterBufferHEVC` has no
+conformance-window fields, so the true size never arrives through the
+normal path at all. `lab dims` reports these as LIMIT rather than
+failing. H.264 is exact at every resolution tested (its own SPS crop
+fields already carry the true size, `b2b7fef`).
+
+The only channel the true size could ever reach this driver through is
+ffmpeg's own packed SPS (`VAEncPackedHeaderDataBufferType`), which
+computes a correct conformance window from `avctx->width/height` — but
+accepting it is a real behavioural change, not a bug fix: advertising
+`VA_ENC_PACKED_HEADER_SEQUENCE` (even to parse two numbers out of it,
+never splicing ffmpeg's actual bytes into the bitstream) makes ffmpeg
+build container extradata from *its own* SPS while the in-band
+bitstream stays this driver's SPS — a narrow but real spec-conformance
+risk, scoped specifically to file-based/muxed output (`ffmpeg -c:v
+hevc_vaapi ... output.mp4`, a use case this project's own README
+documents), not the RTP/Sunshine streaming path this driver actually
+exists for. Full design (the narrow fix: parse only `pic_width/height_
+in_luma_samples` + the conformance-window fields out of ffmpeg's SPS,
+change nothing else) and the exact risk mechanism, read from the
+existing `VAConfigAttribEncPackedHeaders` comment rather than assumed:
+`docs/notes/c8-packed-headers.md`.
 
 **C9. DONE — board-validated 2026-09-21. +19.6 dB.** The gap was not
 tuning. See `docs/hevc_scope_note.md` for the full writeup and DEVLOG §35
