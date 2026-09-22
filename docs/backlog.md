@@ -392,13 +392,37 @@ byte-identical to its reference at 7 sizes plus a non-CTU-aligned
 > motion, forcing a mix of skip and intra-fallback CTUs). **16/16 and
 > 24/24 frames byte-exact, both cases, across two full GOPs each.**
 
-**Still needed before broader trust**: the skip threshold's rate/quality
-tradeoff (cannot affect conformance, only bitrate — still unmeasured),
-any throughput cost (a new per-P-frame download the all-intra path
-never had), the CPU-fallback interaction, and GOPs longer than the ones
-tested (8 frames) — plus larger/real-content resolutions than the
-64x64/128x128 tested so far. `docs/notes/c7-gpu-pframes.md` has the
-full design.
+> **Board, round 3, same day: scaled up, and the throughput cost is
+> real and large.** Pixel-exactness holds at real streaming
+> resolutions and longer GOPs with no degradation: **48/48 frames
+> (640x480, 3 GOPs) and 90/90 frames (1280x720, 3 GOPs) byte-exact**,
+> `testsrc2` motion content both times.
+>
+> **Throughput, measured for the first time, at 1280x720/gop=30 (3
+> reps each, tight clusters, ~2x apart — nowhere near noise):**
+>
+> | mode | fps |
+> |---|---|
+> | GPU intra-only (baseline) | 68.6 / 72.0 / 73.1 |
+> | GPU intra + P-frame | 35.3 / 34.2 / 34.5 |
+>
+> **Enabling P-frames costs roughly HALF the throughput** — the
+> per-P-frame source+reference download and CPU-side skip decision the
+> design doc flagged as "a genuine, acknowledged, unquantified cost" is
+> now quantified, and it's substantial, not incidental. Output did get
+> smaller too (3,745,841 → 3,178,793 bytes, -15.1%, consistent with
+> skip actually saving bits), so the trade isn't nothing — but at these
+> settings intra-only is safely real-time at 720p and P-frame mode is
+> not (34-35 fps against a 60 fps target), before any GPU dispatch cost
+> is even counted against it. **This needs addressing (a cheaper skip
+> decision, avoiding the full source download, or accepting the cost
+> for the bitrate savings) before C7 is a real candidate for enabling
+> by default anywhere near C5's decision.**
+
+**Still needed**: the skip threshold's rate/quality tradeoff (cannot
+affect conformance, only bitrate), the CPU-fallback interaction, GOPs
+longer than 30 frames, and resolutions above 1280x720.
+`docs/notes/c7-gpu-pframes.md` has the full design.
 
 **C8. NEW — HEVC rounds odd frame sizes up to a multiple of 8.**
 854x480 encodes as 856x480. Not fixable as the driver stands: ffmpeg
