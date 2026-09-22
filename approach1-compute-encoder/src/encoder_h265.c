@@ -433,12 +433,18 @@ struct hevc_encoder {
      * for an unvalidated feature. */
     bool use_gpu_pframe;
 
-    /* GPU-path P-frame zero-motion skip (docs/notes/c7-gpu-pframes.md).
-     * One uint32 per CTU (width_ctu * height_ctu entries), nonzero meaning
-     * "host decided this CTU is SKIP" - shared verbatim as the skip_mask
-     * gpu_compute_hevc_dispatch_intra() uploads to the shader AND as the
-     * host's own bookkeeping for cu_skip_flag ctxInc and the DC-for-skip-
-     * neighbour MPM rule (see encode_core_gpu()). Unlike the CPU path's
+    /* GPU-path P-frame zero-motion skip. One uint32 per CTU
+     * (width_ctu * height_ctu entries), nonzero meaning "this CTU is SKIP".
+     * docs/notes/c7-gpu-pframes.md's first cut decided this on the host and
+     * uploaded it as the shader's skip_mask; docs/notes/
+     * c7-pframe-throughput.md moved the decision itself onto the GPU
+     * (hevc_pframe_skip.comp) - this array is now filled by copying back
+     * gpu_compute_get_hevc_skip_data_slot()'s result after a sync, not by
+     * computing it here (decide_gpu_ctu_skips() below still computes it
+     * host-side, but only for the off-board hevc_encoder_encode_gpu_raw()
+     * test path, which has no GPU to run that shader on). Either way it
+     * doubles as the host's own bookkeeping for cu_skip_flag ctxInc and the
+     * DC-for-skip-neighbour MPM rule (see encode_core_gpu()). Unlike the CPU path's
      * cu_skip_map/cu_is_inter (per-8x8-CU, 4 per CTU), this path has
      * exactly one CU per CTU, so one entry per CTU is enough - and every
      * inter CU this path ever signals is a SKIP with motion (0,0) by
@@ -1636,6 +1642,33 @@ static uint32_t compute_sad_ctu_zero(const hevc_encoder_t *enc, int ctu_x, int c
     return sad;
 }
 
+/* CPU path's own per-8x8-CU threshold (encode_cu()) is 96 * (1 + qp/8). One
+ * GPU-path CTU is the SUM of four such CU-sized zero-motion SADs
+ * (compute_sad_ctu_zero() below, and hevc_pframe_skip.comp's GPU
+ * equivalent - docs/notes/c7-pframe-throughput.md), so scaling that same
+ * formula by 4 asks "would each of the four sub-blocks individually have
+ * passed the CPU path's own threshold" - a reasonable starting point, not
+ * a derived constant. BC250_HEVC_GPU_SKIP_THRESHOLD overrides it outright,
+ * same convention as the CPU path's own BC250_HEVC_SKIP_THRESHOLD.
+ *
+ * Factored out to ONE place (used by decide_gpu_ctu_skips() below, for the
+ * off-board hevc_encoder_encode_gpu_raw() test path, and by
+ * hevc_encoder_encode_frame()'s real GPU dispatch, which now hands this
+ * value to hevc_pframe_skip.comp as a push constant instead of running the
+ * SAD loop on the CPU) so the formula cannot drift between the two
+ * callers - moving WHERE the decision runs must not risk two different
+ * answers to WHAT it decides. */
+static uint32_t hevc_gpu_pframe_skip_threshold(int qp) {
+    uint32_t threshold = 4u * 96u * (1u + (uint32_t)(qp / 8));
+    static int s_override = -2;
+    if (s_override == -2) {
+        const char *env = getenv("BC250_HEVC_GPU_SKIP_THRESHOLD");
+        s_override = env ? atoi(env) : -1;
+    }
+    if (s_override >= 0) threshold = (uint32_t)s_override;
+    return threshold;
+}
+
 /* Fills enc->gpu_ctu_skip[] (one uint32 per CTU, nonzero = skip) and
  * enc->last_frame_sad (this frame's total zero-motion SAD, fed to
  * pick_frame_qp() as the temporal-complexity estimate for the NEXT frame -
@@ -1645,31 +1678,67 @@ static uint32_t compute_sad_ctu_zero(const hevc_encoder_t *enc, int ctu_x, int c
  * re-zeroes the map (encode_core_gpu() re-does this marking itself, from
  * this same gpu_ctu_skip[], after its own memset - see there).
  *
- * The threshold below decides RATE/QUALITY, not CORRECTNESS: a CTU marked
- * skip always reconstructs as an exact copy of the reference (see
+ * CPU-only: used by the off-board hevc_encoder_encode_gpu_raw() test path
+ * (docs/notes/c7-gpu-pframes.md), which has no GPU to dispatch
+ * hevc_pframe_skip.comp on. The real board path (hevc_encoder_encode_
+ * frame()) no longer calls this - see docs/notes/c7-pframe-throughput.md.
+ *
+ * The threshold decides RATE/QUALITY, not CORRECTNESS: a CTU marked skip
+ * always reconstructs as an exact copy of the reference (see
  * hevc_intra_wavefront.comp's early return), so no value of this threshold
  * can make the bitstream non-conforming - only worse-compressed or worse-
  * looking. That is deliberate slack: this heuristic has had no board
  * measurement at all (see this file's top-level status note), so getting
  * its exact value right is explicitly not a correctness requirement here,
  * only a tuning one for later. */
-static void decide_gpu_ctu_skips(hevc_encoder_t *enc, int qp) {
-    /* CPU path's own per-8x8-CU threshold (encode_cu()) is
-     * 96 * (1 + qp/8). One CTU here is the SUM of four such CU-sized
-     * zero-motion SADs (compute_sad_ctu_zero() above), so scaling that same
-     * formula by 4 asks "would each of the four sub-blocks individually
-     * have passed the CPU path's own threshold" - a reasonable starting
-     * point, not a derived constant. BC250_HEVC_GPU_SKIP_THRESHOLD
-     * overrides it outright, same convention as the CPU path's
-     * BC250_HEVC_SKIP_THRESHOLD. */
-    uint32_t threshold = 4u * 96u * (1u + (uint32_t)(qp / 8));
-    static int s_override = -2;
-    if (s_override == -2) {
-        const char *env = getenv("BC250_HEVC_GPU_SKIP_THRESHOLD");
-        s_override = env ? atoi(env) : -1;
+/* Refreshes enc->prev_recon_y/cb/cr from ctx->recon_image (docs/notes/
+ * c7-pframe-throughput.md). docs/notes/c7-gpu-pframes.md's first cut did
+ * this download unconditionally, before EVERY P-frame-candidate dispatch,
+ * as a side effect of needing the reference pixels on the host for its own
+ * (now-removed) CPU SAD loop - which is exactly the "full reference
+ * download" c7-pframe-throughput.md's whole point is to stop paying for on
+ * the common path. It has exactly one remaining reason to exist: if a GPU
+ * P-frame candidate's dispatch or readback fails and hevc_encoder_encode_
+ * frame() falls through to the CPU path (encode_core()) for that SAME
+ * frame, encode_core()'s own zero-motion skip decision (encode_cu()) reads
+ * enc->prev_recon_* as the actual previous-frame reference - normally kept
+ * fresh by encode_core()'s own end-of-frame memcpy, which never runs while
+ * the GPU path is handling frames. Called ONLY from that fallback branch
+ * now, so the common (dispatch succeeds) path never pays for this download
+ * at all - matching this feature's own prior acknowledgment that the
+ * cross-path interaction "should be consistent by construction... but has
+ * not been exercised" (still true here: this relocates an existing,
+ * already-untested defensive measure, it does not add a new one).
+ *
+ * A failure here does not by itself make the CPU path's output wrong: a
+ * stale/garbage prev_recon_* will generally fail encode_cu()'s own SAD
+ * threshold against the real current-frame source (an actual previous
+ * reconstruction and an arbitrary stale buffer are unlikely to look
+ * alike), routing those CTUs to intra instead of a wrong skip - but this
+ * is "generally", not a guarantee, which is exactly why this refresh is
+ * still attempted rather than skipped. Returns 0 on success (matching
+ * gpu_compute_hevc_download_recon_nv12()'s own contract), -1 if there is
+ * no usable recon_image yet. */
+static int hevc_refresh_prev_recon_from_gpu(hevc_encoder_t *encoder, bc250_gpu_context_t *gpu_ctx) {
+    if (gpu_compute_hevc_download_recon_nv12(gpu_ctx,
+            encoder->prev_recon_y, (int)encoder->coded_width,
+            encoder->gpu_recon_uv_scratch, (int)encoder->coded_width,
+            (int)encoder->coded_width, (int)encoder->coded_height) != 0) {
+        return -1;
     }
-    if (s_override >= 0) threshold = (uint32_t)s_override;
+    uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
+    for (uint32_t y = 0; y < cch; y++) {
+        const uint8_t *uvrow = encoder->gpu_recon_uv_scratch + (size_t)y * encoder->coded_width;
+        for (uint32_t x = 0; x < ccw; x++) {
+            encoder->prev_recon_cb[y * ccw + x] = uvrow[x * 2 + 0];
+            encoder->prev_recon_cr[y * ccw + x] = uvrow[x * 2 + 1];
+        }
+    }
+    return 0;
+}
 
+static void decide_gpu_ctu_skips(hevc_encoder_t *enc, int qp) {
+    uint32_t threshold = hevc_gpu_pframe_skip_threshold(qp);
     uint32_t total_sad = 0;
     for (uint32_t row = 0; row < enc->height_ctu; row++) {
         for (uint32_t col = 0; col < enc->width_ctu; col++) {
@@ -2058,68 +2127,20 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
          * for the same reason (rate control's temporal-complexity ratio). */
         pick_frame_qp(encoder, is_idr_candidate ? 0 : encoder->last_frame_sad);
 
-        /* P-frame candidate: decide zero-motion skips BEFORE dispatch, since
-         * the decision has to be uploaded as this dispatch's skip_mask, not
-         * applied after the fact (docs/notes/c7-gpu-pframes.md explains why
-         * post-hoc host-side overriding cannot work here - the shader must
-         * see the mask itself, before it decides which CTUs to touch).
-         * Needs this frame's source AND last frame's reconstruction on the
-         * host - both real downloads, unlike the pure-intra fast path above
-         * which never touches the host at all for pixel data. */
-        if (!is_idr_candidate) {
-            gpu_compute_dmabuf_sync_start(gpu_ctx, input_memory);
-            gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
-                                      encoder->dl_y, (int)encoder->width,
-                                      encoder->dl_uv, (int)encoder->width,
-                                      (int)encoder->width, (int)encoder->height);
-            gpu_compute_dmabuf_sync_end(gpu_ctx, input_memory);
-            pad_replicate(encoder->src_y, encoder->coded_width, encoder->coded_height,
-                          encoder->dl_y, encoder->width, encoder->width, encoder->height);
-            {
-                uint32_t cw2 = encoder->width / 2, ch2 = encoder->height / 2;
-                uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
-                for (uint32_t y = 0; y < ch2; y++) {
-                    const uint8_t *uvrow = encoder->dl_uv + (size_t)y * encoder->width;
-                    for (uint32_t x = 0; x < cw2; x++) {
-                        encoder->src_cb[y * ccw + x] = uvrow[x * 2 + 0];
-                        encoder->src_cr[y * ccw + x] = uvrow[x * 2 + 1];
-                    }
-                }
-                pad_replicate(encoder->src_cb, ccw, cch, encoder->src_cb, ccw, cw2, ch2);
-                pad_replicate(encoder->src_cr, ccw, cch, encoder->src_cr, ccw, cw2, ch2);
-            }
-
-            /* Reference = ctx->recon_image, still holding the PREVIOUS
-             * frame's finished reconstruction (this frame's dispatch has
-             * not run yet). Coded dimensions, and no pad_replicate needed
-             * unlike the source above - every pixel in the coded area was
-             * written by a real CTU last frame, none of it is edge-
-             * replicated filler. */
-            if (gpu_compute_hevc_download_recon_nv12(gpu_ctx,
-                    encoder->prev_recon_y, (int)encoder->coded_width,
-                    encoder->gpu_recon_uv_scratch, (int)encoder->coded_width,
-                    (int)encoder->coded_width, (int)encoder->coded_height) == 0) {
-                uint32_t ccw = encoder->coded_width / 2, cch = encoder->coded_height / 2;
-                for (uint32_t y = 0; y < cch; y++) {
-                    const uint8_t *uvrow = encoder->gpu_recon_uv_scratch + (size_t)y * encoder->coded_width;
-                    for (uint32_t x = 0; x < ccw; x++) {
-                        encoder->prev_recon_cb[y * ccw + x] = uvrow[x * 2 + 0];
-                        encoder->prev_recon_cr[y * ccw + x] = uvrow[x * 2 + 1];
-                    }
-                }
-                decide_gpu_ctu_skips(encoder, encoder->qp);
-            } else {
-                /* No usable reference readback (first HEVC frame ever, or a
-                 * transient failure) - fall back to "no CTU skips this
-                 * frame" rather than skip against garbage. has_ref being
-                 * true is what made is_idr_candidate false in the first
-                 * place, so this should not happen in practice; treated
-                 * defensively rather than assumed unreachable. */
-                memset(encoder->gpu_ctu_skip, 0,
-                       (size_t)encoder->width_ctu * encoder->height_ctu * sizeof(uint32_t));
-                encoder->last_frame_sad = 0;
-            }
-        }
+        /* P-frame candidate: no host download of any kind here any more.
+         * docs/notes/c7-gpu-pframes.md's first cut downloaded this frame's
+         * source AND the previous frame's reconstruction to host memory and
+         * ran the zero-motion SAD decision on the CPU - board-measured
+         * (docs/backlog.md C7) at roughly HALF the intra-only throughput at
+         * 720p, dominated by two ~1.66 MB NV12 readbacks (each a GPU-CPU
+         * sync point) plus the CPU SAD loop, every P-frame. hevc_pframe_
+         * skip.comp (docs/notes/c7-pframe-throughput.md) now makes that
+         * same decision on the GPU, reading srcY/srcUV/reconY/reconUV where
+         * they already live and writing the mask directly into the buffer
+         * hevc_intra_wavefront.comp already reads - so all that is needed
+         * here is the threshold value, which is pure arithmetic on `qp`. */
+        uint32_t skip_threshold = is_idr_candidate ? 0u
+            : hevc_gpu_pframe_skip_threshold((int)encoder->qp);
 
         gpu_compute_begin_picture(gpu_ctx, input_surface);
         int recon_was_reset = 0;
@@ -2127,18 +2148,55 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
                                                  (int)encoder->coded_width, (int)encoder->coded_height,
                                                  (int)encoder->width, (int)encoder->height,
                                                  encoder->qp,
-                                                 is_idr_candidate ? NULL : encoder->gpu_ctu_skip,
+                                                 !is_idr_candidate, skip_threshold,
                                                  &recon_was_reset);
         gpu_compute_end_picture(gpu_ctx);
         int slot = gpu_compute_submitted_slot(gpu_ctx);
         gpu_compute_sync_slot(gpu_ctx, slot);
 
         /* A reset recon_image means gpu_compute_hevc_dispatch_intra() ignored
-         * whatever skip_mask it was given (see that function's doc comment)
-         * and coded every CTU intra regardless - encode_core_gpu() must be
-         * told the same thing, or its entropy loop would signal cu_skip_flag
-         * for CTUs the shader never actually skipped. */
+         * want_pframe_skip (see that function's doc comment) and coded every
+         * CTU intra regardless - encode_core_gpu() must be told the same
+         * thing, or its entropy loop would signal cu_skip_flag for CTUs the
+         * shader never actually skipped. */
         bool is_idr_final = is_idr_candidate || (recon_was_reset != 0);
+
+        /* Read the GPU's skip decision back - one tiny buffer
+         * (width_ctu*height_ctu uint32s, e.g. 3600 bytes at 1280x720)
+         * instead of the ~3.3 MB of raw pixels the old CPU-side decision
+         * needed. Still needed on the host: encode_core_gpu()'s CABAC stage
+         * (cu_skip_flag's ctxInc, merge_idx, the MPM DC-for-skip-neighbour
+         * rule) reads enc->gpu_ctu_skip[] directly - that bookkeeping is
+         * inherently host-side entropy coding, not something this task
+         * moves to the GPU (see docs/notes/c7-pframe-throughput.md). */
+        if (!is_idr_final) {
+            void *skip_data = NULL;
+            size_t skip_sz = 0;
+            size_t nctu = (size_t)encoder->width_ctu * encoder->height_ctu;
+            if (gpu_compute_get_hevc_skip_data_slot(gpu_ctx, slot, &skip_data, &skip_sz) == 0 &&
+                skip_data && skip_sz >= nctu * sizeof(uint32_t)) {
+                memcpy(encoder->gpu_ctu_skip, skip_data, nctu * sizeof(uint32_t));
+                /* last_frame_sad is a rate-control heuristic only (fed to
+                 * the NEXT frame's pick_frame_qp() as a temporal-complexity
+                 * estimate - see that call above) - not a correctness value,
+                 * per this function's own established convention. The exact
+                 * CPU-computed total SAD is no longer available without the
+                 * pixel downloads this change removes; every non-skip CTU
+                 * failed the threshold by definition, so (non-skip count) *
+                 * threshold is a deliberate, order-of-magnitude-correct
+                 * proxy in the same units, not the same number decide_gpu_
+                 * ctu_skips() would have produced. */
+                size_t n_skip = 0;
+                for (size_t i = 0; i < nctu; i++) n_skip += encoder->gpu_ctu_skip[i] ? 1u : 0u;
+                encoder->last_frame_sad = (uint32_t)((nctu - n_skip) * (size_t)skip_threshold);
+            } else {
+                /* Readback unavailable (shader failed to load, or a
+                 * transient mapping issue) - no CTU skips this frame rather
+                 * than trusting whatever was last in the buffer. */
+                memset(encoder->gpu_ctu_skip, 0, nctu * sizeof(uint32_t));
+                encoder->last_frame_sad = 0;
+            }
+        }
 
         /* BC250_DUMP_RECON_FRAMES=1: the encoder's OWN reconstruction, as the
          * shader left it. The drift oracle - decode the resulting bitstream
@@ -2178,6 +2236,12 @@ int hevc_encoder_encode_frame(hevc_encoder_t *encoder,
          * dispatch here would be a second submission of the same surface;
          * instead just download and encode on the CPU. Sync-bracketed for
          * the same reason as the main path below. */
+        if (!is_idr_candidate) {
+            /* This frame was meant to be a GPU P-frame candidate - see
+             * hevc_refresh_prev_recon_from_gpu()'s comment for why the CPU
+             * path about to run needs this. */
+            hevc_refresh_prev_recon_from_gpu(encoder, gpu_ctx);
+        }
         gpu_compute_dmabuf_sync_start(gpu_ctx, input_memory);
         gpu_compute_download_nv12(gpu_ctx, &input_surface, input_memory,
                                   encoder->dl_y, (int)encoder->width,
