@@ -454,6 +454,22 @@ struct hevc_encoder {
      * separate is_inter/mv map to keep: is_inter == is_skip here. */
     uint32_t *gpu_ctu_skip;
 
+    /* CPU-path CtDepth per CTU (one uint8 per CTU, raster order, reset each
+     * frame). A6 piece (3) prep, docs/backlog.md: split_cu_flag's ctxInc
+     * (9.3.4.2.2) must test whether a neighbour CU is DEEPER than the
+     * current cqtDepth, not merely whether it exists - the exact bug class
+     * docs/hevc_scope_note.md records as a real, previously-shipped defect
+     * on the GPU path. Every CTU on this path is still unconditionally
+     * split to four 8x8 CUs (CtDepth==1 everywhere, piece (3)'s actual
+     * variable-depth decision is not implemented), so reading this map
+     * instead of raw left/above existence changes nothing numerically
+     * today - condL&&CtDepth[left]>0 is identically condL when every
+     * already-coded CtDepth is 1 - but it means the ctxInc computation is
+     * already correct-by-construction for whichever future pass adds a
+     * real per-CTU depth choice, instead of being an existence proxy that
+     * only happens to agree with the spec while depth stays uniform. */
+    uint8_t *ctdepth;
+
     /* Scratch for de-interleaving ctx->recon_image's packed NV12 UV plane
      * (read back via gpu_compute_hevc_download_recon_nv12()) into the
      * planar prev_recon_cb/prev_recon_cr above, coded chroma dimensions -
@@ -592,6 +608,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
     size_t num_mbs = (size_t)enc->width_ctu * enc->height_ctu;
     enc->gpu_mvs = calloc(num_mbs, sizeof(gpu_mv_t));
     enc->gpu_ctu_skip = calloc(num_mbs, sizeof(uint32_t));
+    enc->ctdepth = calloc(num_mbs, sizeof(uint8_t));
     /* Same sizing as dl_uv (interleaved NV12 UV, row stride = coded_width,
      * height = coded_height/2), not width/height - this scratch is only
      * ever filled from ctx->recon_image, which is allocated at coded
@@ -604,7 +621,7 @@ hevc_encoder_t *hevc_encoder_create(bc250_gpu_context_t *gpu_ctx,
         !enc->cu_skip_map || !enc->cu_is_inter || !enc->mv_x_map || !enc->mv_y_map ||
         !enc->luma_mode_map || !enc->dl_y || !enc->dl_uv ||
         !enc->slice_rbsp || !enc->scratch_out || !enc->gpu_mvs || !enc->gpu_ctu_skip ||
-        !enc->gpu_recon_uv_scratch) {
+        !enc->ctdepth || !enc->gpu_recon_uv_scratch) {
         hevc_encoder_destroy(enc);
         return NULL;
     }
@@ -775,6 +792,7 @@ void hevc_encoder_destroy(hevc_encoder_t *encoder)
     free(encoder->scratch_out);
     free(encoder->gpu_mvs);
     free(encoder->gpu_ctu_skip);
+    free(encoder->ctdepth);
     free(encoder->gpu_recon_uv_scratch);
     free(encoder);
 }
@@ -1350,9 +1368,20 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
 
 static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int ctu_row, bool is_idr) {
     int ctu_x = ctu_col * HEVC_CTU_SIZE, ctu_y = ctu_row * HEVC_CTU_SIZE;
-    int cond_l = ctu_col > 0 ? 1 : 0;
-    int cond_a = ctu_row > 0 ? 1 : 0;
+    uint32_t ctu = (uint32_t)ctu_row * enc->width_ctu + (uint32_t)ctu_col;
+    /* split_cu_flag ctxInc (9.3.4.2.2): condX is 1 iff that neighbour CTU
+     * exists AND its CtDepth is greater than this CTU's cqtDepth (0, the
+     * CTU root - see the ctdepth field's comment on why this reads real
+     * depth instead of raw existence). Every CTU on this path is still
+     * unconditionally split (CtDepth becomes 1 right below), so this is
+     * numerically identical to the old cond_l+cond_a formula today - the
+     * point is that it stays correct once a future pass makes CtDepth
+     * vary, rather than silently reverting to the exact ctxInc bug class
+     * docs/hevc_scope_note.md already records as a real, shipped defect. */
+    int cond_l = (ctu_col > 0 && enc->ctdepth[ctu - 1] > 0) ? 1 : 0;
+    int cond_a = (ctu_row > 0 && enc->ctdepth[ctu - enc->width_ctu] > 0) ? 1 : 0;
     hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
+    enc->ctdepth[ctu] = 1; /* this CTU always splits to four 8x8 CUs, CtDepth 1 */
 
     /* No per-CTU GPU motion vector is looked up any more. enc->gpu_mvs is
      * still filled (motion_estimation.comp's readback in
