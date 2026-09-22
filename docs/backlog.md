@@ -419,10 +419,40 @@ byte-identical to its reference at 7 sizes plus a non-CTU-aligned
 > for the bitrate savings) before C7 is a real candidate for enabling
 > by default anywhere near C5's decision.**
 
+> **Board, round 4, same day: fixed, and it overshot — P-frame mode is
+> now FASTER than the intra-only baseline it was losing to.** The
+> throughput cost traced to two full-frame NV12 host downloads
+> (~2.7 MiB combined) plus a CPU SAD loop, every P-frame, all replaced
+> by one small compute shader (`hevc_pframe_skip.comp`) that reads the
+> source and reference images where they already live on the GPU and
+> writes a packed 14.4 KB verdict directly into the same SSBO the
+> wavefront shader already reads — the same re-verified pixel-exactness
+> test (640x480 and 1280x720, 3 GOPs, `testsrc2`) still passes 48/48
+> and 90/90 with the new dispatch path, and `lab gate` PASS confirms the
+> default (flag-off) path is untouched. Real fps, same settings as
+> round 3:
+>
+> | mode | fps (round 3, before) | fps (round 4, after) |
+> |---|---|---|
+> | GPU intra-only (baseline) | 68.6 / 72.0 / 73.1 | 67.0 / 70.7 / 72.9 |
+> | GPU intra + P-frame | 35.3 / 34.2 / 34.5 | **80.5 / 80.4 / 77.5** |
+>
+> Not just recovered — P-frame mode now **beats the all-intra baseline**
+> by ~10-15%. This makes sense once the shader's own early-return is
+> accounted for: a SKIP CTU costs the wavefront shader nothing (no
+> intra prediction, transform, quant or reconstruction at all, just a
+> flag check), so on `gop=30` — mostly P-frames — the shader is doing
+> real work for a shrinking fraction of CTUs, on top of the compression
+> win already measured (output still ~15% smaller than intra-only).
+> C7 is no longer a throughput trade at all at these settings — it is a
+> straightforward win on both bitrate and fps together.
+
 **Still needed**: the skip threshold's rate/quality tradeoff (cannot
-affect conformance, only bitrate), the CPU-fallback interaction, GOPs
-longer than 30 frames, and resolutions above 1280x720.
-`docs/notes/c7-gpu-pframes.md` has the full design.
+affect conformance, only bitrate) — now the more pressing open question
+given throughput is no longer the constraint — the CPU-fallback
+interaction, real (non-synthetic) content, GOPs longer than 30 frames,
+and resolutions above 1280x720. `docs/notes/c7-gpu-pframes.md` and
+`docs/notes/c7-pframe-throughput.md` have the full design.
 
 **C8. NEW — HEVC rounds odd frame sizes up to a multiple of 8.**
 854x480 encodes as 856x480. Not fixable as the driver stands: ffmpeg
