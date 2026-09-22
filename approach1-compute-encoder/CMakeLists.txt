@@ -363,6 +363,49 @@ if(BUILD_CAVLC_BENCH)
 endif()
 
 # ----------------------------------------------------------------------------
+# gpu_contention - tunable Vulkan compute load generator, standing in for
+# "a game using the GPU" for tools/lab's --load= condition. See
+# tools/gpu_contention.c's own header for why this exists (nlmeans_vulkan,
+# the only load generator before this, was never calibrated against
+# anything real) and why it targets a self-measured duty cycle rather than
+# amdgpu's gpu_busy_percent (unsupported on this board - checked directly).
+# ----------------------------------------------------------------------------
+option(BUILD_GPU_CONTENTION "Build the tunable GPU contention-load generator (tools/gpu_contention.c)" ON)
+if(BUILD_GPU_CONTENTION)
+    set(GPU_CONTENTION_SRC ${CMAKE_CURRENT_SOURCE_DIR}/../tools/gpu_contention.c)
+    set(GPU_CONTENTION_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/../tools/shaders/gpu_contention.comp)
+    if(EXISTS ${GPU_CONTENTION_SRC} AND EXISTS ${GPU_CONTENTION_SHADER})
+        set(GPU_CONTENTION_SPV ${CMAKE_CURRENT_BINARY_DIR}/gpu_contention.comp.spv)
+        if(GLSLANG_VALIDATOR)
+            add_custom_command(
+                OUTPUT ${GPU_CONTENTION_SPV}
+                COMMAND ${GLSLANG_VALIDATOR} -V ${GPU_CONTENTION_SHADER} -o ${GPU_CONTENTION_SPV}
+                DEPENDS ${GPU_CONTENTION_SHADER}
+                COMMENT "Compiling gpu_contention.comp with glslangValidator")
+        elseif(GLSLC)
+            add_custom_command(
+                OUTPUT ${GPU_CONTENTION_SPV}
+                COMMAND ${GLSLC} -c ${GPU_CONTENTION_SHADER} -o ${GPU_CONTENTION_SPV}
+                DEPENDS ${GPU_CONTENTION_SHADER}
+                COMMENT "Compiling gpu_contention.comp with glslc")
+        endif()
+        add_custom_target(gpu_contention_shader DEPENDS ${GPU_CONTENTION_SPV})
+
+        add_executable(gpu_contention ${GPU_CONTENTION_SRC})
+        target_link_libraries(gpu_contention PRIVATE ${Vulkan_LIBRARIES})
+        add_dependencies(gpu_contention gpu_contention_shader)
+        # Shipped beside the binary - gpu_contention.c's own
+        # default_shader_path() resolves this directory via /proc/self/exe.
+        # Deliberately NOT installed to SHADER_INSTALL_PATH: this is a test
+        # tool's own asset, not a runtime dependency of the shipped driver.
+        add_custom_command(TARGET gpu_contention POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy ${GPU_CONTENTION_SPV} $<TARGET_FILE_DIR:gpu_contention>/gpu_contention.comp.spv)
+    else()
+        message(WARNING "BUILD_GPU_CONTENTION=ON but tools/gpu_contention.c or tools/shaders/gpu_contention.comp is missing")
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
 # hevc_cabac_bench - off-board CPU-HEVC harness (docs/backlog.md A4)
 # ----------------------------------------------------------------------------
 # Same rationale, same flag set and the same two-binary split as
