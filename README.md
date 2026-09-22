@@ -246,6 +246,14 @@ ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload'
 # against ffmpeg's decode on both luma and chroma at every QP tested - the
 # chroma-QP defect docs/hevc-gpu-intra.md used to warn about here is fixed:
 BC250_HEVC_GPU=1 ffmpeg -vaapi_device /dev/dri/renderD128 -i input.mp4 -vf 'format=nv12,hwupload' -c:v hevc_vaapi -b:v 6M output_hevc_gpu.mp4
+
+# ...experimental GPU P-frame skip (BC250_HEVC_GPU_PFRAME=1, on top of
+# BC250_HEVC_GPU=1). Faster than the GPU intra path above at real streaming
+# settings (59-78 fps at 1440p/gop=120 vs 47-63 fps), but board-measured
+# 2026-09-22 at LOWER PSNR than intra-only at every matched bitrate - the
+# zero-motion skip threshold has never been tuned against real motion, only
+# validated for pixel-exactness. Not recommended over the intra path above
+# until that's fixed. docs/backlog.md C7.
 ```
 
 > [!NOTE]
