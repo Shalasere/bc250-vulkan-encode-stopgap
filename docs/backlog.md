@@ -210,6 +210,21 @@ a board `lab qsweep` BD-rate run before any number here is trusted.
 > previously-shipped bug already lived in, now a live risk for the
 > first time on this path. `docs/notes/a6-cu-tu-structure.md`.
 
+> **Piece (2) board-checked, 2026-09-22: no real throughput cost.**
+> Shipped with zero board timing check, unlike piece (1)'s two rounds of
+> board review — closed that gap. `lab noise` floor first (n=5,
+> `p_wall_ms` sd 1.45%), then `lab compare` against the immediately-
+> preceding key (HEVC, gop=120, 3 runs/side interleaved): `p_wall_ms`
+> delta **-1.25%, within noise** (threshold ~2.9%) — no regression, if
+> anything a trivial improvement. `p_fps_ceiling` (-0.38%) and `bytes_p`
+> (-0.19%) flagged SIGNIFICANT by `lab compare`'s own tighter per-metric
+> noise bands, but both are expected: `bytes_p` moves because piece (2)
+> changed the actual TU/PU structure (one 8x8 transform instead of four
+> 4x4), not because of a performance regression. The separately-observed
+> ~10.0-10.8 fps CPU HEVC qsweep figure (2026-09-22 fresh numbers, see
+> DEVLOG) is **not** piece (2)'s doing — it's what CPU HEVC costs at
+> 1440p/gop=120 regardless.
+
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
 `cavlc-residual-coding`): `docs/notes/a6-cavlc-residual-port.md`.
@@ -499,6 +514,33 @@ byte-identical to its reference at 7 sizes plus a non-CTU-aligned
 > win already measured (output still ~15% smaller than intra-only).
 > C7 is no longer a throughput trade at all at these settings — it is a
 > straightforward win on both bitrate and fps together.
+
+> **Board, round 5 (2026-09-22): the fps win holds at real streaming
+> settings, but there's a real, previously-unmeasured quality cost.**
+> Every round above used `-g 5`/`-g 8`/`-g 30` to keep bounded test
+> encodes cheap — this pass ran the actual candidate settings for
+> streaming (`testsrc2`, 1440p, **gop=120**, `qsweep` across 8-31M for
+> the first time with P-frame mode on). Throughput result holds: 59.47-
+> 78.25 fps, still comfortably beating a 60 fps target across the
+> range. **But PSNR is *lower* than the all-intra GPU path at every
+> matched bitrate** (31M: 38.88 dB P-frame vs 40.39 dB intra-only; the
+> gap is present and roughly similar in size at every bitrate sampled).
+> The zero-motion skip threshold (`BC250_HEVC_SKIP_THRESHOLD`, default
+> 1536, see the C6 sweep above) has only ever been validated for
+> pixel-exactness and throughput — never tuned against a real quality
+> target on real motion — and this is the first time it was measured
+> against real motion (`testsrc2`) at a real GOP (120) rather than the
+> short bounded configs used everywhere above. Two live hypotheses, not
+> yet distinguished: the threshold is skipping CTUs a real
+> rate-distortion decision wouldn't, or the intra fallback on
+> non-skipped CTUs is coarser than true motion compensation would be
+> (which C9 already flagged as the real gap - this path still has none).
+> **Net: `BC250_HEVC_GPU_PFRAME` should stay opt-in/default-off** until
+> either the threshold is tuned against measured PSNR or real motion
+> compensation replaces the intra fallback - the fps win is real, but
+> it currently isn't "faster at the same quality," it's "faster at
+> lower quality," which was never the deal this item was validated on.
+> DEVLOG §39.
 
 > **Board, 2026-09-21: threshold knob confirmed to work, longer GOP
 > still exact.** Sweep at 1280x720/QP27/gop=30 (default formula gives

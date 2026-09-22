@@ -4860,3 +4860,129 @@ than a fixed encoder-side boundary condition. Not chased further this pass;
 the next step is either identifying what's actually at those coordinates in
 `testsrc`'s known pattern, or switching to a flat/synthetic source that
 isolates position from content to separate the two hypotheses.
+
+## 39. Fresh release-candidate numbers, A6 piece (2) cleared, and a new HEVC P-frame quality finding
+
+Board session, 2026-09-22. Goal: real numbers to answer "is this ready for
+a release" rather than reason from memory of earlier figures.
+
+### Process note first: a day-plus zombie job was contaminating timing numbers
+
+Before any of the numbers below, a "Goal check-in" surfaced a background
+task that turned out to trace to `board_run3.sh`, launched very early this
+session and wedged on a dead SSH connection *before* `tools/lab`'s keepalive
+fix landed. Because bash re-reads a script file fresh on each invocation,
+this stalled job silently resumed once the keepalive fix took effect on its
+next step, and had been running **~1 day 1h 28m**, unnoticed, concurrently
+with every other board job run today — including one instance of this
+section's own numbers-gathering run. Killed the entire zombie process tree
+and the contaminated concurrent run rather than trust its output, ran one
+clean health check (board uptime fine, no lingering ffmpeg/lab processes,
+GPU idle, normal logind session count), then re-ran clean.
+
+**Scope of the contamination: timing only.** Any fps/wall-time figure from
+*earlier in this session*, before this zombie was found and killed, carries
+uncertainty from possible undetected GPU contention during that stretch —
+this includes the A6 mode-search-perf board confirmation and the C7
+GPU-P-frame-throughput board confirmation, both reported in §38 and above.
+Their **directional** results (A6 coarse-then-refine faster than exhaustive;
+C7 GPU skip-shader faster than the CPU-readback version it replaced) are
+still almost certainly right - the zombie's own load was one more `lab`
+invocation, not a heavy synthetic GPU filter, and the deltas reported were
+large - but their **exact percentages** should not be treated as precise
+until re-confirmed on a known-clean board. PSNR/byte-exactness results from
+that period are unaffected; correctness doesn't depend on wall-clock
+contention. The numbers in this section were all taken after the kill and
+the clean health check, on a verified-idle board.
+
+### A6 piece (2): no real throughput cost
+
+Piece (2) (all-TU-size transform kernels, wired in at 8x8) shipped without
+a board timing check - the gap piece (1) didn't leave, having gone through
+two rounds of board review already. Closed it: `lab noise` floor first (n=5,
+HEVC/gop=120, `p_wall_ms` sd 1.45%), then `lab compare` against the
+immediately-preceding key (3 runs/side, interleaved):
+
+```
+metric            work-1d9ca  work-67800      delta   delta%   verdict
+p_wall_ms            80.8767     79.8666    -1.0102   -1.25%   within noise
+p_fps_ceiling       350.6667    349.3333    -1.3333   -0.38%   SIGNIFICANT
+bytes_p               1.0277      1.0257    -0.0020   -0.19%   SIGNIFICANT
+```
+
+`p_wall_ms` - the actual per-frame cost - is within noise (threshold ~2x
+the 1.45% sd, so ~2.9%); if anything a trivial improvement, not a
+regression. `bytes_p`'s SIGNIFICANT flag is expected, not a red flag: piece
+(2) genuinely changed the TU/PU structure (one 8x8 transform replacing four
+4x4), so a small, real byte-count shift is exactly what should happen. The
+~10.0-10.8 fps CPU HEVC qsweep figure below is not piece (2)'s cost - it's
+what CPU HEVC costs at these settings regardless of this change.
+
+### Fresh numbers, testsrc2 2560x1440, gop=120 (real streaming settings, not the small-scale correctness configs)
+
+H.264 scoreboard vs libx264 (load=none/gpu/cpu/both, 150 frames, 2 runs):
+
+```
+load   encoder        fps  cpu_ms/f    rss_mb    hits60
+none   work-678     67.22      2.72       228       yes
+none   libx264      52.22      5.06       285        NO
+gpu    work-678      1.45      5.10       229        NO
+gpu    libx264      52.48      5.02       284        NO
+cpu    work-678     42.73      4.16       229        NO
+cpu    libx264      34.10      7.60       285        NO
+both   work-678      1.11      5.57       229        NO
+both   libx264      39.72      6.77       285        NO
+```
+
+Quality at matched bitrate (load=none): ours PSNR 41.21 dB / SSIM 0.9707
+vs libx264 47.89 dB / SSIM 0.9980 - a real ~6.7 dB gap, wider than earlier
+same-bitrate spot checks suggested.
+
+H.264 qsweep across the full bitrate range confirms the gap **widens** with
+bitrate, not just holds steady:
+
+```
+bitrate   ours fps  ours PSNR  libx264 PSNR   gap
+8M          84.70      35.44        38.91    3.47 dB
+15M         81.39      36.74        41.60    4.86 dB
+20M         77.51      38.31        43.72    5.41 dB
+25M         72.01      39.81        45.73    5.92 dB
+31M         66.04      41.84        47.91    6.07 dB
+```
+
+CPU HEVC qsweep: **10.0-10.8 fps** flat across 8-31M (bitrate has almost no
+effect on CPU HEVC's cost - expected, it's compute-bound not I/O-bound).
+Confirmed above: not an A6-piece-(2) regression.
+
+GPU HEVC intra-only qsweep: 46.57-62.70 fps, PSNR 34.06->40.39 dB rising
+with bitrate as expected.
+
+GPU HEVC P-frame qsweep - **first time this path has been measured at a
+real GOP (120) on real motion (`testsrc2`) rather than the small-scale
+synthetic configs used to validate correctness**:
+
+```
+bitrate   fps     PSNR
+8M        78.25   33.83
+15M       76.73   34.33
+20M       72.90   35.24
+25M       66.00   36.91
+31M       59.47   38.88
+```
+
+**New finding: P-frame PSNR is *lower* than the all-intra GPU path's PSNR
+at every matched bitrate** (e.g. 31M: 38.88 dB P-frame vs 40.39 dB
+intra-only). This is exactly the gap flagged as untested when H.265's
+usability was last discussed - the zero-motion skip threshold has never
+been tuned against real motion, only validated for correctness (byte-level
+determinism, drift) and for throughput. On `testsrc2`'s actual motion, the
+untuned threshold is skipping CUs it shouldn't, or the intra fallback on
+non-skipped CUs is coarser than a real motion-compensated predictor would
+be - either way, enabling P-frame mode currently trades throughput for a
+real quality loss versus just running intra-only, not the "better ratio at
+the same fps" tradeoff the skip mechanism was intended to buy. This is a
+new, previously-undisclosed data point, not merely a re-confirmation - it
+had never been measured at these settings before. `BC250_HEVC_GPU_PFRAME`
+should stay opt-in/off-by-default until this is addressed (either tune the
+skip threshold against a real PSNR target, or don't recommend enabling it
+for streaming).
