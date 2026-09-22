@@ -5006,3 +5006,132 @@ had never been measured at these settings before. `BC250_HEVC_GPU_PFRAME`
 should stay opt-in/off-by-default until this is addressed (either tune the
 skip threshold against a real PSNR target, or don't recommend enabling it
 for streaming).
+
+## 40. A full backlog round, continued: A2/A3 implemented and board-checked, A6 piece 3 prepped with an honest cost disclosure, C7's threshold hypothesis refuted, C6's light-load gap closed
+
+Same day, continued after a Stop-hook rejected the earlier round as
+incomplete. Every item still open after §38/§39 got real, verified work
+this pass - implementations where the risk was bounded, and design/
+decision/investigation where it wasn't.
+
+### A2: implemented the bitmask lever, board-checked
+
+`cavlc_scan_coeffs()` rewritten around a nonzero bitmask + `__builtin_clz`
+instead of walking every scan position twice (docs/backlog.md A2 has the
+full mechanism). Off-board: byte-identical (md5 match old vs new, sink
+match across 6 runs, `cavlc_bench verify` round-trips both profiles
+through the reference decoder, ctest 6/6 relevant suites), and a real
+-41% on the isolated gather+scan stage (`cavlc_bench scan`, 3 interleaved
+runs/side). Board: `lab compare` (H.264, isolates this change) put
+`p_wall_ms` at -0.91%, within noise - **a measured zero at the
+whole-pipeline level**, honestly reported as one. Coefficient discovery
+is real work and genuinely faster in isolation; it just isn't a large
+enough share of the frame's *wall time* (versus GPU dispatch/sync and
+everything else) to move that number outside the noise floor.
+
+### A3: GPU shader mode-search refinement, implemented and board-checked
+
+Added the same +/-1/+/-2 refinement around the coarse winner the CPU
+path already has (`hevc_intra_wavefront.comp`), two extra barriers for
+the whole stage. Compiles clean to SPIR-V off-board (no execution oracle
+exists for this shader - A3's own standing note). Board: mode histogram
+at the same QP27/1080p/`testsrc2` config as the original A3 measurement
+confirms refinement genuinely fires - off-grid modes (outside the old
+11-entry coarse set) now account for ~4% of all CTUs, where before this
+change the shader never selected anything but the coarse grid. Real
+cost: `p_wall_ms` **+3.35%, SIGNIFICANT**. Not yet measured: the actual
+RD benefit at a matched bitrate - SAD can only tie or improve on the
+coarse winner by construction, but that doesn't by itself prove a bytes/
+PSNR win under real VBR rate control, and this pass didn't run that
+comparison. Confirmed cost, unconfirmed benefit - reported as exactly
+that, not rounded up.
+
+### A6 piece 3: ctxInc landmine defused, with a cost this pass almost missed disclosing
+
+Added `enc->ctdepth[]` (one uint8/CTU) so `split_cu_flag`'s ctxInc reads
+real per-CTU depth instead of raw left/above existence - the exact bug
+shape already shipped once on the GPU path (`docs/hevc_scope_note.md`).
+Every CTU on this path still unconditionally splits (uniform CtDepth=1),
+so this changes nothing numerically today: `tools/hevc_host_drift.sh`
+53/53 byte-exact, ctest 6/6 relevant suites. **Board `lab compare` (HEVC
+CPU path) found a real, unexplained +4.96% wall-time cost** despite
+`bytes_p` confirming byte-identity (-0.02%, within noise). Leading
+hypothesis, unconfirmed: adding one field to `hevc_encoder_t` shifted
+later fields' offsets and moved something else in that struct across a
+cache line - a real but indirect mechanism. This change was merged
+without a board timing check, the exact gap A6 piece (2) was already
+called out for and closed - this time the gap wasn't caught until this
+round's own batch board job ran after the fact. Kept anyway (the ctxInc
+fix is a real correctness improvement worth the cost until something
+cheaper is found), but the earlier "pure infrastructure, no behavior
+change" framing was incomplete: no *bitstream* change, but a real
+*wall-time* one, and that should have been checked before merging, not
+after.
+
+### C7: the skip-threshold hypothesis is refuted, not just untested
+
+Real PSNR (fixed 20M/1440p/gop=120/`testsrc2`, `qsweep`'s own PSNR
+machinery - the earlier attempt's stats-file parsing script had a bug
+and never produced a trustworthy number) across the same three
+threshold values C6 byte-swept: 768/1536/3072 give 35.61/35.59/35.60 dB
+- a 0.02 dB spread across a 4x threshold range, i.e. noise, despite C6
+already confirming the same range moves raw byte count substantially
+under fixed QP. Under real VBR rate control, the RC absorbs whatever the
+threshold does to byte count by adjusting QP, so aggregate PSNR converges
+regardless of where the threshold sits. This refutes one of the two live
+hypotheses from §39's P-frame quality finding: tuning
+`BC250_HEVC_SKIP_THRESHOLD` will not close the P-frame-vs-intra-only gap.
+The remaining hypothesis (intra fallback as a quality ceiling below real
+motion compensation, C9's already-flagged gap) is now the only one left.
+
+### C6: light load moves the clock, modestly, without the pin
+
+First attempt at a light-load probe had a broken ffmpeg filter chain
+(missing `-init_hw_device vulkan`) and measured nothing. Fixed and
+re-run with a genuinely light Vulkan compute load: `pp_dpm_sclk`
+BEFORE=13MHz, DURING=29MHz, AFTER=19MHz. A real, modest response - the
+automatic governor is not simply inert, it just doesn't reach the higher
+350/2230MHz DPM states at this load level. Distinct from the original
+finding (the fixed-frequency *pin tool* doing nothing even with root) -
+this is the *default automatic* governor's own behavior under light
+load, tested for the first time.
+
+### C8: decided
+
+NO-GO for now - the packed-headers fix (design already complete,
+`docs/notes/c8-packed-headers.md`) carries a real spec-conformance risk
+on the file/mux output path to fix three cosmetic LIMIT cases on a path
+(streaming) that never hits the bug at all. Revisit if a real user asks
+for the file-output path specifically.
+
+### D1: closed the "needs a board re-measure" gap
+
+Cross-referenced against this round's own fresh H.264 qsweep (already
+gathered in §39): the real GPU-path quality curve is monotonic and
+libx264-shaped (+6.40 dB from 8M to 31M), confirming the rate-control fix
+holds on the actual shipped path, not just the off-board raw-residual
+simulation that originally validated the mechanism.
+
+### D2: still blocked, one new corroborating data point
+
+Confirmed Steam/gamescope has been running continuously for 1 day 5h29m
+- there is no current idle window, and stopping a live session without
+physical console access remains a real risk this item continues to
+decline blind. New data: today's own `scoreboard`/`qsweep` runs (Steam
+confirmed live throughout) landed at a stable 67.2-67.3 fps across two
+independent runs - evidence that an idle-desktop Steam/gamescope session
+(UI up, nothing launched) is not a strong perturber of this metric,
+unlike the documented ~45x hit from real heavy GPU contention. Narrows,
+does not close, the open question.
+
+### New: E1, a real error counter neither key caused
+
+`lab compare`'s H.264 run surfaced `err_alloc_failed=2` and
+`err_slice_overflow=41` (summed over 3x300-frame runs, `bench()`'s
+default `testsrc`/31M/gop=120 config) - identically on both the baseline
+and today's key, so pre-existing and unrelated to anything landed today.
+~4.6% of frames in this specific stress config hit a real slice-buffer
+overflow and fail cleanly (B6's fix working as designed - failing rather
+than corrupting), but a 4.6% frame-failure rate at a bitrate within the
+range D1 flagged as realistic for real sessions (15-50 Mbps) is worth its
+own look. Not investigated this pass - filed as backlog E1.

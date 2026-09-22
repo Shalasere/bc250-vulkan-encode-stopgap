@@ -74,6 +74,22 @@ full reasoning is in `cavlc.c`'s "MEASURED AND REJECTED" comment. It is
 still worth one *board* run, since Zen 2 at BC-250 clocks could shift
 the balance, but nothing off-board justifies the branch.
 
+> **Board, 2026-09-22: no measurable whole-pipeline win.** `lab compare`
+> (H.264, isolates this change - nothing else landed today touches
+> `cavlc.c`'s callers on the H.264 path): `p_wall_ms` delta -0.91%,
+> within noise (floor 0.61%, threshold ~1.22%). The -41% isolated-stage
+> speedup is real (verified twice, see below) but coefficient discovery
+> is only part of CAVLC, which is only part of a frame that also pays
+> for GPU dispatch/sync and everything else `p_wall_ms` includes - **a
+> measured zero at the whole-pipeline level is the honest result here**,
+> not a discrepancy to explain away. Kept: still byte-identical, still a
+> real off-board mechanism improvement, just not one that moves the
+> metric that actually matters for this project's purpose. `err_alloc_
+> failed=2`/`err_slice_overflow=41` also showed up in this same `compare`
+> output, identically on both the baseline and this key - pre-existing,
+> unrelated to this change, and not yet investigated; see the new open
+> item at the end of this file.
+
 **DONE off-board (2026-09-22): the bitmask lever, byte-identical,
 ~-41%.** `cavlc_scan_coeffs` now builds a nonzero bitmask over
 `scanned[]` once, then uses `__builtin_clz` to find `last_idx` and to
@@ -119,6 +135,28 @@ and mode search are invisible to *every* oracle here.
 > theoretical gap inferred from reading the shader. Adding the same
 > refinement stage the CPU path already has is now a board-confirmed
 > opportunity, not attempted here. DEVLOG §38.
+
+> **Implemented and board-confirmed, 2026-09-22: refinement fires, and
+> it has a real, measured cost.** Added the CPU path's own +/-1/+/-2
+> refinement around the coarse winner (angular candidates only), two
+> extra barriers total. Mode histogram, same QP27/1920x1080/`testsrc2`
+> config as the original board measurement (8160 CTUs): Planar still
+> dominates (6549, 80.3%, matching the original 80.2%) but the
+> remaining candidates are no longer confined to the 11-entry coarse
+> grid - off-grid values (3,4,7,8,9,11,12,13,15,16,17,19,20,21,24,25,
+> 27,28,29,32,33 all appear) now make up roughly 4% of all CTUs
+> (~310/8160), confirming the refinement stage is genuinely selecting
+> modes the old coarse-only search could never reach, not just adding
+> dead code. `lab compare` (HEVC GPU-intra path): `p_wall_ms` **+3.35%,
+> SIGNIFICANT** - a real, disclosed throughput cost from the 4 extra
+> SAD evaluations per angular-winner CTU. **Not yet measured: whether
+> this actually improves PSNR/bitrate at a matched setting** - SAD can
+> only tie or improve on the coarse winner by construction, but turning
+> that into an actual bytes/PSNR delta under real VBR rate control needs
+> its own qsweep-vs-qsweep comparison at matching bitrates, which this
+> pass did not run. Until that exists, this is a confirmed real cost
+> with an unconfirmed (though structurally plausible) benefit - do not
+> claim the RD win as proven.
 
 **A4. DONE (2026-09-21).** `hevc_cabac_code_residual_4x4` was really
 6.5–11.5% of frame time on detailed content (not the 5.9% a gprof
@@ -257,6 +295,28 @@ a board `lab qsweep` BD-rate run before any number here is trusted.
 > `max_tb_log2` bump, and the rate-normalized RD comparison this needs
 > are all still real, separate, unattempted work - see the bullets
 > above.
+>
+> **Board, same day: byte-identical confirmed, but NOT free - a real,
+> unexplained +4.96% wall-time cost.** This is a correction to the
+> claim two lines above. `lab compare` (HEVC CPU path, isolates this
+> change - neither A2 nor A3 touches this path): `bytes_p` delta
+> -0.02%, within noise (matches the byte-identity claim). `p_wall_ms`
+> delta **+4.96%, SIGNIFICANT** - a real, measured slowdown from a
+> change that adds exactly one array read and one comparison per CTU,
+> which should not cost anything close to 5% of a ~80ms frame. Not yet
+> root-caused; the leading hypothesis is that adding one `uint8_t
+> *ctdepth` field to `hevc_encoder_t` shifted every later field's
+> offset, moving something else in the same hot struct across a cache
+> line - a real, if indirect, mechanism, but unconfirmed. **This should
+> have been board-timed before merging, exactly the gap A6 piece (2)
+> was called out for and then closed** - it was not, this time, until
+> this round's own batch board run caught it after the fact. Filed as
+> its own open question rather than reverted outright, since the change
+> fixes a real correctness landmine (the ctxInc bug class) that is worth
+> keeping even at this cost until a cheaper implementation is found -
+> but the earlier "pure infrastructure, no behavior change" framing
+> above understated it: no *bitstream* behavior change, but a real
+> wall-time one.
 
 Full writeup, including exactly what (2) undivided-CU splitting and (3)
 all-TU-size transforms would need (a concrete starting point, read from
@@ -481,6 +541,21 @@ service, or this board's SMU firmware is not established. Still
 untested: the actual *light game* load condition this was originally
 about (only a synthetic idle probe was run). DEVLOG §38.
 
+> **Board, 2026-09-22: light load DOES move the clock - modestly,
+> without the pin.** First attempt at this had a broken ffmpeg filter
+> chain (missing `-init_hw_device vulkan`) and measured nothing real;
+> fixed and re-run with a genuinely light Vulkan compute load
+> (`scale_vulkan` down and back up, not the heavy `nlmeans_vulkan`
+> synthetic worst case): `pp_dpm_sclk` BEFORE=13MHz, DURING=29MHz,
+> AFTER=19MHz (not yet settled back to baseline when sampled). A real,
+> if modest, response - the automatic governor does react to light load
+> without the pin being invoked at all, just not by jumping to the
+> higher 350/2230MHz DPM states, which presumably need more sustained
+> utilization than this synthetic light load provides. This is a
+> different question from the original finding (the *pin tool* doing
+> nothing) - it confirms the *default automatic* governor is not simply
+> broken, just conservative at this load level.
+
 **C7. FIRST CUT IMPLEMENTED (2026-09-21), gated off — board-confirmed
 PIXEL-EXACT in every case tested so far.** Zero-motion-SKIP parity with
 the CPU path (not real motion compensation — that's a further step,
@@ -597,6 +672,31 @@ byte-identical to its reference at 7 sizes plus a non-CTU-aligned
 > it currently isn't "faster at the same quality," it's "faster at
 > lower quality," which was never the deal this item was validated on.
 > DEVLOG §39.
+
+> **Board, 2026-09-22: one of the two hypotheses above is refuted -
+> the threshold is not the lever.** Real PSNR (fixed 20M/1440p/gop=120/
+> `testsrc2`, `qsweep`'s own PSNR machinery, not the earlier broken
+> stats-file script) across the same three threshold values C6 already
+> byte-swept:
+>
+> | threshold | fps | PSNR |
+> |---|---|---|
+> | 768 (stricter) | 69.36 | 35.61 dB |
+> | 1536 (default) | 70.69 | 35.59 dB |
+> | 3072 (looser) | 70.17 | 35.60 dB |
+>
+> A 4x range on the threshold moves PSNR by **0.02 dB** - noise, not a
+> trend, even though C6 already confirmed the same range moves byte
+> count substantially under fixed QP. Under real VBR rate control at a
+> fixed bitrate target, the RC absorbs whatever the threshold does to
+> raw byte count by adjusting QP, so the aggregate PSNR converges
+> regardless of where the threshold sits. **This means tuning
+> `BC250_HEVC_SKIP_THRESHOLD` will not close the P-frame-vs-intra-only
+> quality gap above** - the remaining hypothesis (intra fallback is a
+> ceiling below what real motion compensation would deliver, C9's
+> already-flagged gap) is now the only one left standing. Re-tuning the
+> threshold is no longer worth attempting for this purpose; real motion
+> compensation is the only path to closing the gap.
 
 > **Board, 2026-09-21: threshold knob confirmed to work, longer GOP
 > still exact.** Sweep at 1280x720/QP27/gop=30 (default formula gives
@@ -881,3 +981,26 @@ vs Steam down, on the *current* build) to replace the unsourced
 > Steam-UI-vs-real-game run is arguably the more useful one for what
 > this item was actually trying to answer, and needs someone at the
 > physical console to launch and hold open a real game.
+
+---
+
+## E. Opened by the 2026-09-22 board round
+
+**E1. NEW, not yet investigated.** `lab compare`'s H.264 run this round
+(the A2 board check) surfaced two nonzero error counters it flags on
+sight: `err_alloc_failed=2` and `err_slice_overflow=41`, summed across
+3 runs of 300 frames each (`bench()`'s default config: `testsrc`,
+2560x1440, gop=120, 31M) - roughly **4.6% of frames hitting a real
+slice-buffer overflow** (`encoder_h264.c`'s `slice_overflow` path,
+which B6 fixed to fail the frame cleanly rather than silently truncate
+- so this is 41 *failed* frames, not 41 corrupted ones, but still 41
+frames of real content this bench config could not encode at all).
+Identical count on both the baseline and today's key, so nothing
+landed today caused it - it was already there, just never surfaced
+before because nothing previously printed these counters this
+plainly. Not chased this session (out of scope for what this round's
+board job was launched to check) - the counter values, the 31M/`testsrc`
+combination B6 already flagged as capable of exceeding even the
+resized slice buffer on noise-like content, and the exact repro
+command (`tools/lab bench <key>` or any `compare`) are enough to pick
+this up as its own item.
