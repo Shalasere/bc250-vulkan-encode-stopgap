@@ -56,7 +56,11 @@ esac
 
 HOST="${BC250_HOST:-user@10.0.0.104}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAB_REMOTE="/var/home/user/bc250-lab"
+# Must track bc250_lab.sh's own $LAB default/override exactly - this script
+# ships the harness there and bc250_lab.sh reads/writes state there too.
+# Was hardcoded to Bazzite's /var/home/user path; broke outright on a
+# CachyOS reimage where the login is a different user at plain /home.
+LAB_REMOTE="${BC250_LAB_DIR:-/var/home/user/bc250-lab}"
 
 # Keepalive is not optional. A `lab build work` here hung for 76 MINUTES on
 # `ssh ... mkdir -p`, of all things: the board had been power-cycled under a
