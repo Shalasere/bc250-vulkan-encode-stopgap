@@ -278,14 +278,24 @@ static inline void encode_bin(hevc_cabac_t *cb, int ctx_idx, uint32_t bin) {
     cb->low = low << num_bits;
     cb->range = range << num_bits;
     cb->bits_left += num_bits;
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    /* cabac_write_out() drains exactly one byte (bits_left -= 8) per call.
+     * Every increment on this path is bounded by 8 (num_bits is 0 or 1
+     * here, encode_bypass by 1, encode_bypass_bins by <=8, terminate by
+     * <=7), so today a single drain always suffices and `if`/`while` are
+     * provably equivalent - verified by inspection of every caller, not
+     * assumed. `while` costs nothing when one drain is enough and is
+     * simply correct if that bound is ever violated by a future change,
+     * instead of silently leaving undrained bits to desync the next bin -
+     * the same class of bug this project's "measure, don't assume" rule
+     * exists to catch before it ships, not after. */
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 static inline void encode_bypass(hevc_cabac_t *cb, uint32_t bin) {
     cb->low <<= 1;
     if (bin) cb->low += cb->range;
     cb->bits_left++;
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 static inline void encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_bins) {
@@ -296,12 +306,12 @@ static inline void encode_bypass_bins(hevc_cabac_t *cb, uint32_t value, int num_
         cb->low += cb->range * pattern;
         value -= pattern << num_bins;
         cb->bits_left += 8;
-        if (cb->bits_left >= 0) cabac_write_out(cb);
+        while (cb->bits_left >= 0) cabac_write_out(cb);
     }
     cb->low <<= num_bins;
     cb->low += cb->range * value;
     cb->bits_left += num_bins;
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 void hevc_cabac_encode_terminate(hevc_cabac_t *cb, uint32_t bin) {
@@ -318,7 +328,7 @@ void hevc_cabac_encode_terminate(hevc_cabac_t *cb, uint32_t bin) {
         cb->range <<= 1;
         cb->bits_left++;
     }
-    if (cb->bits_left >= 0) cabac_write_out(cb);
+    while (cb->bits_left >= 0) cabac_write_out(cb);
 }
 
 void hevc_cabac_finish(hevc_cabac_t *cb) {
