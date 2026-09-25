@@ -1178,12 +1178,191 @@ fails off-board). Landed; on-board confirmation of `bc250_lab.sh drift
 agent's work, since that's the one path this fix couldn't be exercised
 against here.
 
-**Remaining, not yet reviewed:** ~80 further commits in their history
-(GPU shader techniques - subgroup arithmetic for SAD reduction, reciprocal-
-division removal in a shader, enabling 16-bit shader storage; several more
-`fix(va-api)`/`fix(rate_control)` items around RC mode defaults and CQP/VBR
-handling; a dynamic-realloc approach to the slice-buffer-overflow class B6
-already fixed differently). Candidate list preserved in this session's
-scratch (`/tmp/simpmix_commits.txt` equivalent, regenerable via `git log
-c5a7942..simpmix/main --oneline` once `simpmix` is re-added as a remote)
-for a future pass.
+**G5. Already fixed/not applicable, no action needed (`06b9c9e`, `fb6550b`).**
+`06b9c9e` ("turn the rate control on, and stop resetting it every picture")
+described HEVC being stuck at a fixed QP regardless of requested bitrate,
+via two bugs: `rc_init()` always called with `RC_CQP`, and
+`hevc_encoder_set_qp()` unconditionally stomping `rc.base_qp`/`current_qp`
+on every per-picture `pic_init_qp` call. Both are independently solved on
+our side, more generally: `va_backend.c`'s `bc250_GetConfigAttributes()`/
+`bc250_CreateContext()` already route the caller's real VA-API rate-control
+config attribute into `hevc_encoder_set_rc_mode()` (RC_CQP/RC_VBR/
+RC_LOW_LATENCY, not a `BC250_HEVC_QP`-env-var-gated default), and
+`hevc_encoder_set_qp()`'s `qp_hint_applied` change-detection (backlog D1)
+already stops a resent, unchanged per-picture QP hint from resetting the
+loop, in every RC mode, not just CQP. The commit's own appendix ("encoder's
+own reconstruction is the worse of the two pictures, 25.55 dB vs a
+decoder's") does not reproduce here either: `hevc_host_drift.sh` proves our
+own reconstruction is *byte-identical* to a real decoder's output across
+all 53 cases, which a 25 dB gap would be incompatible with.
+`fb6550b` ("eliminate H.264 scene-change lag and HEVC chroma corruption")
+is two independent fixes, neither applicable: its H.264 half retunes
+`dynamic_governor.c`'s CPU-offload tiering, and that whole file was already
+removed from this tree (see this file's own top-of-repo CLAUDE.md - "The
+CPU-SIMD/governor layer... has been removed... the defects went with it").
+Its HEVC half removes an "illegal merge candidate" GPU-MV injection from
+`derive_merge_candidates()` - our own `derive_merge_candidates()` already
+takes no GPU-MV parameter at all and has never had that injection, per its
+own comment and `docs/notes/dead-motion-search.md`; we went further than
+this fix, not less far.
+
+**G6. `4118dcc` - mixed bag, three sub-findings.** ("fix HEVC merge candidate
+derivation and eliminate FFmpeg CPU tie-up")
+- *Merge-candidate z-scan rewrite* (`hevc_cu_is_available()`/
+  `hevc_cu_rank()` replacing ad-hoc `cu_in_ctu != 3`/`== 0` checks): worked
+  through by hand for this encoder's fixed "every CTU splits into exactly
+  four 8x8 CUs" structure (no deeper quadtree) - the old ad-hoc checks are
+  provably equivalent to the general z-scan-rank comparison for that one
+  fixed partition shape in all four `cu_in_ctu` cases. Confirmed empirically
+  too: `hevc_host_drift.sh`'s 53 cases include multi-CTU P-frame content
+  where a real spec-driven decoder would derive a *different* candidate if
+  our simpler check were wrong, and none do. No action needed unless this
+  encoder ever grows real quadtree depth.
+- *SPS/slice `log2_max_pic_order_cnt_lsb`/POC-LSB width (4-bit vs their
+  8-bit)*: spec-legal at 4 bits for this encoder's reference structure
+  (always exactly `DeltaPOC = -1`, one reference) - HEVC 8.3.1's MSB
+  inference only needs headroom for the actual inter-frame POC delta, and
+  ours is always 1, nowhere near the 4-bit range's ±8 disambiguation
+  window. Board-validated at `qsweep`'s default `gop=120` (DEVLOG §35),
+  which wraps the 4-bit POC LSB 7+ times per GOP and still decodes cleanly
+  via a real decoder - if wraparound were actually broken this would have
+  shown up as decode corruption, not a PSNR improvement. No action needed.
+- *`bc250_EndPicture()` dropping `DRIVER_LOCK` around the synchronous
+  H.264/HEVC encode call itself* (pinning the surface's `ref_count` first,
+  so concurrent filter/hwupload threads aren't blocked for the 10-15ms
+  encode): a real, legitimate technique - the same shape as this project's
+  own sanctioned `bc250_SyncSurface()` lock-drop-before-a-long-wait (see
+  top-of-repo CLAUDE.md's concurrency section) - but NOT ported here. This
+  touches the exact TSan-hardened mutex discipline that file treats as the
+  project's most fragile invariant ("the mutex only works because every
+  accessor takes it"). It needs its own dedicated pass with a TSan run
+  against the concurrency unit test, not a drive-by port bundled into a
+  fork-archaeology sweep - flagging it here as the single highest-value
+  remaining item in this commit rather than either implementing it
+  unverified or losing the idea.
+- Its `gpu_compute.c` changes (persistent `mapped_ptr` instead of
+  map/unmap per upload/download, `is_exported` gating so
+  `gpu_compute_wait_for_image_ready()`'s dma-buf export+ioctl only runs for
+  surfaces an external API actually imported, `next_buffer_hint` round-robin
+  buffer-slot allocation) are real, low-risk, low-to-moderate-value perf
+  ideas, not fixes for anything currently broken. Not implemented this
+  pass; worth picking up with board time.
+
+**G7. DONE - enable the 16-bit shader features the shaders already use
+(`4304022`).** `deblock_filter.comp`, `intra_wavefront.comp`,
+`quantize.comp`, and `reconstruct.comp` all declare SPIR-V `Int16`/
+`StorageBuffer16BitAccess` (confirmed: our own `gpu_compute.c` comment on
+`quant_levels_size` already asserted "verified device support... all true
+on this GPU"), but `bc250_gpu_init()`'s `vkCreateDevice()` only ever
+requested `timelineSemaphore` - never `shaderInt16`,
+`storageBuffer16BitAccess`, or `uniformAndStorageBuffer16BitAccess`. Using
+a SPIR-V capability without enabling the matching device feature is
+undefined behaviour by the Vulkan spec, not merely a validation-layer
+nicety - the fork's own commit reports this manifesting as a real SEGV
+inside `libvulkan_radeon.so` (their v0.4.3) and a 5.3 dB "almost black"
+HEVC corruption (their v0.4.2) on the same GPU family this project targets.
+Fixed by querying `vkGetPhysicalDeviceFeatures2`/
+`VkPhysicalDeviceVulkan11Features` for what the device actually offers and
+chaining that into `VkDeviceCreateInfo.pNext` (falls back to a stderr
+warning, not a hard failure, if a future device doesn't have it - same
+opportunistic-capability pattern as every other feature/extension check in
+this function). Purely additive (only enables features already documented
+as present), so no functional regression is possible; verified off-board
+(`hevc_host_drift.sh` 53/53, ctest 6/6 relevant) since this only affects
+Vulkan device creation and shader dispatch, which the CPU-only host-drift
+harness doesn't exercise at all. **On-board confirmation still pending** -
+this is the one part of this fix a host-only test genuinely cannot reach.
+
+**G8. DONE - three sizes: a one-byte NAL and two 32-bit products
+(`edf78c3`).** CodeQL-class integer-overflow-in-intermediate-expression
+hardening. Two of the three applied: `h264_encoder_create()`'s
+`output_buf_size = width * height * 4 + 65536` and
+`allocate_encoding_buffers()`'s `entropy_size = width * height * 2` both
+computed the product in 32-bit (`uint32_t width, height`) before widening
+to `size_t`/`VkDeviceSize` - harmless at every size this driver accepts
+today (`BC250_MAX_WIDTH`/`HEIGHT` = 4096, per `va_backend.c`), but wrong in
+principle and now cast before multiplying, matching the pattern this
+project already uses everywhere else buffer sizes are computed. The third
+(`hevcps.c`'s one-byte-NAL-at-EOF buffer over-read) doesn't apply: that
+tool doesn't exist in this tree. Verified off-board:
+`hevc_host_drift.sh` 53/53, ctest 6/6 relevant.
+
+**G9. DONE - the reference picture changes hands, it does not get copied
+(`af7626a`, HEVC half only).** `encode_core()` `memcpy`'d
+`recon_y`/`recon_cb`/`recon_cr` into `prev_recon_y`/`cb`/`cr` at the end of
+every frame - ~3 MB/frame at 1080p. `prev_recon_*` is only ever *read*
+(motion search and the skip path's copy) and `recon_*` is only ever
+*written* (every pixel of the coded area, by one CU or another), so the
+two buffers can simply change places - both are separately `malloc()`'d at
+the same size in `hevc_encoder_create_depth()` and freed together in
+`hevc_encoder_destroy()`, confirmed by reading both sites before porting.
+**Board-testing note that would have shipped a real bug:** the first
+attempt placed the pointer swap *before* the `BC250_HEVC_DEBUG_RECON` debug
+dump, which reads `encoder->recon_y` - after the swap that name means the
+*previous* frame's buffer (or uninitialized memory on frame 0), not the one
+just encoded. `hevc_host_drift.sh` (whose oracle IS that debug dump) caught
+it immediately as a 53/53 - not the pointer-swap idea itself, which is
+correct, but where it landed relative to code that names the buffer by role
+rather than by frame. Fixed by moving the swap to after the dump. Verified
+off-board (53/53, ctest 6/6 relevant) only; this is a CPU-only path so a
+board isn't required to trust the fix, but a real-content run is still
+worth it opportunistically.
+Not ported from the same commit: its SSSE3 PSHUFB chroma de-interleave
+(real, low-risk, but touches four call sites in `encoder_h265.c` with
+slightly different strides/pointers each - left for a dedicated pass
+rather than rushed at the end of this one) and `hevc_intra.c`'s
+`zorder_rank()` division-to-shift rewrite (that function doesn't exist in
+this tree at all - our z-scan availability logic lives in the newer,
+generic `gather_wide_n()` per G2, a different implementation already).
+
+**Reviewed, not applicable (`0451398`, `8f81318`, `56ea5fe`, `b0357b3`,
+`1519255`, `9b85e36`, `106ea01`).**
+- The `0451398`→`8f81318`→`56ea5fe`→`b0357b3`→`1519255` chain is the fork
+  iterating on its own regressions around VA-API rate-control defaults
+  (advertising `CBR|VBR` only, then adding `BC250_ENABLE_CQP`/`ICQ`, fixing
+  a `pic_init_qp`-vs-RC-mode interaction it broke along the way, then a
+  program-name-sniffed CBR-vs-low-latency split and VUI framerate
+  extraction). None of it fixes anything broken here: this project's
+  design center is explicit CQP (`hevc_host_drift.sh`, `lab gate`, `lab
+  qsweep` all pass `-rc_mode CQP -qp` or an explicit bitrate directly, never
+  a naive default), so gating CQP behind an env var would regress our own
+  harness, not fix it. `8f81318`'s `VAConfigAttribEncPackedHeaders` change
+  (advertising `SEQUENCE` instead of `NONE`) actively contradicts our own
+  considered, documented choice in `bc250_GetConfigAttributes()` (avoiding
+  an MP4/MKV extradata-vs-in-band-header desync) - explicitly rejected, not
+  merely skipped. `VA_RC_ICQ` support and VUI-driven `set_fps()` are
+  plausible future additive features if a real caller ever needs them; no
+  evidence one does yet.
+- `9b85e36` (subgroup-arithmetic SAD reduction in `motion_estimation.comp`)
+  is algebraically safe (the reduction is over `uint`, not float, so lane
+  order doesn't matter) and a real barrier-count/LDS-footprint win, but a
+  GPU shader change can only be validated on hardware, and this project's
+  own hard-won rule is that GPU motion-estimation output is not always
+  deterministic even without such a change (top-of-repo CLAUDE.md, "GPU
+  motion-estimation non-determinism reaches plain testsrc too") - a real
+  regression here would be hard to distinguish from known noise without
+  dedicated board time. Left for a future pass with the board free.
+- `106ea01`'s CPU-side half (reciprocal-multiply-shift quantization,
+  zero-residual/zero-coeff transform bypass) is already independently
+  implemented on our side, and more thoroughly: `hevc_intra.c`'s
+  `quantize_levels()` already replaces the division with a per-`rem` magic
+  constant and variable shift (`QUANT_MAGIC`/`QUANT_RECIP_SHIFT`), verified
+  against a kept literal-division reference (`hevc_quantize_4x4_ref()`) by
+  `tests/test_hevc_encode.c`; and `hevc_dequant_itransform_4x4()`'s own
+  comment documents a zero-coefficient bypass being tried, *interleaved A/B
+  measured*, and explicitly rejected as under this project's ~2.5%
+  significance floor (+0.71% on the largest, most trustworthy sample) -
+  more rigor than the fork's commit message shows for the same idea. Its
+  GPU-MV-guidance half (feeding `gpu_compute_dispatch_me_only()`'s vectors
+  into `encode_cu()`'s skip fast-path) reintroduces exactly the GPU-MV
+  consumption this project deliberately removed (see G5's `fb6550b` note
+  and `docs/notes/dead-motion-search.md`) - not applicable by design.
+
+**Remaining, not yet reviewed:** ~66 further commits in their history -
+mostly GPU shader/VA-API surface area not yet read in this pass (a
+zero-motion-search cost-model tweak in `8f81318`'s CU-skip threshold and
+DC-only intra fallback at high quality-preset levels, `4721c97`'s
+CABAC+MPM changes, `ef2466f`'s 4x4 transform vectorization, `7c20273`'s
+multi-core slice changes). `simpmix` remote still configured locally
+(`/tmp/simpmix-fork`); regenerate the list via `git log
+c5a7942..simpmix/main --oneline`.

@@ -1731,7 +1731,7 @@ h264_encoder_t *h264_encoder_create(bc250_gpu_context_t *gpu_ctx,
      * below). At 1440p this is 14.8 MB vs 7.4 MB - an irrelevant amount of
      * host memory for one encoder instance - and it took the pathological
      * case from 12-of-12 frames refused to 0. */
-    encoder->output_buf_size = width * height * 4 + 65536;
+    encoder->output_buf_size = (size_t)width * height * 4 + 65536;
     encoder->output_buf = malloc(encoder->output_buf_size);
     if (!encoder->output_buf) {
         free(encoder);

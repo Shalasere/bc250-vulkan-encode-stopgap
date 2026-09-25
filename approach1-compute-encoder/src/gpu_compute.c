@@ -341,7 +341,7 @@ static int allocate_encoding_buffers(gpu_context_t *ctx, uint32_t width, uint32_
     VkDeviceSize quant_levels_size = num_mbs * 24 * 16 * sizeof(int16_t);
     VkDeviceSize nz_count_size = num_mbs * 24 * sizeof(uint32_t);
     VkDeviceSize pred_mode_size = num_mbs * sizeof(uint32_t);
-    VkDeviceSize entropy_size = width * height * 2; /* Generous */
+    VkDeviceSize entropy_size = (VkDeviceSize)width * height * 2; /* Generous */
 
     VkDeviceSize dc_coeff_size = num_mbs * 24 * sizeof(int);
 
@@ -792,6 +792,56 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
         .timelineSemaphore = VK_TRUE
     };
 
+    /* 16-bit storage has to be ENABLED, not merely supported.
+     *
+     * deblock_filter, intra_wavefront, quantize and reconstruct declare
+     * Int16 and StorageBuffer16BitAccess: quantized levels are stored as
+     * int16_t (see allocate_encoding_buffers()'s comment on quant_levels_size
+     * - "verified device support ... all true on this GPU"). Verifying
+     * support and enabling it are different things in Vulkan: a shader may
+     * only use what vkCreateDevice was actually asked for, and until now
+     * this device was only ever asked for timelineSemaphore. Without these
+     * three features the SPIR-V these shaders load is invalid to run, and
+     * using an unenabled capability is undefined behaviour - not merely a
+     * validation-layer nicety, since a future Mesa/RADV update is free to
+     * start enforcing it at any point.
+     *
+     * Requested opportunistically, like every other capability check in
+     * this function: a device that turns out not to offer these still gets
+     * a working H.264 path and a line in the log saying why, instead of
+     * failing somewhere further along. */
+    VkPhysicalDeviceVulkan11Features have11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
+    VkPhysicalDeviceFeatures2 have2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &have11
+    };
+    vkGetPhysicalDeviceFeatures2(ctx->physical_device, &have2);
+
+    VkPhysicalDeviceVulkan11Features features11 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+        .pNext = &features12,
+        .storageBuffer16BitAccess = have11.storageBuffer16BitAccess,
+        .uniformAndStorageBuffer16BitAccess = have11.uniformAndStorageBuffer16BitAccess
+    };
+    VkPhysicalDeviceFeatures2 features2 = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = &features11
+    };
+    features2.features.shaderInt16 = have2.features.shaderInt16;
+
+    if (!have2.features.shaderInt16 || !have11.storageBuffer16BitAccess ||
+        !have11.uniformAndStorageBuffer16BitAccess) {
+        fprintf(stderr, "[bc250-gpu] warning: this device does not offer 16-bit "
+                        "shader support (shaderInt16=%d storageBuffer16=%d "
+                        "uniformAndStorageBuffer16=%d) - deblock_filter/"
+                        "intra_wavefront/quantize/reconstruct will misbehave\n",
+                (int)have2.features.shaderInt16,
+                (int)have11.storageBuffer16BitAccess,
+                (int)have11.uniformAndStorageBuffer16BitAccess);
+    }
+
     /* VK_KHR_external_memory_fd (provides vkGetMemoryFdKHR) and
      * VK_EXT_external_memory_dma_buf (adds the DMA_BUF handle type these
      * NV12 images are created/allocated with - see gpu_compute_create_image())
@@ -892,7 +942,7 @@ int bc250_gpu_init(bc250_gpu_context_t *ctx) {
 
     VkDeviceCreateInfo dev_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        .pNext = &features12,
+        .pNext = &features2,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &q_info,
         .enabledExtensionCount = device_ext_count,

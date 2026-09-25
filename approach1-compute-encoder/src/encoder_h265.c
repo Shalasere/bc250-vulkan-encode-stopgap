@@ -1583,21 +1583,14 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
         rc_update_stats(&encoder->rc, (int)(total * 8));
     }
 
-    /* Update reference buffers for subsequent P-frames */
-    size_t luma_size = (size_t)encoder->coded_width * encoder->coded_height;
-    size_t chroma_size = (size_t)(encoder->coded_width / 2) * (encoder->coded_height / 2);
-    memcpy(encoder->prev_recon_y, encoder->recon_y, luma_size);
-    memcpy(encoder->prev_recon_cb, encoder->recon_cb, chroma_size);
-    memcpy(encoder->prev_recon_cr, encoder->recon_cr, chroma_size);
-    encoder->has_ref = true;
-    encoder->poc++;
-
     /* Debug-only: dump this encoder's own idea of the reconstructed picture
      * (i.e. what a bug-free decoder given this exact bitstream SHOULD
      * reproduce) - lets a diff against a real decoder's actual output
      * localize whether a mismatch is in the prediction/transform/quant
      * math (this dump would ALSO look wrong) or in CABAC/bitstream framing
-     * (this dump looks right, but a real decoder's output doesn't). */
+     * (this dump looks right, but a real decoder's output doesn't). Must run
+     * BEFORE the reference-buffer handoff below: it reads encoder->recon_y,
+     * which only holds THIS frame's reconstruction up until that swap. */
     if (getenv("BC250_HEVC_DEBUG_RECON")) {
         size_t ysz = (size_t)encoder->coded_width * encoder->coded_height;
         size_t csz = (size_t)(encoder->coded_width / 2) * (encoder->coded_height / 2);
@@ -1616,6 +1609,25 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
             fclose(fa);
         }
     }
+
+    /* Update reference buffers for subsequent P-frames.
+     *
+     * The reference picture changes hands, it does not get copied. prev_recon_*
+     * is only ever READ (motion search and the skip path's copy) and recon_*
+     * is only ever WRITTEN - every pixel of the coded area, by one CU or
+     * another - so swapping the pointers leaves both sides holding exactly
+     * what a memcpy used to give them, without the ~3MB-per-1080p-frame copy.
+     * Both buffers stay allocated at the same size (hevc_encoder_create_depth())
+     * and are freed together in hevc_encoder_destroy(), so the swap is
+     * transparent to both. */
+    {
+        uint8_t *t;
+        t = encoder->prev_recon_y;  encoder->prev_recon_y  = encoder->recon_y;  encoder->recon_y  = t;
+        t = encoder->prev_recon_cb; encoder->prev_recon_cb = encoder->recon_cb; encoder->recon_cb = t;
+        t = encoder->prev_recon_cr; encoder->prev_recon_cr = encoder->recon_cr; encoder->recon_cr = t;
+    }
+    encoder->has_ref = true;
+    encoder->poc++;
 
     encoder->frame_count++;
     return (int)total;
