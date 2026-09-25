@@ -1335,7 +1335,16 @@ drift() {
     # adapts - every run then uses the SAME initial QP and a bitrate sweep
     # silently measures one operating point four times.
     local -a RCARGS=(-b:v "$bitrate")
-    [ -n "$qp" ] && RCARGS=(-rc_mode CQP -qp "$qp")
+    local -a CQPENV=()
+    if [ -n "$qp" ]; then
+        RCARGS=(-rc_mode CQP -qp "$qp")
+        # CQP is no longer advertised by default (va_backend.c's
+        # bc250_GetConfigAttributes) - a naive caller landing in it with no
+        # explicit QP is exactly the bitrate-blowup bug that default exists
+        # to prevent. This call site DOES ask for CQP explicitly, so opt
+        # back in.
+        CQPENV=(BC250_ENABLE_CQP=1)
+    fi
     case "$codec" in h264|hevc) ;; *) die "drift: --codec must be h264 or hevc";; esac
 
     local bd; bd=$(art_dir "$key") || exit 1
@@ -1350,6 +1359,7 @@ drift() {
 
     local -a envv=(BC250_DUMP_RECON_FRAMES=1 "BC250_DUMP_DIR=$d/dump" BC250_HEVC_DEBUG_RECON=1)
     [ "$codec" = hevc ] && envv+=(BC250_ENABLE_HEVC=1)
+    envv+=("${CQPENV[@]}")
     if [ -n "$envs" ]; then
         local IFS=,; for kv in $envs; do [ -n "$kv" ] && envv+=("$kv"); done
     fi

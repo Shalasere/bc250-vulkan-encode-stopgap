@@ -240,3 +240,32 @@ sudo ./tools/bc250_uninstall.sh
 # Remove the DKMS audio fix:
 cd audio-fix && sudo ./uninstall_dkms.sh
 ```
+
+---
+
+## 11. FFmpeg: "Driver does not support any RC mode compatible with selected options"
+
+### Symptoms
+A plain FFmpeg command with no explicit rate-control flags refuses to open the encoder at all:
+```text
+[hevc_vaapi @ 0x...] Driver does not support any RC mode compatible with selected options (supported modes: CBR, VBR).
+Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+```
+or, if you passed `-rc_mode CQP` explicitly without also setting `BC250_ENABLE_CQP=1`:
+```text
+[hevc_vaapi @ 0x...] Driver does not support CQP RC mode (supported modes: CBR, VBR).
+```
+
+### Cause
+This is deliberate, not a bug: **Constant QP (CQP) is fully implemented and supported, but is no longer advertised by default.** A caller that gives FFmpeg no `-b:v`/`-qp`/`-rc_mode` at all will have FFmpeg silently pick a rate-control mode on its own - and for both `h264_vaapi` and `hevc_vaapi` against this driver, that silent default request turned out to be exactly CQP, at a single fixed QP guessed from a hardcoded 4 Mbps/generic-content assumption with no feedback loop to correct it. Measured on real content (Big Buck Bunny, 1080p24): that guess cost **2.5-3.7x the intended bitrate** compared to the identical request made explicitly via VBR - a large file, silently, with no error at all. Refusing the encoder outright when nothing specific was actually requested is the fix: a loud, immediate error is strictly better than a quietly oversized file.
+
+### Action Needed
+Give FFmpeg an explicit target - either is fine, and both are correctly rate-controlled on this driver:
+```bash
+# Bitrate-driven (recommended for anything going to a file or a real player):
+ffmpeg -i input.mp4 -c:v hevc_vaapi -rc_mode VBR -b:v 4M output.mp4
+
+# Constant QP (deterministic single-QP output, e.g. for byte-exactness testing):
+BC250_ENABLE_CQP=1 ffmpeg -i input.mp4 -c:v hevc_vaapi -rc_mode CQP -qp 27 output.mp4
+```
+`tools/bc250_lab.sh`'s own `drift --qp=<N>` already sets `BC250_ENABLE_CQP=1` for you - this only matters when driving the driver directly.

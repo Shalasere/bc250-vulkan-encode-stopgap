@@ -120,7 +120,37 @@ VAStatus bc250_GetConfigAttributes(VADriverContextP ctx, VAProfile profile, VAEn
                 attrib_list[i].value = VA_RT_FORMAT_YUV420;
                 break;
             case VAConfigAttribRateControl:
-                attrib_list[i].value = VA_RC_CBR | VA_RC_VBR | VA_RC_CQP;
+                /* CBR/VBR only by default. CQP is real and fully supported -
+                 * bc250_CreateContext() below still honors an explicit
+                 * VA_RC_CQP request unconditionally - but it is NOT
+                 * advertised unless BC250_ENABLE_CQP=1, because a caller
+                 * that queries this attribute and gets CQP back as an
+                 * option, without ever asking for a specific QP or bitrate,
+                 * can end up defaulting into it anyway.
+                 *
+                 * That is not hypothetical: a plain `ffmpeg -c:v hevc_vaapi`
+                 * with no -b:v/-qp at all negotiated exactly VA_RC_CQP
+                 * against this driver, landing on whatever QP
+                 * rc_estimate_base_qp() guesses from a hardcoded 4 Mbps/
+                 * generic-content assumption (rate_control.c) - a single
+                 * fixed QP with no feedback loop at all. Measured on real
+                 * content (Big Buck Bunny, 1080p24, 60s): that QP guess
+                 * (~21-27 depending on rounding) cost 13.1 Mbps at HEVC's
+                 * own QP 27 alone, against 3.9 Mbps for the identical
+                 * request made explicitly via VBR - a >3x difference for
+                 * the exact same "I didn't ask for anything specific" input,
+                 * because CQP by definition cannot adapt to what the loop
+                 * measures and VBR/CBR can. Advertising only the modes that
+                 * *can* adapt makes a naive caller's silent default land
+                 * somewhere bounded instead.
+                 *
+                 * This project's own tooling that deliberately wants CQP
+                 * (tools/bc250_lab.sh's `drift --qp=N`) sets
+                 * BC250_ENABLE_CQP=1 itself - see that call site. */
+                attrib_list[i].value = VA_RC_CBR | VA_RC_VBR;
+                if (getenv("BC250_ENABLE_CQP")) {
+                    attrib_list[i].value |= VA_RC_CQP;
+                }
                 break;
             case VAConfigAttribEncPackedHeaders:
                 /* bc250_RenderPicture() below treats VAEncPackedHeaderParameterBufferType

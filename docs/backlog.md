@@ -1580,10 +1580,87 @@ tracked separately because it came from a direct user report against
 Verified off-board only (`hevc_host_drift.sh` 53/53, `ctest` 6/6 relevant,
 plus a direct manual check of all three drain-mode decisions via
 `BC250_DEBUG_RC=1` against the standalone `hostrepro` harness - see DEVLOG
-§42.4). **Not yet re-measured end-to-end on the board**: the original
-3.7x file-size gap hasn't been reproduced and re-measured after this fix,
-so this closes the mechanism that plausibly explains it, not yet confirmed
-as the complete explanation. The separate RC-mode-*negotiation* question
-(what this driver advertises via `VAConfigAttribRateControl` when ffmpeg
-asks with no explicit `-rc_mode`) is still open - see section G's note on
-`0451398`→`b0357b3`.
+§42.4). **Superseded by H2's board measurement**: re-measured end-to-end
+against real content, this fix on its own was NOT the dominant cause of
+the original report - H2 found the actual mechanism. Kept as a real,
+independently-justified fix (it does correctly separate live-streaming
+drain from file-encode drain), just not the whole story.
+
+**H2. DONE - CQP was the silent default for a caller who asked for
+nothing, board-confirmed as the actual mechanism behind H1's report.**
+Re-measuring H1 end-to-end (real Big Buck Bunny content, both codecs)
+found the RC drain fix alone didn't close the gap - a plain `ffmpeg -c:v
+h264_vaapi`/`hevc_vaapi` with zero rate-control flags still produced
+14.8-15.1 Mbps, and `BC250_DEBUG_RC=1` showed why: it negotiates
+`VAConfigAttribRateControl == VA_RC_CQP` *exactly*, landing on a QP
+guessed from a hardcoded 4 Mbps/generic-content assumption
+(`rc_estimate_base_qp()`) with no feedback loop to correct it, since CQP
+is a fixed operating point by definition. `bc250_GetConfigAttributes()`
+was advertising `CBR | VBR | CQP` unconditionally, so a caller with no
+opinion at all could still land in the one mode that can't adapt.
+
+Board-measured, controlling one variable at a time (real content, 1080p24,
+60s): explicit `-rc_mode VBR -b:v 4M` hits 3.89-3.99 Mbps precisely for
+*both* codecs - the RC algorithm itself is sound. Explicit `-rc_mode CQP
+-qp 27` costs 6.28 Mbps (H.264) vs. 13.1 Mbps (HEVC) - a real, separate
+2.1x gap at the *identical* QP, tracked as H3 below since it's a different
+mechanism (see there). The naive-default 14.8-15.1 Mbps sits close to the
+CQP-27 numbers, consistent with landing in an unadapting CQP state rather
+than a properly-adapting one.
+
+Fixed the same way this fork's `0451398`→`b0357b3` chain tried to
+(backlog section G's earlier review of that chain declined to port it
+verbatim, for reasons that no longer apply now that this is a confirmed,
+not hypothetical, mechanism): `bc250_GetConfigAttributes()` no longer
+advertises CQP by default, only `CBR | VBR`. `BC250_ENABLE_CQP=1` re-adds
+it - `bc250_CreateContext()`'s actual mode-selection logic is completely
+unchanged, this only touches what's offered to a caller deciding what to
+request. `tools/bc250_lab.sh`'s one call site that wants CQP (`drift
+--qp=<N>`) sets the env var itself now.
+
+**The actual effect on a naive call was a genuine surprise, not the hoped-
+for outcome, and is recorded honestly rather than oversold**: FFmpeg's own
+client-side check has no "try the next mode" fallback - denied CQP, it
+refuses outright (`Driver does not support any RC mode compatible with
+selected options (supported modes: CBR, VBR)`) rather than silently
+falling through to VBR. So the fix turns "silently 2.5-3.7x oversized
+file" into "loud, immediate, actionable error" - a real improvement, just
+not "naive callers now get a sane bounded default for free." Documented
+for the next person who hits either error string:
+`docs/troubleshooting.md` §11.
+
+Verified board-side, not just reasoned about: naive-default now refused
+cleanly (both codecs), explicit CQP with `BC250_ENABLE_CQP=1` reproduces
+the exact same byte count as the pre-fix measurement (98,368,368 bytes,
+same QP/content), explicit CQP without the opt-in is refused with the
+analogous error. Off-board: `ctest` 6/6 relevant, `hevc_host_drift.sh`
+53/53 (neither touches the VA-API attribute layer this changes).
+Full writeup: `docs/DEVLOG.md` §43.
+
+**H3. Real, documented, NOT a quick fix - HEVC lacks real motion
+compensation, costing ~2x the bits of H.264 at matched QP on real motion
+content.** Isolated cleanly in H2's own measurement: the H.264/HEVC size
+ratio at QP 27 is 1.09x with P-frames removed entirely (`-g 1`, all-
+intra) and 2.09x with them active (`-g 120`) - the *entire* 2x gap is
+P-frame behavior, not intra-coding efficiency (which is already at
+parity). This is this project's own documented, known limitation working
+exactly as expected once real (not synthetic) content exercises it: HEVC
+P-frames are zero-motion-skip-or-intra-fallback only (no AMVP, no MVD
+signalling, no inter residual - see `derive_merge_candidates()`'s own
+comment and `docs/notes/dead-motion-search.md`), so any block that can't
+pass the static-skip threshold gets fully intra-coded from scratch every
+frame, where H.264's real motion-compensated inter prediction captures
+the same motion for a fraction of the cost. Never visible before this
+session because every prior HEVC quality/QP measurement in this project's
+own history ran on synthetic or all-intra content, where P-frame behavior
+either isn't exercised or doesn't matter.
+
+Explicitly not attempted: giving HEVC real motion compensation is a
+substantial encoder feature (a real motion search, AMVP candidate
+derivation, MVD entropy coding, `rqt_root_cbf`/inter residual coding) -
+comparable in scope to G17's HEVC multi-slice threading, and deserves the
+same treatment: its own dedicated, deliberately-scoped task with real
+board verification at every step, not something to bolt onto an RC-fix
+session. Tracked here so the next pass has the actual measured cost
+(2.09x, isolated from everything else) to work from instead of a vague
+"HEVC seems worse" impression.

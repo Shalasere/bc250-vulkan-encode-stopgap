@@ -5301,3 +5301,73 @@ explicit `-rc_mode`) is a separate, still-unreviewed question - see
 `docs/backlog.md`'s fork-review section G for the parallel fork's own
 attempt at that (`0451398`→`b0357b3`, reviewed and not adopted as-is, for
 reasons unrelated to this fix).
+
+## 43. Root-caused and fixed: the RC-mode-negotiation half of the same bug - CQP was the silent default, now it's an explicit opt-in
+
+§42 fixed the drain mechanism; it turned out not to be the dominant cause
+of the original report. Board-measured with real content (Big Buck Bunny,
+1080p24, 60s), holding everything else fixed:
+
+| request | result |
+|---|---|
+| `-rc_mode VBR -b:v 4M` (either codec) | 3.89-3.99 Mbps - dead on target |
+| `-rc_mode CQP -qp 27`, H.264 | 6.28 Mbps (a fixed cost, not a bug) |
+| `-rc_mode CQP -qp 27`, HEVC | 13.1 Mbps - **2.1x H.264 at the identical QP** |
+| all-intra (`-g 1`) at QP 27, either codec | ratio drops to 1.09x |
+| plain `ffmpeg -c:v h264_vaapi`/`hevc_vaapi`, no flags at all | 14.8-15.1 Mbps |
+
+Two separate findings fell out of this table. The all-intra-vs-normal-GOP
+comparison (1.09x vs 2.09x) isolates a real, separate, and *architectural*
+gap - HEVC's P-frames are zero-motion-skip-or-intra-fallback only, no real
+motion compensation, so real motion content pays full intra cost every
+frame where H.264 pays a cheap MC-residual cost instead. That's tracked
+separately (backlog section H2) since it's a large feature, not a fix.
+
+The naive-default row is the one that actually explains the original
+report: a plain `ffmpeg -c:v hevc_vaapi` with *zero* rate-control flags
+negotiated `VAConfigAttribRateControl == VA_RC_CQP` against this driver -
+exactly, not as a fallback among several options - landing on whatever QP
+`rc_estimate_base_qp()` guesses from a hardcoded 4 Mbps/generic-content
+assumption (`rate_control.c`), with no feedback loop to correct it since
+CQP mode is a single fixed point by definition. `bc250_GetConfigAttributes()`
+(`va_backend.c`) was advertising `VA_RC_CBR | VA_RC_VBR | VA_RC_CQP`
+unconditionally, so a caller who never asked for anything specific could
+still end up in the one mode that can't adapt to what it's given.
+
+Fixed by no longer advertising CQP by default - only `CBR | VBR`, both of
+which measure and correct toward whatever bitrate they're actually told to
+hit. `BC250_ENABLE_CQP=1` re-adds it for anyone who wants it explicitly
+(`bc250_CreateContext()`'s own mode-selection logic, which honors whatever
+`VAConfigAttribRateControl` value a config was actually created with, is
+completely unchanged - this only touches what gets offered when a caller
+asks what's available before deciding what to request).
+
+**What this actually does to a naive call turned out to be a genuine
+surprise, not the hoped-for outcome:** FFmpeg's own client-side check
+(queries `VAConfigAttribRateControl` before ever calling `vaCreateConfig`)
+does not have a "try the next best mode" fallback - it computes one
+specific request, and if that request isn't in the advertised set, it
+refuses outright with `Driver does not support any RC mode compatible
+with selected options (supported modes: CBR, VBR)`, for *both* codecs.
+It does not silently fall through to VBR/CBR on its own. So the practical
+effect isn't "naive callers now get a sane bounded default automatically"
+- it's "naive callers now get a loud, immediate, actionable error instead
+of a silently 2.5-3.7x oversized file." Confirms clean either way: the
+explicit-CQP-with-opt-in path reproduces the exact same 98,368,368-byte
+result measured before this change (byte-for-byte, same QP, same
+content), and the explicit-CQP-without-opt-in path is refused with an
+analogous, specific error (`Driver does not support CQP RC mode`).
+`docs/troubleshooting.md` §11 documents both error strings and the fix
+for a real user hitting either one. `tools/bc250_lab.sh`'s one call site
+that genuinely wants CQP (`drift --qp=<N>`) sets `BC250_ENABLE_CQP=1`
+itself now.
+
+Verified off-board (ctest 6/6 relevant, `hevc_host_drift.sh` 53/53 -
+neither exercises the VA-API attribute-negotiation layer this touches)
+and on the board directly against real FFmpeg invocations: the naive-
+default case for both codecs, the CQP-opt-in case, and the CQP-without-
+opt-in case all behaved exactly as designed, not merely as hoped.
+`test_va_api.c`'s own CQP/VBR config-creation tests call `vaCreateConfig`
+directly with a hardcoded attribute value and never query
+`bc250_GetConfigAttributes` for the default, so they're unaffected and
+needed no changes.
