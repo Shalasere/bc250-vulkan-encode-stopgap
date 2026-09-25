@@ -1446,3 +1446,52 @@ docs + a `PutImage` parameter-shadowing fix worth a quick look). `simpmix`
 remote still configured locally (`/tmp/simpmix-fork`); regenerate the list
 via `git log
 c5a7942..simpmix/main --oneline`.
+
+---
+
+## H. User-reported, not from fork archaeology (2026-09-24)
+
+**H1. DONE - rate control drained by wall-clock time unconditionally,
+ballooning file-encode bitrate.** Real user report (oblique99, DM to
+Shalasere): plain `ffmpeg -c:v h264_vaapi`/`hevc_vaapi` (no explicit
+`-b:v`/`-qp`) on the same Big Buck Bunny source gave 281 MiB/3.9 Mbps on an
+Intel iGPU vs. 1.00 GiB/14.4 Mbps on this driver - roughly 3.7x. Root
+cause: `rate_control.c`'s `rc_update_stats()` has drained its leaky bucket
+by real `CLOCK_MONOTONIC` elapsed time, unconditionally, since §16
+(DEVLOG) - correct for live streaming (a network consumes frames in real
+time, so a slow encoder needs a proportionally bigger per-frame budget to
+hit its target bitrate over the wire) but wrong for file/offline encoding
+(a container's declared bitrate comes from `total_bits / (frame_count /
+nominal_fps)`, not from how long the encode actually took, so the same
+"catch up to real time" inflation goes straight into the file instead of
+being absorbed by network pacing). HEVC's CPU-only path (~10 fps in this
+project's own numbers) hits this constantly; H.264 less often but not
+never.
+
+Fixed: `rc_update_stats()` now picks nominal (fixed per-frame quota) drain
+by default, and only uses wall-clock drain when
+`program_invocation_short_name` matches a recognized live-streaming server
+(`sunshine`, `wivrn-server`, `wivrn`) - `BC250_RC_NOMINAL_DRAIN=1`/
+`BC250_RC_WALLCLOCK_DRAIN=1` force either direction explicitly.
+`BC250_DEBUG_RC=1` now logs the decision and the process name it was based
+on. Full writeup, evidence, and verification: `docs/DEVLOG.md` §42.
+
+A parallel community fork (simpmix/bc250-encoding-decoding-fix, commit
+`1519255`) independently found and fixed the same underlying mechanism -
+useful as a cross-check that this is the right root cause, though the
+exact fix (this project's own drain-mode cache, matching the existing
+`BC250_RC_NOMINAL_DRAIN` idiom already in this file) wasn't copied
+verbatim. See backlog section G for that fork's other work; this item is
+tracked separately because it came from a direct user report against
+*this* codebase, not from reading the fork's history.
+
+Verified off-board only (`hevc_host_drift.sh` 53/53, `ctest` 6/6 relevant,
+plus a direct manual check of all three drain-mode decisions via
+`BC250_DEBUG_RC=1` against the standalone `hostrepro` harness - see DEVLOG
+§42.4). **Not yet re-measured end-to-end on the board**: the original
+3.7x file-size gap hasn't been reproduced and re-measured after this fix,
+so this closes the mechanism that plausibly explains it, not yet confirmed
+as the complete explanation. The separate RC-mode-*negotiation* question
+(what this driver advertises via `VAConfigAttribRateControl` when ffmpeg
+asks with no explicit `-rc_mode`) is still open - see section G's note on
+`0451398`→`b0357b3`.

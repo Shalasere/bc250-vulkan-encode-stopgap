@@ -5,6 +5,11 @@
  *
  * rate_control.c - Proportional-Integral CBR/VBR/Low-Latency rate controller
  */
+/* _GNU_SOURCE for program_invocation_short_name (rc_drain_mode()'s live-
+ * streaming-process detection) - must precede every include, same rule as
+ * gpu_compute.c's own _GNU_SOURCE comment. Safe project-wide-inconsistent:
+ * nothing else in this file needs a GNU extension. */
+#define _GNU_SOURCE
 #include "rate_control.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +17,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <errno.h>
 
 /*
  * rc_estimate_base_qp - derive a starting QP from the requested bitrate and
@@ -249,28 +255,65 @@ void rc_update_stats(rate_control_t *rc, int bits_used) {
      * from injecting a huge one-shot drain that would slam QP to qp_min;
      * outside those cases it is a no-op. Falls back to the old fixed quota
      * when no timestamp is available yet. See docs/DEVLOG.md §16. */
-    /* TEST-ONLY (BC250_RC_NOMINAL_DRAIN=1): pin the drain to the fixed
-     * per-frame quota by pretending no clock is available, taking the
-     * already-existing fallback path below.
+    /* Which of the two drain models actually applies here.
      *
-     * Why this exists: the wall-clock drain makes the encoder's output a
-     * function of how fast it ran, which is correct for live streaming but
-     * destroys byte-exactness as a verification oracle - any optimization
-     * that changes speed also legitimately changes the bitstream, so a
-     * differing md5 no longer distinguishes "faster" from "broken". Setting
-     * this makes output timing-independent so an A/B of a supposedly
-     * output-neutral change can be checked byte-for-byte. Never set in
-     * production: it reintroduces the §16 failure mode where a slow encoder
-     * drains as if it were hitting its target frame rate. */
-    static int nominal_drain = -1;
-    if (nominal_drain < 0) {
-        const char *e = getenv("BC250_RC_NOMINAL_DRAIN");
-        nominal_drain = (e && strcmp(e, "1") == 0) ? 1 : 0;
+     * Wall-clock drain (above) is correct for LIVE streaming: the network
+     * consumes frames in real time, so if the encoder can't sustain the
+     * negotiated fps, inflating the per-frame budget to match real elapsed
+     * time is what keeps the STREAM's bitrate on target (§16's origin
+     * story). It is WRONG for file/offline encoding: an ffmpeg transcode's
+     * output container plays back at its *nominal* framerate regardless of
+     * how long the encode actually took, so the same "catch up to real
+     * time" inflation goes straight into the file's bitrate/size instead of
+     * being absorbed by network pacing. HEVC's CPU-only path (~10 fps in
+     * this project's own numbers) hits this constantly on anything encoded
+     * slower than real time; H.264 hits it less often but is not immune.
+     *
+     * Confirmed live, not just theoretical: a user ran plain `ffmpeg -c:v
+     * h264_vaapi`/`hevc_vaapi` (no explicit bitrate) against this driver
+     * and got a file at several times the requested/expected bitrate
+     * (Intel iGPU reference: ~3.9 Mbps H.264 on a 1080p24 clip; this
+     * driver: 14.4 Mbps on the identical source) - this is that bug.
+     *
+     * So: default to nominal (the fixed per-frame quota, which the old
+     * unconditional-wall-clock code treated as a mere fallback) for
+     * anything that isn't recognizably a live-streaming server, and use
+     * wall-clock only when the process is one of the known live consumers
+     * this project actually targets. BC250_RC_NOMINAL_DRAIN=1/
+     * BC250_RC_WALLCLOCK_DRAIN=1 force either direction explicitly - the
+     * former is also what tools/hevc_host_drift.sh's BC250_RC_NOMINAL_DRAIN
+     * export already relies on for byte-exact A/B testing (wall-clock drain
+     * makes output a function of how fast the encoder ran, which any
+     * output-neutral speed optimization would then also change, destroying
+     * byte-exactness as a verification oracle - unrelated to which mode is
+     * live-appropriate, but why forcing nominal needs to keep working). */
+    static int drain_mode = -1; /* -1 = undecided, 0 = nominal, 1 = wall-clock */
+    if (drain_mode < 0) {
+        const char *e_nom = getenv("BC250_RC_NOMINAL_DRAIN");
+        const char *e_wc = getenv("BC250_RC_WALLCLOCK_DRAIN");
+        if (e_nom && strcmp(e_nom, "1") == 0) {
+            drain_mode = 0;
+        } else if (e_wc && strcmp(e_wc, "1") == 0) {
+            drain_mode = 1;
+        } else {
+            drain_mode = 0;
+            const char *self = program_invocation_short_name;
+            if (self && (strcmp(self, "sunshine") == 0 ||
+                         strcmp(self, "wivrn-server") == 0 ||
+                         strcmp(self, "wivrn") == 0)) {
+                drain_mode = 1;
+            }
+        }
+        if (getenv("BC250_DEBUG_RC")) {
+            fprintf(stderr, "[bc250-rc] drain_mode=%s (process=\"%s\")\n",
+                    drain_mode ? "wall-clock" : "nominal",
+                    program_invocation_short_name ? program_invocation_short_name : "?");
+        }
     }
 
     struct timespec now;
     uint64_t now_ns = 0;
-    if (!nominal_drain && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+    if (drain_mode && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
         now_ns = (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
     }
 

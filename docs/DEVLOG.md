@@ -5214,3 +5214,90 @@ the bare ref name. `build work` was never affected by this bug (it ships
 the live local tree directly and never reads `$REPO` for source), which is
 exactly why nothing caught it until the first `build <ref>` call all
 session.
+
+## 42. §16's wall-clock drain was right for streaming and wrong for files — real, user-reported, now conditional
+
+§16 fixed rate control by draining the leaky bucket by real elapsed wall-
+clock time rather than a fixed per-frame quota, specifically to correct a
+live-streaming undershoot: a 1440p Sunshine session negotiates 60 fps, this
+encoder sustains ~40, and draining a fixed quota per call enforces the
+target bitrate only if frames arrive at the *negotiated* rate. That fix was
+correct, and stayed correct for streaming. What it didn't account for:
+`rc_update_stats()` applied it unconditionally, to every caller, including
+a plain `ffmpeg -c:v h264_vaapi`/`hevc_vaapi` file transcode.
+
+### 42.1 The bug
+
+A file's declared bitrate is `total_bits / (frame_count / nominal_fps)` -
+duration is fixed by frame count and the stream's *declared* framerate, not
+by how long the encode actually took. Wall-clock drain reasons the opposite
+way: if the encoder falls behind its nominal fps (HEVC's CPU-only path,
+~10 fps in this project's own numbers, does this constantly; H.264 less
+often but not never), it inflates the per-frame bit budget to make the
+*real-time* output rate hit target - which is exactly right when a network
+is consuming frames in real time, and exactly wrong when a container is
+just going to declare whatever duration the frame count implies. The
+inflation goes straight into the file's actual bitrate/size instead of
+being absorbed by network pacing.
+
+### 42.2 How this was found
+
+Not from this project's own test harness - `hevc_host_drift.sh`'s CQP cases
+never reach `rc_update_stats()` at all (`RC_CQP` returns immediately), and
+its handful of VBR cases run a few frames of a tiny synthetic clip fast and
+consistently enough that wall-clock drain happened to behave deterministic
+in practice, run after run, which is exactly why it never got caught here.
+It was found by a real user (oblique99) DMing a direct reproduction: the
+same Big Buck Bunny source, transcoded with plain `ffmpeg -c:v
+h264_vaapi`/`hevc_vaapi` (no explicit `-b:v`/`-qp`) on both an Intel iGPU
+and this driver. Intel: 281 MiB / 3.9 Mbps. This driver: 1.00 GiB /
+14.4 Mbps - roughly 3.7x, on an *identical* source and *identical* ffmpeg
+invocation. (A parallel community fork independently hit and diagnosed the
+same underlying drain mechanism, commit `1519255` - a useful cross-check
+that this analysis has the right mechanism, though its exact fix wasn't
+reused verbatim here.)
+
+### 42.3 The fix
+
+`rc_update_stats()` now decides which drain model applies once per
+process, cached in a static exactly like the existing `BC250_RC_NOMINAL_
+DRAIN` escape hatch already was:
+
+1. `BC250_RC_NOMINAL_DRAIN=1` forces the fixed per-frame quota (unchanged -
+   this is also what makes `hevc_host_drift.sh`'s `BC250_DRIFT_BS_MD5`
+   recording byte-reproducible for A/B testing).
+2. `BC250_RC_WALLCLOCK_DRAIN=1` forces wall-clock drain explicitly.
+3. Otherwise: wall-clock drain only when `program_invocation_short_name`
+   matches a known live-streaming server (`sunshine`, `wivrn-server`,
+   `wivrn`); nominal (fixed quota) for everything else, which is the new
+   default and the behavior change from §16.
+
+`BC250_DEBUG_RC=1` now also logs which mode was picked and for what
+process name, alongside its existing `rc_init` line.
+
+### 42.4 Verification
+
+Confirmed directly, not just by inspection: ran the standalone `hostrepro`
+harness with `BC250_DEBUG_RC=1` under a VBR case (kbps>0) three ways -
+plain invocation (`drain_mode=nominal, process="hostrepro"`), invoked via a
+symlink named `sunshine` (`drain_mode=wall-clock, process="sunshine"`), and
+with `BC250_RC_WALLCLOCK_DRAIN=1` forced on the plain name (`drain_mode=
+wall-clock`) - all three matched the intended decision table.
+`hevc_host_drift.sh` 53/53 byte-exact and `ctest` 6/6 relevant suites both
+still pass unchanged (the VBR drift cases now run under nominal drain by
+default instead of incidentally-stable wall-clock drain, and remain
+byte-exact against a real decoder either way, since the oracle checks
+self-consistency, not a fixed golden bitstream).
+
+### 42.5 Still open
+
+The reported 3.7x file-size gap was not fully re-measured end-to-end after
+this fix (that needs the board, a real Big Buck Bunny transcode, and a
+side-by-side against the Intel iGPU numbers from the original report) -
+this closes the *mechanism* that plausibly explains it, not yet confirmed
+as the complete explanation. The RC-mode-*negotiation* question (what this
+driver advertises via `VAConfigAttribRateControl` when ffmpeg asks with no
+explicit `-rc_mode`) is a separate, still-unreviewed question - see
+`docs/backlog.md`'s fork-review section G for the parallel fork's own
+attempt at that (`0451398`→`b0357b3`, reviewed and not adopted as-is, for
+reasons unrelated to this fix).

@@ -316,13 +316,18 @@ int main(void) {
      * run spent three frames at delta 8, the other four).
      *
      * Mechanism: h264_encoder_create() calls rc_init(..., RC_LOW_LATENCY, ...)
-     * (encoder_h264.c), and in every non-CQP mode rc_update_stats() drains its
-     * leaky bucket by target_bitrate * REAL elapsed wall-clock seconds, read
-     * from clock_gettime(CLOCK_MONOTONIC) (rate_control.c). That is correct and
-     * deliberate for live streaming - see the comment there and DEVLOG.md §16 -
-     * but it makes the bitstream depend on execution speed, so the buffer
-     * crosses a QP-step threshold a frame earlier or later depending on
-     * scheduling noise.
+     * (encoder_h264.c), and in every non-CQP mode rc_update_stats() can drain
+     * its leaky bucket by target_bitrate * REAL elapsed wall-clock seconds,
+     * read from clock_gettime(CLOCK_MONOTONIC) (rate_control.c), instead of a
+     * fixed per-frame quota. That is correct and deliberate for live
+     * streaming - see the comment there and DEVLOG.md §16 - but it makes the
+     * bitstream depend on execution speed, so the buffer crosses a QP-step
+     * threshold a frame earlier or later depending on scheduling noise.
+     * Since rate_control.c only picks wall-clock drain by default for a
+     * recognized live-streaming process name (sunshine/wivrn-server/wivrn),
+     * this test binary would already get nominal drain without the env var
+     * below - it's set explicitly anyway so this test doesn't depend on
+     * that default, or on what this binary happens to be named.
      *
      * This is also precisely why test_hevc_encode IS deterministic:
      * hevc_encoder_create() calls rc_init(..., RC_CQP, ...) (encoder_h265.c),
