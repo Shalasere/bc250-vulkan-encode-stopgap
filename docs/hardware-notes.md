@@ -5,7 +5,7 @@
 - **Compute Units**: 40 CUs (20 WGPs, physically present on the PS5-derived die).
   - *Stock Mining Board State*: Often ships software-limited to 24 CUs (12 WGPs).
   - *40 CU Unlock*: Re-enabled via the community `amdgpu` kernel patch ([duggasco/bc250-40cu-unlock](https://github.com/duggasco/bc250-40cu-unlock)) or distributions like Bazzite/SkillFishOS.
-- **Hardware Video Block**: VCN 3.0 (Video Core Next) — permanently unprovisioned/eFused off by the AMD/Sony Platform Security Processor (PSP).
+- **Hardware Video Block**: VCN 2.0.3 (Video Core Next, `UVD_VERSION = 0x0002001B`) — not VCN 3.0 as earlier notes here said; corrected against this project's own separate VCN-enablement research, which instantiates it on this exact board as `vcn_v2_0`. Physically present on the die but permanently unprovisioned and unmanaged by SMU/VBIOS/PSP for this SKU.
 - **Codename**: Cyan Skillfish (Device ID: `1002:13fe`)
 
 ## Memory Map & Architecture

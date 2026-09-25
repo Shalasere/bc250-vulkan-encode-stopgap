@@ -1434,18 +1434,110 @@ only (`hevc_host_drift.sh` 53/53, ctest 6/6 relevant), since the actual
 CPU-contention claim can only be measured live, with a real host process
 alongside it, on the board.
 
-**Remaining, not yet reviewed:** ~56 further commits in their history -
-mostly GPU shader/VA-API surface area not yet read in this pass (a
-zero-motion-search cost-model tweak in `8f81318`'s CU-skip threshold and
-DC-only intra fallback at high quality-preset levels, `4721c97`'s
-CABAC+MPM+OMP-wait-policy changes, `ef2466f`'s 4x4 transform vectorization,
-`7c20273`'s multi-core slice changes, `d2501c0`'s Sunshine-latency/slice-
-thread tuning, `024ef52`'s ME-only-path buffer allocation - tied to
-`106ea01`'s rejected GPU-MV path, likely N/A - and `f2eb143`'s VCN-fabric
-docs + a `PutImage` parameter-shadowing fix worth a quick look). `simpmix`
-remote still configured locally (`/tmp/simpmix-fork`); regenerate the list
-via `git log
-c5a7942..simpmix/main --oneline`.
+**G13. N/A - confirmed, not just assumed (`024ef52`).** Fixes a real SEGV
+in `gpu_compute_dispatch_me_only()` (missing buffer allocation - a second
+door into the same GPU buffers as `gpu_compute_dispatch_encode_ext()`,
+walking past its allocation check). That function doesn't exist in this
+tree at all - confirmed by grep, not inferred from G6's earlier "we don't
+consume the GPU-MV path" finding - because it's precisely the function
+`106ea01` introduced and this project never adopted. Nothing to fix.
+
+**G14. Mixed - one doc correction landed, one code fix already present
+(`f2eb143`).** Its `bc250_PutImage()` "parameter shadow" rename
+(`src_y`→`req_src_y`, avoiding a collision with a same-named local variable
+used lower in the function body) is **already the case on our side** -
+confirmed by reading the current signature and body together, not assumed
+from the rename alone. Its VCN hardware documentation rewrite
+(`docs/hardware-notes.md`, `docs/vcn-registers.md`: this project's docs
+said "VCN 3.0"; independent evidence says otherwise) prompted a real
+correction, landed this pass: this project's own separate VCN-enablement
+research (out of scope for the stopgap itself, but its own findings are
+fair game for fixing a factual error in *this* repo's docs) instantiates
+the block as `vcn_v2_0`, not VCN 3.0. Corrected the version number in both
+files to VCN 2.0.3 (`UVD_VERSION = 0x0002001B`) with a note explaining the
+correction and its source. Deliberately did NOT import the fork's
+extensive rewritten security-architecture narrative (Data Fabric ACL at
+`SEC_GASKET~0x24`, a 926-write PSP bootloader table, a specific hazard
+register, an AC-power-cycle claim) - those are specific, strong technical
+claims this pass has no way to verify independently, and asserting them
+without a citable source would repeat exactly the mistake top-of-repo
+CLAUDE.md's "before you assert a mechanism, grep the DEVLOG" rule exists to
+prevent, just against a different document. `vcn-registers.md` now says
+plainly that it states only what's relevant to this driver's "why compute
+shaders, not hardware VCN" rationale, and defers the precise mechanism to
+this project's separate VCN-enablement research rather than asserting one.
+
+**G15. Everything applicable already present, more rigorously
+(`4721c97`).** Three of its four pieces: `cabac_write_residual_block()`
+inlined as `static inline __attribute__((always_inline))` and
+`cabac_encode_decision()` hidden via `#pragma GCC visibility push(hidden)`
+- both **already exactly this** on our side, and our own comment history
+goes further than the fork's commit message: it documents a real,
+investigated, *unresolved* hazard from applying the same hidden-visibility
+pragma to `cabac_write_residual_block` itself (changes the CABAC bitstream
+output on the all-intra oracle; `-fno-ipa-cp-clone` and a manual review
+against ITU-T 9.3.3.1.3 both ruled out but never explained it), and
+explicitly documents NOT to apply that pragma there. The HEVC MPM
+`above_avail` CTU-boundary rule (ITU-T H.265 8.4.2: `candIntraPredModeB`
+forced to DC when the above neighbour crosses into a previous CTU row) is
+also already present, verbatim in effect (`(cu_y > 0) && ((cu_y %
+HEVC_CTU_SIZE) != 0)`) - confirmed by reading `encode_cu()` directly. The
+tooling fixes in the same commit (`bc250_lab.sh`'s `IFS=' ' read`
+robustness fix, `test_hevc_encode` added to the `units` test list) are
+likewise already present, with this project's own reasoning on file. The
+one piece NOT adopted: hardcoding `OMP_NUM_THREADS=2`/`OMP_DYNAMIC=FALSE`
+into the install scripts' persisted environment - this is the same
+default-OpenMP-thread-count question G12 already deferred (interacts with
+published throughput numbers, needs its own board measurement, not a
+bundled-in change), now confirmed as a recurring theme across three
+separate fork commits (`73b339e`, `4721c97`, `d2501c0`) rather than a
+one-off suggestion.
+
+**G16. Real, verified, low priority (`ef2466f`).** SSE4.1 vectorization of
+the HEVC 4x4 forward/inverse transforms (four columns at once instead of a
+scalar 4x4 matrix product), runtime-dispatched with the scalar path kept as
+fallback, verified bit-identical via bitstream md5 before/after on the
+fork's own board. Not adopted this pass: the fork's own measurement was
+74→75.5 fps (~2%), and this project's own documented significance floor is
+"no delta under ~2.5% of wall time is a result" (top-of-repo CLAUDE.md) -
+this is very likely a real but sub-noise-floor gain here too, not worth the
+verification cost (our own byte-exactness + board re-measurement) against
+its own stated size. Worth revisiting only if the transform stage becomes
+measurably hot in a future profile, not preemptively.
+
+**G17. Real, substantial, NOT attempted this pass (`7c20273`).** HEVC
+currently has no slice-level threading at all (single CABAC engine, single
+core) - the fork's version splits an HEVC frame into N independent slices
+(a whole number of CTU rows each, so a slice boundary is also a CTU-row
+boundary - conveniently the same boundary the MPM/merge-candidate
+availability rules already respect), each with its own CABAC engine,
+output buffer and SAD accumulator, encoded via `#pragma omp parallel for`.
+Their own numbers: 78.2→111.2 fps (+42%) at their default of 4 slices, for
+-0.58 dB - a real, meaningful, honestly-disclosed trade for a box whose job
+is streaming a game while the game runs. This is a legitimate, valuable
+feature gap, not a bug fix - but porting it properly means adapting
+`hevc_cu_is_available()`'s slice-aware `cuy_min` threading through this
+project's OWN (different) merge-candidate and intra-availability code
+(this project never adopted `hevc_cu_is_available()`/`hevc_cu_rank()` in
+the first place - see G6 - so this is new infrastructure, not a drop-in),
+splitting per-slice encoder state, and re-verifying byte-exactness at every
+slice count the way the fork did (1 slice must reproduce today's exact
+bitstream; every slice count must still match a real decoder). That is a
+dedicated feature-engineering task in its own right, not something to
+rush at the tail of an archaeology pass - flagged here as the single
+highest-value item left in the fork's history, for whoever picks this up
+next.
+
+**Remaining, effectively closed out.** Of the original ~189-commit
+history, what's left after this pass is almost entirely either their
+from-scratch H.264/HEVC software *decoder* (~45 commits, a different
+project, out of scope from the first review) or the CPU-SIMD/dynamic-
+governor heuristic layer this project deliberately removed (`dynamic_
+governor.c`, `cpu_simd_me.c` - confirmed not present, per top-of-repo
+CLAUDE.md and re-confirmed against `d2501c0` in this pass). `simpmix`
+remote still configured locally (`/tmp/simpmix-fork`) if a future session
+wants to regenerate the list via `git log c5a7942..simpmix/main --oneline`
+and spot-check anything not explicitly named above.
 
 ---
 
