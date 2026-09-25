@@ -23,6 +23,8 @@
 #include <dlfcn.h>
 #include <sys/ioctl.h>
 #include <linux/dma-buf.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #define BC250_DEVICE_ID 0x13FE
 #define AMD_VENDOR_ID   0x1002
@@ -1870,6 +1872,66 @@ int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory) {
  * whichever path a given ffmpeg build takes, the frame gets captured.
  * Compiled in unconditionally but a no-op (single getenv check) unless the
  * env var is set, so it costs nothing in normal operation. */
+/* Every opt-in diagnostic dump in the driver is created through this.
+ *
+ * These dumps run inside whatever process loaded the driver - a game, a
+ * browser, Steam - and their default target, /tmp/bc250_dump_frames, is a
+ * fixed, predictable path in a directory anyone on the machine can already
+ * write to. A plain fopen() there is a classic symlink-race: another local
+ * user creates that directory first, or a symlink at the exact name this
+ * driver is about to write next, and this process - possibly running as a
+ * different, more privileged user - follows it and overwrites whatever the
+ * link points at. Every dump call site used to do exactly that.
+ *
+ * Fixed by construction here, not by caller discipline: the file is opened
+ * with O_NOFOLLOW (refuse a symlink rather than follow it) and mode 0600,
+ * and the default directory is the caller's own XDG_RUNTIME_DIR (created
+ * 0700, private to the user by systemd's own convention) instead of the
+ * shared /tmp - BC250_DUMP_DIR still overrides both when set, since that is
+ * an explicit, deliberate choice by whoever set it, not a guessed default.
+ * `name` is a bare filename (no '/'), so a caller cannot be tricked into
+ * writing outside the chosen directory either. Returns NULL, and says why
+ * on stderr, when there is nowhere safe to write - the caller already
+ * treats a NULL FILE* as "skip this dump," so nothing else has to change. */
+static FILE *debug_dump_open_flags(const char *name, const char *what, int extra_flags, const char *fmode) {
+    char dir[512];
+    const char *chosen = getenv("BC250_DUMP_DIR");
+    if (chosen && chosen[0]) {
+        if (snprintf(dir, sizeof(dir), "%s", chosen) >= (int)sizeof(dir)) return NULL;
+    } else {
+        const char *run = getenv("XDG_RUNTIME_DIR");
+        if (!run || !run[0]) {
+            fprintf(stderr, "[bc250] %s: no XDG_RUNTIME_DIR to put the dump in - set BC250_DUMP_DIR\n", what);
+            return NULL;
+        }
+        if (snprintf(dir, sizeof(dir), "%s/bc250_dump_frames", run) >= (int)sizeof(dir)) return NULL;
+        if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+            fprintf(stderr, "[bc250] %s: cannot create %s: %s\n", what, dir, strerror(errno));
+            return NULL;
+        }
+    }
+    if (!name || strchr(name, '/')) return NULL;
+
+    char path[768];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path)) return NULL;
+    int fd = open(path, O_WRONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC | extra_flags, 0600);
+    if (fd < 0) {
+        fprintf(stderr, "[bc250] %s: cannot create %s: %s\n", what, path, strerror(errno));
+        return NULL;
+    }
+    FILE *f = fdopen(fd, fmode);
+    if (!f) close(fd);
+    return f;
+}
+
+FILE *bc250_debug_dump_open(const char *name, const char *what) {
+    return debug_dump_open_flags(name, what, O_TRUNC, "wb");
+}
+
+FILE *bc250_debug_dump_open_append(const char *name, const char *what) {
+    return debug_dump_open_flags(name, what, O_APPEND, "ab");
+}
+
 void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
                                   const uint8_t *uv_plane, int uv_pitch,
                                   int width, int height) {
@@ -1877,11 +1939,9 @@ void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
     if (!y_plane || !uv_plane || width <= 0 || height <= 0) return;
 
     static int dump_frame_index = 0;
-    const char *dump_dir = getenv("BC250_DUMP_DIR");
-    if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
-    char dump_path[600];
-    snprintf(dump_path, sizeof(dump_path), "%s/frame_%05d.nv12", dump_dir, dump_frame_index);
-    FILE *dumpf = fopen(dump_path, "wb");
+    char dump_name[64];
+    snprintf(dump_name, sizeof(dump_name), "frame_%05d.nv12", dump_frame_index);
+    FILE *dumpf = bc250_debug_dump_open(dump_name, "BC250_DUMP_INPUT_FRAMES");
     if (dumpf) {
         for (int r = 0; r < height; r++) {
             fwrite(y_plane + (size_t)r * y_pitch, 1, (size_t)width, dumpf);
@@ -1890,8 +1950,6 @@ void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
             fwrite(uv_plane + (size_t)r * uv_pitch, 1, (size_t)width, dumpf);
         }
         fclose(dumpf);
-    } else {
-        fprintf(stderr, "[bc250-gpu] BC250_DUMP_INPUT_FRAMES: failed to open %s: %s\n", dump_path, strerror(errno));
     }
     dump_frame_index++;
 }
@@ -3137,8 +3195,6 @@ void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height) {
     if (!ctx || ctx->recon_image.y_plane == VK_NULL_HANDLE || width <= 0 || height <= 0) return;
 
     static int dump_frame_index = 0;
-    const char *dump_dir = getenv("BC250_DUMP_DIR");
-    if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
 
     size_t y_size = (size_t)width * height;
     size_t uv_size = (size_t)width * (height / 2);
@@ -3148,9 +3204,9 @@ void gpu_compute_debug_dump_recon(gpu_context_t *ctx, int width, int height) {
 
     if (gpu_compute_download_nv12(ctx, &ctx->recon_image, ctx->recon_memory,
                                    y_buf, width, uv_buf, width, width, height) == 0) {
-        char dump_path[600];
-        snprintf(dump_path, sizeof(dump_path), "%s/recon_%05d.nv12", dump_dir, dump_frame_index);
-        FILE *dumpf = fopen(dump_path, "wb");
+        char dump_name[64];
+        snprintf(dump_name, sizeof(dump_name), "recon_%05d.nv12", dump_frame_index);
+        FILE *dumpf = bc250_debug_dump_open(dump_name, "BC250_DUMP_RECON_FRAMES");
         if (dumpf) {
             fwrite(y_buf, 1, y_size, dumpf);
             fwrite(uv_buf, 1, uv_size, dumpf);
@@ -3184,8 +3240,6 @@ void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, g
     if (!ctx || !image || image->y_plane == VK_NULL_HANDLE || width <= 0 || height <= 0) return;
 
     static int dump_frame_index = 0;
-    const char *dump_dir = getenv("BC250_DUMP_DIR");
-    if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
 
     size_t y_size = (size_t)width * height;
     size_t uv_size = (size_t)width * (height / 2);
@@ -3206,15 +3260,13 @@ void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, g
     gpu_compute_dmabuf_sync_end(ctx, memory);
 
     if (download_ok == 0) {
-        char dump_path[600];
-        snprintf(dump_path, sizeof(dump_path), "%s/real_%05d.nv12", dump_dir, dump_frame_index);
-        FILE *dumpf = fopen(dump_path, "wb");
+        char dump_name[64];
+        snprintf(dump_name, sizeof(dump_name), "real_%05d.nv12", dump_frame_index);
+        FILE *dumpf = bc250_debug_dump_open(dump_name, "BC250_DUMP_REAL_INPUT");
         if (dumpf) {
             fwrite(y_buf, 1, y_size, dumpf);
             fwrite(uv_buf, 1, uv_size, dumpf);
             fclose(dumpf);
-        } else {
-            fprintf(stderr, "[bc250-gpu] BC250_DUMP_REAL_INPUT: failed to open %s: %s\n", dump_path, strerror(errno));
         }
     }
     free(y_buf);

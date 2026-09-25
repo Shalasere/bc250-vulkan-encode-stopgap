@@ -1412,7 +1412,10 @@ dec = open(os.path.join(d, "dec.nv12"), "rb").read()
 # gpu_compute_debug_dump_recon(); the CPU HEVC path appends planar I420 via
 # BC250_HEVC_DEBUG_RECON. Detect rather than assume.
 nv12 = sorted(glob.glob(os.path.join(d, "dump", "recon_*.nv12")))
-i420 = os.path.join(d, "bc250_hevc_debug_recon_i420.raw")
+# bc250_debug_dump_open_append() (encoder security hardening, symlink-race
+# fix) writes into BC250_DUMP_DIR rather than the process's CWD, so this
+# lands in dump/ alongside the NV12 dumps now, not loose in $d.
+i420 = os.path.join(d, "dump", "bc250_hevc_debug_recon_i420.raw")
 frames = []
 if nv12:
     for p in nv12:

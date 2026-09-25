@@ -1126,6 +1126,58 @@ runtime AVX2-dispatched) and board-tested:
   can outrun. Do not re-attempt without that characterization - two
   different guesses have already produced two different wrong answers.
 
+**G4. DONE - debug-dump files: private directory, 0600, no symlinks
+followed.** Their `f495a24` ("debug dumps: private directory, 0600, no
+symbolic links followed") flagged a real local symlink-race: every
+`BC250_DUMP_*`/`BC250_HEVC_DEBUG_RECON` debug hook created its dump file
+with a plain `fopen(path, "wb"/"ab")` into a shared, world-writable
+default (`/tmp/bc250_dump_frames`, or the process's bare CWD for the HEVC
+recon dump) - a symlink planted at that exact path before the encoder runs
+would make it open (and truncate/append) an arbitrary file the *encoder's*
+user can write, with the *attacker's* chosen name.
+
+Ported in our own idiom rather than copying their patch: a single
+`bc250_debug_dump_open()`/`bc250_debug_dump_open_append()` pair (the
+`_append` variant added here, since one call site - the HEVC CPU path's
+I420 recon dump - genuinely needs `O_APPEND` across a whole run) in
+`gpu_compute.c`, used by all five call sites (`bc250_debug_dump_nv12_
+frame()`, `gpu_compute_debug_dump_recon()`, `gpu_compute_debug_dump_real_
+input()` in `gpu_compute.c`; the `BC250_DUMP_QUANT_LEVELS` block in
+`encoder_h264.c`; the `BC250_HEVC_DEBUG_RECON` block in `encoder_h265.c`).
+Each: resolves to `BC250_DUMP_DIR` if the caller set it, else creates
+`$XDG_RUNTIME_DIR/bc250_dump_frames` (0700, private by systemd convention)
+instead of shared `/tmp`; rejects a `name` containing `/`; opens with
+`O_NOFOLLOW | O_CLOEXEC`, mode 0600.
+
+This changed real, relied-upon behavior in two harnesses that both
+happened to depend on the old CWD-relative default, caught only by
+actually running them rather than by inspection:
+- `tools/hevc_host_drift.sh` ran its HEVC recon dump with no
+  `XDG_RUNTIME_DIR` in that shell and no `BC250_DUMP_DIR` set, so the new
+  code correctly refused to guess a location (`bc250_debug_dump_open_
+  append()` returned NULL) and the oracle's own Python comparison failed
+  outright ("no such file"), rather than silently comparing stale data -
+  fixed by having the script set `BC250_DUMP_DIR="$WORK"` itself (its own
+  already-private, already-throwaway run directory), which is exactly the
+  "explicit, deliberate choice" the new default-suppression is designed to
+  respect.
+- `tools/bc250_lab.sh`'s `drift` command sets `BC250_DUMP_DIR="$d/dump"`
+  for the NV12 dump functions but its Python comparison expected the HEVC
+  I420 recon dump at bare `$d` (the old code's implicit CWD, since the
+  subshell `cd`s to `$d` before invoking ffmpeg) - now that this dump
+  honors `BC250_DUMP_DIR` too, it lands in `$d/dump` alongside the NV12
+  dumps instead. Fixed by updating the comparison's expected path rather
+  than trying to give the I420 and NV12 dumps different directories from
+  one shared env var.
+
+Verified off-board only so far (host-drift is GPU-free and does not
+exercise `gpu_compute.c`'s three call sites): `hevc_host_drift.sh` 53/53
+byte-exact, ctest 6/6 relevant suites (`VaApiDriverTest` pre-existingly
+fails off-board). Landed; on-board confirmation of `bc250_lab.sh drift
+--codec=hevc` still worth doing next time the board is free of the build
+agent's work, since that's the one path this fix couldn't be exercised
+against here.
+
 **Remaining, not yet reviewed:** ~80 further commits in their history
 (GPU shader techniques - subgroup arithmetic for SAD reduction, reciprocal-
 division removal in a shader, enabling 16-bit shader storage; several more

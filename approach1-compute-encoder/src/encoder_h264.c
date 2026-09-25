@@ -2371,18 +2371,15 @@ int h264_encoder_finish_frame(h264_encoder_t *encoder,
          * intermediate values. Dumps every frame while set; caller should
          * limit clip length. */
         if (quant_levels && getenv("BC250_DUMP_QUANT_LEVELS")) {
-            const char *dump_dir = getenv("BC250_DUMP_DIR");
-            if (!dump_dir || dump_dir[0] == '\0') dump_dir = "/tmp/bc250_dump_frames";
-            char path[600];
-            snprintf(path, sizeof(path), "%s/quant_levels_%05u.bin", dump_dir, encoder->frame_count);
-            FILE *qf = fopen(path, "wb");
+            char name[64];
+            snprintf(name, sizeof(name), "quant_levels_%05u.bin", encoder->frame_count);
+            FILE *qf = bc250_debug_dump_open(name, "BC250_DUMP_QUANT_LEVELS");
             if (qf) {
                 fwrite(quant_levels, sizeof(int), (size_t)encoder->total_mbs * 24 * 16, qf);
                 fclose(qf);
             }
-            char meta_path[600];
-            snprintf(meta_path, sizeof(meta_path), "%s/quant_levels_%05u.meta", dump_dir, encoder->frame_count);
-            FILE *mf = fopen(meta_path, "w");
+            snprintf(name, sizeof(name), "quant_levels_%05u.meta", encoder->frame_count);
+            FILE *mf = bc250_debug_dump_open(name, "BC250_DUMP_QUANT_LEVELS");
             if (mf) {
                 fprintf(mf, "width_in_mbs=%u\nheight_in_mbs=%u\ntotal_mbs=%u\nqp=%d\nis_idr=%d\n",
                         encoder->width_in_mbs, encoder->height_in_mbs, encoder->total_mbs, qp, is_idr ? 1 : 0);

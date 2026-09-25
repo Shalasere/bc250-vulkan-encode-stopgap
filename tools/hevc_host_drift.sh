@@ -85,6 +85,11 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SRC="$REPO/approach1-compute-encoder/src"
 WORK="${1:-/tmp/bc250_host_drift}"
 rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
+# bc250_debug_dump_open()/_append() (encoder security hardening, symlink-race
+# fix) no longer write into the CWD by default - they need an explicit,
+# deliberate directory. $WORK is already private to this run, so point them
+# there instead of the shared XDG_RUNTIME_DIR default.
+export BC250_DUMP_DIR="$WORK"
 
 command -v ffmpeg >/dev/null || { echo "ffmpeg required"; exit 2; }
 

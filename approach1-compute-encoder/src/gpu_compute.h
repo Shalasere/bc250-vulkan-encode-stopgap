@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <time.h>
 
 #ifdef __cplusplus
@@ -528,11 +529,23 @@ int gpu_compute_dmabuf_sync_end(gpu_context_t *ctx, gpu_memory_t memory);
  * like every other opportunistic capability check in this file. */
 int gpu_compute_wait_for_image_ready(gpu_context_t *ctx, gpu_memory_t memory);
 
+/* Creates a diagnostic dump file safely: 0600, refuses to follow a symlink
+ * at the target name, and defaults to the caller's own (private, 0700)
+ * XDG_RUNTIME_DIR instead of the shared /tmp - BC250_DUMP_DIR still
+ * overrides both when set. `name` must be a bare filename, no '/'. Returns
+ * NULL (after printing why, tagged with `what`) when there is nowhere safe
+ * to write. Every dump hook below goes through this - see gpu_compute.c. */
+FILE *bc250_debug_dump_open(const char *name, const char *what);
+
+/* Same as bc250_debug_dump_open(), but O_APPEND instead of O_TRUNC, for a
+ * dump file that accumulates one record per frame across a whole run. */
+FILE *bc250_debug_dump_open_append(const char *name, const char *what);
+
 /* Test-harness instrumentation (tools/quality_test.sh): dumps raw NV12
- * frame bytes to BC250_DUMP_DIR (default /tmp/bc250_dump_frames) when
- * BC250_DUMP_INPUT_FRAMES=1 is set in the environment; a no-op otherwise.
- * Shared by every known VA-API upload path so the harness catches whichever
- * one a given libva/ffmpeg build actually uses. See gpu_compute.c. */
+ * frame bytes via bc250_debug_dump_open() when BC250_DUMP_INPUT_FRAMES=1 is
+ * set in the environment; a no-op otherwise. Shared by every known VA-API
+ * upload path so the harness catches whichever one a given libva/ffmpeg
+ * build actually uses. See gpu_compute.c. */
 void bc250_debug_dump_nv12_frame(const uint8_t *y_plane, int y_pitch,
                                   const uint8_t *uv_plane, int uv_pitch,
                                   int width, int height);
@@ -694,9 +707,9 @@ int gpu_compute_hevc_download_recon_nv12(gpu_context_t *ctx,
  * via its own GL blit, bypassing both of those paths entirely). Call right
  * before gpu_compute_dispatch_encode() so it sees exactly what the encoder
  * is about to encode, regardless of how the surface's contents got there.
- * No-op unless BC250_DUMP_REAL_INPUT=1 is set (BC250_DUMP_DIR for the
- * directory, default /tmp/bc250_dump_frames, same as the other dump hooks -
- * files are named real_NNNNN.nv12 to disambiguate from frame_/recon_). */
+ * No-op unless BC250_DUMP_REAL_INPUT=1 is set (via bc250_debug_dump_open(),
+ * same as the other dump hooks - files are named real_NNNNN.nv12 to
+ * disambiguate from frame_/recon_). */
 void gpu_compute_debug_dump_real_input(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory, int width, int height);
 
 #ifdef __cplusplus
