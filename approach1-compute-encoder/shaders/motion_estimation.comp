@@ -62,7 +62,7 @@
  * report for the full numbers, pixel tables, and visual comparisons.
  */
 #version 450
-layout(local_size_x = 64) in; // Wave64 / Dual-Wave32 for RDNA 2
+layout(local_size_x = 64) in; // Wave64 / Dual-Wave32 - RDNA's native-Wave32 SIMD32 execution model, introduced in RDNA1 and unchanged since
 
 layout(set = 0, binding = 0, r8) uniform readonly image2D currentImage;
 layout(set = 0, binding = 1, r8) uniform readonly image2D referenceImage;
