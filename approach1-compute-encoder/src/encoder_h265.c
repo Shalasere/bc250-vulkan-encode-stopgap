@@ -82,6 +82,7 @@
 #define NAL_UNIT_VPS               32
 #define NAL_UNIT_SPS               33
 #define NAL_UNIT_PPS               34
+#define NAL_UNIT_AUD               35
 #define NAL_UNIT_CODED_SLICE_TRAIL_R     1
 #define NAL_UNIT_CODED_SLICE_IDR_W_RADL 19
 
@@ -139,6 +140,30 @@ static void write_profile_tier_level(bitstream_t *bs, int level_idc) {
     bs_write_u(bs, 16, 0);
     bs_write_u(bs, 12, 0); /* reserved_zero_44bits */
     bs_write_u(bs, 8, level_idc);
+}
+
+/* Access Unit Delimiter (NAL type 35, Rec. ITU-T H.265 7.3.2.5) - one per
+ * frame, before VPS/SPS/PPS/slice on IDR frames and before the slice alone
+ * otherwise. H.264's write_aud() calls this "essential for Sunshine /
+ * Moonlight / WebRTC to identify frame boundaries" and this project's HEVC
+ * path never had the equivalent: some hardware decoders (Qualcomm OMX on
+ * Android, in particular, per the fork commit this was ported from) rely
+ * on it being present rather than merely legal to omit. pic_type is 3 bits
+ * (Table 7-3): 0 restricts the picture to I-slices, 1 to P and I - this
+ * encoder never emits B-slices, so is_idr picks between exactly those two. */
+static size_t write_aud_hevc(uint8_t *buf, size_t buf_size, bool is_idr) {
+    uint8_t rbsp[8];
+    bitstream_t bs;
+    bs_init(&bs, rbsp, sizeof(rbsp));
+    bs_write_u(&bs, 3, is_idr ? 0 : 1); /* pic_type */
+    bs_rbsp_trailing_bits(&bs);
+
+    bitstream_t out_bs;
+    bs_init(&out_bs, buf, buf_size);
+    bs_write_nal_header_hevc(&out_bs, NAL_UNIT_AUD);
+    size_t off = bs_bytes_written(&out_bs);
+    if (off >= buf_size) return 0;
+    return off + bs_rbsp_to_ebsp(buf + off, buf_size - off, rbsp, bs_bytes_written(&bs));
 }
 
 static size_t write_vps(uint8_t *buf, size_t buf_size) {
@@ -1536,6 +1561,7 @@ static int encode_core(hevc_encoder_t *encoder, uint8_t *output_buf, size_t outp
     }
 
     size_t total = 0;
+    total += write_aud_hevc(encoder->scratch_out + total, encoder->scratch_out_cap - total, is_idr);
     if (write_param_sets) {
         total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
         total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,
@@ -2081,6 +2107,7 @@ static int encode_core_gpu(hevc_encoder_t *encoder, uint8_t *output_buf, size_t 
     if (bs_overflowed(&slice_bs)) return -1;
 
     size_t total = 0;
+    total += write_aud_hevc(encoder->scratch_out + total, encoder->scratch_out_cap - total, is_idr);
     if (write_param_sets) {
         total += write_vps(encoder->scratch_out + total, encoder->scratch_out_cap - total);
         total += write_sps(encoder->scratch_out + total, encoder->scratch_out_cap - total,

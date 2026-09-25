@@ -1728,6 +1728,24 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     pthread_mutex_init(&data->lock, &attr);
     pthread_mutexattr_destroy(&attr);
 
+    /* h264_encoder_finish_frame()/encode_raw()'s `#pragma omp parallel for
+     * ... if(num_slices > 1)` (BC250_SLICES_PER_FRAME > 1, this project's
+     * own Sunshine guide recommends 4) runs once per frame - a ~1ms region
+     * every ~16ms at 60fps. Without OMP_WAIT_POLICY, libgomp's default is
+     * to actively spin-poll for a while before blocking, and this library
+     * is loaded into an arbitrary host process (a game, Steam, Sunshine)
+     * that owns the rest of that 16ms - a fork of this project's own
+     * history measured GCC libgomp's default costing 600%+ host CPU
+     * between frames from exactly this shape. Passive (futex) waiting adds
+     * a wake-latency in the microseconds against a millisecond-scale
+     * parallel region, so it cannot show up in this project's own
+     * throughput numbers (all measured in frames/sec); it only changes
+     * what an idle thread does for the other ~15ms. Must be set before
+     * libgomp's first parallel region ever runs - vaInitialize() is the
+     * earliest hook this driver has. */
+    setenv("OMP_WAIT_POLICY", "PASSIVE", 1);
+    setenv("GOMP_SPINCOUNT", "0", 1);
+
     if (gpu_compute_init(&data->gpu) != 0) {
         fprintf(stderr, "[bc250-drv] Failed to initialize Vulkan compute backend!\n");
         pthread_mutex_destroy(&data->lock);

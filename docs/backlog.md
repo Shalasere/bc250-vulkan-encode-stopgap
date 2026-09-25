@@ -1358,11 +1358,91 @@ generic `gather_wide_n()` per G2, a different implementation already).
   consumption this project deliberately removed (see G5's `fb6550b` note
   and `docs/notes/dead-motion-search.md`) - not applicable by design.
 
-**Remaining, not yet reviewed:** ~66 further commits in their history -
+**G10. DONE - HEVC never emitted an Access Unit Delimiter (`73b339e`,
+partial).** H.264's `write_aud()` already generates one per frame (NAL
+type 9) - its own comment calls it "essential for Sunshine / Moonlight /
+WebRTC to identify frame boundaries," i.e. this project's actual primary
+use case, not merely a hardware-decoder nicety. The HEVC path had no
+equivalent at all. Added `write_aud_hevc()` (NAL type 35, ITU-T H.265
+7.3.2.5), called at the front of both `total` accumulations in
+`encoder_h265.c` (the CPU path and the GPU-intra path), mirroring where
+H.264 emits its own AUD. `tests/test_hevc_encode.c`'s NAL-sequence
+assertions updated to expect it (AUD before VPS/SPS/PPS/IDR, and before
+each TRAIL_R). Verified off-board: `hevc_host_drift.sh` 53/53 (AUD is
+decoder-transparent, doesn't touch reconstruction), ctest 6/6 relevant
+including the updated `HevcEncodeBitstreamTest`.
+The rest of `73b339e` needed no action: its CABAC `if`->`while` hunk is
+G1 (already landed, identical fix, independently arrived at); its
+`slice_loop_filter_across_slices_enabled_flag` removal matches G2 (already
+fixed, and more precisely - see below); its DC-intra availability
+branching was `949cf11`'s bug (see next) at an intermediate, still-wrong
+stage of the same fix and was superseded two days later in their own
+history, so there's nothing there to port; its CPU-thread-default changes
+touch `cpu_simd_me.c`, which doesn't exist in this tree.
+
+**G11. Confirmed already fixed, and more precisely
+(`949cf11`).** A severe, real HEVC quality bug in the fork's history:
+`hevc_predict_4x4()`'s DC mode branched on `avail_left`/`avail_top` and
+computed `dcVal`/boundary-filtered only the available edge(s) - but their
+own `gather_neighbors()` had *already* run the 8.4.4.2.2 reference-sample
+substitution by that point, so there was no such thing as an "unavailable"
+edge left to branch on; a decoder (which only ever sees the substituted
+state) computes `dcVal` over both edges unconditionally and filters both,
+per 8.4.4.2.5. Their own numbers: encoder reconstruction vs. real decoded
+output diverged from 53.67 dB to 24.09 dB - a 56%-of-pixels mismatch - and
+quality *stopped improving* below QP 18 because the encoder was optimizing
+against a picture no decoder would ever produce. This exact bug class does
+not exist on our side: `predict_block4()` (backlog A6's generic-over-
+block-size replacement, using `gather_neighbors_wide()`) already computes
+`dc` unconditionally over both edges with no availability branching at
+all - confirmed by reading the current function, not inferred. Also
+consistent with `hevc_host_drift.sh`'s existing 53/53 byte-exact result:
+a 24 dB encoder-vs-decoder gap would be incompatible with that oracle
+passing.
+Confirms `pps_loop_filter_across_slices_enabled_flag` similarly: this
+project's PPS leaves it at 1 (not 0, unlike the fork's fix) but the slice
+header evaluates the FULL 7.3.6.1 compound condition (`pps_loop_filter_
+across_slices_enabled_flag && (SAO || !deblocking_disabled)`) rather than
+just forcing the first term false - genuinely implementing the spec
+condition rather than working around it, and arriving at the same correct
+"omit the bit" result via the real logic.
+
+**G12. DONE - libgomp never told to wait passively (`73b339e`, a piece not
+initially ported).** `73b339e`'s va_backend.c hunk sets `OMP_WAIT_POLICY=
+PASSIVE`/`GOMP_SPINCOUNT=0` alongside its (N/A - `cpu_simd_me.c`-specific)
+thread-count changes; the thread-count part doesn't apply here, but the
+wait-policy part does and this project never had it at all - confirmed by
+grepping the whole tree for `OMP_WAIT_POLICY`/`GOMP_SPINCOUNT`/
+`omp_set_num_threads`, all zero hits. This project genuinely uses OpenMP
+the same way: `h264_encoder_finish_frame()`/`encode_raw()`'s `#pragma omp
+parallel for schedule(static) if(num_slices > 1)` runs once per frame
+whenever `BC250_SLICES_PER_FRAME > 1` - which `docs/sunshine-guide.md`
+recommends set to 4. Without `OMP_WAIT_POLICY`, libgomp's default is to
+actively spin-poll for a while before blocking; this driver is loaded into
+an arbitrary host process (a game, Steam, Sunshine) that owns the other
+~15ms of every 16ms frame interval between those parallel regions - the
+exact shape the fork's own commit measured at 600%+ host CPU. Fixed with
+two `setenv()` calls in `bc250_Initialize()`, the earliest hook this
+driver has, before libgomp's first parallel region can run. Deliberately
+NOT changed: default OpenMP team size (`omp_set_num_threads()`/
+`BC250_MAX_CPU_THREADS`) - that interacts with published throughput
+numbers and deserves its own measurement, not a bundled-in change. Passive
+waiting only affects what an *idle* thread does between regions (a
+microsecond-scale futex wake vs. instant spin-detection), so it cannot
+regress any of this project's own frames/sec numbers - verified off-board
+only (`hevc_host_drift.sh` 53/53, ctest 6/6 relevant), since the actual
+CPU-contention claim can only be measured live, with a real host process
+alongside it, on the board.
+
+**Remaining, not yet reviewed:** ~56 further commits in their history -
 mostly GPU shader/VA-API surface area not yet read in this pass (a
 zero-motion-search cost-model tweak in `8f81318`'s CU-skip threshold and
 DC-only intra fallback at high quality-preset levels, `4721c97`'s
-CABAC+MPM changes, `ef2466f`'s 4x4 transform vectorization, `7c20273`'s
-multi-core slice changes). `simpmix` remote still configured locally
-(`/tmp/simpmix-fork`); regenerate the list via `git log
+CABAC+MPM+OMP-wait-policy changes, `ef2466f`'s 4x4 transform vectorization,
+`7c20273`'s multi-core slice changes, `d2501c0`'s Sunshine-latency/slice-
+thread tuning, `024ef52`'s ME-only-path buffer allocation - tied to
+`106ea01`'s rejected GPU-MV path, likely N/A - and `f2eb143`'s VCN-fabric
+docs + a `PutImage` parameter-shadowing fix worth a quick look). `simpmix`
+remote still configured locally (`/tmp/simpmix-fork`); regenerate the list
+via `git log
 c5a7942..simpmix/main --oneline`.

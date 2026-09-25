@@ -263,14 +263,14 @@ static void test_multi_frame_gop(void) {
         if (f) fwrite(out_buf, 1, (size_t)written, f);
 
         if (frame == 0 || frame == 29) {
-            int expected_types[] = { 32 /* VPS */, 33 /* SPS */, 34 /* PPS */, 19 /* IDR_W_RADL */ };
-            int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 4);
-            assert(ok && "expected VPS,SPS,PPS,IDR sequence on keyframe");
+            int expected_types[] = { 35 /* AUD */, 32 /* VPS */, 33 /* SPS */, 34 /* PPS */, 19 /* IDR_W_RADL */ };
+            int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 5);
+            assert(ok && "expected AUD,VPS,SPS,PPS,IDR sequence on keyframe");
             if (frame == 0) idr_bytes = written;
         } else {
-            int expected_types[] = { 1 /* TRAIL_R */ };
-            int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 1);
-            assert(ok && "expected TRAIL_R P-slice NAL");
+            int expected_types[] = { 35 /* AUD */, 1 /* TRAIL_R */ };
+            int ok = check_nal_sequence(out_buf, (size_t)written, expected_types, 2);
+            assert(ok && "expected AUD,TRAIL_R P-slice NAL");
             if (frame == 1) {
                 static_p_bytes = written;
                 static_sad = hevc_encoder_get_last_frame_sad(enc);
