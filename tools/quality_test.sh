@@ -106,6 +106,23 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/approach1-compute-encoder/build}"
 BC250_ENV_SCRIPT="${BC250_ENV_SCRIPT:-$HOME/build-deps/env.sh}"
 WORK_DIR="${WORK_DIR:-/tmp/bc250_quality_test}"
+
+# ffmpeg's per-output-stream `-fps_mode passthrough` (the modern replacement
+# for the removed global `-vsync`) only exists from ffmpeg 5.1 onward - an
+# older ffmpeg (e.g. Ubuntu 22.04's apt package, ~4.4) rejects it outright
+# ("Unrecognized option 'fps_mode'") and exits nonzero, which is exactly the
+# CI break this detection exists to prevent from recurring: this project has
+# now run into ffmpeg builds on BOTH sides of that flag's introduction (a
+# too-new local ffmpeg that removed -vsync, and a too-old CI ffmpeg that
+# never gained -fps_mode), so pin neither - probe once, at the top of the
+# script, with a near-instant throwaway encode. Rebuild if there's ever a
+# second variable that needs this ffmpeg version, but not before.
+if ffmpeg -hide_banner -loglevel quiet -f lavfi -i "color=s=2x2:d=0.04" \
+        -fps_mode passthrough -f null - </dev/null >/dev/null 2>&1; then
+    FFMPEG_FPSMODE=(-fps_mode passthrough)
+else
+    FFMPEG_FPSMODE=(-vsync 0)
+fi
 WIDTH="${WIDTH:-640}"
 HEIGHT="${HEIGHT:-480}"
 FRAMERATE="${FRAMERATE:-25}"
@@ -262,7 +279,7 @@ fi
 # ------------------------------------------------------------------
 echo -e "\n${BOLD}[5/6] Decoding with ffmpeg's software H.264 decoder (oracle)...${NC}"
 DECODED="$WORK_DIR/decoded.yuv"
-ffmpeg -y -v error -i "$ENCODED" -fps_mode passthrough -f rawvideo -pix_fmt nv12 "$DECODED"
+ffmpeg -y -v error -i "$ENCODED" "${FFMPEG_FPSMODE[@]}" -f rawvideo -pix_fmt nv12 "$DECODED"
 DECODED_BYTES=$(wc -c < "$DECODED")
 DECODED_FRAMES=$(( DECODED_BYTES / FRAME_SIZE ))
 echo -e "  ${GREEN}✓ Decoded $DECODED_FRAMES frame(s) ($DECODED_BYTES bytes)${NC}"
