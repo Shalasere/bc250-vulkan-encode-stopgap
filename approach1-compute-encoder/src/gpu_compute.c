@@ -14,9 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if defined(__x86_64__) || defined(__i386__)
-#include <immintrin.h>
-#endif
 #include <errno.h>
 #include <time.h>
 #include <unistd.h>
@@ -1976,50 +1973,6 @@ int gpu_compute_upload_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t
     return 0;
 }
 
-#if defined(__x86_64__) || defined(__i386__)
-/* gpu_compute_download_nv12() reads back a VkMapMemory()-mapped surface,
- * which this driver's memory-type selection puts in a HOST_VISIBLE but not
- * HOST_CACHED heap (see bc250_gpu_init()'s BC250_PERF_STATS memtype dump) -
- * i.e. write-combining (WC) host memory. WC has no cache line backing a
- * read: an ordinary load only pulls a handful of bytes per bus transaction,
- * so a plain memcpy() out of it is far slower than the same memcpy() would
- * be on ordinary cached memory, with no indication anything is wrong beyond
- * "this copy is slow." docs/backlog.md's read-side counterpart to the
- * upload-side write-combining note already on file for shadow_copy().
- *
- * MOVNTDQA (here as AVX2 `vmovntdqa`/_mm256_stream_load_si256) is the x86
- * instruction built for exactly this: it pulls a full line into a fill
- * buffer in one transaction. On ordinary cached memory it behaves like a
- * normal aligned load, so using it unconditionally here is safe regardless
- * of how a given surface actually got mapped - no WC-detection needed, only
- * an AVX2-capability check, done once and cached. */
-__attribute__((target("avx2")))
-static void wc_read_avx2(uint8_t *dst, const uint8_t *src, size_t n) {
-    size_t i = 0;
-    /* _mm256_stream_load_si256 requires a 32-byte aligned source address;
-     * copy up to the next alignment boundary with an ordinary (slow, but
-     * short) access first. */
-    size_t misalign = (size_t)((0u - (uintptr_t)src) & 31u);
-    if (misalign > n) misalign = n;
-    if (misalign) { memcpy(dst, src, misalign); i = misalign; }
-    for (; i + 32 <= n; i += 32) {
-        __m256i v = _mm256_stream_load_si256((const __m256i *)(src + i));
-        _mm256_storeu_si256((__m256i *)(dst + i), v);
-    }
-    if (i < n) memcpy(dst + i, src + i, n - i);
-    _mm_sfence();
-}
-
-static void wc_read(uint8_t *dst, const uint8_t *src, size_t n) {
-    static int have_avx2 = -1;
-    if (have_avx2 < 0) have_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
-    if (have_avx2) { wc_read_avx2(dst, src, n); return; }
-    memcpy(dst, src, n);
-}
-#else
-static void wc_read(uint8_t *dst, const uint8_t *src, size_t n) { memcpy(dst, src, n); }
-#endif
-
 int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory_t memory,
                              uint8_t *y_plane, int y_pitch,
                              uint8_t *uv_plane, int uv_pitch,
@@ -2047,12 +2000,12 @@ int gpu_compute_download_nv12(gpu_context_t *ctx, gpu_image_t *image, gpu_memory
 
     const uint8_t *src_y = mapped + layout_y.offset;
     for (int r = 0; r < height; r++) {
-        wc_read(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, (size_t)width);
+        memcpy(y_plane + (size_t)r * y_pitch, src_y + (size_t)r * layout_y.rowPitch, width);
     }
 
     const uint8_t *src_uv = mapped + uv_offset + layout_uv.offset;
     for (int r = 0; r < height / 2; r++) {
-        wc_read(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, (size_t)width);
+        memcpy(uv_plane + (size_t)r * uv_pitch, src_uv + (size_t)r * layout_uv.rowPitch, width);
     }
 
     vkUnmapMemory(ctx->device, memory.memory);
