@@ -1664,3 +1664,17 @@ board verification at every step, not something to bolt onto an RC-fix
 session. Tracked here so the next pass has the actual measured cost
 (2.09x, isolated from everything else) to work from instead of a vague
 "HEVC seems worse" impression.
+
+Full scoping pass (what's already there, what's genuinely missing, a
+phased plan cheapest-first): `docs/notes/hevc-real-motion-compensation-
+scope.md`. The short version: the GPU motion search already runs
+unconditionally and already produces real per-CTU vectors
+(`motion_estimation.comp` → `enc->gpu_mvs[]`) - `docs/notes/dead-motion-
+search.md` says outright this is "the seam a real MVD/AMVP path would
+reconnect to." Nothing consumes it. Phase 1 (reuse that vector as a real
+merge candidate with actual residual coding, no AMVP/MVD needed) is
+plausibly enough to close most of the gap on its own, since it directly
+targets the measured mechanism (every CU that fails zero-motion skip
+today falls straight to full intra); Phase 2 (full AMVP + MVD signalling,
+a real per-CU search) is the larger, separate tier and its value should
+be judged after Phase 1 is board-measured, not assumed up front.
