@@ -262,7 +262,7 @@ fi
 # ------------------------------------------------------------------
 echo -e "\n${BOLD}[5/6] Decoding with ffmpeg's software H.264 decoder (oracle)...${NC}"
 DECODED="$WORK_DIR/decoded.yuv"
-ffmpeg -y -v error -vsync 0 -i "$ENCODED" -f rawvideo -pix_fmt nv12 "$DECODED"
+ffmpeg -y -v error -i "$ENCODED" -fps_mode passthrough -f rawvideo -pix_fmt nv12 "$DECODED"
 DECODED_BYTES=$(wc -c < "$DECODED")
 DECODED_FRAMES=$(( DECODED_BYTES / FRAME_SIZE ))
 echo -e "  ${GREEN}✓ Decoded $DECODED_FRAMES frame(s) ($DECODED_BYTES bytes)${NC}"
