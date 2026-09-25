@@ -1049,3 +1049,89 @@ combination B6 already flagged as capable of exceeding even the
 resized slice buffer on noise-like content, and the exact repro
 command (`tools/lab bench <key>` or any `compare`) are enough to pick
 this up as its own item.
+
+---
+
+## G. Learning from `simpmix/bc250-encoding-decoding-fix` (2026-09-24)
+
+That repo shares real git history with this one (common ancestor
+`c5a7942`, 2026-09-16) and actively merges this project's own commits
+alongside ~189 of its own (mostly MTSistemi via PR, some simpmix directly)
+- confirmed via `git merge-base`/`git log`, not assumed. A first pass
+through the encoder-relevant subset (filtering out their large from-scratch
+H.264/HEVC software decoder, which is out of this project's scope, and a
+CPU/GPU dynamic-governor feature this project explicitly removed and
+documented reasons against - see README's Known Limitations):
+
+**G1. DONE - CABAC drain hardening, `if`→`while`.** Every
+`hevc_cabac.c` bin-encoding function guarded `cabac_write_out()` (drains
+exactly one byte per call) with a single `if (bits_left >= 0)`. Verified
+by inspection that every current call site's increment is bounded by 8,
+making `if`/`while` provably equivalent today - but `while` is free when
+one drain suffices and simply correct if that bound is ever violated by a
+future change, instead of silently leaving undrained bits to desync the
+arithmetic coder. Verified byte-identical: `hevc_host_drift.sh` 53/53,
+ctest 6/6 relevant suites. Landed.
+
+**G2. Already fixed on our side, confirmed by comparison, no action
+needed.** Their v0.5.0 headline "+12 to +21 dB PSNR" fix (Planar's
+`p[-1][4]` bottom-left reference sample hardcoded to `left[3]` instead of
+a real z-scan-availability check) is the *exact* bug class this project's
+own `gather_neighbors()`/`gather_wide_n()` already handle correctly - our
+own comment history references finding and fixing this independently, and
+the current live path (`gather_wide_n()`, generic over block size) never
+had the hardcoded shortcut at all. Similarly their `slice_loop_filter_
+across_slices_enabled_flag` illegal-presence fix - we already omit that
+bit under the identical correct 7.3.6.1 condition, with our own reasoning
+already on file. Neither needed porting.
+
+**G3. TRIED, REVERTED - write-combining GPU-readback via AVX2 stream
+loads.** Their `gpu_compute_download_nv12()` fix (plain `memcpy` -> `_mm256_
+stream_load_si256`/MOVNTDQA for reading write-combining VkMapMemory()
+surface memory) claimed byte-identical output at 31->65 fps on their
+board. Implemented in our own idiom (`wc_read()`/`wc_read_avx2()`,
+runtime AVX2-dispatched) and board-tested:
+
+- Off-board: byte-identical (host-drift 53/53, ctest 6/6) - expected,
+  since host-drift is GPU-free and never exercises this function.
+- **On-board: a real, large win and a real, confirmed regression at the
+  same time.** `lab compare --codec=hevc` (CPU HEVC path, which calls
+  this function every frame for input readback): `p_wall_ms` **78.28ms
+  -> 47.96ms, -38.73%, SIGNIFICANT** - almost exactly the fork's own
+  claimed magnitude. But `lab gate`'s byte-exactness check (all-intra
+  `testsrc -g 1`, this project's one fully-deterministic oracle) **FAILED**:
+  output differs from the pre-change baseline (8100938 vs 8120615 bytes).
+- Tried one fix (an `_mm_lfence()` before the streaming loads, reasoning
+  that the existing `gpu_compute_dmabuf_sync_start/end` bracket makes data
+  coherent for an *ordinary* load but doesn't itself order a *non-temporal*
+  load against it): **did not fix it, and produced a THIRD different byte
+  count** (8127297, different again from both the baseline and the first
+  attempt) - confirming this is a genuine **non-deterministic race**
+  (CPU reading before the write is fully visible some fraction of the
+  time), not a fixed, one-fence-away ordering bug.
+- **Reverted both attempts.** `main` is back to the plain-memcpy version
+  with no correctness risk. The fork's "byte-identical, only faster"
+  claim does not hold as stated on this board/toolchain/driver
+  combination - whether that's a difference in kernel version, RADV
+  build, or something else in how this specific memory ends up mapped is
+  not established.
+- **Left as a real, unsolved, high-value opportunity, not silently
+  dropped.** A genuine ~38% CPU HEVC wall-time win (on a path currently
+  stuck around 10 fps) is a large enough prize to justify real
+  investigation later: dumping raw bytes from both the memcpy and
+  MOVNTDQA paths under a forced-repeat harness to characterize exactly
+  which bytes differ and when (first row? last row? content-dependent?),
+  and checking whether the dma-buf sync ioctl's actual kernel-side
+  implementation on this board/kernel does anything a non-temporal load
+  can outrun. Do not re-attempt without that characterization - two
+  different guesses have already produced two different wrong answers.
+
+**Remaining, not yet reviewed:** ~80 further commits in their history
+(GPU shader techniques - subgroup arithmetic for SAD reduction, reciprocal-
+division removal in a shader, enabling 16-bit shader storage; several more
+`fix(va-api)`/`fix(rate_control)` items around RC mode defaults and CQP/VBR
+handling; a dynamic-realloc approach to the slice-buffer-overflow class B6
+already fixed differently). Candidate list preserved in this session's
+scratch (`/tmp/simpmix_commits.txt` equivalent, regenerable via `git log
+c5a7942..simpmix/main --oneline` once `simpmix` is re-added as a remote)
+for a future pass.
