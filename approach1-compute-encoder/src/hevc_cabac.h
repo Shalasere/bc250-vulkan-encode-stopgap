@@ -94,7 +94,19 @@ extern "C" {
  * every existing context index is unchanged. */
 #define HEVC_CTX_SIG_CG     128   /* 4 contexts: 0-1 luma, 2-3 chroma */
 #define HEVC_CTX_TRANS_SUBDIV 132 /* 3 contexts: split_transform_flag, by 5-log2TrafoSize */
-#define HEVC_NUM_CTX        135
+/* Real inter prediction (AMVP + mvd_coding), backlog H3 / docs/notes/
+ * hevc-real-motion-compensation-scope.md. Appended after every existing
+ * bank for the same reason HEVC_CTX_SIG_CG/HEVC_CTX_TRANS_SUBDIV were:
+ * no existing context index moves. HEVC_CTX_MERGE_FLAG (126) already
+ * existed - the context slot and its P-slice init value were set up
+ * ahead of a caller that never arrived until now. */
+#define HEVC_CTX_MVD        135   /* 2 contexts: abs_mvd_greater0_flag (shared
+                                    * across the x/y components, ITU-T H.265
+                                    * Table 9-4's NUM_MV_RES_CTX=2 - not one
+                                    * context per component), abs_mvd_greater1_flag */
+#define HEVC_CTX_MVP_IDX    137   /* 1 context: mvp_l0_flag */
+#define HEVC_CTX_ROOT_CBF   138   /* 1 context: rqt_root_cbf */
+#define HEVC_NUM_CTX        139
 
 typedef struct {
     /* Output sink: a plain bit-level bitstream_t (bitstream.h/.c, the same
@@ -156,6 +168,39 @@ void hevc_cabac_code_pred_mode_flag(hevc_cabac_t *cb, int pred_mode);
 
 /* merge_idx for skip CU (ITU-T H.265 7.3.8.6): bin 0 coded with context 0. */
 void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx);
+
+/* merge_flag for a non-skip inter CU (ITU-T H.265 7.3.8.6): 1 = merge mode
+ * (a following merge_idx selects the vector - hevc_cabac_code_merge_idx()
+ * above), 0 = explicit AMVP mode (mvp_l0_flag + mvd_coding() below). Single
+ * context (HEVC_CTX_MERGE_FLAG), no ctx_inc - the slot has existed since
+ * this file's original context table, unused until now. */
+void hevc_cabac_code_merge_flag(hevc_cabac_t *cb, int merge_flag);
+
+/* mvp_l0_flag (ITU-T H.265 7.3.8.6): selects which of the (at most two)
+ * AMVP predictors derive_amvp_candidates() built is the base for mvd_coding()
+ * below. Single context, one bin (0 or 1 directly - no further binarization,
+ * per Table 9-38's "FL cMax=1" for this element). */
+void hevc_cabac_code_mvp_flag(hevc_cabac_t *cb, int mvp_idx);
+
+/* rqt_root_cbf (ITU-T H.265 7.3.8.5): only ever called for an explicit-AMVP
+ * inter CU (merge_flag == 0) - for PART_2Nx2N + merge_flag == 1, this bit is
+ * NOT present in the bitstream at all (7.3.8.5's presence condition is
+ * `!(PartMode == PART_2Nx2N && merge_flag)`) and a real decoder infers it as
+ * 1 (7.4.9.5) - the caller must not call this in that case. Gates whether a
+ * transform_tree() follows at all. */
+void hevc_cabac_code_rqt_root_cbf(hevc_cabac_t *cb, int cbf);
+
+/* mvd_coding(x0, y0, refList) (ITU-T H.265 7.3.8.9): the explicit motion
+ * vector difference, quarter-pel units. Binarization per 9.3.3.9/9.3.3.3:
+ * abs_mvd_greater0_flag[0], abs_mvd_greater0_flag[1] (context-coded, shared
+ * context regardless of x/y - Table 9-4's NUM_MV_RES_CTX is 2 total, not 4),
+ * then abs_mvd_greater1_flag[0]/[1] (context-coded, only if the matching
+ * greater0 flag was 1), then for each component with greater0 set: an
+ * order-1 Exp-Golomb abs_mvd_minus2 (bypass, only if greater1 was also set)
+ * followed by mvd_sign_flag (bypass). mvd_x/mvd_y may be any signed value;
+ * 0 for a component means neither flag nor remainder nor sign is written
+ * for it, per the syntax's own "if (abs_mvd_greater0_flag[compIdx])" gates. */
+void hevc_cabac_code_mvd(hevc_cabac_t *cb, int mvd_x, int mvd_y);
 
 /* split_cu_flag: ctx_inc = (left neighbor CU coded at a depth greater than
  * `depth`) + (above neighbor CU coded at a depth greater than `depth`),

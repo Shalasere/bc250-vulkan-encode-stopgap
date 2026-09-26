@@ -1637,44 +1637,49 @@ analogous error. Off-board: `ctest` 6/6 relevant, `hevc_host_drift.sh`
 53/53 (neither touches the VA-API attribute layer this changes).
 Full writeup: `docs/DEVLOG.md` §43.
 
-**H3. Real, documented, NOT a quick fix - HEVC lacks real motion
-compensation, costing ~2x the bits of H.264 at matched QP on real motion
-content.** Isolated cleanly in H2's own measurement: the H.264/HEVC size
-ratio at QP 27 is 1.09x with P-frames removed entirely (`-g 1`, all-
-intra) and 2.09x with them active (`-g 120`) - the *entire* 2x gap is
-P-frame behavior, not intra-coding efficiency (which is already at
-parity). This is this project's own documented, known limitation working
-exactly as expected once real (not synthetic) content exercises it: HEVC
-P-frames are zero-motion-skip-or-intra-fallback only (no AMVP, no MVD
-signalling, no inter residual - see `derive_merge_candidates()`'s own
-comment and `docs/notes/dead-motion-search.md`), so any block that can't
-pass the static-skip threshold gets fully intra-coded from scratch every
-frame, where H.264's real motion-compensated inter prediction captures
-the same motion for a fraction of the cost. Never visible before this
-session because every prior HEVC quality/QP measurement in this project's
-own history ran on synthetic or all-intra content, where P-frame behavior
-either isn't exercised or doesn't matter.
+**H3. IMPLEMENTED (off-board validated, gated, not yet board-tested) -
+HEVC now has real AMVP+MVD motion compensation.** Was: HEVC P-frames were
+zero-motion-skip-or-intra-fallback only, costing ~2x the bits of H.264 at
+matched QP on real motion content (H.264/HEVC size ratio 1.09x all-intra
+vs. 2.09x with P-frames active at QP 27 - the entire 2x gap was P-frame
+behavior). Root cause and full isolation as originally written below is
+unchanged and still the reference measurement.
 
-Explicitly not attempted: giving HEVC real motion compensation is a
-substantial encoder feature (a real motion search, AMVP candidate
-derivation, MVD entropy coding, `rqt_root_cbf`/inter residual coding) -
-comparable in scope to G17's HEVC multi-slice threading, and deserves the
-same treatment: its own dedicated, deliberately-scoped task with real
-board verification at every step, not something to bolt onto an RC-fix
-session. Tracked here so the next pass has the actual measured cost
-(2.09x, isolated from everything else) to work from instead of a vague
-"HEVC seems worse" impression.
+**What shipped:** `derive_amvp_candidates()` (encoder_h265.c, alongside
+the existing `derive_merge_candidates()`), full `merge_flag=0` explicit
+signalling (`mvp_l0_flag`, `mvd_coding()`, `rqt_root_cbf`), reusing the
+existing codec-agnostic transform/residual pipeline for a motion-
+compensated (rather than intra) prediction. The vector comes from the
+GPU motion search that already ran unconditionally and was previously
+discarded (`motion_estimation.comp` → `enc->gpu_mvs[]`, or
+`BC250_HEVC_FAKE_GPU_MV` off-board), truncated to this encoder's
+integer-pel/even-aligned block-copy MC constraint. New CABAC contexts
+(`HEVC_CTX_MVD`, `HEVC_CTX_MVP_IDX`, `HEVC_CTX_ROOT_CBF`) with init
+values cross-verified against HM's `ContextTables.h`, not guessed.
 
-Full scoping pass (what's already there, what's genuinely missing, a
-phased plan cheapest-first): `docs/notes/hevc-real-motion-compensation-
-scope.md`. The short version: the GPU motion search already runs
-unconditionally and already produces real per-CTU vectors
-(`motion_estimation.comp` → `enc->gpu_mvs[]`) - `docs/notes/dead-motion-
-search.md` says outright this is "the seam a real MVD/AMVP path would
-reconnect to." Nothing consumes it. Phase 1 (reuse that vector as a real
-merge candidate with actual residual coding, no AMVP/MVD needed) is
-plausibly enough to close most of the gap on its own, since it directly
-targets the measured mechanism (every CU that fails zero-motion skip
-today falls straight to full intra); Phase 2 (full AMVP + MVD signalling,
-a real per-CU search) is the larger, separate tier and its value should
-be judged after Phase 1 is board-measured, not assumed up front.
+Gated behind `BC250_HEVC_ENABLE_INTER=1` (default off - not yet board-
+validated), matching the project's own `BC250_HEVC_GPU`/`BC250_ENABLE_
+HEVC` precedent. `hevc_host_drift.sh` 53/53 byte-exact with the flag both
+on and off; `ctest`'s 6 GPU-free tests unaffected. Debug traces available
+via `BC250_HEVC_DEBUG_INTER=1`.
+
+**The originally-scoped "Phase 1" (reuse the GPU vector as a plain merge
+candidate, no AMVP/MVD) turned out to be spec-illegal, not merely
+smaller-scoped**, and was never built: a merge candidate must be
+independently derivable by any decoder from already-decoded bitstream
+state alone, which an encoder-only GPU estimate can never be. What
+shipped is the full AMVP+MVD tier (originally scoped as "Phase 2").
+`docs/notes/hevc-real-motion-compensation-scope.md` records both the
+rejected idea and why, and the as-shipped design.
+
+One real bug found and fixed during bring-up, left as a note for anyone
+extending inter coding further: `cbf_luma` must not be signalled when
+`cbf_cb == 0 && cbf_cr == 0` at `trafoDepth == 0` for an inter CU (7.3.8.8)
+- it's inferred as 1 instead. Every existing (intra) call site got away
+with signalling it unconditionally because `CuPredMode == MODE_INTRA`
+already satisfies that condition regardless.
+
+**Not yet done:** board validation (this was all off-board, host-repro/
+CABAC-oracle only, no real Vulkan hardware in the loop for the GPU MV
+readback itself), and a decision on whether to enable the flag by
+default once board-measured.

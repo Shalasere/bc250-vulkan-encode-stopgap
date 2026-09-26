@@ -987,12 +987,14 @@ static inline uint32_t compute_sad_4x4_chroma(const uint8_t *src_cb,
  * anyway - see there for why that is the right number and not merely the
  * cheap one.
  *
- * Giving this encoder real motion needs explicit MVD signalling (merge_flag
- * = 0 + AMVP + mvd_coding + rqt_root_cbf), not a sixth entry in this list.
- * Whoever does that re-introduces a motion search, and should re-read
- * hevc_encoder_encode_raw()'s BC250_HEVC_FAKE_GPU_MV comment first: that
- * hook and the six drift cases using it are the only way a non-zero vector
- * reaches this code on a machine with no GPU. */
+ * Real motion needed explicit MVD signalling (merge_flag = 0 + AMVP +
+ * mvd_coding + rqt_root_cbf), not a sixth entry in this list - a candidate
+ * here must be independently derivable by any decoder from already-decoded
+ * bitstream state alone, which an encoder-side GPU estimate never is. That
+ * path now exists: see derive_amvp_candidates() below and the
+ * BC250_HEVC_ENABLE_INTER branch in encode_cu() (docs/backlog.md H3). This
+ * merge-candidate list itself is unchanged and still caps out at the 5
+ * spatial/temporal derivations above. */
 static int derive_merge_candidates(const hevc_encoder_t *enc,
                                    int cux, int cuy,
                                    hevc_mv_t cand_mvs[5])
@@ -1107,6 +1109,115 @@ static int derive_merge_candidates(const hevc_encoder_t *enc,
     return num_cand;
 }
 
+/* AMVP predictor derivation (Rec. ITU-T H.265 8.5.3.2.6/8.5.3.2.7), up to
+ * two candidates. This is what gives the GPU's own motion estimate a real
+ * way to reach the bitstream (docs/notes/hevc-real-motion-compensation-
+ * scope.md): a merge candidate can only ever be a value BOTH sides already
+ * derived identically from bitstream state, so a GPU-side estimate has no
+ * merge-list slot to occupy - it can only arrive via an explicit mvd_coding()
+ * delta against one of these two predictors, both of which a decoder
+ * derives itself the exact same way.
+ *
+ * Same neighbour POSITIONS as derive_merge_candidates() (A0/A1/B0/B1/B2 -
+ * 8.5.3.2.7's own list, before this project's earlier B0/A0 CTU-boundary
+ * simplification was proven equivalent for our fixed 2x2-CU-per-CTU shape
+ * - see G6/4118dcc's review), but a different selection rule: AMVP takes
+ * the FIRST available candidate from the A group (A0 then A1) and,
+ * separately, the first available from the B group (B0, B1, B2 in that
+ * order - spec's own scan order, offsets {+1,0,-1} at cuy-1), rather than
+ * merge's "keep every non-duplicate spatial candidate."
+ *
+ * Scaling (8.5.3.2.7's "isScaledFlagLX", used when a neighbour references a
+ * different picture than the current CU) does not apply here: this encoder
+ * only ever has exactly one reference picture (DeltaPOC = -1, always), so
+ * every available inter neighbour necessarily refers to it - there is
+ * nothing to scale. That is also why, when the A group finds nothing, B's
+ * candidate can stand in for A directly (8.5.3.2.6's fallback for
+ * isScaledFlagLX == 0): with a single reference the fallback's own
+ * scaling step is a no-op, not an approximation of one. */
+static int derive_amvp_candidates(const hevc_encoder_t *enc,
+                                  int cux, int cuy,
+                                  hevc_mv_t amvp_mvs[2])
+{
+    uint32_t w_cu = enc->width_ctu * 2;
+    uint32_t h_cu = enc->height_ctu * 2;
+    int cu_in_ctu = (cuy & 1) * 2 + (cux & 1);
+
+    bool has_a = false;
+    hevc_mv_t mv_a = {0, 0};
+    /* A0 (Below-Left) first, then A1 (Left) - spec's own scan order for
+     * the A group, opposite of merge's (which never needs A0 unless A1 is
+     * absent or a duplicate). */
+    if (cux > 0 && (cuy + 1) < (int)h_cu && cu_in_ctu == 0) {
+        uint32_t a0_idx = (uint32_t)(cuy + 1) * w_cu + (uint32_t)(cux - 1);
+        if (enc->cu_is_inter[a0_idx]) {
+            has_a = true;
+            mv_a.x = enc->mv_x_map[a0_idx];
+            mv_a.y = enc->mv_y_map[a0_idx];
+        }
+    }
+    if (!has_a && cux > 0) {
+        uint32_t a1_idx = (uint32_t)cuy * w_cu + (uint32_t)(cux - 1);
+        if (enc->cu_is_inter[a1_idx]) {
+            has_a = true;
+            mv_a.x = enc->mv_x_map[a1_idx];
+            mv_a.y = enc->mv_y_map[a1_idx];
+        }
+    }
+
+    bool has_b = false;
+    hevc_mv_t mv_b = {0, 0};
+    /* B0 (Above-Right), then B1 (Above), then B2 (Above-Left) - spec's own
+     * scan order for the B group. B0's position availability is the same
+     * "cu_in_ctu != 3" simplification derive_merge_candidates() already
+     * uses (G6-reviewed, provably equivalent for this fixed CU structure). */
+    if (cuy > 0 && (cux + 1) < (int)w_cu && cu_in_ctu != 3) {
+        uint32_t b0_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux + 1);
+        if (enc->cu_is_inter[b0_idx]) {
+            has_b = true;
+            mv_b.x = enc->mv_x_map[b0_idx];
+            mv_b.y = enc->mv_y_map[b0_idx];
+        }
+    }
+    if (!has_b && cuy > 0) {
+        uint32_t b1_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)cux;
+        if (enc->cu_is_inter[b1_idx]) {
+            has_b = true;
+            mv_b.x = enc->mv_x_map[b1_idx];
+            mv_b.y = enc->mv_y_map[b1_idx];
+        }
+    }
+    if (!has_b && cux > 0 && cuy > 0) {
+        uint32_t b2_idx = (uint32_t)(cuy - 1) * w_cu + (uint32_t)(cux - 1);
+        if (enc->cu_is_inter[b2_idx]) {
+            has_b = true;
+            mv_b.x = enc->mv_x_map[b2_idx];
+            mv_b.y = enc->mv_y_map[b2_idx];
+        }
+    }
+
+    /* Single-reference fallback (see this function's header comment):
+     * B stands in for an empty A group directly, no scaling needed. */
+    if (!has_a && has_b) {
+        has_a = true;
+        mv_a = mv_b;
+    }
+
+    int n = 0;
+    if (has_a) amvp_mvs[n++] = mv_a;
+    /* Pruning: B against A, same equality check derive_merge_candidates()
+     * uses for its own duplicates. */
+    if (has_b && (!has_a || mv_b.x != mv_a.x || mv_b.y != mv_a.y)) {
+        amvp_mvs[n++] = mv_b;
+    }
+    while (n < 2) {
+        amvp_mvs[n].x = 0;
+        amvp_mvs[n].y = 0;
+        n++;
+    }
+    return n;
+}
+
 static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y, bool is_idr) {
     int qp = enc->qp;
     uint32_t cw = enc->coded_width, ch = enc->coded_height;
@@ -1123,6 +1234,11 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
     bool is_skip = false;
     int chosen_merge_idx = 0;
     int chosen_dx = 0, chosen_dy = 0;
+    /* Hoisted out of the merge-decision block below so the inter-MVD
+     * decision after it can reuse the same number instead of recomputing
+     * an identical SAD - both are "how well does zero motion explain this
+     * block" and there is exactly one right answer to that question per CU. */
+    uint32_t sad_zero = 0;
 
     if (!is_idr && enc->has_ref) {
         hevc_mv_t cand_mvs[5];
@@ -1151,10 +1267,10 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
          * are byte-identical (RC_CQP ignores est_sad entirely) and of the
          * three VBR ones only 128x128 p2 gop8 @4000 kbps changes - one QP
          * step on one frame. docs/notes/dead-motion-search.md. */
-        uint32_t sad_zero = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
-                            compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
-                                                   enc->prev_recon_cb, enc->prev_recon_cr,
-                                                   ccw, cx, cy, 0, 0);
+        sad_zero = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, 0, 0) +
+                   compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                          enc->prev_recon_cb, enc->prev_recon_cr,
+                                          ccw, cx, cy, 0, 0);
         enc->last_frame_sad += sad_zero;
 
         uint32_t threshold = 96 * (1 + (enc->qp / 8));
@@ -1207,6 +1323,80 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
         }
     }
 
+    /* Real inter prediction via explicit AMVP+MVD (docs/notes/hevc-real-
+     * motion-compensation-scope.md, backlog H3) - gated behind
+     * BC250_HEVC_ENABLE_INTER=1 until board-validated, matching this
+     * project's own established pattern for landing a not-yet-proven
+     * change (BC250_HEVC_GPU, BC250_ENABLE_HEVC). Off by default: nothing
+     * about the existing 53/53 byte-exact behavior changes unless this is
+     * explicitly requested.
+     *
+     * Only tried when skip was not already chosen (skip is already the
+     * cheapest possible encoding whenever it applies - no vector, however
+     * signaled, beats zero bits) and a real, non-zero GPU motion estimate
+     * exists for this CU's CTU (enc->gpu_mvs[], populated by
+     * motion_estimation.comp's readback in hevc_encoder_encode_frame(), or
+     * BC250_HEVC_FAKE_GPU_MV off-board - see hevc_encoder_encode_raw()). */
+    bool is_inter_mvd = false;
+    int inter_dx = 0, inter_dy = 0, inter_mvp_idx = 0;
+    hevc_mv_t inter_mvd = {0, 0};
+    if (!is_skip && !is_idr && enc->has_ref && enc->gpu_mvs && enc->num_gpu_mvs > 0) {
+        static int s_enable_inter = -1;
+        if (s_enable_inter < 0) s_enable_inter = getenv("BC250_HEVC_ENABLE_INTER") ? 1 : 0;
+        if (s_enable_inter) {
+            uint32_t ctu_idx = ((uint32_t)cuy / 2) * enc->width_ctu + ((uint32_t)cux / 2);
+            if (ctu_idx < enc->num_gpu_mvs) {
+                const gpu_mv_t *gm = &enc->gpu_mvs[ctu_idx];
+                /* This encoder's motion compensation is integer-pel,
+                 * even-aligned block copy only - there is no fractional-pel
+                 * interpolation filter anywhere in the CPU reconstruction
+                 * path. Truncate the GPU's quarter-pel estimate to exactly
+                 * what the reconstruction below can realise: the same
+                 * (/4) & ~1 constraint the removed merge-list-injection
+                 * code used (backlog G6/4118dcc's review of that fork
+                 * commit), now applied where it is actually spec-legal -
+                 * as the real vector an explicit mvd_coding() signals,
+                 * not smuggled into a merge list a decoder derives on its
+                 * own. */
+                int gdx = (gm->mvx / 4) & ~1;
+                int gdy = (gm->mvy / 4) & ~1;
+                int cx = cu_x / 2, cy = cu_y / 2;
+                if (!(gdx == 0 && gdy == 0) &&
+                    cu_x + gdx >= 0 && cu_x + gdx + HEVC_CU_SIZE <= (int)cw &&
+                    cu_y + gdy >= 0 && cu_y + gdy + HEVC_CU_SIZE <= (int)ch) {
+                    uint32_t gpu_sad = compute_sad_8x8_luma(enc->src_y, enc->prev_recon_y, cw, cu_x, cu_y, gdx, gdy) +
+                                       compute_sad_4x4_chroma(enc->src_cb, enc->src_cr,
+                                                              enc->prev_recon_cb, enc->prev_recon_cr,
+                                                              ccw, cx, cy, gdx / 2, gdy / 2);
+                    /* Worth an explicit vector - real per-bit cost: merge_flag,
+                     * mvp_l0_flag, mvd_coding, and a real (non-inferred)
+                     * rqt_root_cbf - only when real motion clearly explains
+                     * this block better than assuming none at all. sad_zero
+                     * is already computed above for the skip decision. */
+                    if (gpu_sad < sad_zero) {
+                        hevc_mv_t amvp[2];
+                        derive_amvp_candidates(enc, cux, cuy, amvp);
+                        hevc_mv_t want = { (int16_t)(gdx * 4), (int16_t)(gdy * 4) };
+                        int d0 = abs((int)want.x - amvp[0].x) + abs((int)want.y - amvp[0].y);
+                        int d1 = abs((int)want.x - amvp[1].x) + abs((int)want.y - amvp[1].y);
+                        inter_mvp_idx = (d1 < d0) ? 1 : 0;
+                        inter_mvd.x = (int16_t)(want.x - amvp[inter_mvp_idx].x);
+                        inter_mvd.y = (int16_t)(want.y - amvp[inter_mvp_idx].y);
+                        inter_dx = gdx;
+                        inter_dy = gdy;
+                        is_inter_mvd = true;
+                        if (getenv("BC250_HEVC_DEBUG_INTER"))
+                            fprintf(stderr, "[INTER] frame=%u cu=(%d,%d) mv=(%d,%d) amvp=[(%d,%d),(%d,%d)] "
+                                            "mvp_idx=%d mvd=(%d,%d) gpu_sad=%u sad_zero=%u\n",
+                                    enc->frame_count, cu_x, cu_y, inter_dx, inter_dy,
+                                    amvp[0].x, amvp[0].y, amvp[1].x, amvp[1].y,
+                                    inter_mvp_idx, inter_mvd.x, inter_mvd.y, gpu_sad, sad_zero);
+                    }
+                }
+            }
+        }
+    }
+
     if (is_skip) {
         enc->cu_skip_map[cu_idx] = 1;
         enc->cu_is_inter[cu_idx] = 1;
@@ -1230,6 +1420,162 @@ static void encode_cu(hevc_encoder_t *enc, hevc_cabac_t *cab, int cu_x, int cu_y
                    &enc->prev_recon_cr[(cy + cdy + y) * ccw + (cx + cdx)],
                    HEVC_PU_SIZE);
         }
+        for (int pu = 0; pu < 4; pu++) {
+            int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
+            enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = HEVC_MODE_DC;
+        }
+        return;
+    }
+
+    if (is_inter_mvd) {
+        enc->cu_skip_map[cu_idx] = 0;
+        enc->cu_is_inter[cu_idx] = 1;
+        enc->mv_x_map[cu_idx] = (int16_t)(inter_dx * 4);
+        enc->mv_y_map[cu_idx] = (int16_t)(inter_dy * 4);
+
+        hevc_cabac_code_cu_skip_flag(cab, 0, skip_ctx_inc);
+        hevc_cabac_code_pred_mode_flag(cab, 0 /* MODE_INTER */);
+        /* part_mode: PART_2Nx2N is bin="1", context 0 - per Table 9-34 this
+         * codeword is identical for intra and inter at this fixed CU size
+         * (log2CbSize == MinCbLog2SizeY == 3, so inter PART_NxN is not a
+         * legal option at all - 7.4.9.5 requires MinCbLog2SizeY > 3 for
+         * that - and 2Nx2N's own bin/context don't depend on prediction
+         * mode either way). Reusing the "_intra"-named function here is
+         * correct, not a shortcut: the bits it writes are exactly right. */
+        hevc_cabac_code_part_mode_intra(cab, 1 /* PART_2Nx2N */);
+        hevc_cabac_code_merge_flag(cab, 0);
+        /* mvd_coding() BEFORE mvp_l0_flag - verified against HM's own
+         * decoder source (TDecEntropy::decodePUWise(): decodeMvdPU() is
+         * called before decodeMVPIdxPU()), not assumed from the syntax
+         * table's visual layout alone. Getting this backwards desyncs the
+         * arithmetic decoder from this bin onward - caught by
+         * hevc_host_drift.sh's byte-exactness oracle, not by inspection. */
+        hevc_cabac_code_mvd(cab, inter_mvd.x, inter_mvd.y);
+        hevc_cabac_code_mvp_flag(cab, inter_mvp_idx);
+
+        /* Motion-compensated prediction: the same integer-pel, even-aligned
+         * block copy the skip path above already does, just from a real,
+         * explicitly-signaled non-zero offset instead of (0,0). */
+        uint8_t pred[HEVC_CU_SIZE * HEVC_CU_SIZE];
+        for (int y = 0; y < HEVC_CU_SIZE; y++)
+            memcpy(&pred[y * HEVC_CU_SIZE],
+                   &enc->prev_recon_y[(cu_y + inter_dy + y) * cw + (cu_x + inter_dx)],
+                   HEVC_CU_SIZE);
+
+        int16_t residual[HEVC_CU_SIZE * HEVC_CU_SIZE];
+        for (int y = 0; y < HEVC_CU_SIZE; y++)
+            for (int x = 0; x < HEVC_CU_SIZE; x++)
+                residual[y * HEVC_CU_SIZE + x] =
+                    (int16_t)(enc->src_y[(cu_y + y) * cw + (cu_x + x)] - pred[y * HEVC_CU_SIZE + x]);
+
+        int16_t luma_coeff[HEVC_CU_SIZE * HEVC_CU_SIZE];
+        /* use_dst=0: DST-VII is the 4x4-luma-INTRA-only alternative
+         * transform (8.6.4.1) - never applies to inter, and this is an 8x8
+         * TU regardless. */
+        hevc_transform_quant(residual, qp, 3, 0, luma_coeff);
+        int cbf_luma = 0;
+        for (int i = 0; i < HEVC_CU_SIZE * HEVC_CU_SIZE; i++) if (luma_coeff[i]) { cbf_luma = 1; break; }
+
+        int cx = cu_x / 2, cy = cu_y / 2;
+        int cdx = inter_dx / 2, cdy = inter_dy / 2;
+        uint8_t pred_cb[16], pred_cr[16];
+        for (int y = 0; y < HEVC_PU_SIZE; y++) {
+            memcpy(&pred_cb[y * HEVC_PU_SIZE],
+                   &enc->prev_recon_cb[(cy + cdy + y) * ccw + (cx + cdx)], HEVC_PU_SIZE);
+            memcpy(&pred_cr[y * HEVC_PU_SIZE],
+                   &enc->prev_recon_cr[(cy + cdy + y) * ccw + (cx + cdx)], HEVC_PU_SIZE);
+        }
+        int16_t res_cb[16], res_cr[16];
+        for (int y = 0; y < 4; y++)
+            for (int x = 0; x < 4; x++) {
+                res_cb[y * 4 + x] = (int16_t)(enc->src_cb[(cy + y) * ccw + (cx + x)] - pred_cb[y * 4 + x]);
+                res_cr[y * 4 + x] = (int16_t)(enc->src_cr[(cy + y) * ccw + (cx + x)] - pred_cr[y * 4 + x]);
+            }
+        int cqp = hevc_chroma_qp_from_luma(qp);
+        int16_t coeff_cb[16], coeff_cr[16];
+        hevc_transform_quant_4x4(res_cb, cqp, 0, coeff_cb);
+        hevc_transform_quant_4x4(res_cr, cqp, 0, coeff_cr);
+        int cbf_cb = any_nonzero16(coeff_cb);
+        int cbf_cr = any_nonzero16(coeff_cr);
+
+        /* rqt_root_cbf (7.3.8.5): only present for an explicit-AMVP inter
+         * CU (merge_flag == 0, exactly this branch) - the skip and merge-
+         * with-2Nx2N cases infer it as 1 without it ever being written,
+         * which is why the skip path above never calls this. */
+        int rqt_root_cbf = cbf_luma || cbf_cb || cbf_cr;
+        hevc_cabac_code_rqt_root_cbf(cab, rqt_root_cbf);
+        if (getenv("BC250_HEVC_DEBUG_INTER"))
+            fprintf(stderr, "[INTER-CBF] frame=%u cu=(%d,%d) rqt_root_cbf=%d cbf_luma=%d cbf_cb=%d cbf_cr=%d\n",
+                    enc->frame_count, cu_x, cu_y, rqt_root_cbf, cbf_luma, cbf_cb, cbf_cr);
+
+        if (rqt_root_cbf) {
+            hevc_cabac_code_cbf_chroma(cab, cbf_cb, 0);
+            hevc_cabac_code_cbf_chroma(cab, cbf_cr, 0);
+            /* cbf_luma is only SIGNALED here when cbf_cb || cbf_cr (7.3.8.8's
+             * transform_tree(): the "CuPredMode == MODE_INTRA || trafoDepth
+             * != 0 || cbf_cb || cbf_cr" condition - intra is always true
+             * regardless, which is why the two intra call sites for this
+             * function get away with calling it unconditionally). For our
+             * inter CUs, trafoDepth is always 0, so when both chroma cbf's
+             * are 0, cbf_luma must NOT be written - it's inferred as 1 per
+             * 7.4.9.8 (and rqt_root_cbf == 1 with cbf_cb == cbf_cr == 0
+             * already forces cbf_luma == 1, so the inferred value always
+             * matches the computed one; nothing else needs to change). */
+            if (cbf_cb || cbf_cr)
+                hevc_cabac_code_cbf_luma(cab, cbf_luma, 0);
+            if (cbf_luma) {
+                int16_t recon_residual[HEVC_CU_SIZE * HEVC_CU_SIZE];
+                hevc_dequant_itransform(luma_coeff, qp, 3, 0, recon_residual);
+                for (int y = 0; y < HEVC_CU_SIZE; y++)
+                    for (int x = 0; x < HEVC_CU_SIZE; x++)
+                        enc->recon_y[(cu_y + y) * cw + (cu_x + x)] =
+                            clip8i(pred[y * HEVC_CU_SIZE + x] + recon_residual[y * HEVC_CU_SIZE + x]);
+                /* scan_idx = 0 (diagonal) unconditionally: 7.4.9.11's mode-
+                 * dependent scan only applies when CuPredMode == MODE_INTRA -
+                 * an inter TU always uses the diagonal scan, there is no
+                 * hevc_scan_idx_for_mode() call here on purpose. */
+                hevc_cabac_code_residual(cab, luma_coeff, 3 /* log2_size: 8x8 */, 1 /* luma */, 0 /* diag */);
+            } else {
+                for (int y = 0; y < HEVC_CU_SIZE; y++)
+                    memcpy(&enc->recon_y[(cu_y + y) * cw + cu_x], &pred[y * HEVC_CU_SIZE], HEVC_CU_SIZE);
+            }
+            if (cbf_cb) {
+                int16_t rres_cb[16];
+                hevc_dequant_itransform_4x4(coeff_cb, cqp, 0, rres_cb);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++)
+                        enc->recon_cb[(cy + y) * ccw + (cx + x)] = clip8i(pred_cb[y * 4 + x] + rres_cb[y * 4 + x]);
+                hevc_cabac_code_residual_4x4(cab, coeff_cb, 0, 0 /* chroma always diagonal in 4:2:0 */);
+            } else {
+                for (int y = 0; y < 4; y++)
+                    memcpy(&enc->recon_cb[(cy + y) * ccw + cx], &pred_cb[y * 4], 4);
+            }
+            if (cbf_cr) {
+                int16_t rres_cr[16];
+                hevc_dequant_itransform_4x4(coeff_cr, cqp, 0, rres_cr);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++)
+                        enc->recon_cr[(cy + y) * ccw + (cx + x)] = clip8i(pred_cr[y * 4 + x] + rres_cr[y * 4 + x]);
+                hevc_cabac_code_residual_4x4(cab, coeff_cr, 0, 0);
+            } else {
+                for (int y = 0; y < 4; y++)
+                    memcpy(&enc->recon_cr[(cy + y) * ccw + cx], &pred_cr[y * 4], 4);
+            }
+        } else {
+            /* No residual at all: reconstruction is the motion-compensated
+             * prediction directly, for every plane. */
+            for (int y = 0; y < HEVC_CU_SIZE; y++)
+                memcpy(&enc->recon_y[(cu_y + y) * cw + cu_x], &pred[y * HEVC_CU_SIZE], HEVC_CU_SIZE);
+            for (int y = 0; y < 4; y++) {
+                memcpy(&enc->recon_cb[(cy + y) * ccw + cx], &pred_cb[y * 4], 4);
+                memcpy(&enc->recon_cr[(cy + y) * ccw + cx], &pred_cr[y * 4], 4);
+            }
+        }
+
+        /* Same "treat as DC for a future intra neighbor's MPM derivation"
+         * substitution the skip path above already applies (8.4.2: a
+         * non-intra neighbor contributes INTRA_DC, not its real mode -
+         * there is no "real mode" for an inter CU to contribute anyway). */
         for (int pu = 0; pu < 4; pu++) {
             int px = cu_x + pu_off_x[pu], py = cu_y + pu_off_y[pu];
             enc->luma_mode_map[(py / 4) * enc->mode_map_stride + (px / 4)] = HEVC_MODE_DC;
@@ -1408,13 +1754,15 @@ static void encode_ctu(hevc_encoder_t *enc, hevc_cabac_t *cab, int ctu_col, int 
     hevc_cabac_code_split_cu_flag(cab, 1, cond_l + cond_a);
     enc->ctdepth[ctu] = 1; /* this CTU always splits to four 8x8 CUs, CtDepth 1 */
 
-    /* No per-CTU GPU motion vector is looked up any more. enc->gpu_mvs is
-     * still filled (motion_estimation.comp's readback in
-     * hevc_encoder_encode_frame(), or BC250_HEVC_FAKE_GPU_MV off-board) but
-     * nothing downstream can use it: the merge list is a fixpoint at zero,
-     * so the only vector this encoder can signal is (0,0) whatever the GPU
-     * found. See derive_merge_candidates()'s comment and
-     * docs/notes/dead-motion-search.md. */
+    /* No per-CTU GPU motion vector is looked up here directly - each
+     * encode_cu() call below reads enc->gpu_mvs itself (motion_estimation.
+     * comp's readback in hevc_encoder_encode_frame(), or
+     * BC250_HEVC_FAKE_GPU_MV off-board) when deciding whether to signal an
+     * explicit AMVP+MVD inter CU (BC250_HEVC_ENABLE_INTER, docs/backlog.md
+     * H3). The merge list itself is still a fixpoint at zero - see
+     * derive_merge_candidates()'s comment and docs/notes/dead-motion-
+     * search.md - real motion reaches the bitstream through the separate
+     * MVD path instead. */
     static const int cu_off_x[4] = { 0, 8, 0, 8 };
     static const int cu_off_y[4] = { 0, 0, 8, 8 };
     for (int i = 0; i < 4; i++)
@@ -2393,14 +2741,18 @@ int hevc_encoder_encode_raw(hevc_encoder_t *encoder,
      * confirm the P-frame *syntax* but cannot reach the MV-selection logic
      * at all - and that is where the real defect turned out to be.
      *
-     * Say the current state plainly: since the motion search was removed
-     * (docs/notes/dead-motion-search.md) NOTHING reads encoder->gpu_mvs, so
-     * this hook has no effect on the output and the six drift cases that
-     * set it are byte-identical to the same cases without it. It is kept,
-     * with the readback in hevc_encoder_encode_frame() it stands in for,
-     * because it is the seam a real MVD/AMVP path would reconnect to, and
-     * because deleting the only off-board source of a non-zero vector is
-     * how the injection bug above stayed invisible the first time. */
+     * Say the current state plainly: the merge-candidate list derived by
+     * derive_merge_candidates() still ignores encoder->gpu_mvs entirely (a
+     * merge candidate must be independently derivable by any decoder from
+     * bitstream state alone, which a GPU-side estimate never is - see that
+     * function's comment). What DOES read this array now is encode_cu()'s
+     * BC250_HEVC_ENABLE_INTER path (docs/backlog.md H3): when enabled, a
+     * non-zero, in-bounds vector here can be signalled as an explicit
+     * AMVP+MVD inter CU. With the flag off (the default), this hook still
+     * has no effect on the output. It is kept, with the readback in
+     * hevc_encoder_encode_frame() it stands in for, because it is the only
+     * off-board source of a non-zero vector, and deleting it is how the
+     * injection bug above stayed invisible the first time. */
     if (encoder->gpu_mvs && encoder->has_ref) {
         const char *fake = getenv("BC250_HEVC_FAKE_GPU_MV");
         if (fake) {

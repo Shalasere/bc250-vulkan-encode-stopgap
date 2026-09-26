@@ -143,6 +143,18 @@ static const uint8_t INIT_PRED_MODE    = 149;
 static const uint8_t INIT_MERGE_FLAG   = 110;
 static const uint8_t INIT_MERGE_IDX    = 122;
 
+/* Real inter prediction (AMVP + mvd_coding), P-slice (initType 1) only -
+ * cross-checked against HM's ContextTables.h directly (not taken on trust
+ * from any one source), which also confirms the four values above:
+ * INIT_MVD[NUMBER_OF_SLICE_TYPES][2] row 1 = {140, 198}, INIT_MVP_IDX row 1
+ * = {168}, INIT_QT_ROOT_CBF row 1 = {79}, INIT_MERGE_FLAG_EXT row 1 = {110},
+ * INIT_MERGE_IDX_EXT row 1 = {122}, INIT_PRED_MODE row 1 = {149},
+ * INIT_SKIP_FLAG row 1 = {197, 185, 201} - all match this file's existing
+ * values exactly. */
+static const uint8_t INIT_MVD[2]     = { 140, 198 }; /* greater0, greater1 */
+static const uint8_t INIT_MVP_IDX    = 168;
+static const uint8_t INIT_ROOT_CBF   = 79;
+
 /* Banks that only a transform block larger than 4x4 needs - see
  * hevc_cabac.h. Same row convention as the tables above: row 0 is the
  * P-slice initialiser, row 1 the I-slice one. ITU-T H.265 Tables 9-25
@@ -196,6 +208,9 @@ void hevc_cabac_reset_contexts(hevc_cabac_t *cb, int slice_qp, int slice_type) {
         cb->ctx[HEVC_CTX_PRED_MODE] = hevc_sbac_init_state(slice_qp, INIT_PRED_MODE);
         cb->ctx[HEVC_CTX_MERGE_FLAG] = hevc_sbac_init_state(slice_qp, INIT_MERGE_FLAG);
         cb->ctx[HEVC_CTX_MERGE_IDX] = hevc_sbac_init_state(slice_qp, INIT_MERGE_IDX);
+        init_bank(&cb->ctx[HEVC_CTX_MVD], INIT_MVD, 2, slice_qp);
+        cb->ctx[HEVC_CTX_MVP_IDX] = hevc_sbac_init_state(slice_qp, INIT_MVP_IDX);
+        cb->ctx[HEVC_CTX_ROOT_CBF] = hevc_sbac_init_state(slice_qp, INIT_ROOT_CBF);
     }
 }
 
@@ -388,6 +403,61 @@ void hevc_cabac_code_merge_idx(hevc_cabac_t *cb, int merge_idx) {
 
 void hevc_cabac_code_split_cu_flag(hevc_cabac_t *cb, int bin, int ctx_inc) {
     encode_bin(cb, HEVC_CTX_SPLIT_FLAG + ctx_inc, (uint32_t)(bin ? 1 : 0));
+}
+
+void hevc_cabac_code_merge_flag(hevc_cabac_t *cb, int merge_flag) {
+    encode_bin(cb, HEVC_CTX_MERGE_FLAG, (uint32_t)(merge_flag ? 1 : 0));
+}
+
+void hevc_cabac_code_mvp_flag(hevc_cabac_t *cb, int mvp_idx) {
+    encode_bin(cb, HEVC_CTX_MVP_IDX, (uint32_t)(mvp_idx ? 1 : 0));
+}
+
+void hevc_cabac_code_rqt_root_cbf(hevc_cabac_t *cb, int cbf) {
+    encode_bin(cb, HEVC_CTX_ROOT_CBF, (uint32_t)(cbf ? 1 : 0));
+}
+
+/* k-th order Exp-Golomb, Rec. ITU-T H.265 9.3.3.3, for a non-negative value.
+ * Not the same binarization as write_coef_remain_exp_golomb() above: that
+ * one implements 9.3.3.13's Rice-then-EGk hybrid with a bin-count-reduction
+ * cutoff specific to coeff_abs_level_remaining, which is the wrong shape for
+ * abs_mvd_minus2 (9.3.3.9) - a plain, unmodified EGk. Mirrors the spec's own
+ * pseudocode structure directly (prefix-then-suffix, k incrementing once per
+ * prefix bit) rather than a derived closed form, since a literal
+ * transcription is the easiest version of this to check by re-reading the
+ * spec text next to it. */
+static void write_egk_bypass(hevc_cabac_t *cb, uint32_t abs_val, int k) {
+    while (abs_val >= (1u << k)) {
+        encode_bypass(cb, 1);
+        abs_val -= (1u << k);
+        k++;
+    }
+    encode_bypass(cb, 0);
+    encode_bypass_bins(cb, abs_val, k);
+}
+
+void hevc_cabac_code_mvd(hevc_cabac_t *cb, int mvd_x, int mvd_y) {
+    uint32_t ax = (uint32_t)(mvd_x < 0 ? -mvd_x : mvd_x);
+    uint32_t ay = (uint32_t)(mvd_y < 0 ? -mvd_y : mvd_y);
+    /* abs_mvd_greater0_flag[0], abs_mvd_greater0_flag[1] */
+    encode_bin(cb, HEVC_CTX_MVD, ax > 0 ? 1u : 0u);
+    encode_bin(cb, HEVC_CTX_MVD, ay > 0 ? 1u : 0u);
+    /* abs_mvd_greater1_flag[0], abs_mvd_greater1_flag[1] - only if the
+     * matching greater0 flag was set */
+    if (ax > 0) encode_bin(cb, HEVC_CTX_MVD + 1, ax > 1 ? 1u : 0u);
+    if (ay > 0) encode_bin(cb, HEVC_CTX_MVD + 1, ay > 1 ? 1u : 0u);
+    /* abs_mvd_minus2[0] (if greater1) + mvd_sign_flag[0] (if greater0),
+     * then the same pair for component 1 - matches 7.3.8.9's own order,
+     * one component fully before the other, not interleaved with the
+     * flags above. */
+    if (ax > 0) {
+        if (ax > 1) write_egk_bypass(cb, ax - 2, 1);
+        encode_bypass(cb, mvd_x < 0 ? 1u : 0u);
+    }
+    if (ay > 0) {
+        if (ay > 1) write_egk_bypass(cb, ay - 2, 1);
+        encode_bypass(cb, mvd_y < 0 ? 1u : 0u);
+    }
 }
 
 void hevc_cabac_code_part_mode_intra(hevc_cabac_t *cb, int is_2nx2n) {

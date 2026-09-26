@@ -7,10 +7,26 @@ the scoping pass for closing it - reading what's actually in the tree
 today before proposing what to add, not a specification written from
 memory of the standard.
 
-**Not started this session.** Comparable in size to backlog G17 (HEVC
-multi-slice threading) - a real feature project with its own board
-verification at every step, not something to bolt onto an RC-negotiation
-fix.
+**Status update: implemented, and Phase 1 below turned out to be
+spec-illegal, not merely unimplemented.** A merge candidate
+(`derive_merge_candidates()`'s list) must be independently derivable by
+any compliant decoder from already-decoded bitstream state alone - an
+encoder-side-only GPU motion estimate can never legally be a sixth entry
+in that list, no matter how the ordering/pruning bug G6 found is fixed.
+Only `mvd_coding()` (an explicit, bitstream-transmitted delta against an
+AMVP predictor) can introduce a genuinely new vector. So what shipped is
+what section 3 below calls "Phase 2" - full AMVP + MVD signalling -
+implemented directly, gated behind `BC250_HEVC_ENABLE_INTER=1`,
+board-off validated at 53/53 byte-exact via `hevc_host_drift.sh` with the
+flag both on and off. Section 3's "Phase 1" text is kept below, struck
+through in spirit but not in fact, as a record of the wrong idea and why
+it doesn't work - don't revive it.
+
+**Was not started the session this note was written.** Comparable in
+size to backlog G17 (HEVC multi-slice threading) - a real feature
+project with its own board verification at every step, not something to
+bolt onto an RC-negotiation fix. (It has since been started and landed
+off-board; see the status update above.)
 
 ## 1. What's actually there today
 
@@ -84,40 +100,48 @@ needs, in ascending order of how much new machinery each one requires:
   search refinement (the shape of thing `docs/notes/dead-motion-search.md`
   removed, now with somewhere legal to put its answer).
 
-## 3. A phased plan, cheapest-and-most-certain first
+## 3. A phased plan, cheapest-and-most-certain first (superseded - see the
+   status update at the top)
 
 **Phase 1 - merge with real residual, using the vector that's already
-computed.** Reuse `enc->gpu_mvs[]`'s per-CTU vector as a genuine
-additional merge candidate (fixing G6's ordering bug this time), and
-remove the implicit "merge chosen ⇒ must be zero-residual skip" coupling:
-let a CU take `merge_flag=1` with a *non-zero* vector, predict from that
-offset in `prev_recon_*`, and run the existing transform/quant/residual
-pipeline against the resulting (small) residual instead of falling to
-intra. Needs: `merge_flag` + `rqt_root_cbf` CABAC contexts (new but
-small), generalizing the CU-encode path to accept a motion-compensated
-prediction (mechanical - the transform/residual code doesn't care where
-`residual[]` came from), and revisiting `derive_merge_candidates()`'s 5-
-candidate list construction. Does **not** need AMVP, MVD coding, or a new
-motion search - the GPU already supplies the vector.
+computed. REJECTED, not merely deprioritized:** this is spec-illegal, not
+just unimplemented. The idea below was to reuse `enc->gpu_mvs[]`'s
+per-CTU vector as a genuine additional merge candidate (fixing G6's
+ordering bug this time) and let a CU take `merge_flag=1` with a
+*non-zero* vector. That can't work: `derive_merge_candidates()`'s list
+must be reconstructible by a decoder from bitstream state it has already
+parsed - spatial/temporal neighbor MVs - and a GPU-side motion estimate
+is never part of that state. A decoder given this bitstream would derive
+a *different* (all-zero) merge list than the encoder used, and decode a
+different picture from CU 1 onward. There is no ordering/pruning fix for
+this; the defect is categorical. (Original, now-superseded text, kept for
+the record: "remove the implicit 'merge chosen ⇒ must be zero-residual
+skip' coupling: predict from that offset in `prev_recon_*`, and run the
+existing transform/quant/residual pipeline against the resulting (small)
+residual instead of falling to intra. Needs: `merge_flag` + `rqt_root_cbf`
+CABAC contexts (new but small)... Does **not** need AMVP, MVD coding, or a
+new motion search - the GPU already supplies the vector." That last
+sentence is exactly the wrong turn - it does need AMVP/MVD, unavoidably.)
 
-This targets the measured mechanism directly: every CU that fails the
-zero-motion skip test today goes straight to full intra. A block moving
-with the CTU's real (small, coherent) motion - the common case for
-camera pans and character motion, which is most of what a real film
-looks like - would get a cheap motion-compensated residual instead.
-Expect this to close a meaningful fraction of the 2.09x gap, not
-necessarily all of it: one CTU-wide vector is coarser than a per-CU
-search, and it says nothing about content whose real motion isn't well
-described by a single 16x16-CTU-granularity vector.
-
-**Phase 2 - full AMVP + MVD signalling.** The "real x265-grade P-frame"
-tier: a real per-CU motion search (reviving the shape of what `dead-
-motion-search.md` removed, now with `mvd_coding()` to put its answer
-into), a genuine AMVP candidate list, and the full new CABAC syntax set
-above. Comparable in scope to G17, likely larger given the new entropy-
-coding surface. Whether it's worth doing at all should be decided *after*
-Phase 1 lands and gets board-measured - if Phase 1 closes most of the
-gap, Phase 2's marginal return may not justify its cost.
+**Phase 2 - full AMVP + MVD signalling. This is what shipped.** The "real
+x265-grade P-frame" tier: `derive_amvp_candidates()` (new, alongside
+`derive_merge_candidates()`), the full new CABAC syntax set from section 2
+(`merge_flag`, `mvp_l0_flag`, `mvd_coding()`, `rqt_root_cbf`, with CABAC
+context init values cross-verified against HM's `ContextTables.h`), and
+the existing transform/residual pipeline reused for a motion-compensated
+prediction instead of a motion search of its own - the vector still comes
+from `enc->gpu_mvs[]`/`BC250_HEVC_FAKE_GPU_MV`, truncated to the
+integer-pel, even-aligned constraint this encoder's block-copy MC
+requires. Landed behind `BC250_HEVC_ENABLE_INTER=1` (default off,
+unvalidated-on-real-hardware-yet), `hevc_host_drift.sh` 53/53 byte-exact
+with the flag both on and off, `ctest`'s 6 GPU-free tests unaffected. One
+real bug found and fixed during bring-up: `cbf_luma` was being signalled
+unconditionally, but 7.3.8.8's `transform_tree()` only signals it when
+`CuPredMode == MODE_INTRA || trafoDepth != 0 || cbf_cb || cbf_cr` - for an
+inter CU with both chroma CBFs 0, it must be *inferred* as 1, not written;
+the extra bit desynced CABAC from that CU onward. Invisible on the intra
+call sites because `MODE_INTRA` makes that condition unconditionally true
+there.
 
 ## 4. Verification this would need, matching how everything else in this
    tree gets landed

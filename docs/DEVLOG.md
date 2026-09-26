@@ -5371,3 +5371,117 @@ opt-in case all behaved exactly as designed, not merely as hoped.
 directly with a hardcoded attribute value and never query
 `bc250_GetConfigAttributes` for the default, so they're unaffected and
 needed no changes.
+
+## 44. H3 implemented: HEVC P-frames get real AMVP+MVD motion compensation, off-board validated
+
+§43 found and fixed the RC-negotiation bug but also left H3 on record: at
+matched QP on real content, HEVC cost 2.09x what H.264 did with P-frames
+active, dropping to 1.09x all-intra - the entire gap was P-frame
+behavior. Root cause, also already on record: HEVC P-frames were
+zero-motion-skip-or-full-intra-fallback only, with no path for "moved a
+little, code a small residual" - exactly what H.264's real inter
+prediction does cheaply.
+
+**The first scoping pass got the mechanism wrong, and that was caught
+before writing code.** `docs/notes/hevc-real-motion-compensation-scope.md`
+originally proposed a cheap "Phase 1": inject the GPU's already-computed
+per-CTU motion vector as a sixth entry in `derive_merge_candidates()`'s
+candidate list, with real residual coding but no AMVP/MVD machinery.
+That's spec-illegal, not just smaller in scope - a merge candidate must
+be independently derivable by any compliant decoder from already-decoded
+bitstream state alone (spatial/temporal neighbor MVs), and an
+encoder-only GPU estimate is never part of that state. A decoder given
+such a bitstream would derive a different (all-zero) merge list and
+diverge from CU 1 onward. There's no ordering or pruning fix for this;
+the defect is categorical. Caught by re-reading `derive_merge_candidates()`'s
+own header comment before implementing, not by testing a broken version
+first.
+
+**What actually shipped is the note's "Phase 2": full explicit AMVP+MVD
+signalling**, verified against authoritative sources at every step rather
+than written from memory of the spec:
+
+- `derive_amvp_candidates()` (`encoder_h265.c`, new, alongside the
+  existing `derive_merge_candidates()`) - ITU-T H.265 8.5.3.2.6/8.5.3.2.7,
+  simplified for this encoder's fixed single-reference (`DeltaPOC=-1`)
+  case, so no motion-vector scaling is ever needed. Reuses the same
+  position-availability rules `derive_merge_candidates()` already uses
+  (validated equivalent to full z-scan-rank checks for this encoder's
+  fixed 2x2-CU-per-CTU layout).
+- New CABAC contexts: `HEVC_CTX_MVD` (2, shared between x/y per
+  9.3.3.9/Table 9-4), `HEVC_CTX_MVP_IDX`, `HEVC_CTX_ROOT_CBF`
+  (`hevc_cabac.h`/`.c`). Init values (`INIT_MVD={140,198}`,
+  `INIT_MVP_IDX=168`, `INIT_ROOT_CBF=79`) cross-verified two ways before
+  writing them down: against a parallel fork's independently-arrived-at
+  implementation (`simpmix/bc250-encoding-decoding-fix#48`), then
+  independently against HM's own `ContextTables.h` - including
+  cross-checking 4 of this project's own already-shipped context values
+  against the same HM source as a trust check on both references.
+- `mvd_coding()` (`hevc_cabac_code_mvd()`): `abs_mvd_greater0_flag`x2 →
+  `abs_mvd_greater1_flag`x2 (both context-coded) → per-component (x fully
+  before y) order-1 Exp-Golomb `abs_mvd_minus2` + sign, both bypass-coded.
+  A genuinely distinct binarization from the Rice-adaptive
+  `coeff_abs_level_remaining` scheme already used for residual coding
+  (9.3.3.13) - written as its own `write_egk_bypass()` helper rather than
+  reusing `write_coef_remain_exp_golomb()`, whose cutoff constant is
+  specific to residual coding.
+- `encode_cu()`: a new inter-decision block, gated by
+  `BC250_HEVC_ENABLE_INTER=1` (default off, matching the
+  `BC250_HEVC_GPU`/`BC250_ENABLE_HEVC` precedent for landing
+  not-yet-board-validated behavior safely). Only considered when skip
+  wasn't already chosen and a real GPU motion estimate exists for the
+  CTU (`enc->gpu_mvs[]`, from `motion_estimation.comp`'s readback or
+  `BC250_HEVC_FAKE_GPU_MV` off-board), truncated to this encoder's
+  integer-pel/even-aligned block-copy MC constraint
+  (`(mvx/4) & ~1`, the same constraint the removed CPU motion search used).
+  Chosen only when the GPU's SAD at that vector beats the zero-motion SAD.
+  Writes `cu_skip_flag(0)`, `pred_mode_flag(0)`, the existing
+  `part_mode`/2Nx2N codeword (identical bits for intra and inter at this
+  fixed CU size - verified against 7.4.9.5's `MinCbLog2SizeY` constraint,
+  not assumed), `merge_flag(0)`, then **`mvd_coding()` before
+  `mvp_l0_flag`** - order confirmed against HM's actual decoder source
+  (`TDecEntropy::decodePUWise()` calls `decodeMvdPU()` before
+  `decodeMVPIdxPU()`), the reverse of what the syntax table's visual
+  layout suggests. Motion-compensated luma/chroma prediction reuses the
+  skip path's existing block-copy, now from the real offset; residual
+  reuses the existing codec-agnostic transform/quant/CABAC-residual
+  pipeline unchanged, with `scan_idx` hardcoded to diagonal (0) rather
+  than `hevc_scan_idx_for_mode()`, since 7.4.9.11's mode-dependent scan is
+  intra-only.
+
+**One real bug found and fixed during bring-up, the kind only
+byte-exactness catches:** after landing the above, `hevc_host_drift.sh`
+failed 4 of 53 cases with the flag on (the fake-GPU-MV and one VBR
+case), starting at exactly the first frame the new code path fired.
+Root cause, found by reading HM's decoder source rather than guessing:
+per 7.3.8.8 `transform_tree()`, `cbf_luma` is only *signalled* when
+`CuPredMode == MODE_INTRA || trafoDepth != 0 || cbf_cb || cbf_cr`. Every
+existing call site in this codebase is intra-only, where `MODE_INTRA`
+makes that condition unconditionally true - so both shipped, unconditional
+calls to `hevc_cabac_code_cbf_luma()` were coincidentally correct there,
+and this had never been exercised any other way. The new inter call site
+is the first place `trafoDepth == 0` and `CuPredMode == MODE_INTER` can
+both hold, and its debug trace showed `cbf_cb=0, cbf_cr=0` for nearly
+every fired CU - meaning the extra, spec-illegal bit was being written on
+almost every single inter CU, byte-desyncing CABAC from that point
+onward (consistent with the observed "corruption starts at frame 2,
+grows across later frames" pattern - each corrupted frame became the
+next reference). Fixed by only calling `hevc_cabac_code_cbf_luma()` when
+`cbf_cb || cbf_cr`, otherwise leaving it un-signalled (`rqt_root_cbf==1`
+with both chroma CBFs 0 already forces the inferred value to match the
+computed one, so no other logic needed to change).
+
+**Verification, off-board (no board/Vulkan hardware available in this
+pass):** `tools/hevc_host_drift.sh` 53/53 byte-exact with
+`BC250_HEVC_ENABLE_INTER=1` and 53/53 unchanged with it unset;
+`ctest` 6/6 GPU-free tests unaffected (`VaApiDriverTest`'s failure in this
+environment is a pre-existing WSL/llvmpipe Vulkan out-of-device-memory
+condition, unrelated to this change - it needs real GPU hardware to
+allocate the surfaces it's testing).
+
+**Not done:** board validation of the real (non-`BC250_HEVC_FAKE_GPU_MV`)
+GPU motion-estimation readback feeding this path, a bitrate/PSNR
+re-measurement of the 2.09x gap with the flag on, and any decision about
+enabling it by default. `docs/backlog.md` H3 and
+`docs/notes/hevc-real-motion-compensation-scope.md` both updated to match
+this state.
