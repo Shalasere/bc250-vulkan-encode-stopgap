@@ -5479,9 +5479,51 @@ environment is a pre-existing WSL/llvmpipe Vulkan out-of-device-memory
 condition, unrelated to this change - it needs real GPU hardware to
 allocate the surfaces it's testing).
 
-**Not done:** board validation of the real (non-`BC250_HEVC_FAKE_GPU_MV`)
-GPU motion-estimation readback feeding this path, a bitrate/PSNR
-re-measurement of the 2.09x gap with the flag on, and any decision about
-enabling it by default. `docs/backlog.md` H3 and
-`docs/notes/hevc-real-motion-compensation-scope.md` both updated to match
-this state.
+**Not done at the time of writing above, now done:** board validation of
+the real (non-`BC250_HEVC_FAKE_GPU_MV`) GPU motion-estimation readback,
+and a bitrate/PSNR re-measurement with the flag on. `docs/backlog.md` H3
+and `docs/notes/hevc-real-motion-compensation-scope.md` both updated to
+match this state.
+
+### 44.1 Board result: correct, but effectiveness regresses - matched-bitrate PSNR is worse with the flag on, not better
+
+Board (`shalasere@10.0.0.104`, real hardware, real GPU motion-estimation
+readback - not `BC250_HEVC_FAKE_GPU_MV`): `tools/lab units`/`audit` clean
+(5/5 unit tests, mask EXACT), so the build and driver are healthy on this
+board independent of H3. Then `tools/lab qsweep --codec=hevc
+--content=bbb --res=1920x1080 --frames=150 --bitrates=4M,8M,13M --no-ref`,
+run twice - once with `BC250_HEVC_ENABLE_INTER` unset, once with it set
+to `1` - same build, same content, same bitrates, only the flag differs:
+
+| bitrate | PSNR, flag off | PSNR, flag on | Δ |
+|---|---|---|---|
+| 4M  | 28.79 dB | 28.07 dB | −0.72 dB |
+| 8M  | 28.93 dB | 28.19 dB | −0.74 dB |
+| 13M | 29.35 dB | 28.55 dB | −0.80 dB |
+
+No crash, no `ENCODE FAILED`, both streams decode cleanly - this is not
+a repeat of the cbf_luma bug or any other correctness defect. It is a
+real, consistent quality regression at every bitrate tested: turning the
+feature on makes output *worse*, not better, which is the opposite of
+what H3 exists to fix.
+
+**Diagnosis, not yet fixed:** `encode_cu()`'s inter-vs-skip/intra
+decision picks the new AMVP+MVD path whenever `gpu_sad < sad_zero` -
+comparing residual cost only. It never charges for the real signalling
+bits that path actually costs (`mvd_coding()`, `mvp_l0_flag`,
+`rqt_root_cbf`, the extra `cbf_cb`/`cbf_cr`/`cbf_luma` flags) against a
+skip CU's zero extra bits, or against what intra would have cost at the
+same QP. This is the exact bug class `v0.5.0`'s A3 piece hit and fixed
+for intra mode selection ("SAD-only search never charged for signalling
+bits" - biasing the search against the *exact* CABAC-measured cost of a
+non-MPM mode fixed a real RD regression there). The fix here is
+presumably the same shape: bias the inter-vs-skip/intra decision by an
+estimated (or exactly measured) signalling-bit cost instead of comparing
+raw SAD, then re-run this exact qsweep A/B to confirm the sign flips
+before considering the default.
+
+**Verdict: stays gated off, and is not being described as closing the
+2.09x gap.** The feature is real, spec-correct, and safely inert unless
+explicitly requested - but as tuned today it is a net quality loss when
+turned on, not a win. Not included as a positive feature in any release
+note until the RD-decision fix lands and re-measures cleanly.

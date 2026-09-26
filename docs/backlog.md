@@ -1637,8 +1637,10 @@ analogous error. Off-board: `ctest` 6/6 relevant, `hevc_host_drift.sh`
 53/53 (neither touches the VA-API attribute layer this changes).
 Full writeup: `docs/DEVLOG.md` §43.
 
-**H3. IMPLEMENTED (off-board validated, gated, not yet board-tested) -
-HEVC now has real AMVP+MVD motion compensation.** Was: HEVC P-frames were
+**H3. IMPLEMENTED, board-validated for correctness, BOARD-MEASURED NOT
+YET EFFECTIVE - HEVC now has real AMVP+MVD motion compensation, but it
+currently makes matched-bitrate quality worse, not better.** Was: HEVC
+P-frames were
 zero-motion-skip-or-intra-fallback only, costing ~2x the bits of H.264 at
 matched QP on real motion content (H.264/HEVC size ratio 1.09x all-intra
 vs. 2.09x with P-frames active at QP 27 - the entire 2x gap was P-frame
@@ -1679,7 +1681,31 @@ extending inter coding further: `cbf_luma` must not be signalled when
 with signalling it unconditionally because `CuPredMode == MODE_INTRA`
 already satisfies that condition regardless.
 
-**Not yet done:** board validation (this was all off-board, host-repro/
-CABAC-oracle only, no real Vulkan hardware in the loop for the GPU MV
-readback itself), and a decision on whether to enable the flag by
-default once board-measured.
+**Board-measured 2026-09-25 (bbb content, 1920x1080, gop=120,
+`qsweep --codec=hevc --no-ref` at 4M/8M/13M): a real, consistent PSNR
+REGRESSION at every matched bitrate with `BC250_HEVC_ENABLE_INTER=1`
+versus the same build with it unset** - 28.79/28.93/29.35 dB (off) vs.
+28.07/28.19/28.55 dB (on), i.e. **−0.72 to −0.80 dB at matched bitrate**.
+No crash, no `ENCODE FAILED`, bitstream decodes cleanly (the units/audit
+gate and byte-exactness oracle both stayed clean) - this is a real
+effectiveness problem, not a correctness one. The feature does the
+opposite of its intended job as currently tuned.
+
+**Likely cause, same bug class this project already hit and fixed once
+(A3, `v0.5.0` - "SAD-only search never charged for signalling bits"):**
+the inter-vs-skip/intra decision in `encode_cu()` picks the AMVP+MVD
+path purely on `gpu_sad < sad_zero` - comparing residual cost only,
+never charging for the real signalling overhead
+(`mvd_coding()`/`mvp_l0_flag`/`rqt_root_cbf`/the extra `cbf` flags)
+against the zero extra bits a skip CU costs, or against what intra would
+have cost at the same QP. On real motion content that overhead is
+apparently often not worth paying, so the encoder frequently takes an
+expensive real vector when a cheaper path existed - not a bitstream
+defect, an RD-blind heuristic.
+
+**Left OFF by default and not recommended for release-notes framing as
+"closes the gap" until this is fixed and re-measured.** Next step, if
+picked back up: bias the decision by an estimated signalling-bit cost
+(mirroring exactly how A3 was fixed for intra mode selection) rather
+than comparing raw SAD, then re-run this same qsweep A/B to confirm the
+regression flips to an improvement before touching the default.
