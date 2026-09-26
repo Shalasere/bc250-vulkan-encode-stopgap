@@ -15,11 +15,11 @@ On modern AMD APUs, the Video Core Next (VCN) IP block is an independent coproce
 On the BC-250 SKU this authentication/provisioning step never succeeds, so VCN never comes up - this driver exists because of that, not because of any one specific error code, which this file will not assert without a citable source.
 
 ### 2. SMN Bus & Dynamic IP Discovery vs. Static PCIe MMIO
-* On RDNA 2 (Navi 2x / Oberon), registers are **not** statically mapped into the PCIe BAR address space at fixed offsets.
+* On this generation of AMD GPU IP blocks (including Oberon/Cyan Skillfish), registers are **not** statically mapped into the PCIe BAR address space at fixed offsets.
 * All IP block communication is routed dynamically through the **System Management Network (SMN)** bus and configured via the GPU's binary **IP Discovery** table at boot.
 * Attempting to perform arbitrary MMIO writes to offsets like `BAR + 0x7E00` does not reach the VCN block; it hits unrelated unmapped physical memory space, risking PCIe bus lockups and kernel panics.
 
 ### 3. Conclusion & Solution
 Because the silicon VCN block is permanently locked by hardware eFuses and signed firmware requirements, the project uses **Approach 1: The Vulkan Compute VA-API Driver**. 
 
-By utilizing the APU's **40 unlocked RDNA 2 Compute Units (2,560 stream processors)** to execute parallel compute shaders for motion estimation, transform, quantization, and entropy coding, we achieve high-performance hardware-like encoding without touching the locked VCN silicon.
+By utilizing the APU's **40 unlocked Compute Units (2,560 stream processors)** to execute parallel compute shaders for motion estimation, transform, quantization, and entropy coding, we achieve high-performance hardware-like encoding without touching the locked VCN silicon.

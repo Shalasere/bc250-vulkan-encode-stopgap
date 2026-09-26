@@ -382,7 +382,29 @@ VAStatus bc250_CreateSurfaces(VADriverContextP ctx, int width, int height, int f
 VAStatus bc250_CreateSurfaces2(VADriverContextP ctx, unsigned int format, unsigned int width, unsigned int height,
                               VASurfaceID *surfaces, unsigned int num_surfaces,
                               VASurfaceAttrib *attrib_list, unsigned int num_attribs) {
-    (void)attrib_list; (void)num_attribs;
+    /* bc250_QuerySurfaceAttributes() above never advertises
+     * VASurfaceAttribMemoryType at all - this driver only ever hands back
+     * its own internally Vulkan-allocated surfaces, it never wraps a
+     * caller-supplied buffer. A caller asking to import external memory
+     * (VA_SURFACE_ATTRIB_MEM_TYPE_V4L2/USER_PTR/KERNEL_DRM/DRM_PRIME(_2) -
+     * DRM_PRIME_2 specifically is how Gamescope and Sunshine/Steam Link's
+     * screencasting request zero-copy DMA-BUF import) must get a real
+     * error, not silent success with an unrelated internal surface: a
+     * caller that believes its import succeeded skips its own EGL/GL blit
+     * fallback and ends up encoding an unrelated, uninitialized buffer -
+     * solid green or black (NV12 Y=0/U=0/V=0). VA_SURFACE_ATTRIB_MEM_TYPE_VA
+     * (native VA memory, no import) and an unset/zero value (attribute
+     * present but no explicit type requested) are the only two cases this
+     * driver can honestly satisfy. */
+    if (attrib_list) {
+        for (unsigned int i = 0; i < num_attribs; i++) {
+            if (attrib_list[i].type != VASurfaceAttribMemoryType) continue;
+            int mem_type = attrib_list[i].value.value.i;
+            if (mem_type != 0 && mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_VA) {
+                return VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE;
+            }
+        }
+    }
     return bc250_CreateSurfaces(ctx, width, height, format, num_surfaces, surfaces);
 }
 
@@ -1786,7 +1808,14 @@ VAStatus bc250_Initialize(VADriverContextP ctx, int *major_version, int *minor_v
     data->max_width = BC250_MAX_WIDTH;
     data->max_height = BC250_MAX_HEIGHT;
     ctx->pDriverData = data;
-    ctx->str_vendor = "AMD BC-250 RDNA2 Compute VA-API Driver";
+    /* Not "RDNA2" - the BC-250/Oberon GPU is semi-custom (RDNA1-generation
+     * memory subsystem, no Infinity Cache, plus RDNA2-generation ray-
+     * tracing BVH units grafted on), and this driver's own Vulkan compute
+     * code has nothing RDNA2-specific in it either way - see
+     * gpu_compute.c's ACE comment and the shaders' Wave32/64 comments.
+     * This string is user-visible (e.g. `vainfo`'s "Driver version:"),
+     * so it gets the same accuracy bar as the rest of the driver. */
+    ctx->str_vendor = "AMD BC-250 Compute VA-API Driver";
 
     /* libva's core vaInitialize() validates these counts and the vtable
      * completeness before returning control to the driver's caller - both

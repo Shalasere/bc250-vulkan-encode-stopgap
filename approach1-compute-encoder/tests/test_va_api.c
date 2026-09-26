@@ -174,6 +174,79 @@ int main(void) {
     assert(status == VA_STATUS_SUCCESS);
     printf("[PASS] Allocated 2 1080p surfaces (IDs %d, %d)\n", surfaces[0], surfaces[1]);
 
+    /* 5b. CreateSurfaces2 external-memory-import rejection (Gamescope/
+     * Sunshine/Steam Link screencasting green-black-screen guard). This
+     * driver only ever hands back its own internally Vulkan-allocated
+     * surfaces - it never actually wraps a caller-supplied buffer, and
+     * bc250_QuerySurfaceAttributes() above never advertises
+     * VASurfaceAttribMemoryType at all. A caller requesting zero-copy
+     * DMA-BUF import (VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 is what
+     * Gamescope/screencasting actually requests) must get a real error
+     * so it falls back to its own blit path, not silent success with an
+     * unrelated, uninitialized surface - that mismatch is exactly what
+     * produced solid green/black screens on the sibling fork this driver
+     * shares lineage with (its own CreateSurfaces2 had the identical gap
+     * until this same class of fix landed there first). */
+    {
+        VASurfaceID import_surfaces[1];
+
+        /* No attrib_list at all (FFmpeg's own vaCreateSurfaces2 call
+         * shape) must keep working exactly as before. */
+        status = ctx.vtable->vaCreateSurfaces2(&ctx, VA_RT_FORMAT_YUV420, 64, 64,
+                                                import_surfaces, 1, NULL, 0);
+        assert(status == VA_STATUS_SUCCESS);
+        ctx.vtable->vaDestroySurfaces(&ctx, import_surfaces, 1);
+
+        /* An explicit request for this driver's own native memory must
+         * also keep working. */
+        VASurfaceAttrib native_attrib = {
+            .type = VASurfaceAttribMemoryType,
+            .flags = VA_SURFACE_ATTRIB_SETTABLE,
+            .value = { .type = VAGenericValueTypeInteger,
+                       .value = { .i = VA_SURFACE_ATTRIB_MEM_TYPE_VA } }
+        };
+        status = ctx.vtable->vaCreateSurfaces2(&ctx, VA_RT_FORMAT_YUV420, 64, 64,
+                                                import_surfaces, 1, &native_attrib, 1);
+        assert(status == VA_STATUS_SUCCESS);
+        ctx.vtable->vaDestroySurfaces(&ctx, import_surfaces, 1);
+
+        /* A request to import an external DRM_PRIME_2 DMA-BUF (Gamescope's
+         * actual request) must be rejected, not silently satisfied with an
+         * unrelated internal surface. */
+        VASurfaceAttrib prime2_attrib = {
+            .type = VASurfaceAttribMemoryType,
+            .flags = VA_SURFACE_ATTRIB_SETTABLE,
+            .value = { .type = VAGenericValueTypeInteger,
+                       .value = { .i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 } }
+        };
+        status = ctx.vtable->vaCreateSurfaces2(&ctx, VA_RT_FORMAT_YUV420, 64, 64,
+                                                import_surfaces, 1, &prime2_attrib, 1);
+        assert(status == VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+
+        /* Same for the older single-plane DRM_PRIME and for USER_PTR. */
+        VASurfaceAttrib prime1_attrib = {
+            .type = VASurfaceAttribMemoryType,
+            .flags = VA_SURFACE_ATTRIB_SETTABLE,
+            .value = { .type = VAGenericValueTypeInteger,
+                       .value = { .i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME } }
+        };
+        status = ctx.vtable->vaCreateSurfaces2(&ctx, VA_RT_FORMAT_YUV420, 64, 64,
+                                                import_surfaces, 1, &prime1_attrib, 1);
+        assert(status == VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+
+        VASurfaceAttrib userptr_attrib = {
+            .type = VASurfaceAttribMemoryType,
+            .flags = VA_SURFACE_ATTRIB_SETTABLE,
+            .value = { .type = VAGenericValueTypeInteger,
+                       .value = { .i = VA_SURFACE_ATTRIB_MEM_TYPE_USER_PTR } }
+        };
+        status = ctx.vtable->vaCreateSurfaces2(&ctx, VA_RT_FORMAT_YUV420, 64, 64,
+                                                import_surfaces, 1, &userptr_attrib, 1);
+        assert(status == VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE);
+
+        printf("[PASS] CreateSurfaces2 rejects external DMA-BUF/USER_PTR import, keeps native/no-attrib paths working\n");
+    }
+
     /* 6. Create Context */
     VAContextID context_id = VA_INVALID_ID;
     status = ctx.vtable->vaCreateContext(&ctx, config_id, 1920, 1080, 0, surfaces, 2, &context_id);
